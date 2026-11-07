@@ -1,8 +1,8 @@
 import { memo, useMemo, useState } from 'react'
 import { useRobotIds } from '../lib/hooks'
-import { fmt, fmtClock, kindLabel, robotName } from '../lib/format'
+import { fmt, fmtClock, kindLabel, robotName, robotShort } from '../lib/format'
 import { useStore } from '../lib/store'
-import { SEVERITY_COLOR, stateColor } from '../lib/theme'
+import { C, RESCUE_KINDS, SEVERITY_COLOR, stateColor } from '../lib/theme'
 import type { TraceEntry } from '../lib/types'
 import { FleetGlyph } from '../screens/prelaunch/ConfigFields'
 import { Panel, SensorChips, StatePill } from '../ui/Panel'
@@ -37,12 +37,13 @@ export function DecisionTrace() {
             role="tab"
             aria-selected={filter === id}
             onClick={() => setFilter(id)}
-            className={`rounded-[2px] px-2 py-0.5 text-[12px] font-[600] ${filter === id ? 'bg-bay-2 text-bone shadow-[inset_0_0_0_1px_var(--color-rule-2)]' : 'text-dim hover:text-haze'}`}
+            title={id === 'all' ? undefined : robotName(id)}
+            className={`rounded-[2px] px-2 py-0.5 text-[12px] font-[600] whitespace-nowrap ${id === 'all' ? '' : 'font-cond font-[750] tracking-[0.03em]'} ${filter === id ? 'bg-bay-2 text-bone shadow-[inset_0_0_0_1px_var(--color-rule-2)]' : 'text-dim hover:text-haze'}`}
           >
-            {id === 'all' ? 'Whole fleet' : robotName(id)}
+            {id === 'all' ? 'Whole fleet' : robotShort(id)}
           </button>
         ))}
-        <span className="ml-auto flex items-center gap-2.5 text-[11px] text-dim">
+        <span className="ml-auto hidden items-center gap-2.5 text-[11px] text-dim @min-[400px]:flex">
           <Legend color={SEVERITY_COLOR.info} label="info" />
           <Legend color={SEVERITY_COLOR.warn} label="warn" />
           <Legend color={SEVERITY_COLOR.critical} label="critical" />
@@ -69,6 +70,8 @@ const Legend = ({ color, label }: { color: string; label: string }) => (
 
 const TraceRow = memo(function TraceRow({ t }: { t: TraceEntry }) {
   const sev = SEVERITY_COLOR[t.severity] ?? SEVERITY_COLOR.info
+  // rescue-sequence steps read in the rescue colour unless they carry a warning
+  const kindColor = t.severity === 'info' ? (RESCUE_KINDS.has(t.kind) ? C.rescue : undefined) : sev
   const conf = Math.max(0, Math.min(1, t.confidence ?? 0))
   return (
     <li
@@ -78,12 +81,15 @@ const TraceRow = memo(function TraceRow({ t }: { t: TraceEntry }) {
       <span className="absolute top-0 bottom-0 left-0 w-[3px]" style={{ backgroundColor: sev }} aria-hidden />
       <div className="flex items-center gap-2">
         <time className="num shrink-0 font-mono text-[11px] text-dim [font-stretch:80%]">{fmtClock(t.t)}</time>
-        <span className="flex shrink-0 items-center gap-1 text-[12.5px] font-[650] text-bone">
+        <span className="font-cond flex shrink-0 items-center gap-1 text-[13px] font-[780] tracking-[0.03em] text-bone" title={robotName(t.robot)}>
           <FleetGlyph kind={t.robot.startsWith('scout') ? 'scout' : 'rover'} on size={10} />
-          {robotName(t.robot)}
+          {robotShort(t.robot)}
         </span>
-        <StatePill state={t.state} color={stateColor(t.state)} />
-        <span className="font-semi-cond min-w-0 truncate text-[13.5px] font-[750]" style={{ color: t.severity === 'info' ? undefined : sev }}>
+        {/* the decision itself outranks the FSM state when the column is narrow */}
+        <span className="hidden shrink-0 @min-[400px]:inline-flex">
+          <StatePill state={t.state} color={stateColor(t.state)} />
+        </span>
+        <span className="font-semi-cond min-w-0 truncate text-[13.5px] font-[750]" style={{ color: kindColor }}>
           {kindLabel(t.kind)}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-1.5" title={`confidence ${conf.toFixed(2)}`}>

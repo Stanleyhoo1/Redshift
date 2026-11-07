@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import _paths  # noqa: F401
+from redshift_autonomy.agent_fsm import display_name, role_of
 from redshift_autonomy.edge_budget import PROFILES
 from redshift_autonomy.physics_model import RoverPhysics
 from redshift_sim.world_builder import SECTORS, robot_names
@@ -19,7 +20,7 @@ SPEED_CHOICES = (0.5, 1.0, 1.5, 2.0)
 
 class Fleet(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    rovers: int = Field(1, ge=1, le=2)
+    rovers: int = Field(2, ge=1, le=2)
     drones: int = Field(1, ge=0, le=1)
 
 
@@ -49,7 +50,9 @@ def options() -> dict:
         'sectors': [{'id': k, 'label': SECTOR_LABELS[k], 'size_m': L, 'res_m': r, 'cells': int(round(L / r))}
                     for k, (L, r) in SECTORS.items()],
         'gravity': {'min': 1.0, 'max': 3.0, 'step': 0.1, 'default': d.gravity_g},
-        'fleet': {'rovers': {'min': 1, 'max': 2, 'default': 1}, 'drones': {'min': 0, 'max': 1, 'default': 1}},
+        'fleet': {'rovers': {'min': 1, 'max': 2, 'default': d.fleet.rovers},
+                  'drones': {'min': 0, 'max': 1, 'default': d.fleet.drones},
+                  'roles': {r: {'role': role_of(r), 'name': display_name(r)} for r in ('rover_0', 'rover_1', 'scout_0')}},
         'edge_profiles': [{k: v for k, v in p.as_dict().items()} for p in PROFILES.values()],
         'backends': [{'id': 'gazebo', 'label': 'Gazebo Harmonic', 'available': gazebo_available()},
                      {'id': 'mock', 'label': 'Mock physics', 'available': True}],

@@ -156,8 +156,23 @@ def b64_jpeg(img: np.ndarray, q: int = 72) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
+RESCUE_BGR = (61, 255, 198)  # #c6ff3d, the UI's rescue colour
+
+
+def depth_colormap(depth: np.ndarray, near: float = 0.0, far: float = 25.0) -> np.ndarray:
+    """Turbo colour map, near = red, far = blue, no return (inf / nan) = black."""
+    ok = np.isfinite(depth)
+    v = np.clip((far - np.where(ok, depth, far)) / (far - near), 0, 1)
+    img = cv2.applyColorMap((v * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    img[~ok] = (12, 8, 14)
+    return img
+
+
 def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: list, dust: float,
-                 seismic: bool, label: str, mode: str, unc: float, rng: np.random.Generator) -> np.ndarray:
+                 seismic: bool, label: str, mode: str, unc: float, rng: np.random.Generator,
+                 others: list | None = None, want_depth: bool = False):
+    """RGB frame (BGR array). `others` = teammate rovers [{x, y, short, damaged, lock}]; with want_depth
+    also returns the colour-mapped depth frame of the same view."""
     W, H, hfov, pitch, cam_h = 320, 240, math.radians(80), math.radians(-12), 1.0
     f = (W / 2) / math.tan(hfov / 2)
     u, v = np.meshgrid(np.arange(W, dtype=np.float32) - W / 2, np.arange(H, dtype=np.float32) - H / 2)
@@ -185,6 +200,7 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
     haze = np.clip(d / 55.0, 0, 1)[..., None] ** 1.3
     img = np.where(down[..., None], ground * (1 - haze) + sky_hor * haze, sky)
     img = np.clip(img, 0, 255).astype(np.uint8)
+    depth = np.where(down, d, np.inf).astype(np.float32) if want_depth else None
 
     # boulders (3-D-ish ellipses) + perception boxes burned into the frame
     boxes = []
@@ -195,14 +211,41 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
         lat = -dx * math.sin(yaw) + dy * math.cos(yaw)
         if 1.5 <= fwd <= 22 and abs(math.atan2(lat, fwd)) <= hfov / 2:
             seen.append((fwd, lat, r))
-    for fwd, lat, r in sorted(seen, reverse=True):  # paint far to near
+    mates = []
+    for o in others or []:
+        dx, dy = o["x"] - pose["x"], o["y"] - pose["y"]
+        fwd = dx * math.cos(yaw) + dy * math.sin(yaw)
+        lat = -dx * math.sin(yaw) + dy * math.cos(yaw)
+        if 0.6 <= fwd <= 24 and abs(math.atan2(lat, fwd)) <= hfov / 2 + 0.3:
+            seen.append((fwd, lat, -1.0))
+            mates.append((fwd, o))
+    for fwd, lat, r in sorted(seen, key=lambda q: q[0], reverse=True):  # paint far to near
         cx = W / 2 - f * lat / fwd
         base = H / 2 - f * math.tan(math.atan(-cam_h / fwd) - pitch)
+        if r < 0:  # a teammate rover: wheels, chassis, mast
+            o = next(m for d0, m in mates if d0 == fwd)
+            s_ = f / fwd
+            hw, body_lo, body_hi = 0.5 * s_, 0.22 * s_, 0.62 * s_
+            for wx_ in (-0.42, 0.42):
+                cv2.ellipse(img, (int(cx + wx_ * s_), int(base - 0.12 * s_)), (max(1, int(0.13 * s_)), max(1, int(0.13 * s_))), 0, 0, 360, (36, 32, 40), -1, cv2.LINE_AA)
+            p0, p1 = (int(cx - hw), int(base - body_hi)), (int(cx + hw), int(base - body_lo))
+            cv2.rectangle(img, p0, p1, (196, 200, 206), -1, cv2.LINE_AA)
+            cv2.rectangle(img, (p0[0], int(base - body_hi)), (p1[0], int(base - body_hi + 0.08 * s_)), (70, 150, 220), -1)
+            cv2.line(img, (int(cx + 0.25 * s_), int(base - body_hi)), (int(cx + 0.25 * s_), int(base - 1.05 * s_)), (150, 150, 160), max(1, int(0.03 * s_)), cv2.LINE_AA)
+            if o.get("damaged"):
+                cv2.circle(img, (int(cx + 0.25 * s_), int(base - 1.08 * s_)), max(2, int(0.06 * s_)), (60, 60, 255), -1, cv2.LINE_AA)
+                cv2.line(img, (int(cx - 0.3 * s_), int(base - 0.45 * s_)), (int(cx - 0.05 * s_), int(base - 0.3 * s_)), (40, 40, 60), max(1, int(0.02 * s_)), cv2.LINE_AA)
+            if depth is not None:
+                depth[max(0, p0[1]): max(0, int(base)), max(0, p0[0]): max(0, p1[0])] = fwd
+            boxes.append((cx - hw * 1.08, base - 1.12 * s_, hw * 2.16, 1.12 * s_, fwd, 0.93, o))
+            continue
         rad = f * r / fwd
         cy = base - rad * 0.7
         cv2.ellipse(img, (int(cx), int(cy)), (max(2, int(rad)), max(2, int(rad * 0.75))), 0, 0, 360, (70, 66, 80), -1, cv2.LINE_AA)
         cv2.ellipse(img, (int(cx - rad * 0.25), int(cy - rad * 0.25)), (max(1, int(rad * 0.55)), max(1, int(rad * 0.35))), 0, 0, 360, (110, 104, 122), -1, cv2.LINE_AA)
-        boxes.append((cx - rad * 1.1, cy - rad * 0.95, rad * 2.2, rad * 1.8, fwd, 0.78 + 0.2 * min(1, r)))
+        if depth is not None:
+            cv2.ellipse(depth, (int(cx), int(cy)), (max(2, int(rad)), max(2, int(rad * 0.75))), 0, 0, 360, float(fwd), -1)
+        boxes.append((cx - rad * 1.1, cy - rad * 0.95, rad * 2.2, rad * 1.8, fwd, 0.78 + 0.2 * min(1, r), None))
 
     if dust > 0:
         tan = np.full_like(img, (92, 140, 196))
@@ -213,13 +256,16 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
         img = np.roll(img, int(rng.integers(-4, 5)), axis=1)
 
     labels = []  # placed label rects, nearest rock first, so labels never pile up
-    for bx, by, bw, bh, rng_m, conf in sorted(boxes, key=lambda b: b[4]):
+    banner = None
+    for bx, by, bw, bh, rng_m, conf, mate in sorted(boxes, key=lambda b: b[4]):
         if mode == "LIDAR_ONLY":
             conf *= 0.55
-        col = (56, 178, 255)
+        col = (56, 178, 255) if mate is None else RESCUE_BGR
         p0, p1 = (int(bx), int(by)), (int(bx + bw), int(by + bh))
-        cv2.rectangle(img, p0, p1, col, 1, cv2.LINE_AA)
-        text = f"ROCK {conf:.2f}  {rng_m:.1f} m"
+        cv2.rectangle(img, p0, p1, col, 2 if mate is not None and mate.get("lock") else 1, cv2.LINE_AA)
+        if mate is not None and mate.get("lock"):
+            banner = mate.get("lock")
+        text = f"ROCK {conf:.2f}  {rng_m:.1f} m" if mate is None else f"ROVER {mate['short']} {conf:.2f}  {rng_m:.1f} m{'  DAMAGED' if mate.get('damaged') else ''}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.33, 1)
         tx = int(min(max(2, p0[0]), W - tw - 2))
         ty = p0[1] - 4 if p0[1] - 4 - th > 2 else p1[1] + th + 4
@@ -231,11 +277,22 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
     # corridor overlay + HUD
     cv2.line(img, (W // 2 - 40, H - 1), (W // 2 - 14, int(H * 0.62)), (255, 195, 76), 1, cv2.LINE_AA)
     cv2.line(img, (W // 2 + 40, H - 1), (W // 2 + 14, int(H * 0.62)), (255, 195, 76), 1, cv2.LINE_AA)
+    if banner:  # §8.8 lock-on label across the top of the frame
+        sc = 0.36
+        (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, sc, 1)
+        while tw > W - 8 and sc > 0.2:
+            sc -= 0.02
+            (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, sc, 1)
+        cv2.rectangle(img, (0, 26), (W, 30 + th + 8), (20, 14, 18), -1)
+        cv2.putText(img, banner, ((W - tw) // 2, 30 + th + 2), cv2.FONT_HERSHEY_SIMPLEX, sc, RESCUE_BGR, 1, cv2.LINE_AA)
+    if want_depth:
+        return img, depth_colormap(depth)
     return img
 
 
 def scout_camera(tex: np.ndarray, px_m: float, size_m: float, pose: dict, science: list, perm: list,
-                 scanning: bool, dust: float, label: str) -> np.ndarray:
+                 scanning: bool, dust: float, label: str, rovers: list | None = None,
+                 terrain: Terrain | None = None, alt: float = 12.0, want_depth: bool = False):
     W, H, foot = 320, 240, 24.0
     s = (W / foot) * px_m  # output px per texture px
     cx_t = (pose["x"] + size_m / 2) / px_m
@@ -263,10 +320,32 @@ def scout_camera(tex: np.ndarray, px_m: float, size_m: float, pose: dict, scienc
         px, py = to_px(x, y)
         rr = int(r * W / foot)
         cv2.circle(img, (px, py), rr, (92, 74, 255), 1, cv2.LINE_AA)
+    for o in rovers or []:
+        px, py = to_px(o["x"], o["y"])
+        if -10 <= px < W + 10 and -10 <= py < H + 10:
+            half = max(3, int(0.5 * W / foot))
+            col = (60, 60, 255) if o.get("damaged") else (196, 200, 206)
+            cv2.rectangle(img, (px - half, py - half), (px + half, py + half), col, -1, cv2.LINE_AA)
+            cv2.rectangle(img, (px - half - 4, py - half - 4), (px + half + 4, py + half + 4), RESCUE_BGR if o.get("damaged") else (230, 242, 92), 1, cv2.LINE_AA)
+            cv2.putText(img, o["short"] + (" SOS" if o.get("damaged") else ""), (px - half - 4, py - half - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                        (60, 60, 255) if o.get("damaged") else (230, 242, 92), 1, cv2.LINE_AA)
     if scanning:
         cv2.drawMarker(img, (W // 2, H // 2), (230, 242, 92), cv2.MARKER_CROSS, 26, 1, cv2.LINE_AA)
         cv2.circle(img, (W // 2, H // 2), 46, (230, 242, 92), 1, cv2.LINE_AA)
         cv2.putText(img, "SLOPE SCAN", (W // 2 - 32, H // 2 + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 242, 92), 1, cv2.LINE_AA)
+    if want_depth and terrain is not None:
+        # nadir depth: altitude above the ground under the drone, plus the relief across the footprint
+        s2 = (W / foot) * terrain.res
+        cx2 = (pose["x"] + size_m / 2) / terrain.res
+        cy2 = (pose["y"] + size_m / 2) / terrain.res
+        M2 = cv2.getRotationMatrix2D((cx2, cy2), ang, s2)
+        M2[0, 2] += W / 2 - cx2
+        M2[1, 2] += H / 2 - cy2
+        hz = cv2.flip(cv2.warpAffine(terrain.heights, M2, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE), 0)
+        dep = alt + float(terrain.height_at(pose["x"], pose["y"])) - hz
+        return img, depth_colormap(dep, max(0.0, alt - 4.0), alt + 4.0)
+    if want_depth:
+        return img, None
     return img
 
 

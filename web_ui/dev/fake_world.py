@@ -27,7 +27,7 @@ OPTIONS = {
         {"id": "large", "label": "Large", "size_m": 200, "res_m": 1.0, "cells": 200},
     ],
     "gravity": {"min": 1.0, "max": 3.0, "step": 0.1, "default": 2.2},
-    "fleet": {"rovers": {"min": 1, "max": 2, "default": 1}, "drones": {"min": 0, "max": 1, "default": 1}},
+    "fleet": {"rovers": {"min": 1, "max": 2, "default": 2}, "drones": {"min": 0, "max": 1, "default": 1}},
     "edge_profiles": [
         {"id": "orin_nano_15w", "label": "Orin Nano 15 W", "device": "NVIDIA Jetson Orin Nano", "watts_idle": 5, "watts_max": 15, "perf_scale": 2.6, "perception_hz_max": 10, "max_expansions": 60000},
         {"id": "orin_nx_25w", "label": "Orin NX 25 W", "device": "NVIDIA Jetson Orin NX", "watts_idle": 7, "watts_max": 25, "perf_scale": 1.6, "perception_hz_max": 15, "max_expansions": 120000},
@@ -35,7 +35,7 @@ OPTIONS = {
         {"id": "rpi5_8w", "label": "Raspberry Pi 5", "device": "Raspberry Pi 5 (8 GB)", "watts_idle": 3, "watts_max": 8, "perf_scale": 5.0, "perception_hz_max": 5, "max_expansions": 30000},
     ],
     "backends": [{"id": "gazebo", "label": "Gazebo Harmonic", "available": True}, {"id": "mock", "label": "Mock physics", "available": True}],
-    "defaults": {"sector": "medium", "gravity_g": 2.2, "fleet": {"rovers": 1, "drones": 1}, "edge_profile": "orin_nano_15w", "sim_backend": "gazebo", "seed": 42, "gazebo_gui": False, "sim_speed": 1.0},
+    "defaults": {"sector": "medium", "gravity_g": 2.2, "fleet": {"rovers": 2, "drones": 1}, "edge_profile": "orin_nano_15w", "sim_backend": "gazebo", "seed": 42, "gazebo_gui": False, "sim_speed": 1.0},
     "sim_speed": {"choices": [0.5, 1.0, 1.5, 2.0], "min": 0.25, "max": 3.0, "default": 1.0},
 }
 
@@ -67,6 +67,7 @@ class World:
         self.new_hazard = (0, 0.0)
         self.last_trace_t = 0.0
         self.trace_id = 0
+        self.dead_goals: list[tuple] = []  # frontiers A* could not reach; skipped from then on
         self.out_traces: list[dict] = []
         self.out_events: list[dict] = []
         self.rng = np.random.default_rng(int(config.get("seed", 42)) + 1)
@@ -231,6 +232,8 @@ class World:
                 gx, gy = (j + 0.5) * cs - L / 2, (i + 0.5) * cs - L / 2
                 d = math.hypot(gx - x, gy - y)
                 if d < 6 or abs(gx) > 0.47 * L or abs(gy) > 0.47 * L:
+                    continue
+                if any(math.hypot(gx - ax, gy - ay) < 3 for ax, ay in self.dead_goals):
                     continue
                 turn = abs(math.atan2(math.sin(math.atan2(gy - y, gx - x) - yaw), math.cos(math.atan2(gy - y, gx - x) - yaw)))
                 s = -0.5 * d - 4.0 * turn - sum(20.0 for ax, ay in avoid if math.hypot(gx - ax, gy - ay) < 8) + self.rng.uniform(0, 3)

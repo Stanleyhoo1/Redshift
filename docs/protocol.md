@@ -97,6 +97,11 @@ scan_complete, resume, edge_throttle, mission_complete`.
  "breadcrumbs":38,"last_safe":[1.0,2.0],"tip_alarm_deg":28.8,"max_slope_deg":16.8,"altitude_agl":null}
 ```
 Rover states: `BOOT, EXPLORING, REPLANNING, CAUTION, SAFE_HOLD, RECOVERY_REVERSE, AWAIT_SCOUT, RESUMING, MISSION_COMPLETE`.
+The tip/slip permanent hazard is a 2.5 m disc on the failure point once `RECOVERY_REVERSE` has backed out of it. If the
+reverse times out short (traced as such, not as "reached"), the disc shrinks to stay 0.6 m clear of the rover (min
+1.0 m), or a 1.0 m disc is placed just beyond the rover towards the failure point: a rover inside its own lethal zone
+could not plan out of it and no rescuer could reach it. A route never halts on cells it was planned past on purpose
+(escaping an inflation ring, or a 0.3 m tight-clearance route); only cells that became lethal since do.
 Scout states: `BOOT, TAKEOFF, SURVEY, FLY_TO_SCAN, SCANNING, MISSION_COMPLETE`.
 
 ### 3.4 Edge telemetry
@@ -121,11 +126,14 @@ Commands (published by the backend; executed by `world_interface_node` (Gazebo) 
 (`max_step_size` unchanged), the mock via its pacer. `duration_s` / `seismic_s` are simulated seconds.
 `spawn_rockslide` drops a ~7 m-wide line of boulders across the robot's planned path (`scene_events.rockslide_layout`):
 7 m ahead along the route, or 60 % of the remaining route when that is shorter (never under 3 m), so the line never
-lands beyond the path's end; along the heading when there is no path.
+lands beyond the path's end. With under 4 m of route left (the rover is about to reach its goal) the slide is armed
+and waits, up to 8 simulated seconds, for the rover's next planned route and lands across that
+(`scene_events.rockslide_due`; the event then carries `waited_s`); after that, or with no path, along the heading.
+A second request while one is armed is ignored.
 
 Events (one per executed command):
 ```json
-{"op":"spawn_rockslide","ok":true,"robot":"rover_0","impact":[x,y],"rocks":[[x,y,r]],"t":0.0}
+{"op":"spawn_rockslide","ok":true,"robot":"rover_0","impact":[x,y],"rocks":[[x,y,r]],"waited_s":0.0,"t":0.0}
 {"op":"jolt","ok":true,"robot":"rover_0","t":0.0}
 {"op":"anomaly","ok":true,"dust_level":0.85,"duration_s":25,"t":0.0}
 {"op":"set_speed","ok":true,"speed":2.0,"t":0.0}
@@ -200,3 +208,133 @@ Client → server: `{"type":"select_camera","robot":"scout_0"}`.
 
 Frames are strict JSON: non-finite numbers are sent as `null`. Each client has its own bounded queue; a client more than
 240 frames behind, or whose socket blocks a send for 2 s, is closed with code 1013 and is expected to reconnect.
+
+## 8. Fleet health, SOS and rescue (v2, Phase 1)
+
+### 8.1 Fleet, roles and display names
+Default fleet is **2 rovers + 1 drone** (`fleet.rovers` 1–2, default 2; `fleet.drones` 0–1, default 1).
+
+| id | role | display name | short label |
+|---|---|---|---|
+| `rover_0` | `scout` | Scout Rover 1 | `ROVER_1` |
+| `rover_1` | `recovery` | Heavy Recovery Rover 2 | `ROVER_2` |
+| `scout_0` | `drone` | Survey Drone | `DRONE` |
+
+Both rovers use `ROVER_SPEC` (identical physics). `role` comes from the index: `rover_0` = scout, any other rover = recovery.
+
+### 8.2 New ROS topics
+| topic | type | publisher | rate (sim) | payload |
+|---|---|---|---|---|
+| `/<rover>/hw_status` | String JSON | world (mock_world_node / world_interface_node) | 5 Hz | §8.3 |
+| `/<rover>/cmd_vel_hw` | Twist | world_interface_node (Gazebo only) | as cmd_vel | `/<rover>/cmd_vel` scaled by drivetrain health, bridged to gz `/<rover>/cmd_vel` |
+| `/<r>/perception/depth/compressed` | CompressedImage (jpeg) | perception_node | perception rate | colour-mapped depth (turbo, near = red), same size as the RGB frame |
+| `/fleet/sos` | String JSON | damaged rover agent | 1 Hz while active, once on resolve | §8.4 |
+| `/fleet/rescue` | String JSON | recovery rover agent | on phase change + 1 Hz | §8.4 |
+
+The drivetrain fault is applied by the world *before* the wheels (mock: inside the dynamics; Gazebo: the
+`cmd_vel` → `cmd_vel_hw` relay), so the rover only learns about it from its sensors: `hw_status` (motor-controller
+diagnostics) and commanded vs. measured wheel speed.
+
+### 8.3 `hw_status` (simulated motor controllers + solar panel)
+```json
+{"robot":"rover_0","t":1762550000.1,"wheel_health":[1.0,1.0,1.0,1.0],"faults":[],
+ "motor_current_a":[3.1,3.0,3.2,3.1],"solar_w":182.4,"irradiance":0.93}
+```
+`wheel_health` 0–1 per wheel (FL, FR, RL, RR): fraction of commanded torque the actuator delivers.
+`faults` e.g. `"DRIVE_FL_OVERCURRENT"`, `"DRIVE_RL_ENCODER_LOST"`. `irradiance` = dust transmittance
+`1 − 0.85·dust_level`. `solar_w` = 220 W peak × irradiance × max(0, n̂·ŝ), where n̂ is the panel normal from the chassis
+attitude and ŝ is the sun direction (55° elevation, the rendered sun's azimuth). A level rover gets ≈ 180 W.
+`motor_current_a` is computed from the raw commanded `cmd_vel`, before the fault is applied: a faulty wheel draws
+current with little output. `t` is wall-clock epoch time (§2.1). In Gazebo, rovers move only while
+`world_interface_node` relays `cmd_vel` → `cmd_vel_hw`.
+
+### 8.4 SOS / rescue payloads
+```json
+{"id":"sos-rover_0-1","robot":"rover_0","xy":[12.3,-4.0],"yaw":1.2,"health_pct":7.5,"faults":["DRIVE_FL_OVERCURRENT"],
+ "status":"active","t":1762550000.1}
+{"id":"sos-rover_0-1","rescuer":"rover_1","target":"rover_0","phase":"DOCKING","range_m":2.4,"locked":true,"t":…}
+```
+`status`: `active` | `resolved`. `phase`: `TRANSIT` | `DOCKING` | `REPAIRING` | `DONE` | `ABORTED`. Every message,
+including the final `DONE` / `ABORTED` one, carries the SOS `id` and `target`; after `DONE` / `ABORTED` the damaged
+rover reports its rescue block as `AWAITING` again (no rescuer) while its SOS is still active.
+
+### 8.5 World commands / events (additions to §4)
+- `{"op":"critical_damage","robot":"rover_0"}` — debris strike plus a drivetrain fault (wheel_health →
+  `[0.08, 0.35, 0.05, 0.30]`, faults `DRIVE_FL_OVERCURRENT`, `DRIVE_FR_TORQUE_DERATED`, `DRIVE_RL_ENCODER_LOST`,
+  `DRIVE_RR_TORQUE_DERATED`). The strike reads ≈ 5.1 g above gravity on the IMU in both backends:
+  - mock: a 0.12 s vertical + lateral half-sine and a 5° roll kick (gyro ≈ 0.6 rad/s, below the tip and gyro gates);
+  - Gazebo: 40 ms of force along the chassis normal (92 % of the weight) plus a lateral push through the centre of mass
+    that reverses half-way (net Δv ≈ 0), so no wheel lifts. A hop would read random 5–30 g touchdown spikes, because
+    DART resolves the landing in one 4 ms step. No roll kick. Persistent wrenches accumulate in gz-sim, so the
+    mid-pulse reversal is published as a delta.
+
+  Event: `{"op":"critical_damage","ok":true,"robot":"rover_0","impact":[x,y],"peak_g":5.11,"wheel_health":[…],"t":…}`.
+  `peak_g` = measured |a| peak / g0 − mission gravity. Rejections: unknown or non-rover robot, a strike already
+  under way, and (Gazebo only) no odometry yet or a jolt under way.
+- `{"op":"repair","robot":"rover_0","by":"rover_1"}` — the world checks the true centre distance between the
+  two robots is ≤ 1.6 m; if so it ramps wheel_health back to 1.0 over 4 s (sim) and clears faults. Event:
+  `{"op":"repair","ok":true|false,"robot":"rover_0","by":"rover_1","distance_m":1.34,"detail":"…","t":…}`
+  (sent when the repair starts with `"done":false`, and again with `"done":true` plus `wheel_health` when health is
+  restored).
+  - The distance is planar.
+  - `by` must be a different rover.
+  - A repeat request during a repair answers `ok:true`, "repair already in progress".
+  - A new strike cancels a repair, and no done event follows.
+  - Faults clear only when the repair completes.
+
+### 8.6 Rover FSM additions
+Damaged rover: `… → SAFE_HOLD (critical, 1.0 s) → AWAIT_RESCUE` (SOS broadcast) `→ RESUMING → EXPLORING` once its
+estimated health is ≥ 60 % again. Recovery rover: `EXPLORING → RESCUE_TRANSIT` (A* to a stand-off cell 2.0–2.45 m
+from the teammate, preferring 2.2 m on the side facing the approach; the teammate is planned as an uninflated 1.5 m
+keep-out, and cells outside the rescuer's reachable region are skipped) `→ RESCUE_DOCKING` (perception-locked creep to ≤ 1.5 m centre distance) `→ REPAIRING → RESUMING → EXPLORING`.
+With one rover there is no rescuer: the damaged rover stays in `AWAIT_RESCUE` and says so in its trace.
+New trace kinds: `critical_damage`, `sos`, `rescue_start`, `rescue_route`, `rescue_dock`, `rescue_lock`, `docked`,
+`repair_start`, `repair_complete`, `repaired`, `rescue_abort`, `rescue_noroute` (no reachable stand-off on
+the current map). New trace sensor tag `DIAG` (motor-controller diagnostics).
+
+Docking is entered when the A* stand-off is reached within 3.0 m (or anywhere within 2.4 m); during transit a LiDAR
+corridor return closer than 4 m to the target is the target itself and does not trigger a re-plan. Docked = centre
+distance ≤ 1.45 m with a perception lock (or after 5 s without one, traced as odometry-only). The rescuer actuates the
+repair with `/world/command {"op":"repair"}` (the simulated repair tool), retries every 8 s, and once the target
+reports its SOS resolved backs off 2 m and resumes exploring. The docking creep stops while a LiDAR corridor return is
+more than 0.9 m short of the target's centre (something between the two rovers); the corridor ignores returns within
+1.0 m of the sensor, so the last ≈0.45 m of the creep relies on the perception lock and odometry. Teammates are lethal 0.9 m discs in each rover's
+planning cost map (not in the shared map, which filters robot returns).
+
+### 8.7 Agent state / telemetry additions
+`agent_state` (rovers) and WS telemetry `robots.<r>` gain:
+```json
+"role":"scout", "name":"Scout Rover 1",
+"health":{"pct":92.0,"structure_pct":96.0,"drive_pct":96.0,"battery_pct":81.4,"battery_wh":488.4,"capacity_wh":600,
+          "solar_w":182.4,"load_w":131.0,"net_w":51.4,"faults":[],"critical":false,"shocks":2,"peak_g":1.9,
+          "last_shock_g":0.4},
+"rescue":{"id":"sos-rover_0-1","role":"rescuer","peer":"rover_0","phase":"DOCKING","range_m":2.4,"locked":true} | null,
+"sensors":{"accel":[0.1,-0.2,21.6],"accel_g":2.20,"gyro":[0.0,0.01,0.2],"roll_deg":1.2,"pitch_deg":-3.4,
+           "lidar_nearest_m":4.2,"lidar_returns_pct":78.0,"camera_conf":0.97,"v_cmd":0.8,"v_wheel":0.79,
+           "v_ground":0.76,"slip":0.04,"altitude_agl":null}
+```
+Drone: `health` has `structure_pct = drive_pct = 100`, its battery drains with hover power, `solar_w = 0`;
+`sensors.lidar_* = null`, `altitude_agl` set. `health`, `rescue` may be `null` before the first agent_state.
+`accel` is m/s² in the IMU frame; `accel_g` = |accel| / 9.80665 (≈ the mission gravity at rest).
+
+Health model (rover, `redshift_autonomy/rover_health.py`): `pct = structure_pct × drive_pct / 100`. Structure
+loses damage from measured IMU shocks (|a| more than 1.2 g *above* the mission gravity for ≥ 2 *consecutive*
+samples, so a partly airborne chassis and the one-sample contact spikes when its wheels land again, even several
+in a row a sample apart, are not impacts, and never set an impact's peak; armed only after
+50 consecutive at-gravity samples, so an IMU's start-up transient is not one either) and over-tilt.
+`peak_g` is the largest shock of the mission, `last_shock_g` the most recent one (both g above gravity);
+drive health = mean `wheel_health` from `hw_status`, cross-checked against commanded vs. measured wheel speed.
+`pct < 15` → critical. Battery: 600 Wh, starts at the deploy value (rover_0 82 %, rover_1 91 %), integrates
+`solar_w − load_w` where load = 25 W avionics + edge compute power + drive power (physics energy/m × speed).
+
+### 8.8 Detections addition (§3.2)
+Class `ROVER` (a perceived teammate): `{"cls":"ROVER","robot":"rover_0","damaged":true,"conf":0.93,"bbox":[…],
+"range_m":2.4,"bearing_rad":0.05,"world_xy":[x,y],"sources":["CAM","DEPTH","LIDAR"],
+"label":"PERCEIVED: DAMAGED UNIT ROVER_1 | DOCKING FOR REPAIR"}`. The detections JSON also gains
+`"lidar":{"returns_pct":78.0,"nearest_m":4.2}` (rovers; `null` for the drone).
+
+### 8.9 Backend additions
+- `POST /api/inject/damage {robot?}` (default first rover) → `{"ok":true,"detail":"Debris strike: critical damage on Scout Rover 1"}`.
+- WS `camera` frames now carry `"kind":"rgb"|"depth"` (absent = rgb) and are sent for **every** robot: the client's
+  selected robot at full rate (rgb + depth), every other robot's rgb at ≤ 4 Hz.
+- WS events forward `/fleet/sos` as `{op:"sos", …}` and `/fleet/rescue` as `{op:"rescue", …}`.

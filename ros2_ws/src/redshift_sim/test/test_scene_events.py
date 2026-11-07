@@ -3,7 +3,8 @@ import math
 import numpy as np
 import pytest
 
-from redshift_sim.scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_layout
+from redshift_sim.scene_events import (DEFER_MAX_S, JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_due,
+                                       rockslide_layout)
 
 
 def test_rockslide_lies_ahead_on_path_and_across_it():
@@ -53,6 +54,16 @@ def test_rockslide_never_lands_on_the_robot():
     path = np.array([[0.0, 0.0], [4.0, 0.0]])           # 4 m left: clamp to the 3 m minimum stand-off
     _, impact = rockslide_layout(path, pose=(0.0, 0.0, 0.0), ahead_m=7.0, seed=7)
     assert impact == pytest.approx((3.0, 0.0), abs=0.01)
+
+
+def test_rockslide_waits_for_the_next_route_near_the_goal():
+    near_goal = np.array([[0.0, 0.0], [3.0, 0.0]])      # 3 m left: it would land past the goal, off every route
+    assert not rockslide_due(near_goal, (0.0, 0.0, 0.0), waited_s=0.0)
+    assert not rockslide_due(None, (0.0, 0.0, 0.0), waited_s=1.0)              # between routes
+    new_route = np.array([[3.0, 0.0], [3.0, 12.0]])     # the rover picked its next goal: drop across that route
+    assert rockslide_due(new_route, (3.0, 0.0, 0.0), waited_s=2.0)
+    assert rockslide_due(np.array([[0.0, 0.0], [9.0, 0.0]]), (0.0, 0.0, 0.0), waited_s=0.0)
+    assert rockslide_due(near_goal, (0.0, 0.0, 0.0), waited_s=DEFER_MAX_S)     # no new route: heading fallback
 
 
 def test_jolt_profile():

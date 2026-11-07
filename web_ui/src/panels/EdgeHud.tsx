@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { useSelected } from '../lib/hooks'
-import { fmt, robotName } from '../lib/format'
+import { fmt, robotShort } from '../lib/format'
 import { useStore } from '../lib/store'
 import { C } from '../lib/theme'
 import { Panel } from '../ui/Panel'
@@ -19,16 +19,22 @@ export function EdgeHud() {
 
   return (
     <Panel
-      title={`Edge compute${sel ? `, ${robotName(sel)}` : ''}`}
+      title={`Edge compute${sel ? `, ${robotShort(sel)}` : ''}`}
       sensors={['EDGE']}
       right={<span className="font-semi-cond truncate text-[12.5px] font-[700] text-bone">{prof?.label ?? e?.profile ?? '—'}</span>}
-      bodyClass="flex flex-col gap-3 px-3 py-2.5"
+      bodyClass="flex flex-col gap-2.5 px-3 py-2"
     >
       {/* latency: measured on the host vs scaled to the target device */}
       <div>
-        <div className="mb-1 flex items-baseline justify-between text-[12px]">
-          <span className="text-haze">Loop latency</span>
-          <span className="num text-dim">{e ? `${fmt(e.loop_hz, 1)} Hz loop` : ''}</span>
+        <div className="mb-1 flex items-baseline justify-between gap-2 text-[12px]">
+          <span className="text-haze">
+            Loop latency<span className="num text-dim">{e ? `, ${fmt(e.loop_hz, 1)} Hz` : ''}</span>
+          </span>
+          <span className="flex gap-2.5 text-[10.5px] text-dim">
+            <Key c="#8ec5ff">perception</Key>
+            <Key c="#d6a6ff">planner</Key>
+            <Key c="#e3c48c">mapping</Key>
+          </span>
         </div>
         <LatencyBars hostMs={host} deviceMs={e?.device_ms ?? 0} parts={e?.host_ms} device={prof?.device ?? 'device'} />
       </div>
@@ -95,7 +101,7 @@ function LatencyBars({ hostMs, deviceMs, parts, device }: { hostMs: number; devi
   const scale = Math.max(100, Math.ceil(Math.max(hostMs, deviceMs) / 50) * 50)
   const seg = (ms: number) => `${(ms / scale) * 100}%`
   return (
-    <div className="grid grid-cols-[64px_minmax(0,1fr)_56px] items-center gap-x-2 gap-y-1.5 text-[12px]">
+    <div className="grid grid-cols-[64px_minmax(0,1fr)_56px] items-center gap-x-2 gap-y-1.5 text-[12px]" title={`Bars scaled to ${scale} ms`}>
       <span className="text-dim">This host</span>
       <div className="flex h-2.5 overflow-hidden rounded-[1px] bg-rule/60">
         {parts && (
@@ -114,13 +120,6 @@ function LatencyBars({ hostMs, deviceMs, parts, device }: { hostMs: number; devi
         <div className="h-2.5 transition-[width] duration-300" style={{ width: seg(deviceMs), backgroundColor: C.nad }} />
       </div>
       <span className="num text-right font-[700] text-nad">{fmt(deviceMs, 1)} ms</span>
-      <span />
-      <span className="flex gap-3 text-[10.5px] text-dim">
-        <Key c="#8ec5ff">perception</Key>
-        <Key c="#d6a6ff">planner</Key>
-        <Key c="#e3c48c">mapping</Key>
-      </span>
-      <span className="num text-right text-[10.5px] text-dim">/{scale} ms</span>
     </div>
   )
 }

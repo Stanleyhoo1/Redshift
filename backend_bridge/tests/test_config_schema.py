@@ -7,7 +7,7 @@ from backend_bridge.config_schema import MissionConfig, options, physics_preview
 def test_defaults_and_robots():
     c = MissionConfig()
     assert c.sector == 'medium' and c.gravity_g == 2.2 and c.edge_profile == 'orin_nano_15w'
-    assert c.robots == ['rover_0', 'scout_0']
+    assert c.robots == ['rover_0', 'rover_1', 'scout_0']        # default fleet: 2 rovers + 1 drone
     assert c.sim_speed == 1.0 and MissionConfig(sim_speed=2.0).sim_speed == 2.0
     assert MissionConfig(fleet={'rovers': 2, 'drones': 0}).robots == ['rover_0', 'rover_1']
 
@@ -28,7 +28,8 @@ def test_options_catalog_shape():
     assert {p['id'] for p in o['edge_profiles']} == {'orin_nano_15w', 'orin_nx_25w', 'agx_orin_60w', 'rpi5_8w'}
     assert {'id', 'label', 'device', 'watts_idle', 'watts_max', 'perf_scale', 'perception_hz_max',
             'max_expansions'} <= set(o['edge_profiles'][0])
-    assert o['defaults']['fleet'] == {'rovers': 1, 'drones': 1}
+    assert o['defaults']['fleet'] == {'rovers': 2, 'drones': 1}
+    assert o['fleet']['roles']['rover_1'] == {'role': 'recovery', 'name': 'Heavy Recovery Rover 2'}
     assert any(b['id'] == 'mock' and b['available'] for b in o['backends'])
     assert o['sim_speed']['choices'] == [0.5, 1.0, 1.5, 2.0] and o['sim_speed']['default'] == 1.0
 

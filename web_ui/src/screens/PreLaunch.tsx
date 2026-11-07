@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api'
 import { DEFAULT_CONFIG, DEFAULT_OPTIONS } from '../lib/defaults'
-import { fmtSpeed } from '../lib/format'
+import { fmtSpeed, robotName } from '../lib/format'
 import { useStore } from '../lib/store'
 import type { MissionConfig } from '../lib/types'
 import { BackendPicker, EdgePicker, Field, SectorPicker, SpeedPicker, Stepper } from './prelaunch/ConfigFields'
@@ -37,7 +37,7 @@ export default function PreLaunch() {
   const summary = useMemo(() => {
     const r = cfg.fleet.rovers
     const d = cfg.fleet.drones
-    const fleet = `${r} rover${r === 1 ? '' : 's'}${d ? ` and ${d} scout${d === 1 ? '' : 's'}` : ''}`
+    const fleet = `${r} rover${r === 1 ? '' : 's'}${d ? ` and ${d} drone${d === 1 ? '' : 's'}` : ''}`
     return `${sector?.label ?? cfg.sector} sector at ${cfg.gravity_g.toFixed(1)} g with ${fleet} on ${profile?.label ?? cfg.edge_profile}, simulated in ${backend?.label ?? cfg.sim_backend}${speed === 1 ? '' : ` at ${fmtSpeed(speed)} speed`}.`
   }, [cfg, sector, profile, backend, speed])
 
@@ -64,7 +64,7 @@ export default function PreLaunch() {
           <p className="mb-6 text-[13px] text-haze">Agentverse 2026, Robotics track</p>
           <Wordmark g={cfg.gravity_g} min={options.gravity.min} max={options.gravity.max} />
           <p className="font-semi-cond mt-5 max-w-[34ch] text-[22px] leading-snug font-[500] text-bone">
-            An autonomous rover and aerial scout map a Super-Earth sector, thinking entirely on their own edge hardware.
+            Two autonomous rovers and a survey drone map a Super-Earth sector, thinking entirely on their own edge hardware, and rescue each other when one breaks down.
           </p>
         </header>
         <div className="max-w-[640px]">
@@ -90,10 +90,26 @@ export default function PreLaunch() {
           <SectorPicker sectors={options.sectors} value={cfg.sector} onChange={(sector) => update({ sector })} />
         </Field>
 
-        <Field title="Fleet">
+        <Field title="Fleet" hint={cfg.fleet.rovers < 2 ? <span className="text-nad">One rover: nobody can rescue it</span> : 'Rover 2 is the recovery unit for Rover 1'}>
           <div className="grid grid-cols-2 gap-2.5">
-            <Stepper label="Ground rovers" glyph="rover" unit={['rover', 'rovers']} range={options.fleet.rovers} value={cfg.fleet.rovers} onChange={(rovers) => update({ fleet: { ...cfg.fleet, rovers } })} />
-            <Stepper label="Aerial scouts" glyph="scout" unit={['scout', 'scouts']} range={options.fleet.drones} value={cfg.fleet.drones} onChange={(drones) => update({ fleet: { ...cfg.fleet, drones } })} />
+            <Stepper
+              label="Ground rovers"
+              glyph="rover"
+              unit={['rover', 'rovers']}
+              range={options.fleet.rovers}
+              value={cfg.fleet.rovers}
+              onChange={(rovers) => update({ fleet: { ...cfg.fleet, rovers } })}
+              roles={Array.from({ length: options.fleet.rovers.max }, (_, k) => robotName(`rover_${k}`))}
+            />
+            <Stepper
+              label="Aerial drones"
+              glyph="scout"
+              unit={['drone', 'drones']}
+              range={options.fleet.drones}
+              value={cfg.fleet.drones}
+              onChange={(drones) => update({ fleet: { ...cfg.fleet, drones } })}
+              roles={Array.from({ length: options.fleet.drones.max }, (_, k) => robotName(`scout_${k}`))}
+            />
           </div>
         </Field>
 

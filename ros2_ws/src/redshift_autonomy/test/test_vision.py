@@ -131,6 +131,38 @@ def test_dust_raises_uncertainty():
     assert fuse_uncertainty(dusty_conf, 0.6, 0.3, 'LIDAR_ONLY') < u_dust
 
 
+def test_camera_baseline_follows_a_scene_change_only_with_clear_air():
+    rich, _ = render(rock=(5.0, 0.4, 0.8), science=(4.0, -0.8, 0.35))
+    rich = rich.copy()
+    rich[100:160, 120:200] = 245                           # a teammate's white chassis in the first frames
+    rich[120:130, 120:200] = (255, 120, 0)
+    plain, _ = render()
+    q_rich, q_plain = image_quality(rich), image_quality(plain)
+
+    locked = ImageQualityBaseline()
+    for _ in range(5):
+        locked.update(q_rich)
+    assert locked.confidence(q_plain) < 0.7                # a smoother scene looks like a degraded camera
+    for _ in range(30):
+        locked.update(q_plain)                             # no independent confirmation: never re-learned
+    assert locked.confidence(q_plain) < 0.7
+
+    base = ImageQualityBaseline()
+    for _ in range(5):
+        base.update(q_rich)
+    for _ in range(20):
+        base.update(q_plain, clear_air=True)               # LiDAR says the air is clear: the scene changed
+    assert base.confidence(q_plain) > 0.85
+
+    dusty = ImageQualityBaseline()
+    for _ in range(5):
+        dusty.update(q_plain)
+    q_dust = image_quality(haze(plain))
+    for _ in range(30):
+        dusty.update(q_dust, clear_air=True)               # added pixel noise is the optics, never learned
+    assert dusty.confidence(q_dust) < 0.45
+
+
 def organized_scan(obstacle_x=None, noise=0.0, dropout=0.0, backscatter=0.0, seed=0):
     with np.errstate(divide='ignore', invalid='ignore'):
         return _organized_scan(obstacle_x, noise, dropout, backscatter, seed)
@@ -235,3 +267,78 @@ def test_detect_objects_class_subset_and_highpass_nadir():
                           tophat_px=6, max_range=40.0)
     assert {d.cls for d in dets} == {'ROCK'}
     assert detect_objects(rgb, depth, cam, math.pi / 2, 12.0, classes=()) == []
+
+
+# ---------------------------------------------------------------------- teammate perception
+from redshift_autonomy.vision import CameraModel as _CM, depth_colormap, project_box, teammate_detection  # noqa: E402
+
+
+def _cam():
+    return _CM.from_hfov(320, 240, 1.396)
+
+
+def test_project_box_geometry():
+    cam = _cam()
+    bb, xf = project_box(cam, 0.0, (5.0, 0.0, 0.0), 0.0)
+    x, y, w, h = bb
+    assert abs((x + w / 2) - cam.cx) < 2 and abs((y + h / 2) - cam.cy) < 2 and xf == pytest.approx(5.0)
+    left, _ = project_box(cam, 0.0, (5.0, 1.5, 0.0), 0.0)
+    assert left[0] + left[2] / 2 < cam.cx - 20                      # +y (left) → smaller u
+    near, _ = project_box(cam, 0.0, (2.5, 0.0, 0.0), 0.0)
+    assert near[2] > w * 1.6                                        # closer → bigger
+    tilted, _ = project_box(cam, math.radians(12), (5.0, 0.0, 0.0), 0.0)
+    assert tilted[1] + tilted[3] / 2 < cam.cy                        # camera pitched down: level target appears higher
+    assert project_box(cam, 0.0, (-3.0, 0.0, 0.0), 0.0) is None     # behind the camera
+    nadir, _ = project_box(cam, math.pi / 2, (2.0, 0.0, -12.0), 0.0)
+    assert nadir[1] + nadir[3] / 2 < cam.cy                          # nadir: ahead appears toward the top
+
+
+def _depth_with_target(cam, rel, far=30.0):
+    depth = np.full((cam.height, cam.width), far, np.float32)
+    (x, y, w, h), xf = project_box(cam, 0.0, rel, 0.0)
+    depth[y:y + h, x:x + w] = xf - 0.3
+    return depth
+
+
+def test_teammate_detected_only_when_depth_confirms():
+    cam = _cam()
+    rel = (4.0, 0.3, -0.2)
+    depth = _depth_with_target(cam, rel)
+    d = teammate_detection(cam, depth, 0.0, rel, 0.0, rel_base_xy=(4.45, 0.3), robot='rover_0', damaged=True,
+                           label='PERCEIVED: DAMAGED UNIT ROVER_1 | DOCKING FOR REPAIR')
+    assert d is not None and d.cls == 'ROVER' and d.robot == 'rover_0' and d.damaged
+    assert 'DEPTH' in d.sources and 'CAM' in d.sources and d.conf > 0.75
+    assert d.range_m == pytest.approx(4.46, abs=0.6)
+    dd = d.as_dict()
+    assert dd['label'].startswith('PERCEIVED') and dd['robot'] == 'rover_0'
+    # occluded (a boulder in front fills the box at 1.5 m): not perceived
+    occl = depth.copy()
+    (x, y, w, h), _ = project_box(cam, 0.0, rel, 0.0)
+    occl[y:y + h, x:x + w] = 1.5
+    assert teammate_detection(cam, occl, 0.0, rel, 0.0, rel_base_xy=(4.45, 0.3), robot='rover_0') is None
+
+
+def test_teammate_lidar_confirmation_and_range():
+    cam = _cam()
+    rel = (3.0, 0.0, -0.2)
+    blank = np.full((cam.height, cam.width), np.nan, np.float32)      # camera blinded (dust)
+    rng = np.random.default_rng(0)
+    pts = np.column_stack([3.15 + 0.1 * rng.standard_normal(40), 0.3 * rng.standard_normal(40),
+                           0.3 + 0.1 * rng.random(40)])
+    d = teammate_detection(cam, blank, 0.0, rel, 0.0, rel_base_xy=(3.45, 0.0), lidar_pts=pts, robot='rover_0')
+    assert d is not None and d.sources == ['LIDAR']
+    assert d.range_m == pytest.approx(3.45, abs=0.35)
+    assert teammate_detection(cam, blank, 0.0, rel, 0.0, rel_base_xy=(3.45, 0.0), lidar_pts=pts[:3],
+                              robot='rover_0') is None
+
+
+def test_depth_colormap_near_is_warm_and_missing_is_black():
+    depth = np.full((10, 20), np.nan, np.float32)
+    depth[:, :10] = 1.0
+    depth[:, 10:15] = 30.0
+    img = depth_colormap(depth, far_m=30.0)
+    assert img.shape == (10, 20, 3) and img.dtype == np.uint8
+    near, far, none = img[5, 2], img[5, 12], img[5, 18]
+    assert near[0] > near[2]                     # RGB: near → red
+    assert far[2] >= far[0]                      # far → blue
+    assert none.sum() == 0

@@ -2,14 +2,24 @@
 
 Publishes exactly the raw topics the bridge produces (names, types, frame ids, encodings, rates, point-cloud
 layout, no-return encoding; see scripts/check_topics.py), driven by mock_dynamics and rendered by mock_render
-from the same seeded terrain.npz, and implements /world/command `spawn_rockslide` and `jolt` with the same
-/world/events echoes. Physics and IMU run at 100 Hz in one callback group, sensor rendering in another, so
-camera/LiDAR rendering never stalls the IMU stream.
+from the same seeded terrain.npz, and implements /world/command `spawn_rockslide`, `jolt`, `set_speed`,
+`critical_damage` and `repair` with the same /world/events echoes. Physics and IMU run at 100 Hz in one callback
+group, sensor rendering in another, so camera/LiDAR rendering never stalls the IMU stream.
+
+Simulated rover hardware (rover_hw, docs/protocol.md §8): the drivetrain fault is applied inside the dynamics and
+`/<rover>/hw_status` is published at 5 Hz of simulated time. Every robot is also a body in the rendered scene, so the
+robots see each other (each sensor excludes its own body); robots do not collide with each other in the mock.
+
+Ray casting runs in a pool of worker processes (render_pool; parameter `render_procs`, -1 = auto, 0 = in-process):
+the numpy renderer holds the GIL for much of a frame, so a two-rover fleet rendered in this process could not hold
+1× real time. The physics thread snapshots the scene's objects when a frame comes due and a dispatch thread per
+sensor hands the job to a worker.
 """
 from __future__ import annotations
 
 import json
 import math
+import os
 import queue
 import threading
 import time
@@ -30,9 +40,11 @@ from sensor_msgs.msg import CameraInfo, Image, Imu, PointCloud2, PointField
 from std_msgs.msg import String
 
 from .mock_dynamics import RoverSim, ScoutSim
-from .mock_render import Scene, camera_frame, camera_intrinsics, camera_rotation, lidar_scan, rpy_matrix
+from .mock_render import Scene, camera_intrinsics, camera_rotation, robot_body, rpy_matrix
+from .render_pool import RenderPool, scene_objects
 from .robot_models import ROVER_SPEC, SCOUT_SPEC
-from .scene_events import rockslide_layout
+from .rover_hw import REPAIR_RANGE_M, REPAIR_S, hw_status_dict, planar_distance, solar_output
+from .scene_events import rockslide_due, rockslide_layout
 from .sim_pacing import SimPacer
 from .terrain_gen import Terrain
 
@@ -42,6 +54,8 @@ CLOCK_PERIOD_S = 0.01       # /clock granularity (simulated), same as the Gazebo
 ODOM_HZ = 30.0
 WHEEL_ODOM_HZ = 20.0
 LIDAR_HZ = 10.0
+HW_STATUS_HZ = 5.0
+AUTO_RENDER_PROCS = max(0, min(4, (os.cpu_count() or 2) - 4))   # leave cores for the autonomy stack
 OUT_QOS = QoSProfile(depth=10)          # reliable, like the ros_gz bridge: compatible with every subscriber
 CLOUD_DTYPE = np.dtype({'names': ['x', 'y', 'z', 'intensity', 'ring'],
                         'formats': ['<f4', '<f4', '<f4', '<f4', '<u2'],
@@ -70,7 +84,15 @@ class Robot:
         self.sim = (RoverSim(name, spec, spawn, node.g, np.random.default_rng(sum(name.encode())))
                     if self.rover else ScoutSim(name, spec, spawn, node.g))
         self.state = self.sim.snapshot()
+        self.hw = self.sim.drivetrain if self.rover else None
+        self.hw_rng = np.random.default_rng(sum(name.encode()) + 1)
+        self.repair: dict | None = None               # the repair event under way (echoed again when done)
+        self.body = robot_body(name)
+        self.body_ids = node.scene.add_body(self.body)
+        self.body_off = np.array([part[0] for part in self.body], np.float64)
+        self.exclude = frozenset(self.body_ids)       # a robot's sensors never see its own body
         self.path = None
+        self.slide_armed: float | None = None   # sim time a rockslide was requested (rockslide_due)
         self.cam_hz = float(spec.get('camera_hz', 10.0))
         self.fx, self.cx, self.cy = camera_intrinsics(spec['camera_w'], spec['camera_h'], spec['camera_hfov'])
         self.scale = node.render_scale if self.rover else 1.0
@@ -83,6 +105,7 @@ class Robot:
         if self.rover:
             self.pub_wheel = n.create_publisher(Odometry, f'/{r}/wheel_odom', OUT_QOS)
             self.pub_cloud = n.create_publisher(PointCloud2, f'/{r}/lidar/points_raw', OUT_QOS)
+            self.pub_hw = n.create_publisher(String, f'/{r}/hw_status', OUT_QOS)
             n.create_subscription(PathMsg, f'/{r}/planned_path', self.on_path, 5, callback_group=n.cmd_group)
         n.create_subscription(Twist, f'/{r}/cmd_vel', self.on_cmd, qos_profile_sensor_data,
                               callback_group=n.physics_group)
@@ -93,6 +116,10 @@ class Robot:
         else:
             self.sim.cmd = (m.linear.x, m.linear.y, m.linear.z, m.angular.z)
 
+    def place_body(self, scene: Scene, s: dict):
+        scene.set_body_pose(self.body_ids, self.body_off, (s['x'], s['y'], s['z']),
+                            rpy_matrix(s['roll'], s['pitch'], s['yaw']), s['yaw'])
+
     def on_path(self, m: PathMsg):
         self.path = np.array([[p.pose.position.x, p.pose.position.y] for p in m.poses]).reshape(-1, 2)
 
@@ -101,7 +128,7 @@ class MockWorld(Node):
     def __init__(self):
         super().__init__('mock_world')
         for k, v in (('terrain_path', ''), ('robots', ['rover_0', 'scout_0']), ('g_mult', 2.2), ('spawn_json', '{}'),
-                     ('specs_json', '{}'), ('render_scale', 0.5), ('sim_speed', 1.0)):
+                     ('specs_json', '{}'), ('render_scale', 0.5), ('sim_speed', 1.0), ('render_procs', -1)):
             self.declare_parameter(k, v)
         gp = self.get_parameter
         self.g = float(gp('g_mult').value)
@@ -126,6 +153,10 @@ class MockWorld(Node):
                 x, y = terr.spawn_xy[len(self.robots) % len(terr.spawn_xy)] if r.startswith('rover') else terr.scout_spawn_xy
                 sp = (x, y, float(terr.height_at(x, y)), 0.0)
             self.robots.append(Robot(self, r, spec, sp))
+        for rb in self.robots:
+            rb.place_body(self.scene, rb.state)
+        self.dust_level = 0.0
+        self.create_subscription(String, '/world/env_state', self.on_env, 10, callback_group=self.cmd_group)
         self.events = self.create_publisher(String, '/world/events', 10)
         self.create_subscription(String, '/world/command', self.on_command, 10, callback_group=self.cmd_group)
         # this node is the clock source: simulated time is paced by SimPacer (lockstep with the renderers) and
@@ -141,12 +172,22 @@ class MockWorld(Node):
         self._last = time.monotonic()
         self._due = {}                                    # (robot, stream) → next simulated time
         self._slide = 0
+        procs = int(gp('render_procs').value)
+        self.render = RenderPool(self.scene, AUTO_RENDER_PROCS if procs < 0 else procs)
+        if self.render.error is not None:
+            self.get_logger().warn(f'render pool unavailable ({self.render.error}); rendering in-process')
         self._jobs = {'lidar': queue.Queue(), 'cam': queue.Queue()}
-        for kind in self._jobs:                           # renderers run beside physics (numpy releases the GIL)
-            threading.Thread(target=self._render_loop, args=(kind,), name=f'render_{kind}', daemon=True).start()
+        # with a pool, one dispatch thread per sensor (SimPacer keeps one frame per sensor in flight, so frames of
+        # one sensor never overtake each other); in-process, one per kind: more threads would only thrash the GIL
+        n_threads = {'lidar': sum(rb.rover for rb in self.robots), 'cam': len(self.robots)}
+        for kind in self._jobs:
+            for k in range(max(1, n_threads[kind]) if self.render.procs else 1):
+                threading.Thread(target=self._render_loop, args=(kind,), name=f'render_{kind}_{k}',
+                                 daemon=True).start()
         self.create_timer(1.0 / PHYSICS_HZ, self.physics, callback_group=self.physics_group)
         self.get_logger().info(f'mock world ready: {len(terr.rocks)} boulders, {len(terr.science)} crystals, '
                                f'g={self.g}, robots={[r.name for r in self.robots]}, render_scale={self.render_scale}, '
+                               f'render_procs={self.render.procs}, '
                                f'speed={self.pacer.speed:.2f}x')
 
     @property
@@ -158,6 +199,12 @@ class MockWorld(Node):
     def stamp(t: float) -> Time:
         sec = int(t)
         return Time(sec=sec, nanosec=int((t - sec) * 1e9))
+
+    def on_env(self, msg: String):
+        try:
+            self.dust_level = float(json.loads(msg.data).get('dust_level') or 0.0)
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            pass
 
     def emit(self, ev: dict):
         ev.setdefault('t', time.time())
@@ -182,11 +229,12 @@ class MockWorld(Node):
             t = self.pacer.t
             if dt > 0.0:
                 self._step(dt, t)
+            objs = scene_objects(self.scene) if due else None   # boulders, falling rocks, robot bodies now
             for name, kind in due:                        # sample the frame at exactly its due time
                 rb = self.by_name[name]
                 with self.lock:
                     s = rb.state
-                self._jobs[kind].put((rb, s, t))
+                self._jobs[kind].put((rb, s, t, objs))
         if self.pacer.t > self._last_clock:
             self._publish_clock(self.pacer.t)
 
@@ -194,13 +242,24 @@ class MockWorld(Node):
         self.scene.update(t)
         stamp = self.stamp(t)
         for rb in self.robots:
+            if rb.rover and rb.hw.update(t):
+                self._repair_done(rb)
             rb.sim.step(dt, self.scene, t)
             s = rb.sim.snapshot()
             with self.lock:
                 rb.state = s
+            rb.place_body(self.scene, s)
+            if rb.slide_armed is not None:
+                self._try_rockslide(rb, t)
             for ev in (rb.sim.pop_events() if rb.rover else ()):
-                self.get_logger().info(f'jolt {rb.name}: released at roll {ev["release_roll_deg"]:.1f} deg')
+                if ev['op'] == 'jolt':
+                    self.get_logger().info(f'jolt {rb.name}: released at roll {ev["release_roll_deg"]:.1f} deg')
+                else:
+                    self.get_logger().info(f'debris strike on {rb.name}: peak {ev["peak_g"]:.2f} g above gravity, '
+                                           f'wheel health {ev["wheel_health"]}')
                 self.emit(ev)
+            if rb.rover and self._due_now((rb.name, 'hw'), 1.0 / HW_STATUS_HZ, t):
+                self.publish_hw(rb, s)
             if self._due_now((rb.name, 'imu'), 1.0 / IMU_HZ, t):
                 self.publish_imu(rb, s, stamp)
             if self._due_now((rb.name, 'odom'), 1.0 / ODOM_HZ, t):
@@ -213,6 +272,19 @@ class MockWorld(Node):
     def _publish_clock(self, t: float):
         self._last_clock = t
         self.clock_pub.publish(Clock(clock=self.stamp(t)))
+
+    def publish_hw(self, rb: Robot, s: dict):
+        solar_w, irr = solar_output(self.dust_level, s['roll'], s['pitch'], s['yaw'])
+        v_cmd, w_cmd = rb.sim.cmd
+        cur = rb.hw.motor_current(v_cmd, w_cmd, rb.hw_rng)
+        rb.pub_hw.publish(String(data=json.dumps(hw_status_dict(rb.name, time.time(), rb.hw, solar_w, irr, cur))))
+
+    def _repair_done(self, rb: Robot):
+        ev = dict(rb.repair or {'op': 'repair', 'ok': True, 'robot': rb.name})
+        rb.repair = None
+        ev.update(done=True, wheel_health=list(rb.hw.wheel_health), detail='drivetrain restored', t=time.time())
+        self.get_logger().info(f'repair of {rb.name} complete')
+        self.emit(ev)
 
     def publish_imu(self, rb: Robot, s: dict, stamp):
         m = Imu()
@@ -262,18 +334,25 @@ class MockWorld(Node):
             if rb is None or not rb.rover:
                 self.emit({'op': 'spawn_rockslide', 'ok': False, 'robot': cmd.get('robot'), 'detail': 'unknown rover'})
                 return
-            s = rb.state
-            rocks, impact = rockslide_layout(rb.path, (s['x'], s['y'], s['yaw']), seed=self._slide)
-            self._slide += 1
-            self.scene.add_rocks([tuple(r) for r in rocks], t=self.sim_t, drop_m=4.0)
-            self.get_logger().info(f'rockslide #{self._slide} across {rb.name} path at {np.round(impact, 1)}')
-            self.emit({'op': 'spawn_rockslide', 'ok': True, 'robot': rb.name, 'impact': [float(v) for v in impact],
-                       'rocks': [[float(v) for v in r] for r in rocks]})
+            if rb.slide_armed is None:
+                rb.slide_armed = self.sim_t
+                self._try_rockslide(rb, self.sim_t)
         elif op == 'jolt':
             if rb is None or not rb.rover:
                 self.emit({'op': 'jolt', 'ok': False, 'robot': cmd.get('robot'), 'detail': 'unknown rover'})
                 return
             rb.sim.start_jolt()
+        elif op == 'critical_damage':
+            if rb is None or not rb.rover:
+                self.emit({'op': 'critical_damage', 'ok': False, 'robot': cmd.get('robot'), 'detail': 'unknown rover'})
+                return
+            if not rb.sim.start_strike():
+                self.emit({'op': 'critical_damage', 'ok': False, 'robot': rb.name, 'detail': 'strike already under way'})
+                return
+            rb.repair = None                           # a strike cancels any repair in progress
+            self.get_logger().info(f'debris strike on {rb.name} at ({rb.state["x"]:.1f}, {rb.state["y"]:.1f})')
+        elif op == 'repair':
+            self._repair(rb, cmd)
         elif op == 'set_speed':
             try:
                 speed = self.pacer.set_speed(float(cmd.get('speed', 1.0)))
@@ -283,16 +362,55 @@ class MockWorld(Node):
             self.get_logger().info(f'simulation speed set to {speed:.2f}x')
             self.emit({'op': 'set_speed', 'ok': True, 'speed': speed})
 
+    def _try_rockslide(self, rb: Robot, t: float):
+        """Drop the armed rockslide once rockslide_due: across the route ahead, or the next one near a goal."""
+        s = rb.state
+        waited = t - rb.slide_armed
+        if not rockslide_due(rb.path, (s['x'], s['y'], s['yaw']), waited):
+            return
+        rb.slide_armed = None
+        rocks, impact = rockslide_layout(rb.path, (s['x'], s['y'], s['yaw']), seed=self._slide)
+        self._slide += 1
+        self.scene.add_rocks([tuple(r) for r in rocks], t=t, drop_m=4.0)
+        self.get_logger().info(f'rockslide #{self._slide} across {rb.name} path at {np.round(impact, 1)}'
+                               + (f' (waited {waited:.1f} s for the next route)' if waited > 0 else ''))
+        self.emit({'op': 'spawn_rockslide', 'ok': True, 'robot': rb.name, 'impact': [float(v) for v in impact],
+                   'rocks': [[float(v) for v in r] for r in rocks], 'waited_s': round(waited, 2)})
+
+    def _repair(self, rb: Robot | None, cmd: dict):
+        by = self.by_name.get(cmd.get('by'))
+        ev = {'op': 'repair', 'robot': rb.name if rb else cmd.get('robot'), 'by': cmd.get('by')}
+        if rb is None or not rb.rover:
+            self.emit(dict(ev, ok=False, detail='unknown rover'))
+            return
+        if by is None or not by.rover or by is rb:
+            self.emit(dict(ev, ok=False, detail=f'unknown repairing rover {cmd.get("by")!r}'))
+            return
+        with self.lock:
+            a, b = rb.state, by.state
+        dist = round(planar_distance((a['x'], a['y']), (b['x'], b['y'])), 2)
+        ev['distance_m'] = dist
+        if dist > REPAIR_RANGE_M:
+            self.emit(dict(ev, ok=False, detail=f'{by.name} is {dist:.2f} m from {rb.name} '
+                                                f'(repair needs <= {REPAIR_RANGE_M:.1f} m)'))
+            return
+        if not rb.hw.start_repair(self.sim_t, REPAIR_S):
+            self.emit(dict(ev, ok=True, done=False, detail='repair already in progress'))
+            return
+        rb.repair = dict(ev, ok=True)
+        self.get_logger().info(f'repair of {rb.name} by {by.name} started at {dist:.2f} m')
+        self.emit(dict(ev, ok=True, done=False, detail=f'repair started: drivetrain restoring over {REPAIR_S:.1f} s'))
+
     # ------------------------------------------------------------------ render threads
     def _render_loop(self, kind: str):
         jobs = self._jobs[kind]
         while rclpy.ok():
             try:
-                rb, s, t = jobs.get(timeout=0.5)
+                rb, s, t, objs = jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
-                (self.publish_lidar if kind == 'lidar' else self.publish_camera)(rb, s, t)
+                (self.publish_lidar if kind == 'lidar' else self.publish_camera)(rb, s, t, objs)
             except Exception as e:  # noqa: BLE001 - a bad frame must not stall the clock forever
                 self.get_logger().warn(f'{kind} render failed for {rb.name}: {e}')
             finally:
@@ -302,10 +420,10 @@ class MockWorld(Node):
     def _pose(s: dict):
         return np.array([s['x'], s['y'], s['z']]), rpy_matrix(s['roll'], s['pitch'], s['yaw'])
 
-    def publish_lidar(self, rb: Robot, s: dict, t: float):
+    def publish_lidar(self, rb: Robot, s: dict, t: float, objs: dict):
         pos, R = self._pose(s)
         stamp = self.stamp(t)
-        pts = lidar_scan(self.scene, pos + R @ np.asarray(rb.spec['lidar_xyz']), R, rb.spec)
+        pts = self.render.lidar_scan(objs, pos + R @ np.asarray(rb.spec['lidar_xyz']), R, rb.spec, exclude=rb.exclude)
         h, w = pts.shape[:2]
         arr = np.zeros(h * w, CLOUD_DTYPE)
         flat = pts.reshape(-1, 3)
@@ -317,13 +435,14 @@ class MockWorld(Node):
         m.data = arr.tobytes()
         rb.pub_cloud.publish(m)
 
-    def publish_camera(self, rb: Robot, s: dict, t: float):
+    def publish_camera(self, rb: Robot, s: dict, t: float, objs: dict):
         pos, R = self._pose(s)
         stamp = self.stamp(t)
         sp = rb.spec
         Rc = camera_rotation(R, sp['camera_pitch_rad'])
-        rgb, depth = camera_frame(self.scene, pos + R @ np.asarray(sp['camera_xyz']), Rc, sp['camera_w'],
-                                  sp['camera_h'], sp['camera_hfov'], sp.get('camera_far', 40.0), scale=rb.scale)
+        rgb, depth = self.render.camera_frame(objs, pos + R @ np.asarray(sp['camera_xyz']), Rc, sp['camera_w'],
+                                              sp['camera_h'], sp['camera_hfov'], sp.get('camera_far', 40.0),
+                                              scale=rb.scale, exclude=rb.exclude)
         frame = f'{rb.name}/base_link/camera'
         h, w = depth.shape
         img = Image(height=h, width=w, encoding='rgb8', is_bigendian=0, step=3 * w, data=rgb.tobytes())
@@ -351,5 +470,6 @@ def main():
         pass
     finally:
         ex.shutdown()
+        node.render.close()
         node.destroy_node()
         rclpy.try_shutdown()

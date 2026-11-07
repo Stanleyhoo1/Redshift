@@ -1,11 +1,13 @@
-// Mirrors docs/protocol.md (v1). Keep in sync with that file — it is the source of truth.
+// Mirrors docs/protocol.md (v1 + §8 fleet health / SOS / rescue). Keep in sync with that file — it is the source of truth.
+// Every §8 field is optional at runtime: older backends omit it.
 
 export type XY = [number, number]
 export type XYZ = [number, number, number]
 
 export type RobotType = 'rover' | 'scout'
 export type Severity = 'info' | 'warn' | 'critical'
-export type SensorTag = 'CAM' | 'DEPTH' | 'LIDAR' | 'IMU' | 'ODOM' | 'MAP' | 'FLEET' | 'EDGE'
+/** DIAG = motor-controller diagnostics (§8.3 hw_status). */
+export type SensorTag = 'CAM' | 'DEPTH' | 'LIDAR' | 'IMU' | 'ODOM' | 'MAP' | 'FLEET' | 'EDGE' | 'DIAG'
 export type PerceptionMode = 'FUSED' | 'LIDAR_ONLY'
 export type MissionStatus = 'idle' | 'launching' | 'running' | 'degraded' | 'failed' | 'stopped'
 
@@ -19,6 +21,12 @@ export type RoverState =
   | 'AWAIT_SCOUT'
   | 'RESUMING'
   | 'MISSION_COMPLETE'
+  // §8.6: damaged rover
+  | 'AWAIT_RESCUE'
+  // §8.6: recovery rover
+  | 'RESCUE_TRANSIT'
+  | 'RESCUE_DOCKING'
+  | 'REPAIRING'
 export type ScoutState = 'BOOT' | 'TAKEOFF' | 'SURVEY' | 'FLY_TO_SCAN' | 'SCANNING' | 'MISSION_COMPLETE'
 export type AgentState = RoverState | ScoutState
 
@@ -157,6 +165,64 @@ export interface Uncertainty {
   imu_vib: number
 }
 
+// §8.1 roles
+export type RobotRole = 'scout' | 'recovery' | 'drone'
+
+// §8.7 health block (rovers and drone)
+export interface RobotHealth {
+  /** structure_pct × drive_pct / 100 */
+  pct: number
+  structure_pct: number
+  drive_pct: number
+  battery_pct: number
+  battery_wh: number
+  capacity_wh: number
+  solar_w: number
+  load_w: number
+  /** solar_w − load_w; negative = draining */
+  net_w: number
+  faults: string[]
+  /** pct < 15 */
+  critical: boolean
+  shocks: number
+  peak_g: number
+}
+
+// §8.4 / §8.7
+export type RescuePhase = 'TRANSIT' | 'DOCKING' | 'REPAIRING' | 'DONE' | 'ABORTED'
+export interface RescueBlock {
+  id: string
+  /** 'rescuer' on the recovery rover; the damaged rover carries the other side of the link */
+  role: 'rescuer' | 'target' | string
+  /** the other robot; null on the damaged rover until a rescuer has taken its SOS */
+  peer: string | null
+  phase: RescuePhase | string
+  range_m: number | null
+  locked: boolean
+}
+
+// §8.7 sensors block: the raw instrument readings behind the agent's decisions
+export interface RobotSensors {
+  /** m/s² in the IMU frame */
+  accel: XYZ | null
+  /** |accel| / 9.80665 */
+  accel_g: number | null
+  /** rad/s */
+  gyro: XYZ | null
+  roll_deg: number | null
+  pitch_deg: number | null
+  /** null on the drone */
+  lidar_nearest_m: number | null
+  lidar_returns_pct: number | null
+  camera_conf: number | null
+  v_cmd: number | null
+  v_wheel: number | null
+  v_ground: number | null
+  slip: number | null
+  /** drone only */
+  altitude_agl: number | null
+}
+
 // §7 telemetry.robots[r]
 export interface RobotTelemetry {
   type: RobotType
@@ -176,6 +242,28 @@ export interface RobotTelemetry {
   path: XY[]
   trail: XY[]
   last_safe: XY | null
+  // §8.7 (absent on older backends; health / rescue are null before the first agent_state)
+  role?: RobotRole | string
+  name?: string
+  health?: RobotHealth | null
+  rescue?: RescueBlock | null
+  sensors?: RobotSensors | null
+}
+
+// §3.2 + §8.8 detections (not forwarded on /ws today; documented for completeness)
+export type DetectionClass = 'ROCK' | 'CRATER' | 'SCIENCE' | 'SLOPE' | 'ROVER'
+export interface Detection {
+  cls: DetectionClass | string
+  conf: number
+  bbox: [number, number, number, number]
+  range_m: number
+  bearing_rad: number
+  world_xy: XY
+  sources: SensorTag[]
+  /** ROVER only: which teammate, whether it is damaged, and the lock-on label */
+  robot?: string
+  damaged?: boolean
+  label?: string
 }
 
 export interface MissionEnv {
@@ -270,6 +358,48 @@ export interface HazardMarkEvent {
   reason?: string
   t: number
 }
+// §8.4 / §8.5 / §8.9
+export interface SosEvent {
+  op: 'sos'
+  id: string
+  robot: string
+  xy: XY
+  yaw?: number
+  health_pct: number
+  faults: string[]
+  status: 'active' | 'resolved'
+  t: number
+}
+export interface RescueEvent {
+  op: 'rescue'
+  id: string
+  rescuer: string
+  target: string
+  phase: RescuePhase | string
+  range_m: number | null
+  locked: boolean
+  t: number
+}
+export interface CriticalDamageEvent {
+  op: 'critical_damage'
+  ok: boolean
+  robot: string
+  impact: XY
+  peak_g: number
+  wheel_health: number[]
+  t: number
+}
+export interface RepairEvent {
+  op: 'repair'
+  ok: boolean
+  robot: string
+  by: string
+  distance_m: number
+  detail?: string
+  /** true on the second event, when health is restored */
+  done?: boolean
+  t: number
+}
 export interface GenericEvent {
   op: string
   ok?: boolean
@@ -283,6 +413,10 @@ export type WorldEvent =
   | ScanRequestEvent
   | ScanCompleteEvent
   | HazardMarkEvent
+  | SosEvent
+  | RescueEvent
+  | CriticalDamageEvent
+  | RepairEvent
   | GenericEvent
 
 // §7 WebSocket server → client
@@ -305,9 +439,12 @@ export interface TelemetryMsg {
   mission: MissionTelemetry
   robots: Record<string, RobotTelemetry>
 }
+export type CameraKind = 'rgb' | 'depth'
 export interface CameraMsg {
   type: 'camera'
   robot: string
+  /** §8.9: absent = rgb. Depth is colour-mapped (turbo, near = red) and sent for the selected robot only. */
+  kind?: CameraKind
   jpeg_b64: string
   t: number
 }

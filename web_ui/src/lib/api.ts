@@ -83,5 +83,7 @@ export const api = {
   injectAnomaly: (body: { dust_level?: number; duration_s?: number } = {}) =>
     post<OkResponse>('/api/inject/anomaly', body),
   injectTip: (robot?: string) => post<OkResponse>('/api/inject/tip', robot ? { robot } : {}),
+  /** §8.9: debris strike → critical damage on `robot` (default: the first rover) */
+  injectDamage: (robot?: string) => post<OkResponse>('/api/inject/damage', robot ? { robot } : {}),
   setSpeed: (speed: number) => post<OkResponse & { speed?: number }>('/api/sim/speed', { speed }),
 }

@@ -57,6 +57,8 @@ class RosLink:
         n.create_subscription(String, '/fleet/scan_request', lambda m: self._on_event_json(m.data, 'scan_request'), 10)
         n.create_subscription(String, '/fleet/scan_complete', lambda m: self._on_event_json(m.data, 'scan_complete'), 10)
         n.create_subscription(String, '/fleet/hazard_marks', lambda m: self._on_event_json(m.data, 'hazard_mark'), 10)
+        n.create_subscription(String, '/fleet/sos', lambda m: self._on_event_json(m.data, 'sos'), 10)
+        n.create_subscription(String, '/fleet/rescue', lambda m: self._on_event_json(m.data, 'rescue'), 10)
         n.create_subscription(String, '/world/env_state', self._on_env, 10)
         n.create_subscription(Image, '/planet_map/layers', self._on_layers, MAP_QOS)
         n.create_subscription(String, '/planet_map/stats', self._on_stats, MAP_QOS)
@@ -113,6 +115,8 @@ class RosLink:
                                       lambda m, c=c: self._json(c, 'detections', m), 10),
                 n.create_subscription(CompressedImage, f'/{r}/perception/annotated/compressed',
                                       lambda m, c=c: self._on_jpeg(c, m), SENSOR_QOS),
+                n.create_subscription(CompressedImage, f'/{r}/perception/depth/compressed',
+                                      lambda m, c=c: self._on_depth(c, m), SENSOR_QOS),
                 n.create_subscription(Path, f'/{r}/planned_path', lambda m, c=c: self._on_path(c, m), 10),
                 # proof that the simulator renders: a clean (post sensor-effects) camera frame. raw=True skips
                 # deserialising the pixels; only the arrival is recorded.
@@ -145,8 +149,10 @@ class RosLink:
     def _on_imu(self, c: RobotCache, m):
         r, p, _ = quat_to_rpy(m.orientation)
         w = m.angular_velocity
+        a = m.linear_acceleration
         c.imu = {'roll_deg': round(math.degrees(r), 2), 'pitch_deg': round(math.degrees(p), 2),
-                 'gyro': [round(w.x, 3), round(w.y, 3), round(w.z, 3)]}
+                 'gyro': [round(w.x, 3), round(w.y, 3), round(w.z, 3)],
+                 'accel': [round(a.x, 3), round(a.y, 3), round(a.z, 3)]}
 
     def _json(self, c: RobotCache, attr: str, m):
         try:
@@ -162,6 +168,11 @@ class RosLink:
         with self.lock:
             c.jpeg_b64, c.jpeg_t = b, time.time()
             self._mark(c, 'camera')
+
+    def _on_depth(self, c: RobotCache, m):
+        b = base64.b64encode(bytes(m.data)).decode('ascii')
+        with self.lock:
+            c.depth_b64, c.depth_t = b, time.time()
 
     def _on_path(self, c: RobotCache, m):
         xy = [(ps.pose.position.x, ps.pose.position.y) for ps in m.poses]

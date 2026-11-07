@@ -5,6 +5,10 @@
   limit produces), loose-regolith slip on steep grades, boulders block the chassis while the wheels keep
   turning, and the subsidence jolt as a second-order roll mode driven closed-loop to a peak just past the tip
   alarm (like world_interface_node does in Gazebo).
+* Rover drivetrain (rover_hw.Drivetrain): the command is scaled by the wheel health *before* the DiffDrive limits,
+  as the Gazebo `cmd_vel` → `cmd_vel_hw` relay does, so a damaged rover crawls and veers and the autonomy only sees
+  it in its sensors. The debris strike (start_strike) adds the rover_hw half-sine shock to the IMU specific force
+  and a small roll kick to the roll mode, damages the drivetrain and reports the measured |a| peak in its event.
 * Scout: VelocityControl-like body-frame velocity commands with a first-order lag, resting on its skids.
 """
 from __future__ import annotations
@@ -16,6 +20,7 @@ import numpy as np
 from redshift_autonomy.physics_model import RoverPhysics
 
 from .mock_render import rpy_matrix
+from .rover_hw import STRIKE, Drivetrain, peak_g_above_gravity, strike_shape, strike_specific_force
 from .scene_events import JOLT
 
 G0 = 9.80665
@@ -23,6 +28,7 @@ G0 = 9.80665
 V_LIM, W_LIM = 1.2, 1.5
 ACC_UP, ACC_DOWN, W_ACC = 1.5, 2.0, 4.0
 ATTITUDE_TAU_S = 0.08
+CONTACT_TAU_S = 0.05           # tyre / suspension compliance: a stall reaches the chassis accelerometer over ≈ 50 ms
 FOOTPRINT_R = 0.5
 # roll mode of the chassis on its suspension/tyres, and the jolt's drive
 ROLL_W = 5.0                  # rad/s
@@ -33,21 +39,27 @@ SCOUT_TAU_S, SCOUT_YAW_TAU_S = 0.25, 0.2
 
 
 class RoverSim:
-    def __init__(self, name: str, spec: dict, spawn, g_mult: float, rng: np.random.Generator | None = None):
+    def __init__(self, name: str, spec: dict, spawn, g_mult: float, rng: np.random.Generator | None = None,
+                 drivetrain: Drivetrain | None = None):
         self.name, self.spec, self.g = name, spec, float(g_mult)
+        self.drivetrain = drivetrain if drivetrain is not None else Drivetrain(spec.get('track_m', 0.85))
         self.lim = RoverPhysics.from_spec(spec).limits(self.g)
         x, y, _, yaw = spawn
         self.x, self.y, self.yaw, self.yaw0 = float(x), float(y), float(yaw), float(yaw)
         self.z = 0.0
         self.cmd = (0.0, 0.0)
         self.v_drive = self.w_drive = 0.0
-        self.v_wheel = self.v_true = self._v_prev = 0.0
+        self.v_wheel = self.v_true = self._v_imu = 0.0
         self.roll_t = self.pitch_t = 0.0
         self.roll = self.pitch = 0.0
         self.roll_rate = self.pitch_rate = 0.0
         self.phi = self.phid = 0.0
         self.jolting = False
         self._jolt_t = 0.0
+        self.striking = False
+        self._strike_t = 0.0
+        self._strike_peak = 0.0
+        self._strike_xy = (0.0, 0.0)
         self._events: list[dict] = []
         self.wx = self.wy = self.wyaw = 0.0
         self.accel = np.array([0.0, 0.0, self.g * G0])
@@ -73,6 +85,16 @@ class RoverSim:
         self.jolting, self._jolt_t = True, 0.0
         return True
 
+    def start_strike(self) -> bool:
+        """Debris strike: damage the drivetrain now and run the shock; the critical_damage event (with the
+        measured |a| peak) is queued once the shock has passed. False if a strike is already under way."""
+        if self.striking:
+            return False
+        self.striking, self._strike_t, self._strike_peak = True, 0.0, 0.0
+        self._strike_xy = (self.x, self.y)
+        self.drivetrain.apply_critical_damage()
+        return True
+
     def pop_events(self) -> list[dict]:
         ev, self._events = self._events, []
         return ev
@@ -91,8 +113,9 @@ class RoverSim:
         if not self._init:
             _, self.roll_t, self.pitch_t = self._contacts(scene, self.x, self.y, self.yaw)
             self._init = True
-        v_cmd = float(np.clip(self.cmd[0], -V_LIM, V_LIM))
-        w_cmd = float(np.clip(self.cmd[1], -W_LIM, W_LIM))
+        v_hw, w_hw = self.drivetrain.scale(self.cmd[0], self.cmd[1], self.spec['track_m'])
+        v_cmd = float(np.clip(v_hw, -V_LIM, V_LIM))
+        w_cmd = float(np.clip(w_hw, -W_LIM, W_LIM))
         self.v_drive += float(np.clip(v_cmd - self.v_drive, -ACC_DOWN * dt, ACC_UP * dt))
         self.w_drive += float(np.clip(w_cmd - self.w_drive, -W_ACC * dt, W_ACC * dt))
 
@@ -124,6 +147,11 @@ class RoverSim:
         if self.jolting:
             self._jolt_t += dt
             u = JOLT_ACCEL
+        shock = None
+        if self.striking:
+            self._strike_t += dt
+            u += STRIKE['roll_accel'] * strike_shape(self._strike_t)
+            shock = strike_specific_force(self._strike_t)
         self.phid += (u - ROLL_W ** 2 * self.phi - 2 * ROLL_ZETA * ROLL_W * self.phid) * dt
         self.phi += self.phid * dt
         if self.jolting:
@@ -143,10 +171,22 @@ class RoverSim:
         self.wy += self.v_wheel * math.sin(self.wyaw) * dt
 
         R = rpy_matrix(self.roll, self.pitch, self.yaw)
-        a_fwd = (self.v_true - self._v_prev) / dt
-        self._v_prev = self.v_true
+        # the chassis follows a ground-speed step (stall against a rock) through the tyres' compliance, not in one
+        # step: the pacer splits steps at sensor due times, and Δv / dt over a 10 µs step read as thousands of g
+        v_prev = self._v_imu
+        self._v_imu += (self.v_true - self._v_imu) * min(1.0, dt / CONTACT_TAU_S)
+        a_fwd = (self._v_imu - v_prev) / dt
         vib = 0.03 * min(1.0, abs(self.v_true)) * self.rng.standard_normal(3)
         self.accel = R.T @ np.array([0.0, 0.0, self.g * G0]) + np.array([a_fwd, self.v_true * self.w_drive, 0.0]) + vib
+        if shock is not None:
+            self.accel = self.accel + shock
+            self._strike_peak = max(self._strike_peak, float(np.linalg.norm(self.accel)))
+            if self._strike_t >= STRIKE['duration_s'] + STRIKE['settle_s']:
+                self.striking = False
+                self._events.append({'op': 'critical_damage', 'ok': True, 'robot': self.name,
+                                     'impact': [round(float(v), 3) for v in self._strike_xy],
+                                     'peak_g': peak_g_above_gravity(self._strike_peak, self.g),
+                                     'wheel_health': [round(h, 3) for h in self.drivetrain.wheel_health]})
 
     def snapshot(self) -> dict:
         return {'x': self.x, 'y': self.y, 'z': self.z, 'yaw': self.yaw, 'roll': self.roll, 'pitch': self.pitch,

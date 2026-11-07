@@ -68,6 +68,7 @@ export function Stepper({
   onChange,
   glyph,
   unit,
+  roles,
 }: {
   label: string
   range: RangeOption
@@ -75,6 +76,8 @@ export function Stepper({
   onChange: (v: number) => void
   glyph: 'rover' | 'scout'
   unit: [string, string]
+  /** display name of each slot, in deploy order (§8.1 roles) */
+  roles?: string[]
 }) {
   const btn =
     'grid h-9 w-9 place-items-center rounded-[3px] border border-rule bg-bay text-[18px] text-bone hover:border-rule-2 disabled:opacity-30'
@@ -82,11 +85,22 @@ export function Stepper({
     <div className="flex items-center justify-between gap-3 rounded-[3px] border border-rule bg-bay px-3.5 py-2.5">
       <div className="min-w-0">
         <div className="text-[13px] text-haze">{label}</div>
-        <div className="mt-1 flex h-4 items-center gap-1.5">
-          {Array.from({ length: range.max }, (_, k) => (
-            <FleetGlyph key={k} kind={glyph} on={k < value} />
-          ))}
-        </div>
+        {roles ? (
+          <ul className="mt-1.5 grid gap-1" aria-label={`${label} in this fleet`}>
+            {Array.from({ length: range.max }, (_, k) => (
+              <li key={k} className={`flex items-center gap-1.5 text-[12.5px] leading-none ${k < value ? 'text-bone' : 'text-dim line-through decoration-rule-2'}`}>
+                <FleetGlyph kind={glyph} on={k < value} size={11} />
+                <span className="truncate">{roles[k] ?? `${unit[0]} ${k + 1}`}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="mt-1 flex h-4 items-center gap-1.5">
+            {Array.from({ length: range.max }, (_, k) => (
+              <FleetGlyph key={k} kind={glyph} on={k < value} />
+            ))}
+          </div>
+        )}
       </div>
       <div className="flex items-center gap-2">
         <button type="button" className={btn} onClick={() => onChange(value - 1)} disabled={value <= range.min} aria-label={`Fewer ${label.toLowerCase()}`}>

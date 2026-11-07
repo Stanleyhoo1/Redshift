@@ -82,6 +82,16 @@ def _point_along(path: np.ndarray, pose, ahead_m: float):
 
 ROUTE_FRACTION = 0.6     # on a short route the line falls at most this far along what remains (room before the goal)
 MIN_AHEAD_M = 3.0         # never closer than this to the robot
+DEFER_BELOW_M = 4.0       # less route left: the rover is about to reach its goal, so the slide waits for its next route
+DEFER_MAX_S = 8.0         # ... for at most this long (simulated seconds), then falls along the heading
+
+
+def rockslide_due(path_xy, pose, waited_s: float) -> bool:
+    """Drop an armed rockslide now? Not while under DEFER_BELOW_M of route remains: the rover is about to reach its
+    goal and choose a new one, and a slide placed now would fall past the goal, off every route it will drive. It
+    waits (DEFER_MAX_S at most) for the next planned route and then lands across that."""
+    path = None if path_xy is None else np.asarray(path_xy, dtype=np.float64).reshape(-1, 2)
+    return remaining_m(path, pose) >= DEFER_BELOW_M or waited_s >= DEFER_MAX_S
 
 
 def rockslide_layout(path_xy, pose, ahead_m: float = 7.0, width_m: float = 7.0, n: int = 6, seed=None):

@@ -10,6 +10,9 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from . import _paths  # noqa: F401
+from redshift_autonomy.agent_fsm import display_name, role_of
+
 
 def png_b64(rgb: np.ndarray) -> str:
     """RGB uint8 image → base64 PNG (row 0 stays row 0 = south edge of the sector)."""
@@ -70,6 +73,8 @@ class RobotCache:
     trail: Trail = field(default_factory=Trail)
     jpeg_b64: str | None = None
     jpeg_t: float = 0.0
+    depth_b64: str | None = None
+    depth_t: float = 0.0
     cloud: np.ndarray | None = None
     cloud_t: float = 0.0
     first: dict = field(default_factory=dict)          # topic kind -> first-arrival time (readiness)
@@ -118,6 +123,28 @@ def robot_telemetry(c: RobotCache) -> dict:
         'path': path,
         'trail': c.trail.points(),
         'last_safe': a.get('last_safe'),
+        'role': a.get('role') or role_of(c.name),
+        'name': a.get('name') or display_name(c.name),
+        'health': a.get('health'),
+        'rescue': a.get('rescue'),
+        'sensors': sensor_readings(c, imu, unc),
+    }
+
+
+def sensor_readings(c: RobotCache, imu: dict, unc: dict) -> dict:
+    """Live instrument values for the sensor panel (docs/protocol.md §8.7)."""
+    a = c.agent_state or {}
+    lid = (c.detections or {}).get('lidar') or {}
+    acc = imu.get('accel')
+    rover = c.rtype == 'rover'
+    return {
+        'accel': acc, 'accel_g': None if acc is None else round(math.sqrt(sum(v * v for v in acc)) / 9.80665, 3),
+        'gyro': imu.get('gyro'), 'roll_deg': imu.get('roll_deg'), 'pitch_deg': imu.get('pitch_deg'),
+        'lidar_nearest_m': lid.get('nearest_m') if rover else None,
+        'lidar_returns_pct': lid.get('returns_pct') if rover else None,
+        'camera_conf': float(unc.get('camera_conf', 1.0)),
+        'v_cmd': a.get('v_cmd'), 'v_wheel': a.get('v_wheel'), 'v_ground': a.get('v_ground', a.get('speed')),
+        'slip': a.get('slip'), 'altitude_agl': a.get('altitude_agl'),
     }
 
 

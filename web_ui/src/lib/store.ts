@@ -1,15 +1,20 @@
 // Global client state. The WebSocket client (ws.ts) pushes every server message into `ingest`.
 import { create } from 'zustand'
 import { DEFAULT_OPTIONS } from './defaults'
-import { notePathUpdate, noteFrame, pushImu } from './history'
+import { clearHistory, notePathUpdate, noteFrame, pushImu, pushSensors } from './history'
 import { decodeMap, type DecodedMap } from './mapDecode'
+import { clearDistressClock, type Received } from './rescue'
+import { sampleOf } from './sensors'
 import type {
   BootLogMsg,
+  CameraKind,
   LidarMsg,
   MapMsg,
   MissionConfig,
   Options,
+  RescueEvent,
   ServerMsg,
+  SosEvent,
   StatusMsg,
   TelemetryMsg,
   TraceEntry,
@@ -25,6 +30,7 @@ export interface CameraFrame {
   receivedAt: number
   fps: number
 }
+export type RobotCameras = Partial<Record<CameraKind, CameraFrame>>
 export interface EventRecord {
   seq: number
   receivedAt: number
@@ -47,7 +53,14 @@ interface State {
   bootLog: BootLogMsg[]
   telemetry: TelemetryMsg | null
   telemetryAt: number
-  cameras: Record<string, CameraFrame>
+  /** latest frame per robot and kind (§8.9: rgb for every robot, depth for the selected one) */
+  cameras: Record<string, RobotCameras>
+  /** depth vs rgb in the main camera view */
+  cameraKind: CameraKind
+  /** latest `sos` event per SOS id */
+  sos: Record<string, Received<SosEvent>>
+  /** latest `rescue` event per SOS id */
+  rescues: Record<string, Received<RescueEvent>>
   lidar: Record<string, LidarFrame>
   map: DecodedMap | null
   traces: TraceEntry[]
@@ -61,6 +74,7 @@ interface State {
   setOptions: (o: Options, live: boolean) => void
   selectRobot: (r: string) => void
   setFollow: (f: boolean) => void
+  setCameraKind: (k: CameraKind) => void
   beginDeploy: (cfg: MissionConfig) => void
   resetMission: () => void
   ingest: (msg: ServerMsg) => void
@@ -80,6 +94,9 @@ export const useStore = create<State>()((set, get) => ({
   telemetry: null,
   telemetryAt: 0,
   cameras: {},
+  cameraKind: 'rgb',
+  sos: {},
+  rescues: {},
   lidar: {},
   map: null,
   traces: [],
@@ -93,6 +110,7 @@ export const useStore = create<State>()((set, get) => ({
   setOptions: (options, optionsLive) => set({ options, optionsLive }),
   selectRobot: (selectedRobot) => set({ selectedRobot }),
   setFollow: (followRobot) => set({ followRobot }),
+  setCameraKind: (cameraKind) => set({ cameraKind }),
 
   beginDeploy: (cfg) => {
     get().resetMission()
@@ -105,17 +123,22 @@ export const useStore = create<State>()((set, get) => ({
     })
   },
 
-  resetMission: () =>
+  resetMission: () => {
+    clearHistory()
+    clearDistressClock()
     set({
       bootLog: [],
       telemetry: null,
       telemetryAt: 0,
       cameras: {},
+      sos: {},
+      rescues: {},
       lidar: {},
       map: null,
       traces: [],
       events: [],
-    }),
+    })
+  },
 
   ingest: (msg) => {
     switch (msg.type) {
@@ -137,6 +160,7 @@ export const useStore = create<State>()((set, get) => ({
         const now = performance.now()
         for (const [id, r] of Object.entries(msg.robots)) {
           pushImu(id, { t: msg.t, roll: r.imu.roll_deg, pitch: r.imu.pitch_deg })
+          pushSensors(id, sampleOf(r, msg.t))
           notePathUpdate(id, prev?.robots[id]?.path, r.path, [r.pose.x, r.pose.y], now)
         }
         const patch: Partial<State> = { telemetry: msg, telemetryAt: now }
@@ -150,8 +174,10 @@ export const useStore = create<State>()((set, get) => ({
       }
       case 'camera': {
         const now = performance.now()
-        const fps = noteFrame(msg.robot, now)
-        set({ cameras: { ...get().cameras, [msg.robot]: { jpeg_b64: msg.jpeg_b64, t: msg.t, receivedAt: now, fps } } })
+        const kind: CameraKind = msg.kind === 'depth' ? 'depth' : 'rgb'
+        const fps = noteFrame(`${msg.robot}:${kind}`, now)
+        const cams = get().cameras
+        set({ cameras: { ...cams, [msg.robot]: { ...cams[msg.robot], [kind]: { jpeg_b64: msg.jpeg_b64, t: msg.t, receivedAt: now, fps } } } })
         break
       }
       case 'lidar':
@@ -169,7 +195,20 @@ export const useStore = create<State>()((set, get) => ({
         break
       }
       case 'event': {
-        const next = [...get().events, { seq: ++eventSeq, receivedAt: performance.now(), event: msg.event }]
+        const ev = msg.event
+        const now = performance.now()
+        // sos / rescue repeat at 1 Hz while active: keep only the latest per SOS id, out of the event log
+        if (ev.op === 'sos' && typeof (ev as SosEvent).robot === 'string') {
+          const e = ev as SosEvent
+          set({ sos: { ...get().sos, [e.id ?? e.robot]: { ev: e, receivedAt: now } } })
+          break
+        }
+        if (ev.op === 'rescue' && typeof (ev as RescueEvent).target === 'string') {
+          const e = ev as RescueEvent
+          set({ rescues: { ...get().rescues, [e.id ?? e.target]: { ev: e, receivedAt: now } } })
+          break
+        }
+        const next = [...get().events, { seq: ++eventSeq, receivedAt: now, event: ev }]
         if (next.length > EVENT_CAP) next.splice(0, next.length - EVENT_CAP)
         set({ events: next })
         break

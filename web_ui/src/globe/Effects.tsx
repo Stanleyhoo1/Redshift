@@ -23,7 +23,9 @@ function useNewEvents(filter: (e: EventRecord) => boolean): EventRecord[] {
   return useMemo(() => events.filter((e) => e.receivedAt >= mountedAt - 500 && filter(e)), [events, mountedAt, filter])
 }
 
-const isRockslide = (e: EventRecord) => e.event.op === 'spawn_rockslide' && (e.event as RockslideEvent).ok !== false && Array.isArray((e.event as RockslideEvent).impact)
+// a debris strike (§8.5 critical_damage) falls like a small meteor onto the damaged rover
+const isRockslide = (e: EventRecord) =>
+  (e.event.op === 'spawn_rockslide' || e.event.op === 'critical_damage') && (e.event as RockslideEvent).ok !== false && Array.isArray((e.event as RockslideEvent).impact)
 const isPing = (e: EventRecord) => ['scan_request', 'scan_complete', 'hazard_mark'].includes(e.event.op) && Array.isArray((e.event as { xy?: XY }).xy)
 
 export function Effects() {

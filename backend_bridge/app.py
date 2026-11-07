@@ -22,6 +22,7 @@ from .config_schema import MissionConfig, options, physics_preview
 from .encoders import lidar_points_body, png_b64, robot_telemetry
 from .mission_manager import ROOT, MissionManager
 from .ros_link import HAVE_ROS, RosLink
+from redshift_autonomy.agent_fsm import display_name
 from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
 
 log = logging.getLogger('redshift')
@@ -29,6 +30,7 @@ DIST = ROOT / 'web_ui' / 'dist'
 RUNTIME = ROOT / 'runtime'
 TELEMETRY_HZ = 15.0
 LIDAR_HZ = 5.0
+OTHER_CAM_HZ = 4.0          # camera tiles of the robots a client is not focused on
 CLIENT_QUEUE = 240        # ≈ 7 s of outbound frames; a client further behind than that is disconnected
 SEND_TIMEOUT_S = 2.0
 LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1'}
@@ -67,13 +69,14 @@ def origin_ok(origin: str | None, host: str | None) -> bool:
 
 
 class Client:
-    __slots__ = ('ws', 'camera', 'queue', 'task', 'sent_cam')
+    __slots__ = ('ws', 'camera', 'queue', 'task', 'sent_cam', 'sent_depth')
 
     def __init__(self, ws: WebSocket, camera: str):
         self.ws, self.camera = ws, camera
         self.queue: asyncio.Queue[str] = asyncio.Queue(CLIENT_QUEUE)
         self.task: asyncio.Task | None = None
-        self.sent_cam: float | None = None
+        self.sent_cam: dict[str, float] = {}       # robot → timestamp of the last rgb frame sent
+        self.sent_depth: float | None = None
 
 
 class Hub:
@@ -227,7 +230,7 @@ class Hub:
             robots = {r: robot_telemetry(c) for r, c in link.robots.items()}
             layers_v, layers = link.layers_version, link.layers
             stats = dict(link.stats)
-            cams = {r: (c.jpeg_t, c.jpeg_b64) for r, c in link.robots.items()}
+            cams = {r: (c.jpeg_t, c.jpeg_b64, c.depth_t, c.depth_b64) for r, c in link.robots.items()}
         self.broadcast({'type': 'telemetry', 't': round(time.time(), 3), 'mission': self.mission_dict(),
                         'robots': robots})
         if layers is not None and layers_v != state['map_v'] and tick % 4 == 0:
@@ -238,10 +241,19 @@ class Hub:
         lidar_cache: dict = {}
         for cl in list(self.clients.values()):
             r = cl.camera
-            t_jpg, jpg = cams.get(r, (0.0, None))
-            if jpg and cl.sent_cam != t_jpg:
-                cl.sent_cam = t_jpg
-                self.send(cl, dumps({'type': 'camera', 'robot': r, 'jpeg_b64': jpg, 't': round(t_jpg, 3)}))
+            # every robot's feed: the selected one at full rate (rgb + depth), the others at ≤ OTHER_CAM_HZ
+            for rr, (t_jpg, jpg, t_dep, dep) in cams.items():
+                last = cl.sent_cam.get(rr)
+                if not jpg or last == t_jpg or (rr != r and last is not None and t_jpg - last < 1.0 / OTHER_CAM_HZ):
+                    continue
+                cl.sent_cam[rr] = t_jpg
+                self.send(cl, dumps({'type': 'camera', 'robot': rr, 'kind': 'rgb', 'jpeg_b64': jpg,
+                                     't': round(t_jpg, 3)}))
+            t_jpg, jpg, t_dep, dep = cams.get(r, (0.0, None, 0.0, None))
+            if dep and cl.sent_depth != t_dep:
+                cl.sent_depth = t_dep
+                self.send(cl, dumps({'type': 'camera', 'robot': r, 'kind': 'depth', 'jpeg_b64': dep,
+                                     't': round(t_dep, 3)}))
             if r in robots and r.startswith('rover') and tick % int(TELEMETRY_HZ / LIDAR_HZ) == 0:
                 if r not in lidar_cache:
                     cloud = link.lidar_cloud(r)
@@ -417,6 +429,18 @@ async def api_tip(request: Request):
         return {'ok': False, 'detail': msg}
     res = hub.command({'op': 'jolt', 'robot': r})
     return res if not res['ok'] else {'ok': True, 'detail': f'Subsidence jolt applied to {r} chassis'}
+
+
+@app.post('/api/inject/damage')
+async def api_damage(request: Request):
+    body, err = await parse_body(request, RobotBody)
+    if err:
+        return err
+    r, msg = hub.running_rover(body.robot)
+    if msg:
+        return {'ok': False, 'detail': msg}
+    res = hub.command({'op': 'critical_damage', 'robot': r})
+    return res if not res['ok'] else {'ok': True, 'detail': f'Debris strike: critical damage on {display_name(r)}'}
 
 
 @app.post('/api/sim/speed')

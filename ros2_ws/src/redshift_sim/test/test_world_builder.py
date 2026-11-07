@@ -8,7 +8,7 @@ import yaml
 
 from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC, rover_sdf, scout_sdf
 from redshift_sim.terrain_gen import Terrain
-from redshift_sim.world_builder import GZ_CLOCK_TOPIC, STEP_S, WORLD_NAME, build_world, robot_names
+from redshift_sim.world_builder import GZ_CLOCK_TOPIC, STEP_S, WORLD_NAME, build_world, cmd_topic_ros, robot_names
 
 CFG = {'sector': 'small', 'gravity_g': 2.2, 'fleet': {'rovers': 2, 'drones': 1}, 'seed': 3}
 
@@ -69,9 +69,15 @@ def test_bridge_yaml(built):
     assert len(by_robot['rover_0']) == 8 and len(by_robot['scout_0']) == 6
     raw = {e['ros_topic_name'] for e in by_robot['rover_0']}
     assert {'/rover_0/camera/image_raw', '/rover_0/camera/depth_raw', '/rover_0/lidar/points_raw',
-            '/rover_0/imu_raw', '/rover_0/odom', '/rover_0/wheel_odom', '/rover_0/cmd_vel'} <= raw
-    cmd = [e for e in entries if e['ros_topic_name'] == '/rover_0/cmd_vel'][0]
-    assert cmd['direction'] == 'ROS_TO_GZ'
+            '/rover_0/imu_raw', '/rover_0/odom', '/rover_0/wheel_odom', '/rover_0/cmd_vel_hw'} <= raw
+    # rovers drive through the world interface's drivetrain relay: ROS cmd_vel_hw → gz cmd_vel (never ROS cmd_vel)
+    for r in ('rover_0', 'rover_1'):
+        cmd = [e for e in entries if e['gz_topic_name'] == f'/{r}/cmd_vel']
+        assert len(cmd) == 1 and cmd[0]['ros_topic_name'] == f'/{r}/cmd_vel_hw' == cmd_topic_ros(r)
+        assert cmd[0]['direction'] == 'ROS_TO_GZ' and cmd[0]['ros_type_name'] == 'geometry_msgs/msg/Twist'
+        assert not [e for e in entries if e['ros_topic_name'] == f'/{r}/cmd_vel']
+    scout = [e for e in entries if e['gz_topic_name'] == '/scout_0/cmd_vel']
+    assert len(scout) == 1 and scout[0]['ros_topic_name'] == '/scout_0/cmd_vel' and scout[0]['direction'] == 'ROS_TO_GZ'
     clock = [e for e in entries if e['gz_topic_name'] == '/clock']
     assert len(clock) == 1 and clock[0]['ros_topic_name'] == GZ_CLOCK_TOPIC and clock[0]['direction'] == 'GZ_TO_ROS'
 

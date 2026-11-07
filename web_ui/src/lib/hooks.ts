@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
+import { deriveRescue, type RescueView } from './rescue'
 import { sortRobots, useStore } from './store'
 import type { RobotTelemetry } from './types'
 
@@ -37,4 +38,13 @@ export function useCanvasSize(ref: React.RefObject<HTMLElement | null>): { w: nu
     return () => ro.disconnect()
   }, [ref])
   return size
+}
+
+/** The fleet's current SOS / rescue (null when there is none), re-derived on every telemetry frame. */
+export function useRescue(): RescueView | null {
+  const robots = useStore((s) => s.telemetry?.robots)
+  const sos = useStore((s) => s.sos)
+  const rescues = useStore((s) => s.rescues)
+  useTick(1000) // lets a stale event or a finished wrap-up expire without new frames
+  return deriveRescue(robots, sos, rescues, performance.now())
 }

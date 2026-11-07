@@ -152,6 +152,31 @@
   "col_order": "ccw",
   "col0_az_deg": -180.0
  },
+ "/rover_0/hw_status": {
+  "type": "std_msgs/String",
+  "hz": 5.0,
+  "count": 36,
+  "json_keys": [
+   "faults",
+   "irradiance",
+   "motor_current_a",
+   "robot",
+   "solar_w",
+   "t",
+   "wheel_health"
+  ],
+  "wheel_health_len": 4,
+  "motor_current_len": 4,
+  "faults_type": "list",
+  "~wheel_health": [
+   1.0,
+   1.0,
+   1.0,
+   1.0
+  ],
+  "~solar_w": 180.2,
+  "~irradiance": 1.0
+ },
  "/scout_0/odom": {
   "type": "nav_msgs/Odometry",
   "hz": 27.6,

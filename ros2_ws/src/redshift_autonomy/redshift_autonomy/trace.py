@@ -5,7 +5,7 @@ import itertools
 import time
 
 _ids = itertools.count(1)
-SENSORS = ('CAM', 'DEPTH', 'LIDAR', 'IMU', 'ODOM', 'MAP', 'FLEET', 'EDGE')
+SENSORS = ('CAM', 'DEPTH', 'LIDAR', 'IMU', 'ODOM', 'MAP', 'FLEET', 'EDGE', 'DIAG')
 
 
 class TraceBuilder:

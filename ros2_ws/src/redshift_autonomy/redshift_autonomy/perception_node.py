@@ -19,8 +19,13 @@ from std_msgs.msg import Float32, String
 from .edge_budget import PROFILES
 from .physics_model import RoverPhysics
 from .ros_utils import cloud_to_numpy, image_to_numpy, quat_to_rpy, rot_rp
-from .vision import (CameraModel, ImageQualityBaseline, LidarBaseline, annotate, detect_objects, fit_ground_plane,
-                     fuse_uncertainty, image_quality, lidar_corridor, lidar_quality)
+from .agent_fsm import unit_label
+from .vision import (CLEAR_AIR_LIDAR, CameraModel, ImageQualityBaseline, LidarBaseline, annotate, depth_colormap,
+                     detect_objects, fit_ground_plane, fuse_uncertainty, image_quality, lidar_corridor, lidar_quality,
+                     teammate_detection)
+
+TEAMMATE_MAX_M = 25.0
+TEAMMATE_FRESH_S = 1.0
 
 
 class Perception(Node):
@@ -64,6 +69,15 @@ class Perception(Node):
         self.pub_det = self.create_publisher(String, f'/{r}/perception/detections', 10)
         self.pub_unc = self.create_publisher(Float32, f'/{r}/perception/uncertainty', 10)
         self.pub_scan = self.create_publisher(LaserScan, f'/{r}/perception/scan2d', SENSOR_QOS)
+        self.pub_depth = self.create_publisher(CompressedImage, f'/{r}/perception/depth/compressed', SENSOR_QOS)
+        # teammates: fleet-reported poses say where to look; this robot's own sensors confirm them
+        self.mates: dict = {}               # robot → (x, y, z, yaw, t_sim)
+        self.damaged: dict = {}             # robot → SOS id while its SOS is active
+        self.docking: set = set()           # teammates this robot is docking with / repairing
+        for mate in (x for x in self.get_parameter('robots').value if x.startswith('rover') and x != r):
+            self.create_subscription(Odometry, f'/{mate}/odom', lambda m, mate=mate: self.on_mate(mate, m), SENSOR_QOS)
+        self.create_subscription(String, '/fleet/sos', self.on_sos, 10)
+        self.create_subscription(String, '/fleet/rescue', self.on_rescue, 10)
         self.create_timer(0.02, self.tick)
         self.get_logger().info(f'perception up for {r} ({self.rtype}), {self.profile.label}')
 
@@ -82,6 +96,60 @@ class Perception(Node):
         p = m.pose.pose
         self.pose = (p.position.x, p.position.y, quat_to_rpy(p.orientation)[2])
         self.z = p.position.z
+
+    def on_mate(self, robot: str, m: Odometry):
+        p = m.pose.pose
+        self.mates[robot] = (p.position.x, p.position.y, p.position.z, quat_to_rpy(p.orientation)[2],
+                             self.get_clock().now().nanoseconds * 1e-9)
+
+    def on_sos(self, m: String):
+        try:
+            d = json.loads(m.data)
+        except json.JSONDecodeError:
+            return
+        if d.get('status') == 'active':
+            self.damaged[d.get('robot')] = d.get('id')
+        else:
+            self.damaged.pop(d.get('robot'), None)
+
+    def on_rescue(self, m: String):
+        try:
+            d = json.loads(m.data)
+        except json.JSONDecodeError:
+            return
+        if d.get('rescuer') != self.robot:
+            return
+        if d.get('phase') in ('DOCKING', 'REPAIRING'):
+            self.docking.add(d.get('target'))
+        else:
+            self.docking.discard(d.get('target'))
+
+    def teammates(self, cam: CameraModel, depth, cam_pitch: float, cam_xyz, now: float):
+        """ROVER detections for teammates this robot can actually see (camera+depth and/or LiDAR)."""
+        out = []
+        x, y, yaw = self.pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        for mate, (mx, my, mz, myaw, t) in self.mates.items():
+            if now - t > TEAMMATE_FRESH_S:
+                continue
+            dx, dy = mx - x, my - y
+            if math.hypot(dx, dy) > TEAMMATE_MAX_M:
+                continue
+            bx, by = c * dx + s * dy, -s * dx + c * dy               # levelled body frame
+            rel = (bx - cam_xyz[0], by - cam_xyz[1], (mz - self.z) - cam_xyz[2])
+            pts = self.scan_pts if self.rtype == 'rover' else None
+            damaged = mate in self.damaged
+            label = None
+            if damaged:
+                label = f'[PERCEIVED: DAMAGED UNIT {unit_label(mate)}' + (
+                    ' | DOCKING FOR REPAIR]' if mate in self.docking else ']')
+            else:
+                label = f'TEAMMATE {unit_label(mate)}'
+            d = teammate_detection(cam, depth, cam_pitch, rel, myaw - yaw, (bx, by), lidar_pts=pts, robot=mate,
+                                   damaged=damaged, label=label, world_xy=(mx, my))
+            if d is not None:
+                out.append(d)
+        return out
 
     def on_mode(self, m: String):
         if m.data in ('FUSED', 'LIDAR_ONLY'):
@@ -131,8 +199,12 @@ class Perception(Node):
             c = depth[depth.shape[0] // 3:2 * depth.shape[0] // 3, depth.shape[1] // 3:2 * depth.shape[1] // 3]
             c = c[np.isfinite(c) & (c > 0.05)]
             scout_h = float(np.median(c)) if len(c) > 20 else 0.0
-        # clear-condition baseline: rover any time in FUSED mode; scout only at survey altitude
-        if self.mode == 'FUSED' and (scout_h is None or scout_h > 8.0):
+        # clear-condition baseline. Rover: in any mode, re-learning a changed scene when its LiDAR confirms clear
+        # air (else a texture-poor stretch after the warm-up would hold it in CAUTION). Scout (no LiDAR): only in
+        # FUSED mode at survey altitude.
+        if self.rtype == 'rover':
+            self.img_base.update(q, clear_air=self.lidar_conf >= CLEAR_AIR_LIDAR)
+        elif self.mode == 'FUSED' and scout_h > 8.0:
             self.img_base.update(q)
         imu_vib = float(np.std(self.acc)) if len(self.acc) > 10 else 0.0
         lidar_conf = self.lidar_conf if self.rtype == 'rover' else cam_conf
@@ -158,6 +230,16 @@ class Perception(Node):
                   'min_rock_px': 5, 'rock_gray_min': 0.3}
         dets = detect_objects(rgb, d_small, cam, pitch, cam_h, pose=self.pose, cam_conf=cam_conf,
                               slope_limit_deg=self.limits.max_slope_deg, use_camera=self.mode == 'FUSED', **kw)
+        if self.mates:
+            cam_xyz = (self.spec.get('camera_xyz', [0.45, 0.0, 0.5]) if self.rtype == 'rover'
+                       else self.spec.get('camera_xyz', [0.0, 0.0, -0.08]))
+            mates = self.teammates(cam, depth, pitch, cam_xyz, now)
+            if mates:      # a teammate's chassis is not a boulder: drop rock boxes centred inside a teammate box
+                def inside(d, m):
+                    x, y, w, h = d.bbox
+                    mx, my, mw, mh = m.bbox
+                    return mx <= x + w / 2 <= mx + mw and my <= y + h / 2 <= my + mh
+                dets = mates + [d for d in dets if not (d.cls == 'ROCK' and any(inside(d, m) for m in mates))]
         st['detect'] = (time.perf_counter() - t1) * 1000
         st['lidar'] = getattr(self, '_lidar_ms', 0.0)
 
@@ -176,6 +258,16 @@ class Perception(Node):
             msg = CompressedImage(format='jpeg', data=jpg.tobytes())
             msg.header = rgb_msg.header
             self.pub_jpg.publish(msg)
+        dvis = depth_colormap(depth, far_m=25.0 if self.rtype == 'rover' else 30.0)
+        for d in dets:
+            bx_, by_, bw_, bh_ = (int(v) for v in d.bbox)
+            if bw_ > 0:
+                cv2.rectangle(dvis, (bx_, by_), (bx_ + bw_, by_ + bh_), (255, 255, 255), 1)
+        ok, djpg = cv2.imencode('.jpg', cv2.cvtColor(dvis, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if ok:
+            dm = CompressedImage(format='jpeg', data=djpg.tobytes())
+            dm.header = rgb_msg.header
+            self.pub_depth.publish(dm)
         st['annotate'] = (time.perf_counter() - t2) * 1000
 
         out = {'robot': self.robot, 't': time.time(), 'mode': self.mode,
@@ -185,11 +277,25 @@ class Perception(Node):
                             for k, v in self.corridor.items() if k != 'cells'},
                'uncertainty': {'score': round(score, 3), 'camera_conf': round(cam_conf, 3),
                                'lidar_conf': round(lidar_conf, 3), 'imu_vib': round(imu_vib, 3)},
-               'stage_ms': {k: round(v, 2) for k, v in st.items()}, 'perception_hz': round(fps, 2)}
+               'stage_ms': {k: round(v, 2) for k, v in st.items()}, 'perception_hz': round(fps, 2),
+               'lidar': self.lidar_summary()}
         self.pub_det.publish(String(data=json.dumps(out)))
         self.pub_unc.publish(Float32(data=float(score)))
         if self.rtype == 'rover':
             self.publish_scan(rgb_msg.header)
+
+    def lidar_summary(self):
+        if self.rtype != 'rover' or self.lidar_q is None:
+            return None
+        pts = self.scan_pts
+        near = None
+        if len(pts):
+            a, b, c = fit_ground_plane(pts, x_max=12.0, inlier_m=0.2)
+            h = pts[:, 2] - (a * pts[:, 0] + b * pts[:, 1] + c)
+            obs = pts[(h > 0.3) & (h < 2.5)]
+            if len(obs):
+                near = round(float(np.hypot(obs[:, 0], obs[:, 1]).min()), 2)
+        return {'returns_pct': round(100.0 * float(self.lidar_q.get('return_ratio', 0.0)), 1), 'nearest_m': near}
 
     def publish_scan(self, header):
         pts = self.scan_pts

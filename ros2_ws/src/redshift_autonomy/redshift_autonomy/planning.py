@@ -175,6 +175,87 @@ def path_blocked(path, lethal, start_idx: int = 0) -> int:
     return -1
 
 
+def clearance_mask(lethal, clearance_m: float, res: float) -> np.ndarray:
+    """Cells within `clearance_m` (at least one cell) of a lethal cell: the footprint a route check tests."""
+    r = max(1, int(round(clearance_m / res)))
+    return cv2.dilate(np.asarray(lethal, np.uint8), disk_kernel(r)).astype(bool)
+
+
+def path_conflicts(path, blocked) -> frozenset:
+    """Indices of the route's cells that were already inside `blocked` when it was planned: an escape out of an
+    inflation ring or a tight-clearance route passes them on purpose, so they are no reason to halt later."""
+    return frozenset(k for k, (r, c) in enumerate(path or ()) if blocked[r, c])
+
+
+def first_block(path, path_xy, blocked, lethal, start_idx: int = 0, skip_m: float = 0.0,
+                accepted: frozenset = frozenset()):
+    """First route cell from `start_idx` that blocks it: inside `blocked` and not passed on purpose (`accepted`,
+    from `path_conflicts` at planning time), or on a lethal cell itself. Returns (index, metres along the route)
+    or None; the first `skip_m` metres (the segment under the robot) are ignored."""
+    dist = 0.0
+    for k in range(max(0, start_idx), len(path)):
+        if k > start_idx:
+            a, b = path_xy[k - 1], path_xy[k]
+            dist += math.hypot(b[0] - a[0], b[1] - a[1])
+        if dist < skip_m:
+            continue
+        r, c = path[k]
+        if blocked[r, c] and (k not in accepted or lethal[r, c]):
+            return k, dist
+    return None
+
+
+def add_keepout(cm: CostMap, xy, radius_m: float) -> CostMap:
+    """Mark a disc of cell centres within radius_m of xy as core lethal, without an inflation ring (in place). For a
+    teammate the rescuer must come close to: its footprint plus the rescuer's own radius, nothing more."""
+    H, W = cm.cost.shape
+    r0, c0 = world_to_cell(xy[0], xy[1], cm.res, cm.origin, (H, W))
+    span = int(math.ceil(radius_m / cm.res)) + 1
+    rs, cs = slice(max(0, r0 - span), min(H, r0 + span + 1)), slice(max(0, c0 - span), min(W, c0 + span + 1))
+    rr, cc = np.mgrid[rs, cs]
+    cx = cm.origin[0] + (cc + 0.5) * cm.res
+    cy = cm.origin[1] + (rr + 0.5) * cm.res
+    disc = np.hypot(cx - xy[0], cy - xy[1]) <= radius_m
+    cm.cost[rs, cs][disc] = np.inf
+    cm.lethal[rs, cs][disc] = True
+    return cm
+
+
+def reachable_from(cm: CostMap, start) -> np.ndarray:
+    """Cells `astar` can reach from `start` (8-connected): free and caution ground, plus the inflation rings when the
+    start is inside one (astar's escape mode). Lets a caller skip goals in other regions without running A*."""
+    sr, sc = start
+    escape = cm.cost[sr, sc] >= RING
+    passable = (cm.cost < (np.inf if escape else RING)).astype(np.uint8)
+    passable[sr, sc] = 1
+    _, labels = cv2.connectedComponents(passable, connectivity=8)
+    return labels == labels[sr, sc]
+
+
+def standoff_cells(cm: CostMap, target_xy, approach_rad: float, r_min: float = 2.0, r_max: float = 2.45,
+                   r_pref: float = 2.2, step_deg: float = 15.0) -> list:
+    """Every plannable cell (outside lethal cores and inflation rings) whose centre lies r_min..r_max from a teammate,
+    best first: the side facing `approach_rad` (in step_deg bands), then the distance closest to r_pref. A goal
+    there is reached within the 0.6 m pursuit tolerance at <= r_max + 0.6 m from the teammate's centre."""
+    tx, ty = target_xy
+    H, W = cm.cost.shape
+    r0, c0 = world_to_cell(tx, ty, cm.res, cm.origin, (H, W))
+    span = int(math.ceil(r_max / cm.res)) + 1
+    step = math.radians(step_deg)
+    out = []
+    for r in range(max(0, r0 - span), min(H, r0 + span + 1)):
+        for c in range(max(0, c0 - span), min(W, c0 + span + 1)):
+            if cm.cost[r, c] >= RING:
+                continue
+            x, y = cell_to_world((r, c), cm.res, cm.origin)
+            d = math.hypot(x - tx, y - ty)
+            if r_min <= d <= r_max:
+                dev = abs(wrap(math.atan2(y - ty, x - tx) - approach_rad))
+                out.append((round(dev / step), abs(d - r_pref), (r, c)))
+    out.sort()
+    return [rc for _, _, rc in out]
+
+
 @dataclass
 class Frontier:
     target: tuple          # (r, c) frontier cell nearest the cluster centroid

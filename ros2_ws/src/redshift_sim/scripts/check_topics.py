@@ -3,13 +3,14 @@
 
 Listens to every *raw* world topic of the given robots for a few seconds and prints a signature per topic
 (type, rate, frame ids, image encodings/shapes, camera intrinsics, point-cloud layout and ring order, IMU
-gravity, no-return encoding). Save one backend's signature and compare the other against it:
+gravity, no-return encoding, and the JSON shape of the simulated rover hardware `hw_status`). Save one backend's signature and compare the other against it:
 
     python3 check_topics.py --robots rover_0 scout_0 --save gz_signature.json      # with Gazebo running
     python3 check_topics.py --robots rover_0 scout_0 --compare gz_signature.json   # with the mock running
 
 `gz_signature.json` next to this script is the reference captured from Gazebo Harmonic 8.15 (medium sector,
-1 rover + 1 scout, robots at rest).
+1 rover + 1 scout, robots at rest); its `/rover_0/hw_status` entry was added with the drivetrain/solar model
+(docs/protocol.md §8.3).
 
 Exit code 0 = every topic present and structurally identical, rates within ±30 %.
 """
@@ -26,6 +27,7 @@ import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, Imu, PointCloud2
+from std_msgs.msg import String
 
 RATE_TOL = 0.30
 G0 = 9.80665
@@ -35,7 +37,7 @@ def topics_for(robot: str) -> dict:
     t = {'odom': Odometry, 'imu_raw': Imu, 'camera/image_raw': Image, 'camera/depth_raw': Image,
          'camera/camera_info': CameraInfo}
     if robot.startswith('rover'):
-        t.update({'wheel_odom': Odometry, 'lidar/points_raw': PointCloud2})
+        t.update({'wheel_odom': Odometry, 'lidar/points_raw': PointCloud2, 'hw_status': String})
     return {f'/{robot}/{k}': v for k, v in t.items()}
 
 
@@ -56,6 +58,14 @@ def _nonfinite(a: np.ndarray) -> dict:
 
 def describe(msg, odom_yaw: float | None) -> dict:
     """Structural signature of one message (keys starting with '~' are informative, not compared)."""
+    if isinstance(msg, String):                       # hw_status JSON (protocol §8.3)
+        try:
+            j = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return {'json': 'invalid'}
+        return {'json_keys': sorted(j), 'wheel_health_len': len(j.get('wheel_health') or []),
+                'motor_current_len': len(j.get('motor_current_a') or []), 'faults_type': type(j.get('faults')).__name__,
+                '~wheel_health': j.get('wheel_health'), '~solar_w': j.get('solar_w'), '~irradiance': j.get('irradiance')}
     d = {'frame_id': msg.header.frame_id}
     if isinstance(msg, Image):
         d.update(encoding=msg.encoding, width=msg.width, height=msg.height, step=msg.step,

@@ -5,6 +5,9 @@ science crystals that Gazebo renders, published in Gazebo's exact sensor convent
   proportional minimum step) and two secant refinements on the crossing.
 * Objects: boulders and crystals as yawed ellipsoids, intersected analytically after a bounding-sphere cull.
   Rockslide boulders fall from `drop_m` and are added at runtime.
+* Robots: every robot is a few yawed ellipsoids (kind ROBOT, `robot_body`) moved every physics step, so each robot's
+  camera and LiDAR see the others; a sensor excludes its own body (`exclude=` object ids). Robots are not obstacles
+  to `Scene.blocked` (no robot–robot collision in the mock).
 * Conventions (checked against Gazebo by scripts/check_topics.py): camera link x forward, image u → −y,
   v → −z, ray parameter = planar depth, no return = +inf; LiDAR (rings, columns) = (−15°…+10° ascending,
   azimuth −180° + c·1° ccw) in the sensor frame, no return = ±inf along the beam.
@@ -30,6 +33,10 @@ CRYSTAL_EMISSIVE = np.array([0.05, 0.55, 0.65], np.float32)
 EXPOSURE = 0.78
 HAZE_M = 160.0
 MAX_ITERS = 160
+# robot bodies (body-frame offsets from base_link, radii, albedo, emissive), approximating robot_models' SDF visuals
+TYRE_RGB = (0.08, 0.08, 0.09)
+DECK_RGB = (0.10, 0.12, 0.22)                                 # solar panel
+MAST_RGB = (0.30, 0.30, 0.32)
 
 
 def rpy_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -82,9 +89,27 @@ def _default_texture(n: int = 128, seed: int = 7) -> np.ndarray:
     return REGOLITH_RGB[None, None, :] * (0.72 + 0.5 * noise[..., None]) / 0.97
 
 
+def robot_body(name: str) -> list[tuple]:
+    """Ellipsoid parts [(offset (3,), radii (3,), albedo (3,), emissive (3,))] of a robot's body, in its base_link
+    frame. Rovers: chassis in the livery colour (robot_models.rover_livery: rover_0 white with an orange nose stripe,
+    the recovery rovers amber with a dark one), a dark solar deck, a tyre pair per side and the LiDAR mast.
+    Scout: one small flat disc."""
+    from .robot_models import rover_livery
+    z3 = (0.0, 0.0, 0.0)
+    if not name.startswith('rover'):
+        return [((0.0, 0.0, 0.0), (0.30, 0.30, 0.05), (0.80, 0.80, 0.83), (0.0, 0.12, 0.15))]
+    lv = rover_livery(name)
+    return [((0.0, 0.0, 0.0), (0.55, 0.36, 0.25), lv['chassis'], z3),
+            ((-0.05, 0.0, 0.20), (0.42, 0.29, 0.06), DECK_RGB, z3),
+            ((0.0, 0.43, -0.08), (0.50, 0.08, 0.20), TYRE_RGB, z3),
+            ((0.0, -0.43, -0.08), (0.50, 0.08, 0.20), TYRE_RGB, z3),
+            ((0.50, 0.0, 0.0), (0.06, 0.26, 0.05), lv['stripe'], lv['stripe_emissive']),
+            ((0.25, 0.0, 0.45), (0.06, 0.06, 0.20), MAST_RGB, z3)]
+
+
 class Scene:
     """Heightfield (rows = y, cols = x, origin at the sector centre) plus ellipsoid objects."""
-    NONE, GROUND, ROCK, CRYSTAL = 0, 1, 2, 3
+    NONE, GROUND, ROCK, CRYSTAL, ROBOT = 0, 1, 2, 3, 4
 
     def __init__(self, heights: np.ndarray, size_m: float, rocks=(), crystals=(), texture: np.ndarray | None = None,
                  tex_size_m: float = 14.0, g: float = 9.81):
@@ -166,6 +191,24 @@ class Scene:
                          np.tile([shade, 0.98 * shade, 0.96 * shade], (len(r), 1)), np.zeros((len(r), 3)), self.ROCK,
                          drop=drop_m, t_spawn=t)
 
+    def add_body(self, parts) -> list[int]:
+        """Add a robot body (robot_body parts) as ROBOT objects at the origin; place it with set_body_pose."""
+        off = np.array([p[0] for p in parts], np.float64).reshape(-1, 3)
+        return self._add(off, np.array([p[1] for p in parts], np.float64), np.zeros(len(off)),
+                         np.array([p[2] for p in parts], np.float32), np.array([p[3] for p in parts], np.float32),
+                         self.ROBOT)
+
+    def set_body_pose(self, ids, parts, pos, R: np.ndarray, yaw: float) -> None:
+        """Move a robot body (`parts` from robot_body, or their (n, 3) offsets): part centres follow the full
+        attitude R, the ellipsoids themselves only the yaw. Call it from the thread that calls _add (the physics
+        thread): renderers read concurrently and may see a part one step stale, which is harmless for a frame."""
+        off = parts if isinstance(parts, np.ndarray) else np.array([p[0] for p in parts], np.float64).reshape(-1, 3)
+        c = np.asarray(pos, np.float64) + off @ np.asarray(R, np.float64).T
+        ids = np.asarray(ids, np.int64)
+        self.rest_z[ids] = c[:, 2]                     # update() rewrites c[:, 2] from rest_z
+        self.c[ids] = c
+        self.yaw[ids] = yaw
+
     def update(self, t: float) -> None:
         """Advance falling boulders to time t."""
         self.t = float(t)
@@ -174,7 +217,8 @@ class Scene:
             self.c[:, 2] = self.rest_z + np.maximum(0.0, self.drop - 0.5 * self.g * dt * dt)
 
     def blocked(self, x: float, y: float, radius: float) -> bool:
-        """Does a robot disc at (x, y) overlap any landed object's footprint?"""
+        """Does a robot disc at (x, y) overlap any landed object's footprint? Robot bodies never block (the mock
+        has no robot–robot collision)."""
         if not len(self.yaw):
             return False
         dx, dy = x - self.c[:, 0], y - self.c[:, 1]
@@ -182,7 +226,7 @@ class Scene:
         lx, ly = cy * dx + sy * dy, -sy * dx + cy * dy
         landed = self.c[:, 2] - self.radii[:, 2] < self.height_at(self.c[:, 0], self.c[:, 1]) + 0.3
         inside = (lx / (self.radii[:, 0] + radius)) ** 2 + (ly / (self.radii[:, 1] + radius)) ** 2 < 1.0
-        return bool((inside & landed).any())
+        return bool((inside & landed & (self.kind != self.ROBOT)).any())
 
     # ------------------------------------------------------------------ terrain
     def height_at(self, x, y):
@@ -240,8 +284,9 @@ class Scene:
         return t_hit
 
     # ------------------------------------------------------------------ ray casting
-    def raycast(self, o, d, t_min: float, t_max: float):
-        """Rays o + t·d (o: (3,) or (N, 3)). Returns t (inf = miss), kind, unit normal (N, 3), object index."""
+    def raycast(self, o, d, t_min: float, t_max: float, exclude=None):
+        """Rays o + t·d (o: (3,) or (N, 3)). Returns t (inf = miss), kind, unit normal (N, 3), object index.
+        `exclude`: object ids the rays pass through (a sensor's own robot body)."""
         d = np.asarray(d, np.float64).reshape(-1, 3)
         o_arr = np.asarray(o, np.float64)
         single = o_arr.ndim == 1
@@ -252,13 +297,31 @@ class Scene:
         normal = np.zeros((len(d), 3), np.float32)
         dn = d / np.linalg.norm(d, axis=1, keepdims=True)
         dlen_max = float(np.linalg.norm(d, axis=1).max()) if len(d) else 1.0
+        skip = frozenset(exclude) if exclude else ()
+        # view-cone cull (single origin): every ray lies within `cone` of `axis`, so an object whose bounding sphere
+        # is further off-axis than cone + its angular radius cannot be hit. Off for near-omnidirectional fans (LiDAR).
+        cone = None
+        if single and len(d):
+            axis = dn.sum(axis=0)
+            na = float(np.linalg.norm(axis))
+            if na > 1e-9:
+                axis /= na
+                cone = math.acos(max(-1.0, min(1.0, float((dn @ axis).min()))))
+                if cone > math.radians(80.0):
+                    cone = None
         for k in range(len(self.yaw)):
+            if k in skip:
+                continue
             rho = float(self.radii[k].max())
             w = self.c[k] - (o_arr if single else o)
             if single:
                 dist = float(np.linalg.norm(w))
                 if dist > t_max * dlen_max + rho:
                     continue
+                if cone is not None and dist > rho:
+                    off = math.acos(max(-1.0, min(1.0, float(w @ axis) / dist)))
+                    if off > cone + math.asin(rho / dist):
+                        continue
                 along = dn @ w
                 cand = np.flatnonzero((dist * dist - along * along < rho * rho) & (along > -rho))
             else:
@@ -332,13 +395,14 @@ class Scene:
 
 
 def camera_frame(scene: Scene, origin, R_cam: np.ndarray, w: int, h: int, hfov: float, far: float,
-                 scale: float = 0.5, near: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
+                 scale: float = 0.5, near: float = 0.1, exclude=None) -> tuple[np.ndarray, np.ndarray]:
     """RGB (h, w, 3) uint8 and planar depth (h, w) float32 (+inf = no return) from a camera link at `origin`
-    with world-from-camera rotation `R_cam`, rendered at `scale` and upsampled to (w, h)."""
+    with world-from-camera rotation `R_cam`, rendered at `scale` and upsampled to (w, h). `exclude`: object ids
+    invisible to this camera (its own robot body)."""
     rays = _camera_rays(w, h, float(hfov), float(scale))
     d = rays @ np.asarray(R_cam, np.float64).T
     o = np.asarray(origin, np.float64)
-    t, kind, normal, obj = scene.raycast(o, d, near, far)
+    t, kind, normal, obj = scene.raycast(o, d, near, far, exclude=exclude)
     rgb = scene.shade(o, d, t, kind, normal, obj)
     rw, rh = int(round(w * scale)), int(round(h * scale))
     depth = np.where(np.isfinite(t) & (t <= far), t, np.inf).astype(np.float32).reshape(rh, rw)
@@ -349,13 +413,15 @@ def camera_frame(scene: Scene, origin, R_cam: np.ndarray, w: int, h: int, hfov: 
     return img, depth
 
 
-def lidar_scan(scene: Scene, origin, R_body: np.ndarray, spec: dict) -> np.ndarray:
-    """Organized (rings, samples, 3) float32 points in the sensor frame; no return = inf along the beam."""
+def lidar_scan(scene: Scene, origin, R_body: np.ndarray, spec: dict, exclude=None) -> np.ndarray:
+    """Organized (rings, samples, 3) float32 points in the sensor frame; no return = inf along the beam.
+    `exclude`: object ids the beams pass through (its own robot body)."""
     rings, samples = int(spec.get('lidar_rings', 16)), int(spec.get('lidar_samples', 360))
     vmin, vmax = spec.get('lidar_vfov', [-0.2618, 0.1745])
     rmin, rmax = spec.get('lidar_range', [0.3, 25.0])
     ds = _lidar_dirs(rings, samples, float(vmin), float(vmax))
-    t, _, _, _ = scene.raycast(np.asarray(origin, np.float64), ds @ np.asarray(R_body, np.float64).T, rmin, rmax)
+    t, _, _, _ = scene.raycast(np.asarray(origin, np.float64), ds @ np.asarray(R_body, np.float64).T, rmin, rmax,
+                               exclude=exclude)
     # no return: Gazebo writes range = inf along the beam; its beam components are never exactly 0, so the
     # result is ±inf per axis (never inf·0 = NaN)
     away = np.where(ds == 0.0, 1e-9, ds) * np.inf

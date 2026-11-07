@@ -20,12 +20,15 @@ from sensor_msgs.msg import Image, Imu
 from std_msgs.msg import String
 
 from . import grid_map as gm
-from .agent_fsm import RoverFSM, RoverInputs, ScoutFSM, ScoutInputs
+from .agent_fsm import (DOCK_M, ImuWindow, ReplanGate, RoverFSM, RoverInputs, ScoutFSM, ScoutInputs, display_name,
+                        role_of, unit_label)
 from .edge_budget import PROFILES, EdgeBudget
 from .grid_map import slope_from_elevation
 from .physics_model import RoverPhysics
-from .planning import (RING, astar, build_costmap, cell_to_world, cells_to_world, find_frontiers, path_length_m,
-                       pure_pursuit, score_frontiers, world_to_cell, wrap)
+from .rover_health import DroneHealth, RoverHealth
+from .planning import (RING, add_keepout, astar, build_costmap, cell_to_world, cells_to_world, clearance_mask,
+                       find_frontiers, first_block, path_conflicts, path_length_m, pure_pursuit, reachable_from,
+                       score_frontiers, standoff_cells, world_to_cell, wrap)
 from .ros_utils import image_to_numpy, quat_to_rpy
 
 MAP_QOS = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
@@ -37,6 +40,15 @@ REPLAN_PERIOD_S = 4.0        # quiet refresh of the route as the map grows
 LETHAL_CLASSES = (gm.HAZARD, gm.PERMANENT, gm.OBSTACLE)
 BORDER_M = 3.0               # sector edge keep-out (the heightmap ends there)
 SCOUT_LEASH_M = 40.0         # scout surveys within reach of the rovers it supports
+STANDOFF_M = 2.2             # rescue A* goal: preferred distance from the damaged rover's centre (2.0–2.45 m band)
+RESCUE_TRIES = 4             # A* attempts per rescue plan, best stand-off cells first
+PEER_DISC_M = 0.9            # teammates are lethal discs in the planning cost map (the map filters their returns)
+PEER_FRESH_S = 2.0
+SOS_FRESH_S = 4.0
+DOCK_CLEAR_M = 0.9           # a LiDAR corridor return this much short of the teammate's centre is something else in
+                             # the way: the docking creep stops (the teammate's own near face is ≈0.45–0.6 m short).
+                             # The corridor ignores returns within 1.0 m, so the last ≈0.45 m of the creep is unguarded.
+START_BATTERY = {'rover_0': 82.0, 'rover_1': 91.0}
 
 
 class MapView:
@@ -98,6 +110,8 @@ class AgentBase(Node):
                      ('g_mult', 2.2), ('edge_profile', 'orin_nano_15w'), ('size_m', 100.0), ('map_res', 0.5)):
             self.declare_parameter(k, v)
         self.robot = self.get_parameter('robot').value
+        self.role, self.name = role_of(self.robot), display_name(self.robot)
+        self.edge_power_w = 0.0
         self.spec = json.loads(self.get_parameter('spec_json').value or '{}')
         self.robots = list(self.get_parameter('robots').value)
         self.g = float(self.get_parameter('g_mult').value)
@@ -212,6 +226,7 @@ class AgentBase(Node):
         host = {'perception': p_ms, 'planner': self.planner_ms, 'mapping': m_ms}
         hz = {'perception': p_hz, 'planner': LOOP_HZ, 'mapping': self.mapping_hz}
         st = self.edge.update(host, hz, now=self.now_s())
+        self.edge_power_w = float(st.power_w)
         unc = (self.det or {}).get('uncertainty', {}).get('score')
         out = {'robot': self.robot, 'profile': st.profile, 'device': self.profile.device,
                'host_ms': {k: round(v, 2) for k, v in host.items()}, 'device_ms': round(st.device_ms, 1),
@@ -248,16 +263,32 @@ class RoverAgent(AgentBase):
     def __init__(self):
         super().__init__('rover_agent')
         r = self.robot
-        self.fsm = RoverFSM(r, self.limits, g_label=f'{self.g:.1f} g')
+        self.fsm = RoverFSM(r, self.limits, g_label=f'{self.g:.1f} g', role=self.role)
         self.has_scout = any(x.startswith('scout') for x in self.robots)
+        self.peers_list = [x for x in self.robots if x.startswith('rover') and x != r]
+        self.rescuer_available = any(role_of(x) == 'recovery' for x in self.peers_list)
+        self.health = RoverHealth(r, self.g, battery_pct=START_BATTERY.get(r, 85.0),
+                                  tip_alarm_deg=self.limits.tip_alarm_deg, physics=self.physics)
+        self.accel = (0.0, 0.0, 0.0)
+        self.peers: dict = {}               # teammate → (x, y, yaw, t_sim) from their odometry (fleet link)
+        self.sos_seen: dict = {}            # SOS id → (msg, t_sim)
+        self.rescue_seen: dict = {}         # SOS id → latest /fleet/rescue msg
+        self._sos_msg = None                # our own SOS while active / just resolved
+        self._sos_until = -1.0
+        self._sos_last = -1e9
+        self._rescue_last = -1e9
+        self._repairing_by = None
+        self._t_health = None
         self.radius = float(self.spec.get('radius_m', 0.6))
         self.w_max = float(self.spec.get('w_max', 1.0))
         self.roll = self.pitch = 0.0
         self.gyro = 0.0
+        self.imu_win = ImuWindow()          # 100 Hz attitude/rate between the 10 Hz ticks (the FSM sees the window)
         self.v_wheel = 0.0
         self.slip = 0.0
         self._vhist = collections.deque(maxlen=8)
         self.path = None            # [(r, c)]
+        self._path_ok = frozenset()  # route indices planned past lethal cells on purpose (see check_blocked)
         self.path_xy = None
         self.path_idx = 0
         self.goal = None            # (x, y)
@@ -271,7 +302,7 @@ class RoverAgent(AgentBase):
         self.blocked_info = ('', ('LIDAR', 'MAP'), 0.9)
         self._last_map_v = -1
         self._last_replan = -1e9
-        self._last_fail_replan = -1e9
+        self._replan_gate = ReplanGate(1.0)
         self._own_marks: list = []
         self._marks_mask = None
         self._marks_n = 0
@@ -291,6 +322,14 @@ class RoverAgent(AgentBase):
         self.create_subscription(Imu, f'/{r}/imu', self.on_imu, SENSOR_QOS)
         self.create_subscription(Odometry, f'/{r}/wheel_odom', self.on_wheel, SENSOR_QOS)
         self.create_subscription(String, '/fleet/scan_complete', self.on_scan_complete, 10)
+        self.create_subscription(String, f'/{r}/hw_status', self.on_hw, 10)
+        self.create_subscription(String, '/fleet/sos', self.on_sos, 10)
+        self.create_subscription(String, '/fleet/rescue', self.on_rescue, 10)
+        for pr in self.peers_list:
+            self.create_subscription(Odometry, f'/{pr}/odom', lambda m, pr=pr: self.on_peer(pr, m), SENSOR_QOS)
+        self.pub_sos = self.create_publisher(String, '/fleet/sos', 10)
+        self.pub_rescue = self.create_publisher(String, '/fleet/rescue', 10)
+        self.pub_world = self.create_publisher(String, '/world/command', 10)    # repair tool actuation
         self.pub_mode = self.create_publisher(String, f'/{r}/perception/mode_request', 10)
         self.pub_claim = self.create_publisher(String, '/fleet/claims', 10)
         self.pub_hazard = self.create_publisher(String, '/fleet/hazard_marks', 10)
@@ -300,7 +339,7 @@ class RoverAgent(AgentBase):
         self.create_timer(0.2, self.publish_state)
         self.get_logger().info(f'{r}: θmax {self.limits.max_slope_deg:.1f}° ({self.limits.factor}), '
                                f'tip alarm {self.limits.tip_alarm_deg:.1f}°, v_max {self.limits.v_max:.2f} m/s, '
-                               f'scout={self.has_scout}')
+                               f'scout={self.has_scout}, role={self.role}')
 
     # ------------------------------------------------------------------ inputs
     def on_imu(self, m: Imu):
@@ -308,13 +347,176 @@ class RoverAgent(AgentBase):
         self.roll, self.pitch = math.degrees(r), math.degrees(p)
         w = m.angular_velocity
         self.gyro = math.sqrt(w.x * w.x + w.y * w.y + w.z * w.z)
+        self.imu_win.add(self.roll, self.pitch, self.gyro)
+        a = m.linear_acceleration
+        self.accel = (a.x, a.y, a.z)
+        self.health.on_imu(self.now_s(), math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z),
+                           max(abs(self.roll), abs(self.pitch)))
 
     def on_wheel(self, m: Odometry):
         self.v_wheel = m.twist.twist.linear.x
+        self.health.on_drive(self.now_s(), self.cmd[0], self.v_wheel)
+
+    def on_hw(self, m: String):
+        try:
+            d = json.loads(m.data)
+            self.health.on_hw_status(self.now_s(), d.get('wheel_health') or [1.0] * 4, d.get('faults') or [],
+                                     float(d.get('solar_w') or 0.0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    def on_peer(self, robot: str, m: Odometry):
+        p = m.pose.pose
+        self.peers[robot] = (p.position.x, p.position.y, quat_to_rpy(p.orientation)[2], self.now_s())
+
+    def on_sos(self, m: String):
+        try:
+            d = json.loads(m.data)
+        except json.JSONDecodeError:
+            return
+        if d.get('robot') != self.robot and d.get('id'):
+            self.sos_seen[d['id']] = (d, self.now_s())
+
+    def on_rescue(self, m: String):
+        try:
+            d = json.loads(m.data)
+        except json.JSONDecodeError:
+            return
+        if not d.get('id'):
+            return
+        self.rescue_seen[d['id']] = d
+        if d.get('target') == self.robot and d.get('phase') == 'REPAIRING':
+            self._repairing_by = d.get('rescuer')
+
+    # ------------------------------------------------------------------ fleet: SOS / rescue
+    def peer_xy(self, robot: str, fallback=None):
+        p = self.peers.get(robot)
+        if p is not None and self.now_s() - p[3] < PEER_FRESH_S:
+            return p[0], p[1]
+        return fallback
+
+    def active_sos(self):
+        """Freshest active SOS from a teammate (recovery role only), or None."""
+        if self.role != 'recovery':
+            return None
+        now = self.now_s()
+        live = [d for d, t in self.sos_seen.values() if now - t < SOS_FRESH_S and d.get('status') == 'active']
+        if self.fsm.rescue:
+            mine = [d for d in live if d.get('id') == self.fsm.rescue['id']]
+            if mine:
+                return mine[0]
+        return live[0] if live else None
+
+    def rescue_target_xy(self):
+        r = self.fsm.rescue
+        sos = self.active_sos()
+        if r is not None:
+            msg = self.sos_seen.get(r['id'], (None, 0))[0] or {}
+            return self.peer_xy(r['peer'], tuple(msg.get('xy') or ()) or None)
+        if sos is not None:
+            return self.peer_xy(sos['robot'], tuple(sos.get('xy') or ()) or None)
+        return None
+
+    def perceived_teammate(self, target: str):
+        if not self.det or self.now_s() - self.det_t > 1.0:
+            return None
+        for d in self.det.get('detections', []):
+            if d.get('cls') == 'ROVER' and d.get('robot') == target and d.get('range_m'):
+                return {'robot': target, 'range_m': float(d['range_m']), 'conf': float(d.get('conf', 0.8)),
+                        'sources': list(d.get('sources', ['CAM']))}
+        return None
+
+    def publish_sos(self, status: str | None = None):
+        if self._sos_msg is None or self.pose is None:
+            return
+        hs = self.health.state()
+        self._sos_msg.update({'xy': [round(self.pose[0], 2), round(self.pose[1], 2)], 'yaw': round(self.pose[2], 3),
+                              'health_pct': round(hs.pct, 1), 'faults': hs.faults, 't': time.time()})
+        if status:
+            self._sos_msg['status'] = status
+        self.pub_sos.publish(String(data=json.dumps(self._sos_msg)))
+        self._sos_last = self.now_s()
+
+    def publish_rescue(self, phase: str | None = None, act: dict | None = None):
+        """/fleet/rescue update. `act` is the FSM's rescue action: on DONE / ABORTED the FSM has already dropped its
+        rescue record, so the id and target come from the action."""
+        r = self.fsm.rescue
+        if r is None and phase is None:
+            return
+        info = dict(r or {})
+        act = act or {}
+        msg = {'id': info.get('id') or act.get('id'), 'rescuer': self.robot, 'target': info.get('peer') or act.get('target'),
+               'phase': phase or info.get('phase'), 'range_m': info.get('range_m'), 'locked': bool(info.get('locked')),
+               't': time.time()}
+        self.pub_rescue.publish(String(data=json.dumps(msg)))
+        self._rescue_last = self.now_s()
+
+    def plan_rescue(self, visible: bool = True) -> bool:
+        """A* to a free stand-off cell 2.0–2.45 m from the damaged teammate, on the side facing our approach.
+
+        The teammate is planned as an uninflated keep-out (its footprint + our radius): the stand-off is meant to be
+        close to it, and its usual peer disc + inflation ring (≈2.0–2.5 m) would reject a quarter of the cells at
+        2.2 m on open ground, and all of them beside another hazard. Cells outside our reachable region are skipped
+        without running A*."""
+        txy = self.rescue_target_xy()
+        if txy is None or self.pose is None:
+            self._set_path(None)
+            return False
+        tx, ty = txy
+        peer = self.fsm.rescue['peer'] if self.fsm.rescue else None
+        target = (peer, txy)
+        cm = self._costmap(target=target)
+        base = math.atan2(self.pose[1] - ty, self.pose[0] - tx)
+        t0 = time.perf_counter()
+        start = self.map.cell(self.pose[0], self.pose[1])
+        cells = standoff_cells(cm, txy, base, r_pref=STANDOFF_M)
+        reach = reachable_from(cm, start)
+        usable = [rc for rc in cells if reach[rc]]
+        tight = False
+        if not usable:
+            # boxed in by inflation rings (the case _plan's tight retry covers): try 0.3 m clearance, cores still lethal
+            cm_t = self._costmap(tight=True, target=target)
+            cells_t = standoff_cells(cm_t, txy, base, r_pref=STANDOFF_M)
+            reach_t = reachable_from(cm_t, start)
+            usable_t = [rc for rc in cells_t if reach_t[rc]]
+            if usable_t:
+                cm, cells, usable, tight = cm_t, cells_t, usable_t, True
+        for rc in usable[:RESCUE_TRIES]:
+            path, st, _ = self._plan(rc, cm, target=target)
+            if path is None:
+                continue
+            gx, gy = self.map.xy(rc)
+            self.goal, self.goal_rc, self.goal_kind = (gx, gy), rc, 'rescue'
+            self._set_path(path)
+            self._last_replan = self.now_s()
+            if visible:
+                side = math.degrees(math.atan2(gy - ty, gx - tx)) % 360
+                self.trace('rescue_route', ['MAP', 'FLEET'],
+                           f'{unit_label(peer or "?")} at ({tx:.1f}, {ty:.1f}); stand-off '
+                           f'{math.hypot(gx - tx, gy - ty):.1f} m on the {side:.0f}° side',
+                           f'Gravity-aware A* over the shared map at {self.g:.1f} g', 0.9,
+                           f'Rescue route {st["length_m"]:.1f} m ({st["expansions"]} nodes, {st["ms"]:.0f} ms)'
+                           + (' at 0.3 m clearance' if tight or st.get('tight') else ''),
+                           latency_ms=(time.perf_counter() - t0) * 1000, force=True)
+            self.publish_claim()
+            return True
+        if visible:
+            self.trace('rescue_noroute', ['MAP', 'FLEET'],
+                       f'No route to a stand-off beside {unit_label(peer or "?")}: {len(cells)} free cells '
+                       f'2.0–2.45 m from it, {len(usable)} in this rover\'s reachable region',
+                       'Hazards or their inflation enclose the teammate or this rover on the current map', 0.7,
+                       'Holding; re-planning as the map grows', 'warn')
+        self._set_path(None)
+        return False
 
     def on_odom(self, m: Odometry):
         super().on_odom(m)
-        self._vhist.append((self.now_s(), self.pose[0], self.pose[1]))
+        # slip compares wheel speed with ground speed differentiated over these samples: time them by the odometry's
+        # own (simulated) stamp, not by arrival: under CPU load deliveries bunch up, and arrival times then stretch
+        # the window so ground speed reads near zero while the wheels report full speed (a false 70–97 % slip)
+        st = m.header.stamp
+        t = st.sec + st.nanosec * 1e-9
+        self._vhist.append((t if t > 0.0 else self.now_s(), self.pose[0], self.pose[1]))
 
     def on_scan_complete(self, m: String):
         try:
@@ -350,23 +552,38 @@ class RoverAgent(AgentBase):
         lethal = self.map.lethal
         return lethal | self._marks_mask if self._marks_mask is not None else lethal
 
-    def _costmap(self, tight: bool = False):
+    def _costmap(self, tight: bool = False, target=None):
+        """Planning cost map. `target` = (robot, xy) of a teammate we are docking with: planned as an uninflated
+        keep-out (its footprint + our radius) instead of an inflated peer disc."""
         lethal = self._lethal_core()
+        skip = target[0] if target is not None else None
+        peers = [xy for xy in (self.peer_xy(pr) for pr in self.peers_list if pr != skip) if xy is not None
+                 and math.hypot(xy[0] - self.pose[0], xy[1] - self.pose[1]) > 2.5]
+        if peers:
+            lethal = lethal.copy()
+            r_px = max(1, int(round(PEER_DISC_M / self.map.res)))
+            mask = np.zeros(lethal.shape, np.uint8)
+            for x, y in peers:
+                rr, cc = self.map.cell(x, y)
+                cv2.circle(mask, (int(cc), int(rr)), r_px, 1, -1)
+            lethal |= mask.astype(bool)
         cm = build_costmap(self.map.known, lethal, self.map.caution, self.map.slope, self.map.elev, self.limits,
                            self.map.res, self.map.origin, inflation_m=0.3 if tight else self.radius,
                            caution_mode=self.fsm.caution and not tight)
         # sector edge keep-out behaves like an inflation ring: never entered, but escapable if drifted into
         cm.cost[self._border] = np.maximum(cm.cost[self._border], RING)
         cm.lethal |= self._border
+        if target is not None:
+            add_keepout(cm, target[1], PEER_DISC_M + self.radius)
         return cm
 
-    def _plan(self, goal_rc, cm=None):
-        cm = cm if cm is not None else self._costmap()
+    def _plan(self, goal_rc, cm=None, target=None):
+        cm = cm if cm is not None else self._costmap(target=target)
         start = self.map.cell(self.pose[0], self.pose[1])
         path, st = astar(cm, start, goal_rc, max_expansions=self.profile.max_expansions)
         if path is None and not st['capped'] and st['expansions'] < 1500:
             # boxed in by inflation rings: retry with tight clearance (core hazards still excluded)
-            cm_t = self._costmap(tight=True)
+            cm_t = self._costmap(tight=True, target=target)
             path, st2 = astar(cm_t, start, goal_rc, max_expansions=self.profile.max_expansions)
             st = dict(st2, tight=True)
             if path is not None:
@@ -382,6 +599,8 @@ class RoverAgent(AgentBase):
             self.path_xy[0] = self.pose[:2]
         self.path_idx = 0
         self.goal_reached = False
+        # cells this route passes on purpose (ring escape / tight clearance): the unchanged map must not halt it
+        self._path_ok = path_conflicts(path, self._path_footprint()) if path else frozenset()
         self.publish_path(self.path_xy)
 
     def _remaining_m(self):
@@ -456,24 +675,19 @@ class RoverAgent(AgentBase):
                         best, bd = (r, c), d
         return best
 
+    def _path_footprint(self, lethal=None):
+        """Cells too close to a lethal cell for the route check (robot radius less a 0.1 m margin)."""
+        return clearance_mask(self._lethal_core() if lethal is None else lethal, self.radius - 0.1, self.map.res)
+
     def check_blocked(self):
-        """Lethal cells (fresh map) on the next BLOCK_LOOKAHEAD_M of the path → visible re-plan; further out → quiet."""
+        """New lethal cells (fresh map) on the next BLOCK_LOOKAHEAD_M of the path → visible re-plan; further out →
+        quiet. Cells the route was planned past on purpose (escaping an inflation ring, a tight-clearance route) only
+        count once they turn lethal themselves: otherwise the same route is halted and re-planned forever."""
         if self.path is None or self.path_xy is None:
             return None
         lethal = self._lethal_core()
-        r_cells = max(1, int(round((self.radius - 0.1) / self.map.res)))
-        dil = cv2.dilate(lethal.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_cells + 1,) * 2))
-        dist = 0.0
-        for k in range(self.path_idx, len(self.path)):
-            if k > self.path_idx:
-                a, b = self.path_xy[k - 1], self.path_xy[k]
-                dist += math.hypot(b[0] - a[0], b[1] - a[1])
-            if dist < BLOCK_SKIP_M:
-                continue
-            r, c = self.path[k]
-            if dil[r, c]:
-                return k, dist
-        return None
+        return first_block(self.path, self.path_xy, self._path_footprint(lethal), lethal, self.path_idx,
+                           BLOCK_SKIP_M, self._path_ok)
 
     def _blocked_reason(self, k, dist):
         """Describe what blocks the path, from the map classes + camera detections around the blocking cell."""
@@ -500,6 +714,11 @@ class RoverAgent(AgentBase):
 
     def replan(self, visible: bool) -> bool:
         now = self.now_s()
+        if self.fsm.state == 'RESCUE_TRANSIT':
+            self._last_replan = now
+            return self.plan_rescue(visible)
+        if self.fsm.state in ('RESCUE_DOCKING', 'REPAIRING', 'AWAIT_RESCUE', 'SAFE_HOLD'):
+            return False
         old_len = self._remaining_m()
         if self.goal_rc is not None:
             path, st, _ = self._plan(self.goal_rc)
@@ -525,6 +744,7 @@ class RoverAgent(AgentBase):
         t_start = time.perf_counter()
         now = self.now_s()               # simulated seconds: every duration below follows the sim speed
         mono = now
+        imu_win = self.imu_win.take()    # every tick starts a new window, even one that returns early
         if self.pose is None or not self.map.ready:
             return
         if not self._started:
@@ -536,7 +756,7 @@ class RoverAgent(AgentBase):
         self._update_slip()
 
         # map-driven path checks (only on fresh maps)
-        if self.map.version != self._last_map_v and self.fsm.state in ('EXPLORING', 'CAUTION'):
+        if self.map.version != self._last_map_v and self.fsm.state in ('EXPLORING', 'CAUTION', 'RESCUE_TRANSIT'):
             self._last_map_v = self.map.version
             hit = self.check_blocked()
             if hit is not None:
@@ -549,12 +769,33 @@ class RoverAgent(AgentBase):
             elif self.path is not None and mono - self._last_replan > REPLAN_PERIOD_S:
                 self.replan(visible=False)
 
+        # health: battery integration + repair verification
+        dt = 0.0 if self._t_health is None else min(1.0, max(0.0, now - self._t_health))
+        self._t_health = now
+        tw = getattr(self, 'odom_twist', None)
+        self.health.step(now, dt, v_ground=tw.linear.x if tw else 0.0, pitch_rad=math.radians(self.pitch),
+                         compute_w=self.edge_power_w)
+        if self._repairing_by and self.health.drive_pct >= 95.0:
+            self.health.repaired(now, self._repairing_by)
+            self._repairing_by = None
+        hs = self.health.state().as_dict()
+        sos = self.active_sos()
+        txy = self.rescue_target_xy()
+        rng = math.hypot(txy[0] - self.pose[0], txy[1] - self.pose[1]) if txy else None
+        target = (self.fsm.rescue or {}).get('peer') or (sos or {}).get('robot')
+        lock = self.perceived_teammate(target) if target and self.fsm.state == 'RESCUE_DOCKING' else None
+        resolved = False
+        if self.fsm.rescue:
+            msg = self.sos_seen.get(self.fsm.rescue['id'], (None, 0))[0]
+            resolved = bool(msg and msg.get('status') == 'resolved')
+
         d = self.det or {}
         unc = d.get('uncertainty', {})
         cor = d.get('corridor', {})
         cell = self.map.cell(*self.pose[:2])
+        roll_w, pitch_w, gyro_w = imu_win or (self.roll, self.pitch, self.gyro)
         inp = RoverInputs(
-            now=now, pose=self.pose, roll_deg=self.roll, pitch_deg=self.pitch, gyro_rate=self.gyro, slip=self.slip,
+            now=now, pose=self.pose, roll_deg=roll_w, pitch_deg=pitch_w, gyro_rate=gyro_w, slip=self.slip,
             uncertainty=float(unc.get('score', 0.0)), camera_conf=float(unc.get('camera_conf', 1.0)),
             lidar_conf=float(unc.get('lidar_conf', 1.0)),
             corridor_obstacle_m=float(cor.get('obstacle_dist_m') or math.inf), corridor_conf=float(cor.get('conf', 0.0)),
@@ -562,10 +803,17 @@ class RoverAgent(AgentBase):
             blocked_reason=self.blocked_info[0], blocked_sensors=self.blocked_info[1], blocked_conf=self.blocked_info[2],
             has_path=self.path is not None, goal_reached=self.goal_reached, frontiers_left=self.frontiers_left,
             percent_known=float(self.map_stats.get('percent', 0.0)), scan_complete=self.scan_complete,
-            scout_available=self.has_scout, on_hazard_cell=bool(self.map.lethal[cell]))
+            scout_available=self.has_scout, on_hazard_cell=bool(self.map.lethal[cell]), health=hs,
+            rescuer_available=self.rescuer_available, sos=sos, rescue_range_m=rng, rescue_lock=lock,
+            sos_resolved=resolved)
         self.scan_complete = None
         out = self.fsm.step(inp)
         self.out = out
+        if self.fsm.rescue is None and self.goal_kind == 'rescue':
+            # the rescue ended in this step (done or aborted): the re-plan it requests must pick a fresh frontier,
+            # not drive back to the stand-off beside the teammate
+            self.goal = self.goal_rc = None
+            self.goal_kind = 'frontier'
         self.emit(out.traces)
         self._slope_trace(inp)
         if out.drive == 'stop' and self.cmd != (0.0, 0.0):
@@ -586,9 +834,32 @@ class RoverAgent(AgentBase):
             elif a['type'] == 'new_goal' and mono - self._last_select > 1.0:
                 self._last_select = mono
                 self.select_goal()
+            elif a['type'] == 'sos':
+                if a['status'] == 'active':
+                    self._sos_msg = {'id': a['id'], 'robot': self.robot, 'status': 'active'}
+                    self._set_path(None)
+                self.publish_sos(a['status'])
+                if a['status'] == 'resolved':
+                    self._sos_until = now + 3.0          # repeat the resolution a few times (lossy fleet link)
+            elif a['type'] == 'rescue':
+                self.publish_rescue(a['phase'], a)
+                if a['phase'] in ('DOCKING', 'REPAIRING'):
+                    self._set_path(None)
+            elif a['type'] == 'repair':
+                self.pub_world.publish(String(data=json.dumps({'op': 'repair', 'robot': a['target'],
+                                                               'by': self.robot})))
+        # heartbeats
+        if self.fsm.state == 'AWAIT_RESCUE' and now - self._sos_last >= 1.0:
+            self.publish_sos()
+        elif self._sos_msg is not None and self._sos_msg.get('status') == 'resolved':
+            if now < self._sos_until and now - self._sos_last >= 1.0:
+                self.publish_sos()
+            elif now >= self._sos_until:
+                self._sos_msg = None
+        if self.fsm.rescue and now - self._rescue_last >= 1.0:
+            self.publish_rescue()
 
-        if out.request_replan and mono - self._last_fail_replan > 1.0:
-            self._last_fail_replan = mono
+        if self._replan_gate.due(out.request_replan, out.state, mono):
             self.blocked = False
             self.replan(visible=True)
             self.publish_claim()
@@ -624,6 +895,18 @@ class RoverAgent(AgentBase):
                 self.goal_reached = True
                 if self.goal_kind == 'science':
                     self._visited_science.append(self.goal)
+        elif out.drive == 'dock':
+            txy = self.rescue_target_xy()
+            cor = (self.det or {}).get('corridor', {})
+            near = float(cor.get('obstacle_dist_m') or math.inf)
+            if txy is not None:
+                alpha = wrap(math.atan2(txy[1] - y, txy[0] - x) - yaw)
+                rng = math.hypot(txy[0] - x, txy[1] - y)
+                if abs(alpha) > 0.35:
+                    v, w = 0.0, float(np.clip(1.5 * alpha, -0.5, 0.5))
+                elif rng > DOCK_M - 0.05 and near >= rng - DOCK_CLEAR_M:
+                    v = self.limits.v_max * out.speed_scale
+                    w = float(np.clip(1.5 * alpha, -0.4, 0.4))
         elif out.drive == 'reverse' and out.reverse_path:
             rp = out.reverse_path
             while self.rev_idx < len(rp) - 1 and math.hypot(rp[self.rev_idx][0] - x, rp[self.rev_idx][1] - y) < 0.6:
@@ -659,8 +942,24 @@ class RoverAgent(AgentBase):
               'last_safe': list(self.fsm.last_safe) if self.fsm.last_safe else None,
               'tip_alarm_deg': round(self.limits.tip_alarm_deg, 2), 'max_slope_deg': round(self.limits.max_slope_deg, 2),
               'altitude_agl': None, 'pose': [round(v, 3) for v in self.pose] + [round(self.z, 3)],
-              'path_remaining_m': round(self._remaining_m(), 1), 'caution': self.fsm.caution, 't': time.time()}
+              'path_remaining_m': round(self._remaining_m(), 1), 'caution': self.fsm.caution,
+              'role': self.role, 'name': self.name, 'health': self.health.state().as_dict(),
+              'rescue': self._rescue_info(), 'v_cmd': round(self.cmd[0], 3), 'v_wheel': round(self.v_wheel, 3),
+              'v_ground': round(tw.linear.x, 3) if tw else 0.0, 't': time.time()}
         self.pub_state.publish(String(data=json.dumps(st)))
+
+    def _rescue_info(self):
+        r = self.fsm.rescue
+        if r is not None:
+            return {k: r.get(k) for k in ('id', 'role', 'peer', 'phase', 'range_m', 'locked')}
+        if self._sos_msg is not None and self._sos_msg.get('status') == 'active':
+            rs = self.rescue_seen.get(self._sos_msg['id']) or {}
+            if rs.get('phase') in ('ABORTED', 'DONE'):     # that rescuer gave up / left: waiting for help again
+                rs = {}
+            return {'id': self._sos_msg['id'], 'role': 'target', 'peer': rs.get('rescuer'),
+                    'phase': rs.get('phase') or 'AWAITING', 'range_m': rs.get('range_m'),
+                    'locked': bool(rs.get('locked'))}
+        return None
 
 
 # ====================================================================== scout
@@ -676,6 +975,10 @@ class ScoutAgent(AgentBase):
         self.cruise = float(self.spec.get('cruise_agl_m', 12.0))
         self.vz_max = float(self.spec.get('vz_max', 2.0))
         self.fsm = ScoutFSM(r, cruise_agl=self.cruise, max_slope_deg=self.limits.max_slope_deg)
+        self.health = DroneHealth(r, self.g, battery_pct=96.0, mass_kg=float(self.spec.get('mass_kg', 2.0)))
+        self._t_health = None
+        self.accel = (0.0, 0.0, 0.0)
+        self.create_subscription(Imu, f'/{r}/imu', self.on_imu, SENSOR_QOS)
         self.agl = 0.0
         self.ground_z = None
         self.vz = 0.0
@@ -729,6 +1032,10 @@ class ScoutAgent(AgentBase):
         self._z_prev = (now, self.z)
         if self.ground_z is None:
             self.ground_z = self.z - 0.1
+
+    def on_imu(self, m: Imu):
+        a = m.linear_acceleration
+        self.accel = (a.x, a.y, a.z)
 
     def on_req(self, m: String):
         try:
@@ -789,6 +1096,9 @@ class ScoutAgent(AgentBase):
         if self.pose is None:
             return
         now = self.now_s()
+        dt = 0.0 if self._t_health is None else min(1.0, max(0.0, now - self._t_health))
+        self._t_health = now
+        self.health.step(now, dt, airborne=self.agl > 0.5, compute_w=self.edge_power_w)
         x, y, yaw = self.pose
         inp = ScoutInputs(now=now, pose=(x, y, self.z), altitude_agl=self.agl, goal_reached=self.goal_reached,
                           scan_request=self.pending_req, frontiers_left=self.frontiers_left)
@@ -853,7 +1163,9 @@ class ScoutAgent(AgentBase):
               'goal': list(tgt) if tgt else None, 'speed': round(speed, 3), 'v_limit': self.DASH_V,
               'tilt': None, 'slip': None, 'breadcrumbs': None, 'last_safe': None,
               'altitude_agl': round(self.agl, 2), 'pose': [round(v, 3) for v in self.pose] + [round(self.z, 3)],
-              'scan_job': (self.fsm._job or {}).get('id'), 'orbit': bool(out and out.orbit), 't': time.time()}
+              'scan_job': (self.fsm._job or {}).get('id'), 'orbit': bool(out and out.orbit),
+              'role': self.role, 'name': self.name, 'health': self.health.state().as_dict(), 'rescue': None,
+              'v_cmd': None, 'v_wheel': None, 'v_ground': round(speed, 3), 't': time.time()}
         self.pub_state.publish(String(data=json.dumps(st)))
 
 

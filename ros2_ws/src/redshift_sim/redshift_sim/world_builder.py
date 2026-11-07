@@ -104,10 +104,16 @@ def _e(ros, gz, ros_t, gz_t, direction='GZ_TO_ROS'):
             'direction': direction}
 
 
+def cmd_topic_ros(name: str) -> str:
+    """ROS topic bridged to the robot's gz DiffDrive / VelocityControl `/<name>/cmd_vel`. Rovers drive through
+    world_interface_node's drivetrain relay (`cmd_vel` scaled by wheel health → `cmd_vel_hw`, protocol §8.2)."""
+    return f'/{name}/cmd_vel_hw' if name.startswith('rover') else f'/{name}/cmd_vel'
+
+
 def _bridge_entries(name: str) -> list[dict]:
     e = _e
     out = [
-        e(f'/{name}/cmd_vel', f'/{name}/cmd_vel', 'geometry_msgs/msg/Twist', 'gz.msgs.Twist', 'ROS_TO_GZ'),
+        e(cmd_topic_ros(name), f'/{name}/cmd_vel', 'geometry_msgs/msg/Twist', 'gz.msgs.Twist', 'ROS_TO_GZ'),
         e(f'/{name}/odom', f'/{name}/odom', 'nav_msgs/msg/Odometry', 'gz.msgs.Odometry'),
         e(f'/{name}/imu_raw', f'/{name}/imu', 'sensor_msgs/msg/Imu', 'gz.msgs.IMU'),
         e(f'/{name}/camera/image_raw', f'/{name}/camera/image', 'sensor_msgs/msg/Image', 'gz.msgs.Image'),

@@ -1,19 +1,21 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { api } from '../lib/api'
-import { useRobotIds, useTick } from '../lib/hooks'
-import { robotName } from '../lib/format'
+import { useRescue, useRobotIds, useTick } from '../lib/hooks'
+import { robotName, robotShort } from '../lib/format'
 import { isLiveStatus, useStore } from '../lib/store'
 import { C } from '../lib/theme'
 import type { OkResponse } from '../lib/types'
 
-type Kind = 'rockslide' | 'anomaly' | 'tip'
+type Kind = 'rockslide' | 'anomaly' | 'tip' | 'damage'
 
 interface Result {
   ok: boolean
   text: string
 }
 
-const COOLDOWN_MS: Record<Kind, number> = { rockslide: 10000, anomaly: 30000, tip: 25000 }
+const COOLDOWN_MS: Record<Kind, number> = { rockslide: 10000, anomaly: 30000, tip: 25000, damage: 30000 }
+/** §8.9 / demo script: the debris strike always hits Scout Rover 1 so Heavy Recovery Rover 2 can rescue it. */
+const DAMAGE_TARGET = 'rover_0'
 
 export function InjectBar() {
   const ids = useRobotIds()
@@ -23,6 +25,10 @@ export function InjectBar() {
   const dust = useStore((s) => s.telemetry?.mission.env.dust_level ?? 0)
   const [target, setTarget] = useState<string | null>(null)
   const live = isLiveStatus(status)
+  const rescue = useRescue()
+  const rescueActive = !!rescue && !rescue.resolved && !rescue.aborted
+  const hasDamageTarget = rovers.includes(DAMAGE_TARGET)
+  const rescuer = rovers.find((r) => r !== DAMAGE_TARGET)
 
   // follow the operator's selection when it is a rover
   useEffect(() => {
@@ -32,30 +38,30 @@ export function InjectBar() {
 
   return (
     <div className="@container pointer-events-auto rounded-[3px] border border-rule-2 bg-void/88 p-2.5 shadow-[0_18px_50px_-20px_rgba(0,0,0,0.8)] backdrop-blur-md">
-      <div className="grid grid-cols-3 items-start gap-2 @min-[860px]:grid-cols-[150px_repeat(3,minmax(0,1fr))]">
-        {/* wide: a title block left of the buttons; narrow: one header line above them */}
-        <div className="col-span-3 flex items-baseline justify-between gap-3 px-0.5 @min-[860px]:col-span-1 @min-[860px]:min-h-[60px] @min-[860px]:flex-col @min-[860px]:items-start @min-[860px]:justify-between @min-[860px]:gap-1.5 @min-[860px]:px-0 @min-[860px]:pr-1">
-          <h2 className="font-cond text-[17px] leading-[1.02] font-[800] text-bone @min-[860px]:text-[19px]">Inject unscripted change</h2>
-          <div className="flex flex-wrap items-center gap-1 text-[11.5px] text-haze">
-            {rovers.length > 1 ? 'Target' : null}
-            {rovers.length > 1 &&
-              rovers.map((r) => (
-                <button
-                  key={r}
-                  onClick={() => setTarget(r)}
-                  className={`rounded-[2px] px-1.5 py-0.5 font-[650] ${r === rover ? 'bg-bay-2 text-bone shadow-[inset_0_0_0_1px_var(--color-rule-2)]' : 'text-dim hover:text-haze'}`}
-                >
-                  {robotName(r)}
-                </button>
-              ))}
-            {rovers.length === 1 && <span>Target: {robotName(rovers[0])}</span>}
-            {!rovers.length && <span className="text-dim">No rover online</span>}
-          </div>
+      <div className="mb-2 flex items-baseline justify-between gap-3 px-0.5">
+        <h2 className="font-cond text-[17px] leading-none font-[800] text-bone @min-[860px]:text-[18px]">Inject unscripted change</h2>
+        <div className="flex flex-wrap items-center gap-1 text-[11.5px] text-haze">
+          {rovers.length > 1 ? 'Rockslide and tip target' : null}
+          {rovers.length > 1 &&
+            rovers.map((r) => (
+              <button
+                key={r}
+                onClick={() => setTarget(r)}
+                aria-pressed={r === rover}
+                className={`font-cond rounded-[2px] px-1.5 py-0.5 text-[12px] font-[750] tracking-[0.03em] ${r === rover ? 'bg-bay-2 text-bone shadow-[inset_0_0_0_1px_var(--color-rule-2)]' : 'text-dim hover:text-haze'}`}
+              >
+                {robotShort(r)}
+              </button>
+            ))}
+          {rovers.length === 1 && <span>Target: {robotName(rovers[0])}</span>}
+          {!rovers.length && <span className="text-dim">No rover online</span>}
         </div>
+      </div>
+      <div className="grid grid-cols-2 gap-x-2 @min-[620px]:grid-cols-4">
         <InjectButton
           kind="rockslide"
           title="Spawn Meteor / Rockslide Ahead"
-          sub={rover ? `Boulders land across ${robotName(rover)}'s path` : 'Needs a rover'}
+          sub={rover ? `Boulders across ${robotShort(rover)}'s path` : 'Needs a rover'}
           color={C.nad}
           icon={<MeteorIcon />}
           disabled={!live || !rover}
@@ -64,7 +70,7 @@ export function InjectBar() {
         <InjectButton
           kind="anomaly"
           title="Trigger High-G Seismic / Dust Anomaly"
-          sub={dust > 0 ? `Dust storm active, level ${dust.toFixed(2)}` : 'Dust haze for 25 s with a 4 s tremor'}
+          sub={dust > 0 ? `Dust storm active, level ${dust.toFixed(2)}` : 'Dust haze for 25 s, 4 s tremor'}
           color={C.ochre}
           icon={<DustIcon />}
           disabled={!live}
@@ -73,11 +79,29 @@ export function InjectBar() {
         <InjectButton
           kind="tip"
           title="Trigger Tip/Slip Failure"
-          sub={rover ? `Physical jolt to ${robotName(rover)}'s chassis` : 'Needs a rover'}
+          sub={rover ? `Jolt to ${robotShort(rover)}'s chassis` : 'Needs a rover'}
           color={C.ha}
           icon={<TipIcon />}
           disabled={!live || !rover}
           run={() => api.injectTip(rover)}
+        />
+        <InjectButton
+          kind="damage"
+          title="Trigger Critical Damage on Rover 1"
+          sub={
+            !hasDamageTarget
+              ? `No ${robotName(DAMAGE_TARGET)} in this fleet`
+              : rescueActive
+                ? 'Rescue in progress'
+                : rescuer
+                  ? `Debris strike; ${robotShort(rescuer)} rescues`
+                  : 'Debris strike, no rescuer'
+          }
+          color={C.ha}
+          strong
+          icon={<DamageIcon />}
+          disabled={!live || !hasDamageTarget || rescueActive}
+          run={() => api.injectDamage(DAMAGE_TARGET)}
         />
       </div>
     </div>
@@ -92,6 +116,7 @@ function InjectButton({
   icon,
   disabled,
   run,
+  strong = false,
 }: {
   kind: Kind
   title: string
@@ -100,6 +125,8 @@ function InjectButton({
   icon: ReactNode
   disabled: boolean
   run: () => Promise<OkResponse>
+  /** the headline failure: filled, so it reads as the big red button */
+  strong?: boolean
 }) {
   const [busy, setBusy] = useState(false)
   const [until, setUntil] = useState(0)
@@ -129,22 +156,23 @@ function InjectButton({
         type="button"
         onClick={fire}
         disabled={disabled || busy || cooling}
-        className="group relative flex min-h-[60px] items-center gap-2.5 overflow-hidden rounded-[3px] border px-3 py-1.5 text-left transition-colors disabled:opacity-55"
-        style={{ borderColor: `${color}88`, backgroundColor: `${color}14` }}
+        title={`${title}: ${sub}`}
+        className="group relative flex min-h-[60px] flex-1 items-center gap-2.5 overflow-hidden rounded-[3px] border px-3 py-1.5 text-left transition-colors disabled:opacity-55"
+        style={{ borderColor: strong ? color : `${color}88`, backgroundColor: strong ? `${color}2e` : `${color}14` }}
       >
-        <span className="hidden shrink-0 @min-[700px]:block" style={{ color }}>
+        <span className="hidden shrink-0 @min-[1000px]:block" style={{ color }}>
           {icon}
         </span>
         <span className="min-w-0">
           <span className="font-semi-cond block text-[14.5px] leading-[1.1] font-[780] text-bone">{busy ? 'Injecting…' : title}</span>
-          <span className="block truncate text-[11.5px] text-haze">{cooling ? `Ready again in ${Math.ceil(remaining / 1000)} s` : sub}</span>
+          <span className="line-clamp-2 text-[11.5px] leading-[1.25] text-haze @min-[860px]:line-clamp-1">{cooling ? `Ready again in ${Math.ceil(remaining / 1000)} s` : sub}</span>
         </span>
         <span className="absolute inset-0 opacity-0 transition-opacity group-enabled:group-hover:opacity-100" style={{ boxShadow: `inset 0 0 0 1px ${color}` }} />
         {cooling && (
           <span className="absolute bottom-0 left-0 h-[3px]" style={{ width: `${(remaining / COOLDOWN_MS[kind]) * 100}%`, backgroundColor: color }} />
         )}
       </button>
-      <p className={`h-4 truncate px-1 text-[11.5px] ${result ? (result.ok ? 'text-o3' : 'text-ha') : 'text-transparent'}`} role="status">
+      <p className={`h-4 truncate px-1 text-[11.5px] ${result ? (result.ok ? 'text-o3' : 'text-ha') : 'text-transparent'}`} role="status" title={result?.text}>
         {result ? `${result.ok ? 'Sent:' : 'Failed:'} ${result.text}` : '.'}
       </p>
     </div>
@@ -165,6 +193,16 @@ const DustIcon = () => (
     <path d="M3 15 H25 a3.5 3.5 0 1 1 -3.5 3.5" />
     <path d="M3 21 H13" />
     <path d="M2 27 L6 24 L9 27 L13 23 L16 27 L20 24 L23 27 L28 24" strokeWidth="1.5" />
+  </svg>
+)
+const DamageIcon = () => (
+  <svg width="30" height="30" viewBox="0 0 30 30" aria-hidden fill="none" stroke="currentColor" strokeWidth="1.8">
+    <rect x="5" y="15" width="17" height="6" rx="1.5" fill="currentColor" fillOpacity="0.25" />
+    <circle cx="8.5" cy="23.5" r="2.5" />
+    <circle cx="18.5" cy="23.5" r="2.5" strokeDasharray="2 2" />
+    <path d="M2 28 H28" />
+    <path d="M25 2 L18 10 M21 3 L17 7" strokeLinecap="round" />
+    <path d="M12 8 l2 4 l3 -2 l-1 4" strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 )
 const TipIcon = () => (

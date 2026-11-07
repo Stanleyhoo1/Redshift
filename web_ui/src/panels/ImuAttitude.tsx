@@ -17,7 +17,7 @@ export function ImuAttitude() {
 
   return (
     <Panel title="IMU" sensors={['IMU']} chipsFrom={185} right={<span className="num text-[11.5px] text-ha">alarm ±{fmt(alarm, 1)}°</span>} bodyClass="flex flex-col justify-between gap-1.5 px-2.5 pt-1.5 pb-2">
-      <div className="flex justify-center">
+      <div className="flex min-h-[56px] flex-1 justify-center">
         <Horizon roll={roll} pitch={pitch} alarm={alarm} />
       </div>
       <dl className="grid grid-cols-2 gap-2 text-[12px]">
@@ -55,7 +55,7 @@ function Horizon({ roll, pitch, alarm }: { roll: number; pitch: number; alarm: n
   const off = Math.max(-40, Math.min(40, pitch)) * PITCH_PX_PER_DEG
   const lim = Math.min(80, alarm + 25)
   return (
-    <svg viewBox="-70 -70 140 140" className="h-[96px] w-[96px] shrink-0 @min-[180px]:h-[148px] @min-[180px]:w-[148px]" role="img" aria-label={`Roll ${roll.toFixed(1)}°, pitch ${pitch.toFixed(1)}°`}>
+    <svg viewBox="-70 -70 140 140" className="aspect-square h-full max-h-[96px] w-auto shrink-0 @min-[180px]:max-h-[148px]" role="img" aria-label={`Roll ${roll.toFixed(1)}°, pitch ${pitch.toFixed(1)}°`}>
       <defs>
         <clipPath id="hz-clip">
           <circle r={R} />

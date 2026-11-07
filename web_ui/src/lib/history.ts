@@ -1,5 +1,6 @@
 // Non-reactive rolling buffers fed by the store's telemetry ingest. Components read them during
 // renders they already do (telemetry re-renders at 15 Hz), so no extra state churn.
+import type { SensorSample } from './sensors'
 import type { XY } from './types'
 
 export interface ImuSample {
@@ -14,14 +15,38 @@ const imu = new Map<string, ImuSample[]>()
 export function pushImu(robot: string, s: ImuSample) {
   let buf = imu.get(robot)
   if (!buf) imu.set(robot, (buf = []))
-  buf.push(s)
-  const cutoff = s.t - IMU_WINDOW_S
-  let drop = 0
-  while (drop < buf.length && buf[drop].t < cutoff) drop++
-  if (drop) buf.splice(0, drop)
+  pushWindowed(buf, s, IMU_WINDOW_S)
 }
 
 export const imuHistory = (robot: string): readonly ImuSample[] => imu.get(robot) ?? []
+
+/** Append `s` and drop samples older than `windowS` before it (in place). Out-of-order samples reset the buffer. */
+export function pushWindowed<T extends { t: number }>(buf: T[], s: T, windowS: number): T[] {
+  if (buf.length && s.t < buf[buf.length - 1].t - 1) buf.length = 0 // clock went backwards (new mission / reconnect)
+  buf.push(s)
+  const cutoff = s.t - windowS
+  let drop = 0
+  while (drop < buf.length && buf[drop].t < cutoff) drop++
+  if (drop) buf.splice(0, drop)
+  return buf
+}
+
+// ---- live sensor channels (≈20 s at 15 Hz per robot) ---------------------------------------
+export const SENSOR_WINDOW_S = 20
+const sensors = new Map<string, SensorSample[]>()
+
+export function pushSensors(robot: string, s: SensorSample) {
+  let buf = sensors.get(robot)
+  if (!buf) sensors.set(robot, (buf = []))
+  pushWindowed(buf, s, SENSOR_WINDOW_S)
+}
+
+export const sensorHistory = (robot: string): readonly SensorSample[] => sensors.get(robot) ?? []
+
+export function clearHistory() {
+  imu.clear()
+  sensors.clear()
+}
 
 // ---- camera frame-rate estimate ------------------------------------------------------------
 const arrivals = new Map<string, number[]>()

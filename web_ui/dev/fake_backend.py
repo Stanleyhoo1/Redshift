@@ -20,7 +20,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from fake_agents import Rover, Scout
+from fake_agents import LOCK_LABEL, Rover, Scout, display, short
 from fake_render import b64_jpeg, lidar_points, map_png_b64, physics_preview, rover_camera, scout_camera
 from fake_world import OPTIONS, World
 
@@ -47,6 +47,9 @@ class Hub:
         self.speed = 1.0     # UI dev only: scales motion; event timers stay on wall time
         self.pending_rocks: list = []
         self.rng = np.random.default_rng(3)
+        self._fleet_t = 0.0                 # last 1 Hz /fleet/sos + /fleet/rescue repeat
+        self._phase: dict[str, str] = {}    # rescuer id -> last announced phase
+        self._done_until: dict[str, float] = {}  # keep a DONE rescue block in telemetry briefly
 
     # ---- outbound ------------------------------------------------------------------------
     def status_msg(self) -> dict:
@@ -126,8 +129,12 @@ class Hub:
             w = self.world
             await self.broadcast(self.status_msg())
             sx, sy = w.terrain.spawn
-            self.rovers = [Rover(r, sx + 3.0 * k, sy, math.radians(45)) for k, r in enumerate(robots) if r.startswith("rover")]
+            # rovers fan out from the pad on diverging headings, so a rescue later has real ground to cover
+            self.rovers = [Rover(r, sx + 3.0 * k, sy - 1.5 * k, math.radians(45 - 55 * k)) for k, r in enumerate(robots) if r.startswith("rover")]
             self.scouts = [Scout(r, sx - 2.0, sy - 2.0, w.L) for r in robots if r.startswith("scout")]
+            for r in self.rovers:
+                r.peers = [o for o in self.rovers if o is not r]
+            self._phase, self._done_until, self._fleet_t = {}, {}, 0.0
             await self._boot(robots, keys)
             await self.set_status("running")
             self.t_run = time.time()
@@ -172,6 +179,7 @@ class Hub:
                 for sx, sy in found:
                     w.trace(s.id, s.state, "science_target", ["CAM"], f"Nadir frame: cyan cluster at ({sx:.1f}, {sy:.1f})",
                             "Colour and texture match crystal signature from 12 m AGL", 0.81, f"Logged science target #{len(w.found_science)}; tagged on map")
+        self._rescue(now)
         self._narrate(now)
         for a in self.rovers + self.scouts:  # edge budget throttle with hysteresis
             e = w.edge(a.id, a.extra_ms, a.throttle, a.unc)
@@ -192,12 +200,105 @@ class Hub:
                 a._thr_t = now
                 w.trace(a.id, a.state, "edge_throttle", ["EDGE"], f"Compute load {e['load_pct']:.0f} %", "Load < 60 %: headroom restored", 0.93, "Perception rate restored")
 
+    # ---- §8 SOS / rescue orchestration (the fleet + world side of the scripted sequence) ----------
+    def _rescue(self, now: float):
+        w = self.world
+        by_id = {r.id: r for r in self.rovers}
+        for r in self.rovers:
+            if r.state == "AWAIT_RESCUE" and r.sos_id and not r.rescuer_id:
+                able = [o for o in self.rovers if o is not r and not o.faults and o.rescue_target is None
+                        and o.state not in ("AWAIT_RESCUE", "SAFE_HOLD", "RECOVERY_REVERSE")]
+                if able:
+                    o = min(able, key=lambda q: math.hypot(q.x - r.x, q.y - r.y))
+                    r.rescuer_id = o.id
+                    o.start_rescue(r, w, now)
+        for o in self.rovers:
+            t = o.rescue_target
+            if t is None:
+                continue
+            # world side of §8.5 repair: checks the true centre distance, then ramps the target's wheels
+            if o.state == "RESCUE_DOCKING" and o.docked and not o.repair_requested:
+                o.repair_requested = True
+                dist = math.hypot(t.x - o.x, t.y - o.y)
+                ok = dist <= 1.6
+                w.event({"op": "repair", "ok": ok, "robot": t.id, "by": o.id, "distance_m": round(dist, 2),
+                         "detail": f"Repairing {t.id} drivetrain" if ok else f"Too far for a repair: {dist:.2f} m > 1.6 m"})
+                if ok:
+                    t.begin_repair(now)
+                    o.set_state("REPAIRING", now)
+                    w.trace(o.id, "REPAIRING", "repair_start", ["DIAG", "FLEET"],
+                            f"Docked {dist:.2f} m from {short(t.id)}; its motor controllers report {', '.join(t.faults)}",
+                            "Within the 1.6 m repair reach; the world confirms contact", 0.94,
+                            "REPAIRING: swapping the failed drive modules (≈ 4 s)", "info", 15.0)
+            elif o.state == "REPAIRING" and t.repair_done:
+                w.event({"op": "repair", "ok": True, "done": True, "robot": t.id, "by": o.id,
+                         "distance_m": round(math.hypot(t.x - o.x, t.y - o.y), 2), "detail": f"{t.id} drivetrain restored"})
+                w.trace(o.id, "REPAIRING", "repair_complete", ["DIAG", "FLEET"],
+                        f"{short(t.id)} wheel health {min(t.wheel_health):.2f}–{max(t.wheel_health):.2f}; faults cleared",
+                        f"{short(t.id)} health {t.health_pct():.0f} % ≥ 60 %: it can drive itself again", 0.96,
+                        "Rescue complete: resuming my own exploration", "info", 11.0)
+                self._rescue_event(o, "DONE")
+                self._done_until[o.id] = now + 3.0
+                o.set_state("RESUMING", now)
+                o.locked = False
+        # resolved SOS: the damaged rover left AWAIT_RESCUE on its own sensors
+        for r in self.rovers:
+            if r.sos_id and r.state in ("RESUMING", "EXPLORING", "CAUTION") and getattr(r, "_sos_open", False):
+                r._sos_open = False
+                w.event(self._sos_event(r, "resolved"))
+            if r.state == "AWAIT_RESCUE":
+                r._sos_open = True
+        # phase changes go out immediately, everything repeats at 1 Hz
+        for o in self.rovers:
+            if o.rescue_target is not None and o.state in ("RESCUE_TRANSIT", "RESCUE_DOCKING", "REPAIRING"):
+                ph = o.rescue_block("rescuer")["phase"]
+                if self._phase.get(o.id) != ph:
+                    self._phase[o.id] = ph
+                    self._rescue_event(o, ph)
+        if now - self._fleet_t >= 1.0:
+            self._fleet_t = now
+            for r in self.rovers:
+                if r.state == "AWAIT_RESCUE" and r.sos_id:
+                    w.event(self._sos_event(r, "active"))
+            for o in self.rovers:
+                if o.rescue_target is not None and o.state in ("RESCUE_TRANSIT", "RESCUE_DOCKING", "REPAIRING"):
+                    self._rescue_event(o, o.rescue_block("rescuer")["phase"])
+        # drop finished rescue links after the DONE block has been shown for a moment
+        for oid, until in list(self._done_until.items()):
+            if now > until:
+                del self._done_until[oid]
+                o = by_id.get(oid)
+                if o is not None:
+                    o.rescue_target = None
+                    self._phase.pop(oid, None)
+
+    def _sos_event(self, r, status: str) -> dict:
+        h = r.health_json()
+        return {"op": "sos", "id": r.sos_id, "robot": r.id, "xy": [round(r.x, 2), round(r.y, 2)], "yaw": round(r.yaw, 3),
+                "health_pct": h["pct"], "faults": h["faults"], "status": status}
+
+    def _rescue_event(self, o, phase: str):
+        b = o.rescue_block("rescuer")
+        self.world.event({"op": "rescue", "id": b["id"], "rescuer": o.id, "target": o.rescue_target.id, "phase": phase,
+                          "range_m": b["range_m"], "locked": b["locked"] and phase in ("DOCKING", "REPAIRING")})
+
+    def _rescue_json(self, a) -> dict | None:
+        if a.kind != "rover":
+            return None
+        if a.rescue_target is not None:
+            return a.rescue_block("rescuer")
+        for o in self.rovers:
+            if o.rescue_target is a:
+                return o.rescue_block("target")
+        return None
+
     def _narrate(self, now: float):
         """Slope-hazard discoveries plus a routine status trace whenever the feed goes quiet."""
         w = self.world
         cnt, mx = w.new_hazard
         lim = w.limits
-        r = self.rovers[0] if self.rovers else None
+        busy = ("SAFE_HOLD", "AWAIT_RESCUE", "RESCUE_TRANSIT", "RESCUE_DOCKING", "REPAIRING")
+        r = next((q for q in self.rovers if q.state not in busy), None)
         if cnt >= 30 and r and now - getattr(self, "_slope_t", 0) > 7:
             self._slope_t = now
             w.new_hazard = (0, 0.0)
@@ -205,7 +306,9 @@ class Hub:
                     f"Slope {mx:.1f}° > {lim['max_slope_deg']:.1f}° traversable at {w.g:.1f} g ({lim['factor'].replace('_', ' ')} bound)", 0.9,
                     "Marked lethal in the costmap; inflated 0.6 m for robot radius", "warn")
             return
-        if now - w.last_trace_t < 2.3:
+        # routine chatter pauses while a rescue is under way, so the rescue reads as one story
+        rescue_on = any(q.state in busy[1:] for q in self.rovers)
+        if now - w.last_trace_t < (9.0 if rescue_on else 2.3):
             return
         agents = self.rovers + self.scouts
         if not agents:
@@ -239,6 +342,9 @@ class Hub:
             "imu": {"roll_deg": round(a.roll, 2), "pitch_deg": round(a.pitch, 2), "gyro": a.gyro},
             "uncertainty": {"score": round(a.unc, 3), "camera_conf": round(max(0.05, 1 - a.unc * 1.2), 2), "lidar_conf": round(max(0.2, 1 - a.unc * 0.6), 2), "imu_vib": 0.4 if self.world.env["seismic"] else 0.05},
             "edge": e, "path": [list(p) for p in a.path[:150]], "trail": a.trail[-300:], "last_safe": getattr(a, "last_safe", None),
+            # §8.7
+            "role": a.role, "name": a.name, "health": a.health_json(), "rescue": self._rescue_json(a),
+            "sensors": a.sensors_json(self.world, self.rovers + self.scouts),
         }
 
     async def _emit(self, tick: int, now: float):
@@ -259,26 +365,40 @@ class Hub:
             await self.broadcast({"type": "map", "png_b64": map_png_b64(w.terrain, w.cls, w.seen_t, now), "meta": w.meta(), "stats": st})
         wanted = {c["camera"] for c in self.clients.values()}
         agents = {a.id: a for a in self.rovers + self.scouts}
-        cams, lids = {}, {}
+        full, low = tick % 2 == 0, tick % 4 == 0
+        rgb, dep, lids = {}, {}, {}
+        for rid, a in agents.items():
+            sel = rid in wanted
+            if not (low or (full and sel)):
+                continue
+            pose = {"x": a.x, "y": a.y, "z": a.z, "yaw": a.yaw}
+            mates = [{"x": o.x, "y": o.y, "short": short(o.id), "damaged": bool(o.faults),
+                      "lock": (LOCK_LABEL.format(short=short(o.id)) if a.kind == "rover" and a.rescue_target is o and a.locked else None)}
+                     for o in self.rovers if o is not a]
+            if a.kind == "rover":
+                out = rover_camera(w.terrain, w.tex, w.px_m, pose, w.rocks, w.env["dust_level"], w.env["seismic"], a.id, a.mode, a.unc, w.rng,
+                                   others=mates, want_depth=sel and full)
+            else:
+                out = scout_camera(w.tex, w.px_m, w.L, pose, w.terrain.science, w.perm, a.state == "SCANNING", w.env["dust_level"], a.id,
+                                   rovers=mates, terrain=w.terrain, alt=a.alt, want_depth=sel and full)
+            img, depth = out if isinstance(out, tuple) else (out, None)
+            rgb[rid] = json.dumps({"type": "camera", "robot": rid, "kind": "rgb", "jpeg_b64": b64_jpeg(img), "t": round(now, 3)})
+            if depth is not None:
+                dep[rid] = json.dumps({"type": "camera", "robot": rid, "kind": "depth", "jpeg_b64": b64_jpeg(depth, 80), "t": round(now, 3)})
         for rid in wanted:
             a = agents.get(rid)
-            if not a:
-                continue
-            if tick % 2 == 0:
-                pose = {"x": a.x, "y": a.y, "z": a.z, "yaw": a.yaw}
-                if a.kind == "rover":
-                    img = rover_camera(w.terrain, w.tex, w.px_m, pose, w.rocks, w.env["dust_level"], w.env["seismic"], a.id, a.mode, a.unc, w.rng)
-                else:
-                    img = scout_camera(w.tex, w.px_m, w.L, pose, w.terrain.science, w.perm, a.state == "SCANNING", w.env["dust_level"], a.id)
-                cams[rid] = json.dumps({"type": "camera", "robot": rid, "jpeg_b64": b64_jpeg(img), "t": round(now, 3)})
-            if tick % 3 == 0 and a.kind == "rover":
+            if a and tick % 3 == 0 and a.kind == "rover":
                 pose = {"x": a.x, "y": a.y, "z": a.z, "yaw": a.yaw}
                 lids[rid] = json.dumps({"type": "lidar", "robot": rid, "points": lidar_points(w.terrain, pose, w.rocks, w.env["dust_level"], w.rng), "max_range": 25, "t": round(now, 3)})
         for ws, c in list(self.clients.items()):
-            if c["camera"] in cams:
-                await self.send(ws, cams[c["camera"]])
-            if c["camera"] in lids:
-                await self.send(ws, lids[c["camera"]])
+            mine = c["camera"]
+            for rid, msg in rgb.items():
+                if rid == mine or low:
+                    await self.send(ws, msg)
+            if mine in dep:
+                await self.send(ws, dep[mine])
+            if mine in lids:
+                await self.send(ws, lids[mine])
 
     # ---- injections ----------------------------------------------------------------------
     def _rover(self, rid: str | None) -> Rover | None:
@@ -312,6 +432,17 @@ class Hub:
         self.world.env.update({"dust_level": lvl, "until_t": now + dur, "seismic_until": now + 4})
         self.world.event({"op": "anomaly", "ok": True, "dust_level": lvl, "until_t": round(now + dur, 2)})
         return {"ok": True, "detail": f"Dust {lvl:.2f} for {dur:.0f} s with a 4 s tremor"}
+
+    def inject_damage(self, rid: str | None) -> dict:
+        r = self._rover(rid)
+        if not r or not self.world or self.status != "running":
+            return {"ok": False, "detail": "No running mission with that rover"}
+        if r.faults or r.state in ("SAFE_HOLD", "AWAIT_RESCUE") or r.rescue_target is not None:
+            return {"ok": False, "detail": f"{display(r.id)} is already damaged or busy with a rescue"}
+        if any(o.rescue_target is r for o in self.rovers):
+            return {"ok": False, "detail": f"{display(r.id)} is being rescued"}
+        self.world.event(r.strike(self.world, time.time()))
+        return {"ok": True, "detail": f"Debris strike: critical damage on {display(r.id)}"}
 
     def inject_tip(self, rid: str | None) -> dict:
         r = self._rover(rid)
@@ -359,6 +490,10 @@ def build_app(hub: Hub) -> FastAPI:
     @app.post("/api/inject/tip")
     async def tip(body: dict | None = None):
         return JSONResponse(hub.inject_tip((body or {}).get("robot")))
+
+    @app.post("/api/inject/damage")
+    async def damage(body: dict | None = None):
+        return JSONResponse(hub.inject_damage((body or {}).get("robot")))
 
     @app.post("/api/sim/speed")
     async def sim_speed(body: dict | None = None):

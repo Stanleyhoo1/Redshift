@@ -87,3 +87,24 @@ def test_rtf_meter_tracks_speed_resets_and_stalls():
         m.add(3.0 + k * 0.01, k * 0.005)       # 0.5x
     assert m.rtf(3.99) == pytest.approx(0.5, abs=0.02)
     assert m.rtf(6.0) == 0.0                   # no clock for > 1 s: simulation stalled / paused
+
+
+def test_robot_telemetry_carries_role_health_rescue_and_live_sensors():
+    from backend_bridge.encoders import RobotCache, robot_telemetry
+    c = RobotCache('rover_1')
+    c.imu = {'roll_deg': 1.0, 'pitch_deg': -2.0, 'gyro': [0.0, 0.0, 0.1], 'accel': [0.0, 0.0, 21.57]}
+    c.agent_state = {'state': 'RESCUE_DOCKING', 'role': 'recovery', 'name': 'Heavy Recovery Rover 2',
+                     'health': {'pct': 96.0, 'battery_pct': 90.1, 'critical': False},
+                     'rescue': {'id': 'sos-rover_0-1', 'role': 'rescuer', 'peer': 'rover_0', 'phase': 'DOCKING',
+                                'range_m': 2.1, 'locked': True},
+                     'v_cmd': 0.15, 'v_wheel': 0.15, 'v_ground': 0.14, 'slip': 0.02}
+    c.detections = {'uncertainty': {'camera_conf': 0.93}, 'lidar': {'returns_pct': 81.0, 'nearest_m': 1.1}}
+    t = robot_telemetry(c)
+    assert t['role'] == 'recovery' and t['name'] == 'Heavy Recovery Rover 2'
+    assert t['health']['pct'] == 96.0 and t['rescue']['phase'] == 'DOCKING'
+    s = t['sensors']
+    assert s['accel_g'] == pytest.approx(2.2, abs=0.01) and s['lidar_nearest_m'] == 1.1
+    assert s['lidar_returns_pct'] == 81.0 and s['camera_conf'] == 0.93 and s['v_cmd'] == 0.15
+    bare = robot_telemetry(RobotCache('scout_0'))
+    assert bare['role'] == 'drone' and bare['name'] == 'Survey Drone' and bare['health'] is None
+    assert bare['sensors']['lidar_nearest_m'] is None and bare['sensors']['accel'] is None

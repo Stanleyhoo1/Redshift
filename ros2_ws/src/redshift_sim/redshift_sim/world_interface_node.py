@@ -1,4 +1,5 @@
-"""Gazebo implementation of /world/command (rockslide spawning, tip/slip jolts, simulation speed) via gz-transport.
+"""Gazebo implementation of /world/command (rockslide spawning, tip/slip jolts, simulation speed, debris strike /
+critical damage, repair) via gz-transport, plus the simulated rover hardware (rover_hw, docs/protocol.md §8).
 
 Dust/seismic anomalies are handled by sensor_effects_node in both backends; this node only touches
 the physical world. Every executed command is echoed on /world/events.
@@ -8,6 +9,13 @@ it every 4 ms step (≈500 Hz at 2×), and every use_sim_time node would otherwi
 clock reaches this node through ros_gz_bridge (/gz/clock), NOT a Python gz-transport subscription: the Python
 binding holds the GIL inside a blocking gz request, so any Python gz subscription in this process starves every
 service reply (/create, /set_physics) until its timeout. Keep this node gz-publish/request only.
+
+Rover drivetrain: the bridge feeds gz `/<rover>/cmd_vel` from ROS `/<rover>/cmd_vel_hw`, which this node publishes
+for every `/<rover>/cmd_vel` message, scaled by the drivetrain health (rover_hw.Drivetrain.scale), so a damaged rover
+crawls and veers exactly as in the mock. `/<rover>/hw_status` is published at 5 Hz of simulated time from the /gz/clock
+callback. The debris strike is a short two-phase wrench on <rover>::base_link that never lifts a wheel (persistent
+wrench, delta wrench at half time, clear; timed in simulated time like the jolt; see rover_hw); its event reports the
+|a| peak measured on imu_raw.
 """
 from __future__ import annotations
 
@@ -18,21 +26,26 @@ import time
 
 import numpy as np
 import rclpy
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Imu
 from std_msgs.msg import String
 
 from redshift_autonomy.physics_model import RoverPhysics
 
-from .scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_layout
+from .robot_models import ROVER_SPEC, rover_com_z
+from .rover_hw import (REPAIR_RANGE_M, REPAIR_S, STRIKE, Drivetrain, hw_status_dict, peak_g_above_gravity,
+                       planar_distance, solar_output, strike_wrenches_world)
+from .scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_due, rockslide_layout
 from .terrain_gen import Terrain
-from .world_builder import GZ_CLOCK_TOPIC
+from .world_builder import GZ_CLOCK_TOPIC, cmd_topic_ros
 
 
 CLOCK_PERIOD_S = 0.01
+HW_STATUS_PERIOD_S = 0.2
 
 
 def yaw_of(q) -> float:
@@ -79,15 +92,32 @@ class WorldInterface(Node):
         self.clock_pub = self.create_publisher(Clock, '/clock', QoSProfile(depth=10))
         self.create_subscription(Clock, GZ_CLOCK_TOPIC, self._on_gz_clock, QoSProfile(depth=50))
         self.paths: dict[str, np.ndarray] = {}
+        self._sliding: set[str] = set()     # rovers with a rockslide armed (waiting for rockslide_due)
         self.poses: dict[str, tuple] = {}
         self.roll: dict[str, float] = {}
         self.cut_deg = jolt_cut_angle_deg(RoverPhysics().limits(self.g).tip_alarm_deg)
         self._jolting: set[str] = set()
-        for r in self.get_parameter('robots').value:
-            if r.startswith('rover'):
-                self.create_subscription(Path, f'/{r}/planned_path', lambda m, r=r: self._on_path(r, m), 5)
-                self.create_subscription(Odometry, f'/{r}/odom', lambda m, r=r: self._on_odom(r, m), 10)
-                self.create_subscription(Imu, f'/{r}/imu_raw', lambda m, r=r: self._on_imu(r, m), 50)
+        self._striking: set[str] = set()
+        self.rovers = [r for r in self.get_parameter('robots').value if r.startswith('rover')]
+        self.tilt: dict[str, tuple] = {}            # (roll, pitch) rad from imu_raw
+        self.accel: dict[str, float] = {}           # |a| m/s² from imu_raw
+        self._peak: dict[str, float] = {}           # running |a| max while a strike is being measured
+        self.hw = {r: Drivetrain(ROVER_SPEC['track_m']) for r in self.rovers}
+        self.hw_rng = {r: np.random.default_rng(sum(r.encode()) + 1) for r in self.rovers}
+        self.cmd_in: dict[str, Twist] = {}
+        self.repairs: dict[str, dict] = {}          # repair event under way, echoed again when done
+        self.dust_level = 0.0
+        self._next_hw: float | None = None
+        self.hw_pub, self.cmd_hw_pub = {}, {}
+        for r in self.rovers:
+            self.create_subscription(Path, f'/{r}/planned_path', lambda m, r=r: self._on_path(r, m), 5)
+            self.create_subscription(Odometry, f'/{r}/odom', lambda m, r=r: self._on_odom(r, m), 10)
+            self.create_subscription(Imu, f'/{r}/imu_raw', lambda m, r=r: self._on_imu(r, m), 50)
+            self.hw_pub[r] = self.create_publisher(String, f'/{r}/hw_status', QoSProfile(depth=10))
+            self.cmd_hw_pub[r] = self.create_publisher(Twist, cmd_topic_ros(r), QoSProfile(depth=10))
+            self.create_subscription(Twist, f'/{r}/cmd_vel', lambda m, r=r: self._on_cmd_vel(r, m),
+                                     qos_profile_sensor_data)
+        self.create_subscription(String, '/world/env_state', self._on_env, 10)
         self.events = self.create_publisher(String, '/world/events', 10)
         self.create_subscription(String, '/world/command', self._on_cmd, 10)
         self._slide = 0
@@ -99,6 +129,54 @@ class WorldInterface(Node):
         if t - self._last_clock >= CLOCK_PERIOD_S - 1e-9 or t < self._last_clock:
             self._last_clock = t
             self.clock_pub.publish(msg)
+        for r in self.rovers:
+            if self.hw[r].update(t):
+                self._repair_done(r)
+        nxt = self._next_hw                           # 5 Hz of sim time, scheduled like mock_world_node._due_now
+        if nxt is None or t < nxt - 2 * HW_STATUS_PERIOD_S:                    # first clock, or Gazebo reset
+            self._next_hw = t + HW_STATUS_PERIOD_S
+        elif t + 1e-6 >= nxt:
+            self._next_hw = nxt + HW_STATUS_PERIOD_S if t - nxt < HW_STATUS_PERIOD_S else t + HW_STATUS_PERIOD_S
+            for r in self.rovers:
+                self._publish_hw(r)
+                if self.hw[r].repairing:
+                    self._relay(r)                    # health is ramping: apply it even between commands
+
+    # ------------------------------------------------------------------ simulated rover hardware
+    def _on_env(self, msg: String):
+        try:
+            self.dust_level = float(json.loads(msg.data).get('dust_level') or 0.0)
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            pass
+
+    def _on_cmd_vel(self, robot: str, msg: Twist):
+        self.cmd_in[robot] = msg
+        self._relay(robot)
+
+    def _relay(self, robot: str):
+        """cmd_vel → cmd_vel_hw through the drivetrain (zero-latency: called for every incoming command)."""
+        m = self.cmd_in.get(robot)
+        if m is None:
+            return
+        hw = self.hw[robot]
+        if not hw.damaged:
+            self.cmd_hw_pub[robot].publish(m)
+            return
+        v, w = hw.scale(m.linear.x, m.angular.z)
+        out = Twist()
+        out.linear.x, out.linear.y, out.linear.z = float(v), m.linear.y, m.linear.z
+        out.angular.x, out.angular.y, out.angular.z = m.angular.x, m.angular.y, float(w)
+        self.cmd_hw_pub[robot].publish(out)
+
+    def _publish_hw(self, robot: str):
+        roll, pitch = self.tilt.get(robot, (0.0, 0.0))
+        yaw = self.poses.get(robot, (0.0, 0.0, 0.0))[2]
+        solar_w, irr = solar_output(self.dust_level, roll, pitch, yaw)
+        m = self.cmd_in.get(robot)
+        v, w = (m.linear.x, m.angular.z) if m is not None else (0.0, 0.0)
+        cur = self.hw[robot].motor_current(v, w, self.hw_rng[robot])
+        self.hw_pub[robot].publish(String(data=json.dumps(
+            hw_status_dict(robot, time.time(), self.hw[robot], solar_w, irr, cur))))
 
     def _on_path(self, robot, msg: Path):
         self.paths[robot] = np.array([[p.pose.position.x, p.pose.position.y] for p in msg.poses]).reshape(-1, 2)
@@ -109,7 +187,16 @@ class WorldInterface(Node):
 
     def _on_imu(self, robot, msg: Imu):
         q = msg.orientation
-        self.roll[robot] = math.degrees(math.atan2(2 * (q.w * q.x + q.y * q.z), 1 - 2 * (q.x * q.x + q.y * q.y)))
+        roll = math.atan2(2 * (q.w * q.x + q.y * q.z), 1 - 2 * (q.x * q.x + q.y * q.y))
+        pitch = math.asin(max(-1.0, min(1.0, 2 * (q.w * q.y - q.z * q.x))))
+        self.roll[robot] = math.degrees(roll)
+        self.tilt[robot] = (roll, pitch)
+        a = msg.linear_acceleration
+        an = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+        self.accel[robot] = an
+        pk = self._peak.get(robot)                    # the strike thread pops it concurrently: never index it here
+        if pk is not None and an > pk:
+            self._peak[robot] = an
 
     def _emit(self, ev: dict):
         ev.setdefault('t', time.time())
@@ -122,9 +209,16 @@ class WorldInterface(Node):
             return
         op = cmd.get('op')
         if op == 'spawn_rockslide':
-            threading.Thread(target=self._rockslide, args=(cmd.get('robot', 'rover_0'),), daemon=True).start()
+            robot = cmd.get('robot', 'rover_0')
+            if robot not in self._sliding:                 # one armed slide per rover
+                self._sliding.add(robot)
+                threading.Thread(target=self._rockslide, args=(robot,), daemon=True).start()
         elif op == 'jolt':
             self._jolt(cmd.get('robot', 'rover_0'))
+        elif op == 'critical_damage':
+            self._critical_damage(cmd.get('robot', 'rover_0'))
+        elif op == 'repair':
+            self._repair(cmd.get('robot', 'rover_0'), cmd.get('by'))
         elif op == 'set_speed':
             threading.Thread(target=self._set_speed, args=(cmd.get('speed', 1.0),), daemon=True).start()
 
@@ -143,12 +237,23 @@ class WorldInterface(Node):
         self._emit({'op': 'set_speed', 'ok': ok, 'speed': speed})
 
     def _rockslide(self, robot: str):
+        try:
+            pose = self.poses.get(robot)
+            if pose is None:
+                self._emit({'op': 'spawn_rockslide', 'ok': False, 'robot': robot, 'detail': 'no odometry yet'})
+                return
+            # near its goal: wait (simulated time) for the next route; the wall guard only covers a stopped clock
+            t0, w0 = self.sim_t, time.monotonic()
+            while not rockslide_due(self.paths.get(robot), self.poses[robot], self.sim_t - t0) \
+                    and time.monotonic() - w0 < 30.0:
+                time.sleep(0.05)
+            self._drop_rockslide(robot, self.poses[robot], self.sim_t - t0)
+        finally:
+            self._sliding.discard(robot)
+
+    def _drop_rockslide(self, robot: str, pose, waited: float):
         from gz.msgs10.boolean_pb2 import Boolean
         from gz.msgs10.entity_factory_pb2 import EntityFactory
-        pose = self.poses.get(robot)
-        if pose is None:
-            self._emit({'op': 'spawn_rockslide', 'ok': False, 'robot': robot, 'detail': 'no odometry yet'})
-            return
         rocks, impact = rockslide_layout(self.paths.get(robot), pose, seed=self._slide)
         self._slide += 1
         ok_all = True
@@ -158,12 +263,13 @@ class WorldInterface(Node):
                                                    k * 0.9), allow_renaming=True)
             ok, rep = self.gz.request(f'/world/{self.world}/create', req, EntityFactory, Boolean, 2000)
             ok_all &= bool(ok and rep.data)
-        self.get_logger().info(f'rockslide #{self._slide} across {robot} path at {impact}: ok={ok_all}')
+        self.get_logger().info(f'rockslide #{self._slide} across {robot} path at {impact}: ok={ok_all}'
+                               + (f' (waited {waited:.1f} s for the next route)' if waited > 0 else ''))
         self._emit({'op': 'spawn_rockslide', 'ok': ok_all, 'robot': robot, 'impact': list(impact),
-                    'rocks': [list(r) for r in rocks]})
+                    'rocks': [list(r) for r in rocks], 'waited_s': round(waited, 2)})
 
     def _jolt(self, robot: str):
-        if robot in self._jolting:
+        if robot in self._jolting or robot in self._striking:
             return
         self._jolting.add(robot)
         threading.Thread(target=self._jolt_loop, args=(robot,), daemon=True).start()
@@ -196,6 +302,118 @@ class WorldInterface(Node):
                                f'(cut {self.cut_deg:.1f}, start {roll0:.1f}) after {self.sim_t - t0:.2f} s sim')
         self._emit({'op': 'jolt', 'ok': True, 'robot': robot, 'release_roll_deg': round(peak, 1)})
         self._jolting.discard(robot)
+
+
+    # ------------------------------------------------------------------ debris strike / repair (protocol §8.5)
+    def _wrench_msg(self, robot: str, force, torque, offset=None):
+        """EntityWrench on <robot>::base_link; `offset` = point of application in the link frame (gz applies the
+        force at the link origin otherwise)."""
+        ent = self._Entity()
+        ent.name = f'{robot}::base_link'
+        ent.type = self._Entity.LINK
+        msg = self._EntityWrench()
+        msg.entity.CopyFrom(ent)
+        msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z = (float(v) for v in force)
+        msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z = (float(v) for v in torque)
+        if offset is not None:
+            msg.wrench.force_offset.x, msg.wrench.force_offset.y, msg.wrench.force_offset.z = (float(v) for v in offset)
+        return ent, msg
+
+    def _critical_damage(self, robot: str):
+        if robot not in self.hw:
+            self._emit({'op': 'critical_damage', 'ok': False, 'robot': robot, 'detail': 'unknown rover'})
+            return
+        pose = self.poses.get(robot)
+        if pose is None:
+            self._emit({'op': 'critical_damage', 'ok': False, 'robot': robot, 'detail': 'no odometry yet'})
+            return
+        if robot in self._striking or robot in self._jolting:
+            self._emit({'op': 'critical_damage', 'ok': False, 'robot': robot,
+                        'detail': 'strike already under way' if robot in self._striking else 'jolt under way'})
+            return
+        self._striking.add(robot)
+        self.hw[robot].apply_critical_damage()
+        self.repairs.pop(robot, None)                 # a strike cancels any repair in progress
+        self._relay(robot)
+        threading.Thread(target=self._strike_loop, args=(robot, pose), daemon=True).start()
+
+    def _strike_loop(self, robot: str, pose):
+        """Two-phase strike wrench over STRIKE['gz_duration_s'] of sim time, then the IMU peak over gz_measure_s."""
+        ent = None
+        try:
+            roll, pitch = self.tilt.get(robot, (0.0, 0.0))
+            (f1, t1), (f2, t2) = strike_wrenches_world(roll, pitch, pose[2], self.g, ROVER_SPEC['mass_kg'])
+            com = (0.0, 0.0, rover_com_z(ROVER_SPEC))         # whole rover (chassis + wheels), base_link frame
+            ent, first = self._wrench_msg(robot, f1, t1, com)  # at the centre of mass: the push does not roll it
+            _, switch = self._wrench_msg(robot, f2, t2, com)
+            self._peak[robot] = self.accel.get(robot, 0.0)
+            dur = STRIKE['gz_duration_s']
+            t0, w0 = self.sim_t, time.monotonic()
+            self.wrench_pub.publish(first)
+            # timed in simulated time; the wall-clock guards only matter if Gazebo stops publishing its clock
+            while self.sim_t - t0 < dur / 2 and time.monotonic() - w0 < 5.0:
+                time.sleep(0.0005)
+            self.wrench_pub.publish(switch)           # persistent wrenches accumulate: this flips the lateral push
+            t_switch = self.sim_t - t0
+            # second half as long as the first really was (a late switch only lengthens the pulse): net Δv ≈ 0
+            while self.sim_t - t0 < max(dur, 2.0 * t_switch) and time.monotonic() - w0 < 5.0:
+                time.sleep(0.0005)
+            for _ in range(3):
+                self.clear_pub.publish(ent)
+            pulse = self.sim_t - t0
+            while self.sim_t - t0 < STRIKE['gz_measure_s'] and time.monotonic() - w0 < 10.0:
+                time.sleep(0.005)
+            peak = self._peak.pop(robot, 0.0)
+            peak_g = peak_g_above_gravity(peak, self.g)
+            health = [round(h, 3) for h in self.hw[robot].wheel_health]
+            self.get_logger().info(f'debris strike on {robot}: force {np.round(f1, 0)} N, then {np.round(f2, 0)} N '
+                                   f'more at {t_switch:.3f} s, cleared at {pulse:.3f} s sim; IMU peak '
+                                   f'{peak / 9.80665:.2f} g ({peak_g:.2f} g above gravity), wheel health {health}')
+            self._emit({'op': 'critical_damage', 'ok': True, 'robot': robot,
+                        'impact': [round(float(pose[0]), 3), round(float(pose[1]), 3)], 'peak_g': peak_g,
+                        'wheel_health': health})
+        except Exception as e:  # noqa: BLE001 - never leave a persistent wrench on the rover
+            if ent is not None:
+                for _ in range(3):
+                    self.clear_pub.publish(ent)
+            self.get_logger().error(f'debris strike on {robot} failed: {e}')
+            self._emit({'op': 'critical_damage', 'ok': False, 'robot': robot, 'detail': f'strike failed: {e}'})
+        finally:
+            self._peak.pop(robot, None)
+            self._striking.discard(robot)
+
+    def _repair(self, robot: str, by):
+        ev = {'op': 'repair', 'robot': robot, 'by': by}
+        if robot not in self.hw:
+            self._emit(dict(ev, ok=False, detail='unknown rover'))
+            return
+        if by not in self.hw or by == robot:
+            self._emit(dict(ev, ok=False, detail=f'unknown repairing rover {by!r}'))
+            return
+        a, b = self.poses.get(robot), self.poses.get(by)
+        if a is None or b is None:
+            self._emit(dict(ev, ok=False, detail='no odometry yet'))
+            return
+        dist = round(planar_distance(a, b), 2)
+        ev['distance_m'] = dist
+        if dist > REPAIR_RANGE_M:
+            self._emit(dict(ev, ok=False, detail=f'{by} is {dist:.2f} m from {robot} '
+                                                 f'(repair needs <= {REPAIR_RANGE_M:.1f} m)'))
+            return
+        if not self.hw[robot].start_repair(self.sim_t, REPAIR_S):
+            self._emit(dict(ev, ok=True, done=False, detail='repair already in progress'))
+            return
+        self.repairs[robot] = dict(ev, ok=True)
+        self.get_logger().info(f'repair of {robot} by {by} started at {dist:.2f} m')
+        self._emit(dict(ev, ok=True, done=False, detail=f'repair started: drivetrain restoring over {REPAIR_S:.1f} s'))
+
+    def _repair_done(self, robot: str):
+        ev = dict(self.repairs.pop(robot, None) or {'op': 'repair', 'ok': True, 'robot': robot})
+        ev.update(done=True, wheel_health=list(self.hw[robot].wheel_health), detail='drivetrain restored',
+                  t=time.time())
+        self._relay(robot)
+        self.get_logger().info(f'repair of {robot} complete')
+        self._emit(ev)
 
 
 def main():

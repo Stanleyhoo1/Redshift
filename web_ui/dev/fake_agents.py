@@ -8,9 +8,26 @@ import numpy as np
 from fake_render import CLS_OBSTACLE, CLS_PERMANENT
 from fake_world import World
 
+G0 = 9.80665
+# docs/protocol.md §8.1
+NAMES = {"rover_0": ("scout", "Scout Rover 1", "ROVER_1"), "rover_1": ("recovery", "Heavy Recovery Rover 2", "ROVER_2"),
+         "scout_0": ("drone", "Survey Drone", "DRONE")}
+BATTERY_START = {"rover_0": 0.82, "rover_1": 0.91, "scout_0": 0.96}
+DAMAGED_WHEELS = [0.08, 0.35, 0.05, 0.30]
+DAMAGE_FAULTS = ["DRIVE_FL_OVERCURRENT", "DRIVE_RL_ENCODER_LOST"]
+LOCK_LABEL = "[PERCEIVED: DAMAGED UNIT {short} | DOCKING FOR REPAIR]"
+
 
 def wrap(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
+
+
+def short(rid: str) -> str:
+    return NAMES.get(rid, ("", rid, rid.upper()))[2]
+
+
+def display(rid: str) -> str:
+    return NAMES.get(rid, ("", rid, rid))[1]
 
 
 class Agent:
@@ -31,6 +48,63 @@ class Agent:
         self.unc = 0.14
         self.throttle = 0
         self.extra_ms = 0.0
+        self.role, self.name, _ = NAMES.get(rid, ("recovery" if rid.startswith("rover") else "drone", rid, rid.upper()))
+        self.capacity_wh = 600.0 if self.kind == "rover" else 300.0
+        self.battery_wh = self.capacity_wh * BATTERY_START.get(rid, 0.9)
+        self.v_cmd = 0.0
+        self.solar_w = 0.0
+        self.load_w = 0.0
+        self.accel = [0.0, 0.0, G0]
+        self.structure = 100.0
+        self.shocks = 0
+        self.peak_g = 0.0
+        self.rescue: dict | None = None  # §8.7 telemetry block
+        self._edge: dict = {}
+
+    def power(self, w: World, dt: float):
+        """Battery integration: solar − (avionics + edge compute + drive / hover)."""
+        dust = w.env["dust_level"]
+        edge_w = float(self._edge.get("power_w", 10.0)) if self._edge else 10.0
+        if self.kind == "scout":
+            self.solar_w = 0.0
+            self.load_w = (60.0 * w.g ** 1.5 if self.alt > 0.5 else 8.0) + edge_w + float(w.rng.normal(0, 1.5))
+        else:
+            tilt = math.radians(math.hypot(self.roll, self.pitch))
+            irr = 0.93 * (1 - 0.85 * dust) * (1 + float(w.rng.normal(0, 0.006)))
+            self.solar_w = max(0.0, 220.0 * irr * max(0.0, math.cos(tilt)))
+            self.load_w = 25.0 + edge_w + w.limits["energy_j_per_m"] * abs(self.speed) + float(w.rng.normal(0, 0.8))
+        self.battery_wh = min(self.capacity_wh, max(0.0, self.battery_wh + (self.solar_w - self.load_w) * dt / 3600.0))
+
+    def imu_accel(self, w: World, now: float, extra: tuple = (0.0, 0.0, 0.0)):
+        """Specific force in the IMU frame (m/s²): gravity tilted by roll/pitch + vibration + impulses."""
+        g = w.g * G0
+        r, p = math.radians(self.roll), math.radians(self.pitch)
+        sd = 0.10 + 0.35 * abs(self.speed) + (1.8 if w.env["seismic"] else 0.0)
+        a = [-g * math.sin(p) + extra[0], g * math.sin(r) * math.cos(p) + extra[1], g * math.cos(r) * math.cos(p) + extra[2]]
+        self.accel = [round(v + float(w.rng.normal(0, sd)), 3) for v in a]
+        dev = abs(math.sqrt(sum(v * v for v in self.accel)) / G0 - w.g)
+        if dev > 1.2:  # a shock (§8.7 health model)
+            if not getattr(self, "_in_shock", False):
+                self.shocks += 1
+                if self.kind == "rover":
+                    self.structure = max(0.0, self.structure - min(4.0, 0.8 * dev))
+            self._in_shock = True
+            self.peak_g = max(self.peak_g, round(dev, 1))
+        else:
+            self._in_shock = False
+
+    def health_json(self) -> dict:
+        drive = self.drive_pct()
+        pct = self.structure * drive / 100.0
+        net = self.solar_w - self.load_w
+        return {"pct": round(pct, 1), "structure_pct": round(self.structure, 1), "drive_pct": round(drive, 1),
+                "battery_pct": round(100 * self.battery_wh / self.capacity_wh, 1), "battery_wh": round(self.battery_wh, 1),
+                "capacity_wh": self.capacity_wh, "solar_w": round(self.solar_w, 1), "load_w": round(self.load_w, 1),
+                "net_w": round(net, 1), "faults": list(getattr(self, "faults", [])), "critical": pct < 15,
+                "shocks": self.shocks, "peak_g": self.peak_g}
+
+    def drive_pct(self) -> float:
+        return 100.0
 
     def set_state(self, s: str, now: float):
         self.state, self.state_t = s, now
@@ -39,12 +113,16 @@ class Agent:
         if self.state_t == 0.0:
             self.state_t = now
 
+    def drive_factor(self) -> float:
+        return 1.0
+
     def follow(self, dt: float, v: float, reverse: bool = False) -> bool:
         """Pure-pursuit along self.path; returns True at the end."""
         while len(self.path) > 1 and math.hypot(self.path[0][0] - self.x, self.path[0][1] - self.y) < 1.2:
             self.path.pop(0)
         if not self.path or (len(self.path) == 1 and math.hypot(self.path[0][0] - self.x, self.path[0][1] - self.y) < 0.6):
             self.speed = 0.0
+            self.v_cmd = 0.0
             return True
         tx, ty = self.path[min(1, len(self.path) - 1)] if len(self.path) > 1 else self.path[0]
         want = math.atan2(ty - self.y, tx - self.x) + (math.pi if reverse else 0.0)
@@ -56,8 +134,10 @@ class Agent:
             end = self.path[-1]
             v = min(v, 1.0 + 1.5 * math.hypot(end[0] - self.x, end[1] - self.y))
             self.speed = v * max(0.0, math.cos(err)) ** 2
+            self.v_cmd = self.speed
         else:
-            self.speed = v * max(0.25, math.cos(err))
+            self.v_cmd = v * max(0.25, math.cos(err))
+            self.speed = self.v_cmd * self.drive_factor() * (1 - min(0.9, getattr(self, "slip", 0.0)))
         sgn = -1.0 if reverse else 1.0
         self.x += sgn * self.speed * math.cos(self.yaw) * dt
         self.y += sgn * self.speed * math.sin(self.yaw) * dt
@@ -83,6 +163,139 @@ class Rover(Agent):
         self.prev_roll = 0.0
         self.caution_since: float | None = None
         self.goal_t = 0.0
+        # §8.3 motor controllers (slight per-wheel wear) and §8.7 health
+        self.wheel_health = [0.985, 0.978, 0.991, 0.982]
+        self.faults: list[str] = []
+        self.structure = 97.5 + (0.8 if rid.endswith("1") else 0.0)
+        self.damage_t: float | None = None
+        self.damage_handled = False
+        self.repair_t0: float | None = None
+        self.repair_from: list | None = None
+        self.repair_done = False
+        self.sos_id: str | None = None
+        self.sos_n = 0
+        self.rescuer_id: str | None = None
+        self.lone_noted = False
+        self.peers: list = []
+        # recovery side
+        self.rescue_target = None
+        self.locked = False
+        self.docked = False
+        self.repair_requested = False
+
+    # ---- drivetrain / health ---------------------------------------------------------------
+    def drive_factor(self) -> float:
+        return sum(self.wheel_health) / 4
+
+    def drive_pct(self) -> float:
+        # mean wheel health, cross-checked against commanded vs measured wheel speed (faults weigh in hard)
+        return 100.0 * self.drive_factor() ** 1.4
+
+    def health_pct(self) -> float:
+        return self.structure * self.drive_pct() / 100.0
+
+    def strike(self, w: World, now: float) -> dict:
+        """§8.5 critical_damage: debris impulse + drivetrain fault."""
+        self.damage_t = now
+        self.damage_handled = False
+        self.wheel_health = list(DAMAGED_WHEELS)
+        self.faults = list(DAMAGE_FAULTS)
+        self.structure = min(self.structure, 74.0 + float(w.rng.uniform(-1.0, 1.0)))
+        self.repair_t0, self.repair_done, self.rescuer_id, self.lone_noted = None, False, None, False
+        return {"op": "critical_damage", "ok": True, "robot": self.id, "impact": [round(self.x, 2), round(self.y, 2)],
+                "peak_g": 5.1, "wheel_health": list(DAMAGED_WHEELS)}
+
+    def begin_repair(self, now: float):
+        self.repair_t0 = now
+        self.repair_from = list(self.wheel_health)
+
+    def sensors_json(self, w: World, others: list) -> dict:
+        nearest = 25.0
+        for x, y, r in w.rocks:
+            d = math.hypot(x - self.x, y - self.y) - r
+            if d < nearest:
+                nearest = d
+        for o in others:
+            if o is not self and o.kind == "rover":
+                nearest = min(nearest, math.hypot(o.x - self.x, o.y - self.y) - 0.55)
+        dust = w.env["dust_level"]
+        if dust > 0 and w.rng.random() < 0.8 * dust:
+            nearest = min(nearest, float(w.rng.uniform(0.4, 3.5)))  # backscatter off the dust
+        v_wheel = self.v_cmd * self.drive_factor()
+        return {"accel": self.accel, "accel_g": round(math.sqrt(sum(v * v for v in self.accel)) / G0, 3),
+                "gyro": self.gyro, "roll_deg": round(self.roll, 2), "pitch_deg": round(self.pitch, 2),
+                "lidar_nearest_m": round(max(0.2, nearest + float(w.rng.normal(0, 0.03))), 2),
+                "lidar_returns_pct": round(max(5.0, 93.0 - 34.0 * dust + float(w.rng.normal(0, 1.2))), 1),
+                "camera_conf": round(max(0.05, 1 - self.unc * 1.2), 2), "v_cmd": round(self.v_cmd, 3),
+                "v_wheel": round(v_wheel + float(w.rng.normal(0, 0.006)) * (v_wheel > 0), 3), "v_ground": round(self.speed, 3),
+                "slip": round(self.slip, 3), "altitude_agl": None}
+
+    # ---- rescue (recovery side) --------------------------------------------------------------
+    def start_rescue(self, target: "Rover", w: World, now: float):
+        self.rescue_target = target
+        self.locked = self.docked = self.repair_requested = False
+        d = math.hypot(target.x - self.x, target.y - self.y) or 1.0
+        sx = target.x + (self.x - target.x) / d * 2.2
+        sy = target.y + (self.y - target.y) / d * 2.2
+        path = w.plan((self.x, self.y), (sx, sy)) or World._resample([(self.x, self.y), (sx, sy)], 0.8)
+        self.path = path
+        self.goal = [round(sx, 1), round(sy, 1)]
+        self.mode = "FUSED"
+        self.set_state("RESCUE_TRANSIT", now)
+        h = target.health_pct()
+        w.trace(self.id, "RESCUE_TRANSIT", "rescue_start", ["FLEET", "MAP"],
+                f"SOS {target.sos_id} from {short(target.id)} at ({target.x:.1f}, {target.y:.1f}): health {h:.0f} %, {', '.join(target.faults) or 'no faults'}",
+                f"Only able rover in the fleet; A* route {len(path) * 0.8:.1f} m to a 2.2 m stand-off beside the damaged unit",
+                0.94, f"Abandoning frontier goal: AUTONOMOUS RESCUE MODE, transit at {0.85 * w.limits['v_max']:.2f} m/s", "warn", 31.0)
+
+    def rescue_block(self, role: str) -> dict | None:
+        t = self.rescue_target
+        if t is None:
+            return None
+        phase = {"RESCUE_TRANSIT": "TRANSIT", "RESCUE_DOCKING": "DOCKING", "REPAIRING": "REPAIRING"}.get(self.state, "DONE")
+        rng_m = round(math.hypot(t.x - self.x, t.y - self.y), 2)
+        return {"id": t.sos_id, "role": role, "peer": t.id if role == "rescuer" else self.id, "phase": phase, "range_m": rng_m,
+                "locked": self.locked and phase in ("DOCKING", "REPAIRING")}
+
+    def _rescue_step(self, w: World, dt: float, now: float) -> None:
+        t = self.rescue_target
+        st = self.state
+        rng_m = math.hypot(t.x - self.x, t.y - self.y)
+        if st == "RESCUE_TRANSIT":
+            if self.follow(dt, 0.85 * w.limits["v_max"]) or rng_m <= 2.5:
+                self.speed = self.v_cmd = 0.0
+                self.set_state("RESCUE_DOCKING", now)
+                w.trace(self.id, "RESCUE_DOCKING", "rescue_dock", ["ODOM", "MAP", "LIDAR"],
+                        f"Stand-off reached: {rng_m:.1f} m from {short(t.id)} by odometry",
+                        "Map navigation is good to ~0.5 m; the last metre needs a perception lock on the damaged rover",
+                        0.9, "Switching to perception-guided docking at 0.20 m/s", "info", 22.0)
+        elif st == "RESCUE_DOCKING":
+            want = math.atan2(t.y - self.y, t.x - self.x)
+            err = wrap(want - self.yaw)
+            self.yaw = wrap(self.yaw + max(-1.2 * dt, min(1.2 * dt, err)))
+            if not self.locked and abs(err) < 0.12 and now - self.state_t > 1.0:
+                self.locked = True
+                w.trace(self.id, "RESCUE_DOCKING", "rescue_lock", ["CAM", "DEPTH", "LIDAR"],
+                        LOCK_LABEL.format(short=short(t.id)),
+                        f"ROVER detection conf 0.93 at {rng_m:.2f} m, bearing {err:+.2f} rad; depth and LiDAR ranges agree within 0.04 m",
+                        0.93, "Lock acquired: creeping in on the fused range at 0.20 m/s", "info", 44.0)
+            if self.locked and not self.docked:
+                if rng_m > 1.38:
+                    self.v_cmd = 0.2
+                    self.speed = 0.2 * self.drive_factor()
+                    self.x += self.speed * math.cos(self.yaw) * dt
+                    self.y += self.speed * math.sin(self.yaw) * dt
+                else:
+                    self.speed = self.v_cmd = 0.0
+                    self.docked = True
+                    w.trace(self.id, "RESCUE_DOCKING", "docked", ["LIDAR", "DEPTH", "ODOM"],
+                            f"Centre distance {rng_m:.2f} m; LiDAR nearest {rng_m - 0.55:.2f} m to {short(t.id)}'s hull",
+                            "Inside the 1.5 m docking envelope with the lock held",
+                            0.95, "Docked: requesting the field repair", "info", 18.0)
+            else:
+                self.speed = self.v_cmd = 0.0
+        elif st == "REPAIRING":
+            self.speed = self.v_cmd = 0.0
 
     def jolt(self, now: float):
         self.jolt_t = now
@@ -106,6 +319,15 @@ class Rover(Agent):
             pitch += amp * 0.18
             if tj > 4:
                 self.jolt_t = None
+        extra = (0.0, 0.0, 0.0)
+        if self.damage_t is not None and now - self.damage_t < 1.5:
+            td = now - self.damage_t
+            k = math.exp(-td / 0.25)
+            roll += 7.0 * math.exp(-td / 0.3) * math.cos(td * 14)
+            extra = (1.8 * G0 * k * math.cos(td * 30), 1.2 * G0 * k, 5.4 * G0 * k)
+        if self.jolt_t is not None and now - self.jolt_t < 0.5:
+            tj = now - self.jolt_t
+            extra = (0.4 * G0 * math.exp(-tj / 0.15), 1.5 * G0 * math.exp(-tj / 0.15), 0.6 * G0 * math.exp(-tj / 0.15))
         if w.env["seismic"]:
             vib = 2.2
         self.roll = roll + float(w.rng.normal(0, 0.15 + vib))
@@ -115,9 +337,62 @@ class Rover(Agent):
         dust = w.env["dust_level"]
         self.unc += ((0.14 + 0.42 * dust + (0.08 if vib else 0.0)) - self.unc) * min(1.0, dt * 1.5)
         self.slip = 0.7 if (self.jolt_t is not None and now - self.jolt_t < 0.8) else 0.03 + 0.002 * abs(pitch) + float(w.rng.uniform(0, 0.01))
+        self.imu_accel(w, now, extra)
+        self.power(w, dt)
+        if not self.faults and self.repair_t0 is None:  # slow wear on healthy wheels
+            self.wheel_health = [min(1.0, max(0.95, h + float(w.rng.normal(0, 0.0004)))) for h in self.wheel_health]
+        if self.repair_t0 is not None and not self.repair_done:  # §8.5 repair: ramp to 1.0 over 4 s
+            f = min(1.0, (now - self.repair_t0) / 4.0)
+            self.wheel_health = [a + (1.0 - a) * f for a in self.repair_from]
+            if f >= 1.0:
+                self.repair_done = True
+                self.faults = []
+        self._step_fsm(w, dt, now, scouts)
+        if math.hypot(self.trail[-1][0] - self.x, self.trail[-1][1] - self.y) > 0.5:  # docking creeps outside follow()
+            self.trail.append([round(self.x, 2), round(self.y, 2)])
+            del self.trail[:-300]
 
+    def _step_fsm(self, w: World, dt: float, now: float, scouts: list):
+        lim = w.limits
+        v_lim = lim["v_max"]
         st = self.state
         alarm = lim["tip_alarm_deg"]
+        # a struck rover keeps commanding for half a second before the diagnosis lands: wheels lag the command
+        if self.damage_t is not None and not self.damage_handled and now - self.damage_t > 0.5:
+            self.damage_handled = True
+            self.set_state("SAFE_HOLD", now)
+            d, h = self.drive_pct(), self.health_pct()
+            w.trace(self.id, "SAFE_HOLD", "critical_damage", ["IMU", "DIAG", "ODOM"],
+                    f"Shock {self.peak_g:.1f} g; motor controllers: {', '.join(self.faults)}; wheels {self.v_cmd * self.drive_factor():.2f} m/s vs {self.v_cmd:.2f} commanded",
+                    f"Health {h:.0f} % < 15 % critical (structure {self.structure:.0f} %, drive {d:.0f} %): the drivetrain cannot move the rover safely",
+                    0.97, "SAFE_HOLD: drive stopped, brakes on; preparing SOS", "critical", 7.4)
+            self.speed = self.v_cmd = 0.0
+            return
+        if st in ("RESCUE_TRANSIT", "RESCUE_DOCKING", "REPAIRING"):
+            self._rescue_step(w, dt, now)
+            return
+        if st == "AWAIT_RESCUE":
+            self.speed = self.v_cmd = 0.0
+            if self.repair_done and self.health_pct() >= 60:
+                self.set_state("RESUMING", now)
+                w.trace(self.id, "RESUMING", "repaired", ["DIAG", "ODOM", "IMU"],
+                        f"Drive health {self.drive_pct():.0f} % after the field repair; motor controllers report no faults",
+                        f"Health {self.health_pct():.0f} % ≥ 60 % resume threshold; wheel speeds track commands again",
+                        0.95, "SOS resolved: resuming exploration", "info", 12.0)
+            return
+        if st == "SAFE_HOLD" and self.faults:
+            self.speed = self.v_cmd = 0.0
+            if now - self.state_t > 1.0:
+                self.sos_n += 1
+                self.sos_id = f"sos-{self.id}-{self.sos_n}"
+                self.set_state("AWAIT_RESCUE", now)
+                lone = not [p for p in self.peers if p.kind == "rover"]
+                w.trace(self.id, "AWAIT_RESCUE", "sos", ["FLEET", "DIAG"],
+                        f"Health {self.health_pct():.0f} %; {', '.join(self.faults)}; position ({self.x:.1f}, {self.y:.1f})",
+                        f"Cannot self-recover: drive health {self.drive_pct():.0f} % is far below the 60 % needed to move" +
+                        ("; no other rover in the fleet can reach me" if lone else "; a teammate can repair the drivetrain in the field"),
+                        0.96, f"Broadcasting SOS {self.sos_id} at 1 Hz; holding position" + (" (no rescuer available)" if lone else ""), "critical", 9.0)
+            return
         if st not in ("SAFE_HOLD", "RECOVERY_REVERSE") and abs(self.roll) > alarm:
             self.set_state("SAFE_HOLD", now)
             self.speed = 0.0
@@ -228,15 +503,19 @@ class Rover(Agent):
                     "Dust cleared; fused perception trustworthy again", 0.9, "Back to FUSED perception at full speed")
 
     def _new_goal(self, w: World, now: float, scouts: list):
-        others = [s.goal for s in scouts if s.goal]
+        others = [s.goal for s in scouts if s.goal] + [p.goal for p in self.peers if p.goal] + [[p.x, p.y] for p in self.peers]
         g = w.frontier_goal(self.x, self.y, self.yaw, others)
         if g is None:
             self.path = []
             if w.stats()["percent"] >= 95:
                 self.set_state("MISSION_COMPLETE", now)
             return
-        self.goal = [round(g[0], 1), round(g[1], 1)]
         self.path = w.plan((self.x, self.y), g)
+        if not self.path:  # walled in: remember it so the next pick (and the trace) is a real route
+            w.dead_goals.append(g)
+            self.goal = None
+            return
+        self.goal = [round(g[0], 1), round(g[1], 1)]
         dist = math.hypot(g[0] - self.x, g[1] - self.y)
         w.trace(self.id, self.state, "frontier_selected", ["MAP", "FLEET"],
                 f"{int(w.rng.integers(3, 9))} frontier clusters; best at ({g[0]:.1f}, {g[1]:.1f}), {dist:.0f} m",
@@ -362,9 +641,19 @@ class Scout(Agent):
                 self.set_state("SURVEY", now)
                 self._next_lane(w)
         self.z = ground + self.alt
+        if st == "SCANNING":
+            self.v_cmd = self.speed
+        self.imu_accel(w, now)
+        self.power(w, dt)
         if math.hypot(self.trail[-1][0] - self.x, self.trail[-1][1] - self.y) > 1.0:
             self.trail.append([round(self.x, 2), round(self.y, 2)])
             del self.trail[:-300]
+
+    def sensors_json(self, w: World, others: list) -> dict:
+        return {"accel": self.accel, "accel_g": round(math.sqrt(sum(v * v for v in self.accel)) / G0, 3), "gyro": self.gyro,
+                "roll_deg": round(self.roll, 2), "pitch_deg": round(self.pitch, 2), "lidar_nearest_m": None, "lidar_returns_pct": None,
+                "camera_conf": round(max(0.05, 1 - self.unc * 1.2), 2), "v_cmd": round(self.v_cmd, 2), "v_wheel": None,
+                "v_ground": round(self.speed, 2), "slip": None, "altitude_agl": round(self.alt, 1)}
 
     def _next_lane(self, w: World):
         if self.lane_i >= len(self.lanes):

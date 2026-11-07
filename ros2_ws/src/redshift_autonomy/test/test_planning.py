@@ -4,8 +4,10 @@ import numpy as np
 import pytest
 
 from redshift_autonomy.physics_model import RoverPhysics
-from redshift_autonomy.planning import (astar, build_costmap, find_frontiers, path_blocked,
-                                        pure_pursuit, score_frontiers)
+from redshift_autonomy.planning import (RING, add_keepout, astar, build_costmap, cell_to_world, cells_to_world,
+                                        clearance_mask,
+                                        find_frontiers, first_block, path_blocked, path_conflicts, pure_pursuit,
+                                        reachable_from, score_frontiers, standoff_cells, world_to_cell)
 
 RES = 0.5
 ORIGIN = (0.0, 0.0)
@@ -154,6 +156,112 @@ def test_path_blocked_index():
     lethal[0, 6] = True
     assert path_blocked(path, lethal) == 6
     assert path_blocked(path, lethal, start_idx=7) == -1
+
+
+def ring_corridor():
+    """A 2-cell corridor between two lethal walls: every corridor cell lies in the inflation ring, so a rover
+    standing in it can only leave by the ring-escape route, one cell from the walls."""
+    known, lethal, caution, elev = flat()
+    lethal[0:26, 0:10] = True
+    lethal[0:26, 12:40] = True
+    cm = build_costmap(known, lethal, caution, slope_of(elev), elev, lim(2.2), RES, ORIGIN, inflation_m=0.6)
+    path, _ = astar(cm, (2, 10), (35, 20))
+    assert path is not None
+    return lethal, path, cells_to_world(path, RES, ORIGIN)
+
+
+def test_route_planned_through_its_own_ring_is_not_blocked_by_the_unchanged_map():
+    lethal, path, xy = ring_corridor()
+    blocked = clearance_mask(lethal, 0.5, RES)
+    # the bare check flags the planner's own escape route: halt → re-plan the same route → halt (the livelock)
+    assert first_block(path, xy, blocked, lethal, skip_m=1.0) is not None
+    accepted = path_conflicts(path, blocked)
+    assert accepted
+    assert first_block(path, xy, blocked, lethal, skip_m=1.0, accepted=accepted) is None
+
+
+def test_new_lethal_cells_still_block_an_accepted_route():
+    lethal, path, xy = ring_corridor()
+    accepted = path_conflicts(path, clearance_mask(lethal, 0.5, RES))
+    k_rock = next(k for k, (r, c) in enumerate(path) if r == 15)        # a boulder lands in the corridor
+    rocked = lethal.copy()
+    rocked[path[k_rock]] = True
+    hit = first_block(path, xy, clearance_mask(rocked, 0.5, RES), rocked, skip_m=1.0, accepted=accepted)
+    assert hit is not None and hit[0] == k_rock
+    k_open = next(k for k, (r, c) in enumerate(path) if r >= 32)        # and one beside the route in the open
+    r, c = path[k_open]
+    beside = lethal.copy()
+    beside[r, c + 1] = True
+    hit = first_block(path, xy, clearance_mask(beside, 0.5, RES), beside, skip_m=1.0, accepted=accepted)
+    assert hit is not None and hit[0] <= k_open
+    assert hit[1] == pytest.approx(float(np.sum(np.hypot(*np.diff(xy[:hit[0] + 1], axis=0).T))))
+
+
+def test_first_block_ignores_the_segment_under_the_robot():
+    known, lethal, _, _ = flat(10)
+    path = [(0, i) for i in range(10)]
+    xy = cells_to_world(path, RES, ORIGIN)
+    lethal[1, 1] = True                                  # beside cell (0, 1), 0.5 m along the path
+    blocked = clearance_mask(lethal, 0.5, RES)
+    assert first_block(path, xy, blocked, lethal, skip_m=1.0) is None
+    assert first_block(path, xy, blocked, lethal, skip_m=0.0) == (1, pytest.approx(0.5))
+
+
+def target_costmap(tx, ty, n=60, extra=None):
+    """Flat ground with a damaged teammate at (tx, ty), planned as the rescue plans it: an uninflated 1.5 m keep-out
+    (its 0.9 m footprint + the rescuer's 0.6 m radius) on top of the inflated map hazards."""
+    known, lethal, caution, elev = flat(n)
+    if extra is not None:
+        lethal |= extra
+    cm = build_costmap(known, lethal, caution, slope_of(elev), elev, lim(2.2), RES, ORIGIN, inflation_m=0.6)
+    return add_keepout(cm, (tx, ty), 1.5)
+
+
+def test_keepout_is_lethal_without_a_ring():
+    cm = target_costmap(15.0, 15.0)
+    for rc in [(30, 30), (30, 32), (27, 30)]:                     # centres 0.25 / 1.03 / 1.27 m from the teammate
+        assert cm.cost[rc] == np.inf and cm.lethal[rc]
+    assert cm.cost[30, 34] < RING                                  # 2.03 m out: free, no inflation around it
+
+
+@pytest.mark.parametrize('tx,ty', [(15.0, 15.0), (15.3, 14.8), (14.6, 15.4), (15.24, 15.11)])
+def test_standoff_cells_ring_the_target_outside_its_inflation(tx, ty):
+    cm = target_costmap(tx, ty)
+    for approach in np.linspace(-math.pi, math.pi, 13):
+        cells = standoff_cells(cm, (tx, ty), approach)
+        assert cells, 'open ground must always offer a stand-off'
+        for rc in cells:
+            assert cm.cost[rc] < RING
+            x, y = cell_to_world(rc, RES, ORIGIN)
+            assert 2.0 <= math.hypot(x - tx, y - ty) <= 2.45     # goal tolerance 0.6 keeps docking start ≤ 3.05 m
+        x, y = cell_to_world(cells[0], RES, ORIGIN)
+        dev = abs((math.atan2(y - ty, x - tx) - approach + math.pi) % (2 * math.pi) - math.pi)
+        assert dev <= math.radians(22.5)                          # the first choice is in the 2nd 15° band or better
+
+
+def test_standoff_cells_skip_the_side_a_hazard_covers():
+    n = 60
+    hazard = np.zeros((n, n), bool)
+    hazard[:, 32:] = True                                         # everything east of x = 16 m is lethal
+    cm = target_costmap(15.0, 15.0, n, extra=hazard)
+    cells = standoff_cells(cm, (15.0, 15.0), 0.0)                 # approaching from the (blocked) east
+    assert cells
+    assert all(cell_to_world(rc, RES, ORIGIN)[0] < 15.0 for rc in cells)
+
+
+def test_reachable_from_excludes_an_enclosed_pocket():
+    known, lethal, caution, elev = flat()
+    lethal[10:30, 10] = lethal[10:30, 29] = True
+    lethal[10, 10:30] = lethal[29, 10:30] = True                  # a walled pocket
+    cm = build_costmap(known, lethal, caution, slope_of(elev), elev, lim(2.2), RES, ORIGIN, inflation_m=0.6)
+    reach = reachable_from(cm, (2, 2))
+    assert reach[2, 2] and reach[37, 37]
+    assert not reach[20, 20]
+    inside = reachable_from(cm, (20, 20))
+    assert inside[20, 20] and not inside[2, 2]
+    assert cm.cost[9, 9] == RING                                  # inside the wall's inflation ring: may escape it
+    ring_start = reachable_from(cm, (9, 9))
+    assert ring_start[9, 9] and ring_start[2, 2] and not ring_start[20, 20]
 
 
 def test_pure_pursuit_turns_toward_path():

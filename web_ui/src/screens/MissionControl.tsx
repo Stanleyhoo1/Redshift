@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
-import { fmtElapsed, robotName } from '../lib/format'
+import { fmtElapsed, robotShort } from '../lib/format'
 import { useStore } from '../lib/store'
 import { C } from '../lib/theme'
 import { CameraFeed } from '../panels/CameraFeed'
@@ -11,6 +11,8 @@ import { ImuAttitude } from '../panels/ImuAttitude'
 import { InjectBar } from '../panels/InjectBar'
 import { LidarRadar } from '../panels/LidarRadar'
 import { MissionProgress } from '../panels/MissionProgress'
+import { RescueBanner } from '../panels/RescueBanner'
+import { SensorReadings } from '../panels/SensorReadings'
 import { SimSpeed } from '../panels/SimSpeed'
 
 const Globe = lazy(() => import('../globe/Globe'))
@@ -20,17 +22,20 @@ export default function MissionControl() {
     <div className="grid h-full grid-rows-[56px_minmax(0,1fr)]">
       <TopBar />
       <div className="grid min-h-0 grid-cols-[clamp(340px,22.5vw,440px)_minmax(0,1fr)_clamp(370px,24.5vw,480px)] gap-2.5 px-2.5 pb-2.5">
-        <aside className="scroll-thin flex min-h-0 flex-col gap-2.5 overflow-y-auto" aria-label="Sensors">
+        <aside className="scroll-thin flex min-h-0 flex-col gap-2.5 overflow-y-auto" aria-label="Perception">
           <CameraFeed />
-          <div className="grid min-h-[220px] flex-1 grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)] gap-2.5">
+          <div className="grid min-h-[190px] flex-1 grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)] gap-2.5">
             <LidarRadar />
             <ImuAttitude />
           </div>
           <EdgeHud />
         </aside>
         <GlobeStage />
-        <aside className="min-h-0" aria-label="Decisions">
-          <DecisionTrace />
+        <aside className="flex min-h-0 flex-col gap-2.5" aria-label="Sensors and decisions">
+          <SensorReadings />
+          <div className="min-h-0 flex-1">
+            <DecisionTrace />
+          </div>
         </aside>
       </div>
     </div>
@@ -60,7 +65,7 @@ function GlobeStage() {
               aria-pressed={follow}
               className={`rounded-[3px] border px-3 py-1.5 text-[12.5px] font-[650] backdrop-blur-md transition-colors ${follow ? 'border-hb bg-hb/20 text-bone' : 'border-rule-2 bg-void/70 text-haze hover:text-bone'}`}
             >
-              {follow ? `Following ${sel ? robotName(sel) : ''}` : 'Follow selected robot'}
+              {follow ? `Following ${sel ? robotShort(sel) : ''}` : 'Follow selected robot'}
             </button>
             <MapLegend />
           </div>
@@ -71,7 +76,8 @@ function GlobeStage() {
             {detail ? `: ${detail}` : ''}
           </div>
         ) : null}
-        <div className="mx-auto w-full max-w-[980px]">
+        <div className="mx-auto flex w-full max-w-[980px] flex-col gap-2">
+          <RescueBanner />
           <InjectBar />
         </div>
       </div>
@@ -130,7 +136,7 @@ function TopBar() {
         <span className="num ml-2 text-[14px] text-bone">T+{fmtElapsed(mission?.elapsed_s ?? 0)}</span>
       </div>
       <SimSpeed />
-      <div className="num hidden items-baseline gap-4 text-[12.5px] text-haze xl:flex">
+      <div className="num hidden items-baseline gap-4 text-[12.5px] text-haze 2xl:flex">
         <span>
           <span className="text-bone">{g.toFixed(1)} g</span> gravity
         </span>

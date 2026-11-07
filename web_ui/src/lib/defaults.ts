@@ -5,7 +5,7 @@ import type { MissionConfig, Options, PhysicsPreview, LimitingFactor } from './t
 export const DEFAULT_CONFIG: MissionConfig = {
   sector: 'medium',
   gravity_g: 2.2,
-  fleet: { rovers: 1, drones: 1 },
+  fleet: { rovers: 2, drones: 1 },
   edge_profile: 'orin_nano_15w',
   sim_backend: 'gazebo',
   seed: 42,
@@ -20,7 +20,7 @@ export const DEFAULT_OPTIONS: Options = {
     { id: 'large', label: 'Large', size_m: 200, res_m: 1.0, cells: 200 },
   ],
   gravity: { min: 1.0, max: 3.0, step: 0.1, default: 2.2 },
-  fleet: { rovers: { min: 1, max: 2, default: 1 }, drones: { min: 0, max: 1, default: 1 } },
+  fleet: { rovers: { min: 1, max: 2, default: 2 }, drones: { min: 0, max: 1, default: 1 } },
   edge_profiles: [
     { id: 'orin_nano_15w', label: 'Orin Nano 15 W', device: 'NVIDIA Jetson Orin Nano', watts_idle: 5, watts_max: 15, perf_scale: 2.6, perception_hz_max: 10, max_expansions: 60000 },
     { id: 'orin_nx_25w', label: 'Orin NX 25 W', device: 'NVIDIA Jetson Orin NX', watts_idle: 7, watts_max: 25, perf_scale: 1.6, perception_hz_max: 15, max_expansions: 120000 },

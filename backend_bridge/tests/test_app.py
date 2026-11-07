@@ -144,3 +144,55 @@ def test_mission_clock_latches_when_running_begins_even_without_clients(monkeypa
     asyncio.run(hub.on_status())                            # status → running (no clients connected)
     link.sim = (68.0, 1.0)                                  # first telemetry tick a minute later
     assert hub.mission_dict()['elapsed_s'] == 60.0
+
+
+def test_damage_inject_targets_a_running_rover(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    monkeypatch.setattr(appmod.hub, 'link', link)
+    monkeypatch.setattr(appmod.hub, 'mgr', mgr)
+    c = TestClient(appmod.app)
+    r = c.post('/api/inject/damage', json={}).json()
+    assert r['ok'] and 'Scout Rover 1' in r['detail']
+    assert link.cmds == [{'op': 'critical_damage', 'robot': 'rover_0'}]
+    assert c.post('/api/inject/damage', json={'robot': 'rover_1'}).json()['ok']
+    assert c.post('/api/inject/damage', json={'robot': 'scout_0'}).json()['ok'] is False
+    assert len(link.cmds) == 2
+
+
+def test_camera_fan_out_sends_every_robot_and_depth_for_the_selected(monkeypatch):
+    import asyncio
+    import threading
+
+    from backend_bridge.encoders import RobotCache
+
+    class CamLink(FakeLink):
+        def __init__(self):
+            super().__init__()
+            self.lock = threading.Lock()
+            self.robots = {r: RobotCache(r) for r in ('rover_0', 'rover_1', 'scout_0')}
+            self.layers_version, self.layers = 0, None
+            for k, c in enumerate(self.robots.values()):
+                c.jpeg_b64, c.jpeg_t = f'jpg{k}', 100.0 + k
+            self.robots['rover_0'].depth_b64, self.robots['rover_0'].depth_t = 'dep0', 100.0
+
+        def lidar_cloud(self, r):
+            return None
+
+    link, mgr = CamLink(), FakeMgr()
+    monkeypatch.setattr(appmod.hub, 'link', link)
+    monkeypatch.setattr(appmod.hub, 'mgr', mgr)
+    sent = []
+    cl = appmod.Client.__new__(appmod.Client)
+    cl.ws, cl.camera, cl.task, cl.sent_cam, cl.sent_depth = None, 'rover_0', None, {}, None
+    monkeypatch.setattr(appmod.hub, 'clients', {1: cl})
+    monkeypatch.setattr(appmod.hub, 'send', lambda c, text: sent.append(json.loads(text)))
+    monkeypatch.setattr(appmod.hub, 'broadcast', lambda msg: None)
+    asyncio.run(appmod.hub._broadcast_tick({'tick': 0, 'map_v': -1}))
+    cams = [(m['robot'], m['kind']) for m in sent if m['type'] == 'camera']
+    assert set(cams) == {('rover_0', 'rgb'), ('rover_1', 'rgb'), ('scout_0', 'rgb'), ('rover_0', 'depth')}
+    sent.clear()
+    link.robots['rover_1'].jpeg_t += 0.1          # 10 Hz for a non-selected robot: throttled to ≤ 4 Hz
+    link.robots['rover_0'].jpeg_t += 0.1
+    asyncio.run(appmod.hub._broadcast_tick({'tick': 1, 'map_v': -1}))
+    cams = [(m['robot'], m['kind']) for m in sent if m['type'] == 'camera']
+    assert cams == [('rover_0', 'rgb')]

@@ -4,7 +4,7 @@ import * as THREE from 'three'
 import { useRobotIds } from '../lib/hooks'
 import { metresToUnits } from '../lib/geo'
 import { useStore } from '../lib/store'
-import { C, robotColor, stateColor } from '../lib/theme'
+import { ALARM_STATES, C, robotColor, stateColor } from '../lib/theme'
 import { glowTexture, surfacePoint, surfaceQuaternion } from './globeUtil'
 
 const ROVER_SIZE = 0.026
@@ -61,9 +61,14 @@ function sizeFromConfig(st: ReturnType<typeof useStore.getState>): number {
   return st.options.sectors.find((s) => s.id === id)?.size_m ?? 100
 }
 
+const RESCUE_STATES = new Set(['RESCUE_TRANSIT', 'RESCUE_DOCKING', 'REPAIRING'])
+
 function RoverMarker({ id }: { id: string }) {
   const group = useRef<THREE.Group>(null)
   const ring = useRef<THREE.Mesh>(null)
+  const sos = useRef<THREE.Mesh>(null)
+  const sos2 = useRef<THREE.Mesh>(null)
+  const rescue = useRef<THREE.Mesh>(null)
   const glow = useRef<THREE.Sprite>(null)
   const safe = useRef<THREE.Group>(null)
   const geom = useMemo(chevronGeometry, [])
@@ -83,9 +88,31 @@ function RoverMarker({ id }: { id: string }) {
     const sc = stateColor(p.r.state)
     rimMat.color.set(sc)
     glowMat.color.set(sc)
-    const alarm = p.r.state === 'SAFE_HOLD' || p.r.state === 'RECOVERY_REVERSE'
+    const critical = !!p.r.health?.critical || p.r.state === 'AWAIT_RESCUE'
+    const alarm = ALARM_STATES.has(p.r.state) || critical
     const t = clock.elapsedTime
-    if (glow.current) glow.current.scale.setScalar((alarm ? 0.11 : 0.075) * (1 + 0.12 * Math.sin(t * (alarm ? 9 : 2.5))))
+    if (critical) {
+      // damaged unit: the whole marker beats red, hard, so it reads from across the globe
+      const beat = 0.5 + 0.5 * Math.sin(t * 7)
+      rimMat.color.set(C.ha)
+      glowMat.color.set(C.ha)
+      if (glow.current) glow.current.scale.setScalar(0.1 + 0.07 * beat)
+    } else if (glow.current) glow.current.scale.setScalar((alarm ? 0.11 : 0.075) * (1 + 0.12 * Math.sin(t * (alarm ? 9 : 2.5))))
+    // distress rings radiating from a rover awaiting rescue
+    for (const [m, ph] of [[sos.current, 0], [sos2.current, 0.5]] as const) {
+      if (!m) continue
+      m.visible = critical
+      if (!critical) continue
+      const k = (t * 0.8 + ph) % 1
+      m.scale.setScalar(0.03 + 0.09 * k)
+      ;(m.material as THREE.MeshBasicMaterial).opacity = 0.95 * (1 - k)
+    }
+    // rescuer: a turning hi-vis arc while in autonomous rescue mode
+    if (rescue.current) {
+      const on = RESCUE_STATES.has(p.r.state)
+      rescue.current.visible = on
+      if (on) rescue.current.rotation.z = -t * 2.4
+    }
     if (ring.current) {
       ring.current.visible = p.selected
       const s = 1 + 0.25 * ((t * 0.9) % 1)
@@ -116,6 +143,18 @@ function RoverMarker({ id }: { id: string }) {
       <mesh ref={ring} rotation={[-Math.PI / 2, 0, 0]} renderOrder={19}>
         <ringGeometry args={[0.036, 0.04, 48]} />
         <meshBasicMaterial color={C.bone} transparent depthWrite={false} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh ref={sos} rotation={[-Math.PI / 2, 0, 0]} visible={false} renderOrder={18}>
+        <ringGeometry args={[0.86, 1, 56]} />
+        <meshBasicMaterial color={C.ha} transparent depthWrite={false} side={THREE.DoubleSide} blending={THREE.AdditiveBlending} />
+      </mesh>
+      <mesh ref={sos2} rotation={[-Math.PI / 2, 0, 0]} visible={false} renderOrder={18}>
+        <ringGeometry args={[0.86, 1, 56]} />
+        <meshBasicMaterial color={C.ha} transparent depthWrite={false} side={THREE.DoubleSide} blending={THREE.AdditiveBlending} />
+      </mesh>
+      <mesh ref={rescue} rotation={[-Math.PI / 2, 0, 0]} visible={false} renderOrder={19}>
+        <ringGeometry args={[0.044, 0.05, 48, 1, 0, Math.PI * 1.35]} />
+        <meshBasicMaterial color={C.rescue} transparent opacity={0.95} depthWrite={false} side={THREE.DoubleSide} />
       </mesh>
     </group>
     {/* last safe cell: a slowly turning diamond the rover reverses toward */}

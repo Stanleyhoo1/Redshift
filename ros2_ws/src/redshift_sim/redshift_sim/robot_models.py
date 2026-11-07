@@ -27,6 +27,29 @@ SCOUT_SPEC = {
 }
 
 
+ROVER_WHEEL_MASS_KG = 3.0
+ROVER_AXLE_Z = -0.08           # wheel axles below base_link
+
+
+def rover_com_z(spec: dict = ROVER_SPEC) -> float:
+    """Height of the whole rover's centre of mass (chassis + wheels) above its base_link origin."""
+    wheels_m = spec['wheels'] * ROVER_WHEEL_MASS_KG
+    base_m = spec['mass_kg'] - wheels_m
+    return (base_m * (spec['cg_height_m'] - spec['base_height_m']) + wheels_m * ROVER_AXLE_Z) / spec['mass_kg']
+
+
+# Rover paint (docs/protocol.md §8.1 roles): rover_0 is the white scout rover with an orange nose stripe, every other
+# rover is the amber "heavy recovery" rover with a dark stripe. Shared by the SDF and the mock renderer's bodies.
+LIVERY = {
+    'scout': {'chassis': (0.88, 0.88, 0.86), 'stripe': (1.0, 0.35, 0.1), 'stripe_emissive': (0.9, 0.25, 0.05)},
+    'recovery': {'chassis': (0.95, 0.64, 0.10), 'stripe': (0.12, 0.12, 0.13), 'stripe_emissive': (0.0, 0.0, 0.0)},
+}
+
+
+def rover_livery(name: str) -> dict:
+    return LIVERY['scout' if name == 'rover_0' else 'recovery']
+
+
 def _box_inertia(m, x, y, z):
     return (m / 12 * (y * y + z * z), m / 12 * (x * x + z * z), m / 12 * (x * x + y * y))
 
@@ -81,11 +104,13 @@ def _odom_pub(name, hz=30):
 def rover_sdf(name: str, pose, spec: dict = ROVER_SPEC) -> str:
     x, y, z, yaw = pose
     s = spec
+    lv = rover_livery(name)
+    stripe_e = lv['stripe_emissive'] if any(lv['stripe_emissive']) else None
     r = s['wheel_radius_m']
     half_track = s['track_m'] / 2
     half_base = s['wheelbase_m'] / 2
-    axle_z = -0.08
-    wheel_m = 3.0
+    axle_z = ROVER_AXLE_Z
+    wheel_m = ROVER_WHEEL_MASS_KG
     base_m = s['mass_kg'] - 4 * wheel_m
     bx, by, bz = 1.0, 0.62, 0.22
     ixx, iyy, izz = _box_inertia(base_m, bx, by, bz)
@@ -135,7 +160,7 @@ def rover_sdf(name: str, pose, spec: dict = ROVER_SPEC) -> str:
       </collision>
       <visual name="chassis">
         <geometry><box><size>{bx} {by} {bz}</size></box></geometry>
-        {_mat(0.88, 0.88, 0.86, spec=0.5)}
+        {_mat(*lv['chassis'], spec=0.5)}
       </visual>
       <visual name="deck">
         <pose>-0.05 0 0.12 0 0 0</pose>
@@ -145,7 +170,7 @@ def rover_sdf(name: str, pose, spec: dict = ROVER_SPEC) -> str:
       <visual name="stripe">
         <pose>0.505 0 0 0 0 0</pose>
         <geometry><box><size>0.01 0.5 0.06</size></box></geometry>
-        {_mat(1.0, 0.35, 0.1, emissive=(0.9, 0.25, 0.05))}
+        {_mat(*lv['stripe'], emissive=stripe_e)}
       </visual>
       <visual name="mast">
         <pose>{lx} 0 {(lz + 0.11) / 2:.3f} 0 0 0</pose>

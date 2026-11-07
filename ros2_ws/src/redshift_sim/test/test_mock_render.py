@@ -128,3 +128,77 @@ def test_full_rover_and_scout_frames_are_fast_enough():
     assert np.isfinite(depth).mean() > 0.4 and np.isfinite(pts).all(axis=2).mean() > 0.3
     assert dt_rover < 0.08, f'rover camera + lidar took {dt_rover * 1000:.0f} ms'
     assert dt_scout < 0.04, f'scout camera took {dt_scout * 1000:.0f} ms'
+
+
+# ---------------------------------------------------------------- robots in the scene (protocol §8: teammates)
+def _two_rovers():
+    from redshift_sim.mock_render import robot_body
+    sc = flat_scene()
+    bodies = {}
+    for name, x in (('rover_1', 0.0), ('rover_0', 4.0)):          # rover_0 4 m in front of rover_1, both facing +x
+        parts = robot_body(name)
+        ids = sc.add_body(parts)
+        sc.set_body_pose(ids, parts, (x, 0.0, ROVER_SPEC['base_height_m']), np.eye(3), 0.0)
+        bodies[name] = ids
+    return sc, bodies
+
+
+def test_a_robot_is_seen_by_another_robots_camera_and_lidar_but_not_by_its_own():
+    sc, b = _two_rovers()
+    own = frozenset(b['rover_1'])
+    base = np.array([0.0, 0.0, ROVER_SPEC['base_height_m']])
+    cam_o = base + np.array(ROVER_SPEC['camera_xyz'])
+    R = camera_rotation(np.eye(3), ROVER_SPEC['camera_pitch_rad'])
+    rgb, depth = camera_frame(sc, cam_o, R, 320, 240, ROVER_SPEC['camera_hfov'], 40.0, exclude=own)
+    fx, cx, cy = camera_intrinsics(320, 240, ROVER_SPEC['camera_hfov'])
+    # rover_0's chassis centre projected into rover_1's image: a near return (its rear is 4 − 0.55 m away)
+    pc = R.T @ (np.array([4.0, 0.0, ROVER_SPEC['base_height_m']]) - cam_o)
+    u, v = int(round(cx - fx * pc[1] / pc[0])), int(round(cy - fx * pc[2] / pc[0]))
+    patch = depth[v - 3:v + 4, u - 3:u + 4]
+    assert np.median(patch) == pytest.approx(3.45 - 0.45, abs=0.35)
+    # rover_0 is the white scout rover: its (shaded) rear is unsaturated grey, unlike the rust regolith around it
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    assert np.median(hsv[v - 3:v + 4, u - 3:u + 4, 1]) < 60 and np.median(hsv[230, 20:300, 1]) > 90
+    # LiDAR: forward beams return off rover_0's rear, nothing within the robot's own body
+    lid_o = base + np.array(ROVER_SPEC['lidar_xyz'])
+    pts = lidar_scan(sc, lid_o, np.eye(3), ROVER_SPEC, exclude=own)
+    rng = np.linalg.norm(pts, axis=2)
+    fwd = rng[:, 178:183]                                              # azimuth ≈ 0 (column 180)
+    assert np.isfinite(fwd).any() and np.nanmin(np.where(np.isfinite(fwd), fwd, np.nan)) < 3.8
+    assert np.nanmin(np.where(np.isfinite(rng), rng, np.nan)) > 1.0
+    # a ray straight down through rover_1's own deck hits its body unless it is excluded
+    o, d = np.array([[0.0, 0.0, 2.0]]), np.array([[0.0, 0.0, -1.0]])
+    t, kind, _, _ = sc.raycast(o, d, 0.1, 10.0)
+    assert kind[0] == Scene.ROBOT and t[0] == pytest.approx(2.0 - (ROVER_SPEC['base_height_m'] + 0.26), abs=0.02)
+    t, kind, _, _ = sc.raycast(o, d, 0.1, 10.0, exclude=own)
+    assert kind[0] == Scene.GROUND and t[0] == pytest.approx(2.0, abs=0.02)
+    # without exclusion (backward-compatible default) rover_1's own body is part of the scene too
+    _, depth_all = camera_frame(sc, cam_o, R, 320, 240, ROVER_SPEC['camera_hfov'], 40.0)
+    assert np.isfinite(depth_all).sum() >= np.isfinite(depth).sum()
+
+
+def test_recovery_rover_livery_is_amber_and_bodies_follow_their_robot():
+    from redshift_sim.mock_render import robot_body
+    sc, b = _two_rovers()
+    d = np.array([[0.0, 0.0, -1.0]])
+    sc.set_body_pose(b['rover_1'], robot_body('rover_1'), (4.0, 3.0, ROVER_SPEC['base_height_m']), np.eye(3), 0.5)
+    sc.update(5.0)                                                      # falling-rock update keeps robot heights
+    assert sc.c[b['rover_1'][0]][2] == pytest.approx(ROVER_SPEC['base_height_m'])
+    _, kind, _, _ = sc.raycast(np.array([[0.0, 0.0, 3.0]]), d, 0.1, 10.0)
+    assert kind[0] == Scene.GROUND                                      # rover_1 left its spawn point…
+    _, kind, _, obj = sc.raycast(np.array([[4.0, 3.0, 3.0]]), d, 0.1, 10.0)
+    assert kind[0] == Scene.ROBOT and obj[0] in b['rover_1']            # …and its body went with it
+    # look down at rover_1's chassis edge (off the dark deck) from above: amber, saturated
+    R = camera_rotation(np.eye(3), math.pi / 2)
+    rgb, _ = camera_frame(sc, np.array([4.0, 3.0, 4.0]), R, 160, 120, SCOUT_SPEC['camera_hfov'], 40.0)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    amber = (hsv[..., 0] >= 14) & (hsv[..., 0] <= 30) & (hsv[..., 1] > 150) & (hsv[..., 2] > 150)
+    assert amber.sum() > 30
+
+
+def test_robot_bodies_do_not_block_motion():
+    sc, b = _two_rovers()
+    assert not sc.blocked(4.0, 0.0, 0.5)                                # no robot–robot collision in the mock
+    sc.add_rocks([(10.0, 0.0, 0.8)], t=-10.0)
+    sc.update(0.0)
+    assert sc.blocked(10.0, 0.0, 0.5)

@@ -1,8 +1,9 @@
 import { useFrame } from '@react-three/fiber'
 import { useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
+import { metresToUnits } from '../lib/geo'
 import { GHOST_LIFETIME_MS, ghosts, type PathGhost } from '../lib/history'
-import { useRobotIds } from '../lib/hooks'
+import { useRescue, useRobotIds } from '../lib/hooks'
 import { useStore } from '../lib/store'
 import { C, robotColor } from '../lib/theme'
 import { drape, surfacePoint, surfaceQuaternion, useFatLine } from './globeUtil'
@@ -21,8 +22,41 @@ export function PathLines() {
         <RobotPath key={id} id={id} />
       ))}
       <GhostPaths />
+      <RescueTether />
     </group>
   )
+}
+
+const TETHER_N = 40
+
+/** Hi-vis arc from the recovery rover to the damaged one while a rescue is under way, flowing toward the target. */
+function RescueTether() {
+  const v = useRescue()
+  const active = !!v && !!v.rescuer && !v.resolved && !v.aborted
+  const from = useStore((s) => (active && v?.rescuer ? s.telemetry?.robots[v.rescuer]?.pose : undefined))
+  const to = useStore((s) => (active && v ? s.telemetry?.robots[v.target]?.pose : undefined))
+  const map = useStore((s) => s.map)
+  const L = useSectorSize()
+  const locked = !!v?.locked
+  const pos = useMemo(() => {
+    if (!from || !to) return null
+    const d = Math.hypot(to.x - from.x, to.y - from.y)
+    const arc = Math.min(0.06, metresToUnits(d, L) * 0.3)
+    const out = new Float32Array((TETHER_N + 1) * 3)
+    const p = new THREE.Vector3()
+    for (let k = 0; k <= TETHER_N; k++) {
+      const f = k / TETHER_N
+      surfacePoint(map, from.x + (to.x - from.x) * f, from.y + (to.y - from.y) * f, L, 0.012 + arc * 4 * f * (1 - f), from.z + (to.z - from.z) * f, p)
+      out.set([p.x, p.y, p.z], k * 3)
+    }
+    return out
+  }, [from, to, map, L])
+  const line = useFatLine(pos, null, { color: C.rescue, width: 3.2, dashed: true, dashSize: 0.009, gapSize: 0.006 })
+  useFrame((_, dt) => {
+    line.material.dashOffset -= dt * (locked ? 0.06 : 0.035)
+    line.material.opacity = locked ? 1 : 0.85
+  })
+  return <primitive object={line} renderOrder={14} />
 }
 
 function RobotPath({ id }: { id: string }) {
