@@ -171,6 +171,15 @@ def test_trace_dedup():
     assert c['id'] > a['id'] and TRACE_KEYS <= set(a)
 
 
+def test_trace_timestamp_is_wall_clock_while_dedup_follows_sim_time():
+    import time
+    tb = TraceBuilder('rover_0', dedup_s=2.0)
+    a = tb.make('k', 'EXPLORING', ['MAP'], 'x', 'y', 0.9, 'z', now=5.0)     # now = simulated seconds
+    assert abs(a['t'] - time.time()) < 5.0                                     # t = epoch, for the UI clock
+    assert tb.make('k', 'EXPLORING', ['MAP'], 'x', 'y', 0.9, 'z', now=6.9) is None
+    assert tb.make('k', 'EXPLORING', ['MAP'], 'x', 'y', 0.9, 'z', now=7.1) is not None
+
+
 def scout_inp(now, **kw):
     base = dict(now=now, pose=(0.0, 0.0, 12.0), altitude_agl=12.0, goal_reached=False, scan_request=None,
                 scan_stats=None, frontiers_left=True)

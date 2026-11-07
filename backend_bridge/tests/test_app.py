@@ -78,3 +78,69 @@ def test_request_validation_and_origin_guard():
     assert c.post('/api/mission/deploy', json={'sector': 'galactic'}).status_code == 422
     r = c.post('/api/mission/abort', headers={'origin': 'https://evil.example'})
     assert r.status_code == 403
+
+
+class FakeLink:
+    def __init__(self):
+        self.cmds, self.stats, self.env, self.sim = [], {}, {}, (None, None)
+
+    def publish_command(self, cmd):
+        self.cmds.append(cmd)
+        return 1
+
+    def sim_clock(self):
+        return self.sim
+
+
+class FakeMgr:
+    def __init__(self, status='running'):
+        from backend_bridge.config_schema import MissionConfig
+        self.status, self.backend, self.running_since = status, 'mock', 1000.0
+        self.config = MissionConfig(sim_backend='mock')
+
+    def status_dict(self):
+        return {'status': self.status}
+
+
+def test_sim_speed_endpoint_validates_commands_and_records(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    monkeypatch.setattr(appmod.hub, 'link', link)
+    monkeypatch.setattr(appmod.hub, 'mgr', mgr)
+    c = TestClient(appmod.app)
+    assert c.post('/api/sim/speed', json={'speed': 5.0}).status_code == 422
+    assert c.post('/api/sim/speed', json={'speed': 'fast'}).status_code == 422
+    assert c.post('/api/sim/speed', json={}).status_code == 422
+    r = c.post('/api/sim/speed', json={'speed': 2.0}).json()
+    assert r['ok'] and r['speed'] == 2.0
+    assert link.cmds == [{'op': 'set_speed', 'speed': 2.0}]
+    assert appmod.hub.speed == 2.0 and mgr.config.sim_speed == 2.0
+    mgr.status = 'launching'
+    assert c.post('/api/sim/speed', json={'speed': 1.0}).json()['ok'] is False
+    assert len(link.cmds) == 1
+
+
+def test_mission_elapsed_follows_sim_time_and_relatches_on_restart(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    hub = Hub()
+    hub.link, hub.mgr = link, mgr
+    monkeypatch.setattr(appmod.time, 'time', lambda: 1010.0)
+    assert hub.mission_dict()['elapsed_s'] == 10.0          # no /clock yet: wall time since running
+    link.sim = (40.0, 2.0)
+    d = hub.mission_dict()
+    assert d['elapsed_s'] == 0.0 and d['rtf'] == 2.0 and d['sim_time_s'] == 40.0
+    link.sim = (52.5, 2.0)
+    assert hub.mission_dict()['elapsed_s'] == 12.5          # simulated seconds since it began running
+    link.sim = (3.0, 1.0)                                   # world restarted (clock went backwards)
+    assert hub.mission_dict()['elapsed_s'] == 0.0
+    mgr.running_since = None
+    assert hub.mission_dict()['elapsed_s'] == 0.0
+
+
+def test_mission_clock_latches_when_running_begins_even_without_clients(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    hub = Hub()
+    hub.link, hub.mgr = link, mgr
+    link.sim = (8.0, 1.0)
+    asyncio.run(hub.on_status())                            # status → running (no clients connected)
+    link.sim = (68.0, 1.0)                                  # first telemetry tick a minute later
+    assert hub.mission_dict()['elapsed_s'] == 60.0

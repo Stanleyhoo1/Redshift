@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import base64
+import collections
 import math
+import struct
 from dataclasses import dataclass, field
 
 import cv2
@@ -117,3 +119,46 @@ def robot_telemetry(c: RobotCache) -> dict:
         'trail': c.trail.points(),
         'last_safe': a.get('last_safe'),
     }
+
+
+def decode_clock_cdr(raw: bytes) -> float | None:
+    """Seconds from a serialized rosgraph_msgs/Clock (CDR: 4-byte encapsulation header, int32 sec, uint32 nanosec).
+    The backend subscribes to /clock raw (≈100–200 Hz), so it skips rclpy deserialisation."""
+    if len(raw) < 12:
+        return None
+    endian = '<' if raw[1] == 1 else '>'
+    sec, nsec = struct.unpack_from(endian + 'iI', raw, 4)
+    return sec + nsec * 1e-9
+
+
+class RtfMeter:
+    """Achieved real-time factor: simulated seconds per wall second over a sliding window."""
+
+    def __init__(self, window_s: float = 2.0, sample_every_s: float = 0.05):
+        self.window_s, self.every = window_s, sample_every_s
+        self._samples: collections.deque = collections.deque()
+        self._latest: tuple[float, float] | None = None
+
+    @property
+    def sim_t(self) -> float | None:
+        return self._latest[1] if self._latest else None
+
+    def add(self, wall: float, sim: float):
+        if self._latest and sim + 1e-6 < self._latest[1]:
+            self._samples.clear()                  # clock went backwards: a new world started
+        self._latest = (wall, sim)
+        if not self._samples or wall - self._samples[-1][0] >= self.every:
+            self._samples.append((wall, sim))
+        while self._samples and wall - self._samples[0][0] > self.window_s:
+            self._samples.popleft()
+
+    def rtf(self, now_wall: float) -> float | None:
+        if not self._latest or not self._samples:
+            return None
+        w1, s1 = self._latest
+        if now_wall - w1 > 1.0:
+            return 0.0                             # no clock for a second: stalled or paused
+        w0, s0 = self._samples[0]
+        if w1 - w0 < 0.5:
+            return None
+        return (s1 - s0) / (w1 - w0)

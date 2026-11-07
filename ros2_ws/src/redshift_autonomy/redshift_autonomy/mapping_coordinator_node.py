@@ -87,7 +87,6 @@ class MappingCoordinator(Node):
         res = float(self.get_parameter('map_res').value)
         specs = json.loads(self.get_parameter('specs_json').value or '{}')
         self.map = GlobalMap(size_m, res)
-        self.t0 = time.monotonic()
         self.feeds = {r: RobotFeed(r, specs.get(r, {})) for r in self.get_parameter('robots').value}
         for r, f in self.feeds.items():
             self.create_subscription(Odometry, f'/{r}/odom', lambda m, f=f: self.on_odom(f, m), SENSOR_QOS)
@@ -112,7 +111,8 @@ class MappingCoordinator(Node):
                                f'robots={list(self.feeds)}')
 
     def now(self) -> float:
-        return time.monotonic() - self.t0
+        """Simulated seconds (use_sim_time): reveal ages and observation times follow the sim speed."""
+        return self.get_clock().now().nanoseconds * 1e-9
 
     # ------------------------------------------------------------------ inputs
     def on_odom(self, f: RobotFeed, m: Odometry):

@@ -51,7 +51,19 @@ Global:
 | `/fleet/scan_complete` | std_msgs/String | `{id, scout, xy, max_slope_deg, mean_slope_deg, verdict, t}` |
 | `/world/command` | std_msgs/String | §4 |
 | `/world/events` | std_msgs/String | §4 |
-| `/world/env_state` | std_msgs/String | `{dust_level, seismic, until_t}` |
+| `/world/env_state` | std_msgs/String | `{dust_level, seismic, remaining_s}` (`remaining_s` = simulated s of dust left, null when clear) |
+| `/clock` | rosgraph_msgs/Clock | simulated time, ≤100 Hz (every 0.01 s of sim time): `world_interface_node` (republished from Gazebo via `/gz/clock`) or `mock_world_node` |
+| `/gz/clock` | rosgraph_msgs/Clock | Gazebo backend only: gz-sim's per-step clock (250 Hz at 1×) via ros_gz_bridge → `world_interface_node` |
+
+### 2.1 Simulated time
+
+Every autonomy node and `sensor_effects_node` runs with `use_sim_time: true`: timers, hold/settle durations, dedup
+windows and sensor stamps follow `/clock`, so the agents behave identically at any simulation speed. The two clock
+sources keep their own clocks: Gazebo (paced by its physics `real_time_factor`) and the mock world (a lockstep clock:
+time advances at `speed` × wall time but waits for any sensor frame still rendering, so sensor rates hold per
+simulated second and an overloaded renderer lowers the achieved real-time factor instead of dropping frames).
+Human-facing `t` fields in JSON payloads (traces, events, fleet messages) stay **wall-clock epoch** seconds, because
+the UI shows them as times of day.
 
 ## 3. JSON payloads
 
@@ -103,7 +115,10 @@ Commands (published by the backend; executed by `world_interface_node` (Gazebo) 
 {"op":"jolt","robot":"rover_0"}
 {"op":"anomaly","dust_level":0.85,"duration_s":25,"seismic_s":4}
 {"op":"clear_anomaly"}
+{"op":"set_speed","speed":2.0}
 ```
+`set_speed` changes the target real-time factor live (clamped to 0.1–4): Gazebo via `/world/<w>/set_physics`
+(`max_step_size` unchanged), the mock via its pacer. `duration_s` / `seismic_s` are simulated seconds.
 `spawn_rockslide` drops a ~7 m-wide line of boulders across the robot's planned path (`scene_events.rockslide_layout`):
 7 m ahead along the route, or 60 % of the remaining route when that is shorter (never under 3 m), so the line never
 lands beyond the path's end; along the heading when there is no path.
@@ -112,7 +127,8 @@ Events (one per executed command):
 ```json
 {"op":"spawn_rockslide","ok":true,"robot":"rover_0","impact":[x,y],"rocks":[[x,y,r]],"t":0.0}
 {"op":"jolt","ok":true,"robot":"rover_0","t":0.0}
-{"op":"anomaly","ok":true,"dust_level":0.85,"until_t":0.0,"t":0.0}
+{"op":"anomaly","ok":true,"dust_level":0.85,"duration_s":25,"t":0.0}
+{"op":"set_speed","ok":true,"speed":2.0,"t":0.0}
 ```
 
 ## 5. Map layer image (`/planet_map/layers`, WS `map.png_b64`)
@@ -128,7 +144,7 @@ RGB8, height = width = grid cells, **pixel row i = grid row i (row 0 = southmost
 - `GET /api/options` →
   `{sectors:[{id,label,size_m,res_m,cells}], gravity:{min,max,step,default}, fleet:{rovers:{min,max,default}, drones:{min,max,default}},
     edge_profiles:[{id,label,device,watts_idle,watts_max,perf_scale,perception_hz_max,max_expansions}],
-    backends:[{id,label,available}], defaults:MissionConfig}`
+    backends:[{id,label,available}], sim_speed:{choices:[0.5,1,1.5,2], min:0.25, max:3, default:1}, defaults:MissionConfig}`
 - `GET /api/physics_preview?g=2.2` →
   `{g, max_slope_deg, factor:"slip"|"drive_torque"|"tip", drive_deg, slip_deg, tip_deg, tip_alarm_deg, v_max, energy_j_per_m}`
 - `POST /api/mission/deploy` body MissionConfig → `{ok, mission_id, status}`
@@ -136,14 +152,19 @@ RGB8, height = width = grid cells, **pixel row i = grid row i (row 0 = southmost
 - `GET /api/mission/status` → `{status, backend, config, started_at, checklist:{name:bool}, detail}`
 - `POST /api/inject/rockslide` `{robot?}` · `POST /api/inject/anomaly` `{dust_level?, duration_s?}` ·
   `POST /api/inject/tip` `{robot?}` → `{ok, detail}`
+- `POST /api/sim/speed` `{speed}` (0.25–3) → `{ok, speed, detail}` — live speed change of the running mission (also
+  recorded in the mission config that telemetry and status report); `{ok:false}` when no mission is running.
 
 **MissionConfig**
 ```json
 {"sector":"medium","gravity_g":2.2,"fleet":{"rovers":1,"drones":1},
- "edge_profile":"orin_nano_15w","sim_backend":"gazebo","seed":42,"gazebo_gui":false}
+ "edge_profile":"orin_nano_15w","sim_backend":"gazebo","seed":42,"gazebo_gui":false,"sim_speed":1.0}
 ```
 sector ∈ `small (50 m @ 0.5 m) | medium (100 m @ 0.5 m) | large (200 m @ 1.0 m)`;
-edge_profile ∈ `orin_nano_15w | orin_nx_25w | agx_orin_60w | rpi5_8w`; sim_backend ∈ `gazebo | mock`.
+edge_profile ∈ `orin_nano_15w | orin_nx_25w | agx_orin_60w | rpi5_8w`; sim_backend ∈ `gazebo | mock`;
+sim_speed ∈ 0.25–3.0 = target simulated seconds per wall second (the world's `real_time_factor`). Measured on the
+dev machine with 1 rover + 1 scout and the full autonomy stack: Gazebo holds 2× (1.8–2.05), the mock world tops out
+near 1.1–1.5× (its numpy sensor rendering is CPU/GIL-bound); the achieved factor is reported as `rtf`.
 
 Mission status values: `idle | launching | running | degraded | failed | stopped`. A mission that is `degraded`
 only because a subsystem was late returns to `running` when it arrives.
@@ -162,10 +183,13 @@ request (POST) or a `/ws` upgrade whose `Origin` is neither localhost nor this s
 Server → client (JSON text frames):
 - `{"type":"status", status, backend, detail, checklist:{gazebo,bridge,mapping,rover_0,scout_0,...}, config}` — on change and 1 Hz while launching.
 - `{"type":"boot_log","line":"…","t":…}`
-- `{"type":"telemetry","t":…,"mission":{status, backend, elapsed_s, percent_mapped, science_found, hazard_cells, env:{dust_level, seismic}, config},
+- `{"type":"telemetry","t":…,"mission":{status, backend, elapsed_s, sim_time_s, sim_speed, rtf, percent_mapped, science_found, hazard_cells, env:{dust_level, seismic}, config},
    "robots":{"rover_0":{type, pose:{x,y,z,roll,pitch,yaw}, speed, state, mode, goal, v_limit, slip, tip_alarm_deg, max_slope_deg,
    altitude_agl, imu:{roll_deg,pitch_deg,gyro:[x,y,z]}, uncertainty:{score,camera_conf,lidar_conf,imu_vib}, edge:{…§3.4},
    path:[[x,y],…≤150], trail:[[x,y],…≤300], last_safe:[x,y]|null}}}` — 15 Hz.
+  `elapsed_s` = mission time since `running` in **simulated** seconds (wall seconds until `/clock` is seen);
+  `sim_time_s` = simulator clock; `sim_speed` = target; `rtf` = achieved real-time factor over ~2 s (null until
+  measured, 0 when the clock has stalled).
 - `{"type":"camera","robot":"rover_0","jpeg_b64":"…","t":…}` — ≤10 Hz, only the client's selected robot.
 - `{"type":"lidar","robot":"rover_0","points":[[x,y,z],…≤1500],"max_range":25,"t":…}` — 5 Hz, body frame, selected robot.
 - `{"type":"map","png_b64":"…","meta":{size_m,res,cells,origin:[x0,y0],elev_min,elev_max},"stats":{…/planet_map/stats}}` — 2–4 Hz.

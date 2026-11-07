@@ -49,7 +49,7 @@ class Perception(Node):
         self.lidar_q = None
         self.corridor = {'obstacle_dist_m': math.inf, 'slope_ahead_deg': 0.0, 'conf': 0.0, 'points': 0}
         self.scan_pts = np.zeros((0, 3))
-        self._last_frame = 0.0
+        self._last_frame = -1e9
         self._fps = collections.deque(maxlen=10)
         self.create_subscription(Image, f'/{r}/camera/image', lambda m: setattr(self, 'rgb', m), SENSOR_QOS)
         self.create_subscription(Image, f'/{r}/camera/depth', lambda m: setattr(self, 'depth', m), SENSOR_QOS)
@@ -112,7 +112,7 @@ class Perception(Node):
 
     # ------------------------------------------------------------------ main loop
     def tick(self):
-        now = time.monotonic()
+        now = self.get_clock().now().nanoseconds * 1e-9     # simulated: the edge-profile rate is per sim second
         if self.rgb is None or self.depth is None or now - self._last_frame < 1.0 / max(self.hz, 0.5):
             return
         rgb_msg, depth_msg = self.rgb, self.depth

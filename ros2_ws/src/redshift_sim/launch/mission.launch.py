@@ -32,7 +32,10 @@ def _setup(context):
     robots = meta['robots']
     edge = cfg.get('edge_profile', 'orin_nano_15w')
     specs = {r: (ROVER_SPEC if r.startswith('rover') else SCOUT_SPEC) for r in robots}
-    acts = [LogInfo(msg=f'[redshift] backend={backend} sector={size_m}m g={g} robots={robots} runtime={runtime}')]
+    speed = meta['sim_speed']
+    sim = {'use_sim_time': True}      # every consumer runs on /clock; the two clock sources below keep their own
+    acts = [LogInfo(msg=f'[redshift] backend={backend} sector={size_m}m g={g} robots={robots} speed={speed:g}x '
+                        f'runtime={runtime}')]
 
     if backend == 'gazebo':
         acts.append(ExecuteProcess(cmd=['gz', 'sim', '-s', '-r', '--headless-rendering', '-v', '2', meta['world_path']],
@@ -43,20 +46,20 @@ def _setup(context):
                          parameters=[{'config_file': meta['bridge_path']}]))
         acts.append(Node(package='redshift_sim', executable='world_interface_node', name='world_interface',
                          output='screen', parameters=[{'world_name': meta['world_name'], 'terrain_path': meta['terrain_path'],
-                                                       'g_mult': g, 'robots': robots}]))
+                                                       'g_mult': g, 'robots': robots, 'max_step_s': meta['max_step_s']}]))
     else:
         acts.append(Node(package='redshift_sim', executable='mock_world_node', name='mock_world', output='screen',
                          parameters=[{'terrain_path': meta['terrain_path'], 'robots': robots, 'g_mult': g,
-                                      'spawn_json': json.dumps(meta['spawn']), 'specs_json': json.dumps(specs)}]))
+                                      'spawn_json': json.dumps(meta['spawn']), 'specs_json': json.dumps(specs),
+                                      'sim_speed': speed}]))
 
     for r in robots:
         rtype = 'rover' if r.startswith('rover') else 'scout'
         acts.append(Node(package='redshift_sim', executable='sensor_effects_node', name=f'{r}_sensor_effects',
-                         output='log', parameters=[{'robot': r, 'robot_type': rtype,
-                                                    'publish_env': r == robots[0]}]))
+                         output='log', parameters=[dict(sim, robot=r, robot_type=rtype, publish_env=r == robots[0])]))
 
     if autonomy:
-        common = {'g_mult': g, 'edge_profile': edge, 'size_m': size_m, 'map_res': res}
+        common = dict(sim, g_mult=g, edge_profile=edge, size_m=size_m, map_res=res)
         acts.append(Node(package='redshift_autonomy', executable='mapping_coordinator_node', name='mapping_coordinator',
                          output='screen', parameters=[dict(common, robots=robots, specs_json=json.dumps(specs))]))
         for r in robots:

@@ -1,10 +1,11 @@
+import pytest
 import base64
 import math
 
 import cv2
 import numpy as np
 
-from backend_bridge.encoders import (RobotCache, Trail, downsample_path, lidar_points_body, png_b64,
+from backend_bridge.encoders import (RobotCache, RtfMeter, Trail, decode_clock_cdr, downsample_path, lidar_points_body, png_b64,
                                      robot_telemetry)
 
 ROBOT_KEYS = {'type', 'pose', 'speed', 'state', 'mode', 'goal', 'v_limit', 'slip', 'tip_alarm_deg', 'max_slope_deg',
@@ -58,3 +59,31 @@ def test_robot_telemetry_complete_with_partial_cache():
     assert t['imu']['roll_deg'] == round(math.degrees(0.1), 2) and t['edge']['load_pct'] == 50.0
     s = robot_telemetry(RobotCache('scout_0'))
     assert s['type'] == 'scout' and s['slip'] == 0.0
+
+
+def test_decode_clock_cdr():
+    import struct
+    raw = b'\x00\x01\x00\x00' + struct.pack('<iI', 12, 500_000_000)       # CDR LE header + builtin Time
+    assert decode_clock_cdr(raw) == 12.5
+    assert decode_clock_cdr(b'\x00') is None
+    try:
+        from rclpy.serialization import serialize_message
+        from rosgraph_msgs.msg import Clock
+        from builtin_interfaces.msg import Time
+    except ImportError:
+        return
+    assert decode_clock_cdr(serialize_message(Clock(clock=Time(sec=7, nanosec=250_000_000)))) == 7.25
+
+
+def test_rtf_meter_tracks_speed_resets_and_stalls():
+    m = RtfMeter(window_s=2.0)
+    assert m.rtf(0.0) is None
+    for k in range(300):                       # 3 s wall at 200 Hz, sim at 2x
+        m.add(k * 0.01, k * 0.02)
+    assert m.rtf(2.99) == pytest.approx(2.0, abs=0.02) and m.sim_t == pytest.approx(5.98)
+    m.add(3.0, 0.0)                            # new world: clock restarted
+    assert m.sim_t == 0.0 and m.rtf(3.0) is None
+    for k in range(1, 100):
+        m.add(3.0 + k * 0.01, k * 0.005)       # 0.5x
+    assert m.rtf(3.99) == pytest.approx(0.5, abs=0.02)
+    assert m.rtf(6.0) == 0.0                   # no clock for > 1 s: simulation stalled / paused

@@ -13,7 +13,7 @@ from typing import Callable
 import numpy as np
 
 from . import _paths  # noqa: F401
-from .encoders import RobotCache, downsample_path
+from .encoders import RobotCache, RtfMeter, decode_clock_cdr, downsample_path
 from .mission_manager import readiness_from_marks
 
 try:
@@ -23,6 +23,7 @@ try:
     from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
     from rclpy.qos import qos_profile_sensor_data as SENSOR_QOS
     from rclpy.signals import SignalHandlerOptions
+    from rosgraph_msgs.msg import Clock
     from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
     from std_msgs.msg import String
     HAVE_ROS = True
@@ -59,6 +60,8 @@ class RosLink:
         n.create_subscription(String, '/world/env_state', self._on_env, 10)
         n.create_subscription(Image, '/planet_map/layers', self._on_layers, MAP_QOS)
         n.create_subscription(String, '/planet_map/stats', self._on_stats, MAP_QOS)
+        # simulated time (Gazebo or the mock world) → mission clock + achieved real-time factor. ~100 Hz, so raw CDR.
+        n.create_subscription(Clock, '/clock', self._on_clock, SENSOR_QOS, raw=True)
         self._stop = threading.Event()
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(n)
@@ -84,11 +87,12 @@ class RosLink:
     # ------------------------------------------------------------------ fleet (re)configuration
     def reset(self):
         with self.lock:
-            self.env = {'dust_level': 0.0, 'seismic': False, 'until_t': None}
+            self.env = {'dust_level': 0.0, 'seismic': False, 'remaining_s': None}
             self.layers: np.ndarray | None = None
             self.layers_version = 0
             self.stats: dict = {}
             self.first_global: dict = {}
+            self.clock = RtfMeter()
 
     def set_fleet(self, robots: list[str], specs: dict):
         with self.lock:
@@ -195,6 +199,13 @@ class RosLink:
             self.env = d
             self.first_global.setdefault('env', time.time())
 
+    def _on_clock(self, raw: bytes):
+        t = decode_clock_cdr(raw)
+        if t is None:
+            return
+        with self.lock:
+            self.clock.add(time.monotonic(), t)
+
     def _on_layers(self, m):
         arr = np.frombuffer(bytes(m.data), np.uint8).reshape(m.height, m.width, 3)
         with self.lock:
@@ -218,6 +229,11 @@ class RosLink:
             marks = {r: dict(c.first) for r, c in self.robots.items()}
             glob = dict(self.first_global)
         return readiness_from_marks(backend, marks, glob)
+
+    def sim_clock(self) -> tuple[float | None, float | None]:
+        """(latest simulated time s, achieved real-time factor) — None until /clock has been seen."""
+        with self.lock:
+            return self.clock.sim_t, self.clock.rtf(time.monotonic())
 
     def lidar_cloud(self, robot: str):
         with self.lock:

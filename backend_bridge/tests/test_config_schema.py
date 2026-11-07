@@ -8,12 +8,14 @@ def test_defaults_and_robots():
     c = MissionConfig()
     assert c.sector == 'medium' and c.gravity_g == 2.2 and c.edge_profile == 'orin_nano_15w'
     assert c.robots == ['rover_0', 'scout_0']
+    assert c.sim_speed == 1.0 and MissionConfig(sim_speed=2.0).sim_speed == 2.0
     assert MissionConfig(fleet={'rovers': 2, 'drones': 0}).robots == ['rover_0', 'rover_1']
 
 
 @pytest.mark.parametrize('bad', [{'gravity_g': 3.5}, {'gravity_g': 0.9}, {'fleet': {'rovers': 3, 'drones': 1}},
                                  {'fleet': {'rovers': 0, 'drones': 1}}, {'sector': 'huge'},
-                                 {'edge_profile': 'gpu_9000'}, {'unknown_key': 1}])
+                                 {'edge_profile': 'gpu_9000'}, {'unknown_key': 1}, {'sim_speed': 0.1},
+                                 {'sim_speed': 5.0}])
 def test_rejects_invalid(bad):
     with pytest.raises(ValidationError):
         MissionConfig(**bad)
@@ -28,6 +30,7 @@ def test_options_catalog_shape():
             'max_expansions'} <= set(o['edge_profiles'][0])
     assert o['defaults']['fleet'] == {'rovers': 1, 'drones': 1}
     assert any(b['id'] == 'mock' and b['available'] for b in o['backends'])
+    assert o['sim_speed']['choices'] == [0.5, 1.0, 1.5, 2.0] and o['sim_speed']['default'] == 1.0
 
 
 def test_physics_preview_matches_model_and_clamps():

@@ -96,10 +96,16 @@ def _crystal_sdf(k, x, y, ground_z):
   </model>'''
 
 
+GZ_CLOCK_TOPIC = '/gz/clock'      # Gazebo's per-step clock; world_interface_node republishes it throttled on /clock
+
+
+def _e(ros, gz, ros_t, gz_t, direction='GZ_TO_ROS'):
+    return {'ros_topic_name': ros, 'gz_topic_name': gz, 'ros_type_name': ros_t, 'gz_type_name': gz_t,
+            'direction': direction}
+
+
 def _bridge_entries(name: str) -> list[dict]:
-    def e(ros, gz, ros_t, gz_t, direction='GZ_TO_ROS'):
-        return {'ros_topic_name': ros, 'gz_topic_name': gz, 'ros_type_name': ros_t, 'gz_type_name': gz_t,
-                'direction': direction}
+    e = _e
     out = [
         e(f'/{name}/cmd_vel', f'/{name}/cmd_vel', 'geometry_msgs/msg/Twist', 'gz.msgs.Twist', 'ROS_TO_GZ'),
         e(f'/{name}/odom', f'/{name}/odom', 'nav_msgs/msg/Odometry', 'gz.msgs.Odometry'),
@@ -118,11 +124,23 @@ def _bridge_entries(name: str) -> list[dict]:
     return out
 
 
+STEP_S = 0.004               # physics step; the world interface keeps it when changing the speed at run time
+
+
+def sim_speed_of(cfg: dict) -> float:
+    """Target real-time factor from a MissionConfig dict (validated 0.25–3.0 by the backend)."""
+    try:
+        return min(4.0, max(0.1, float(cfg.get('sim_speed', 1.0))))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def build_world(cfg: dict, out_dir) -> dict:
     out = Path(out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     size_m, res = SECTORS[cfg.get('sector', 'medium')]
     g_mult = float(cfg.get('gravity_g', 2.2))
+    speed = sim_speed_of(cfg)
     seed = int(cfg.get('seed', 42))
     names = robot_names(cfg.get('fleet', {'rovers': 1, 'drones': 1}))
     terr = generate_terrain(size_m, seed)
@@ -156,8 +174,8 @@ def build_world(cfg: dict, out_dir) -> dict:
 <world name="{WORLD_NAME}">
   <gravity>0 0 {-G_EARTH * g_mult:.4f}</gravity>
   <physics name="4ms" type="ignored">
-    <max_step_size>0.004</max_step_size>
-    <real_time_factor>1.0</real_time_factor>
+    <max_step_size>{STEP_S}</max_step_size>
+    <real_time_factor>{speed:g}</real_time_factor>
     <dart><collision_detector>bullet</collision_detector></dart>
   </physics>
   <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
@@ -214,12 +232,14 @@ def build_world(cfg: dict, out_dir) -> dict:
 </sdf>
 '''
     (out / 'world.sdf').write_text(world)
-    entries = [e for n in names for e in _bridge_entries(n)]
+    entries = [_e(GZ_CLOCK_TOPIC, '/clock', 'rosgraph_msgs/msg/Clock', 'gz.msgs.Clock')]
+    entries += [e for n in names for e in _bridge_entries(n)]
     (out / 'bridge.yaml').write_text(yaml.safe_dump(entries, sort_keys=False))
     meta = {
         'world_name': WORLD_NAME, 'world_path': str(out / 'world.sdf'),
         'heightmap_path': str(out / 'heightmap.png'), 'terrain_path': str(out / 'terrain.npz'),
         'bridge_path': str(out / 'bridge.yaml'), 'size_m': size_m, 'res': res, 'gravity_g': g_mult,
+        'sim_speed': speed, 'max_step_s': STEP_S,
         'height_max': hmax, 'robots': names, 'spawn': {k: [round(float(v), 4) for v in p] for k, p in spawn.items()},
         'n_rocks': len(terr.rocks), 'n_science': len(terr.science),
     }

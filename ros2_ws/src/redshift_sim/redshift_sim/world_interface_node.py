@@ -1,7 +1,13 @@
-"""Gazebo implementation of /world/command (rockslide spawning and tip/slip jolts) via gz-transport.
+"""Gazebo implementation of /world/command (rockslide spawning, tip/slip jolts, simulation speed) via gz-transport.
 
 Dust/seismic anomalies are handled by sensor_effects_node in both backends; this node only touches
 the physical world. Every executed command is echoed on /world/events.
+
+It also republishes Gazebo's clock on ROS /clock, throttled to CLOCK_PERIOD_S of simulated time: gz-sim publishes
+it every 4 ms step (≈500 Hz at 2×), and every use_sim_time node would otherwise wake for each one. The per-step
+clock reaches this node through ros_gz_bridge (/gz/clock), NOT a Python gz-transport subscription: the Python
+binding holds the GIL inside a blocking gz request, so any Python gz subscription in this process starves every
+service reply (/create, /set_physics) until its timeout. Keep this node gz-publish/request only.
 """
 from __future__ import annotations
 
@@ -14,6 +20,8 @@ import numpy as np
 import rclpy
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
+from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Imu
 from std_msgs.msg import String
 
@@ -21,6 +29,10 @@ from redshift_autonomy.physics_model import RoverPhysics
 
 from .scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_layout
 from .terrain_gen import Terrain
+from .world_builder import GZ_CLOCK_TOPIC
+
+
+CLOCK_PERIOD_S = 0.01
 
 
 def yaw_of(q) -> float:
@@ -49,6 +61,8 @@ class WorldInterface(Node):
         self.declare_parameter('terrain_path', '')
         self.declare_parameter('g_mult', 2.2)
         self.declare_parameter('robots', ['rover_0'])
+        self.declare_parameter('max_step_s', 0.004)
+        self.step_s = float(self.get_parameter('max_step_s').value)
         self.world = self.get_parameter('world_name').value
         self.g = float(self.get_parameter('g_mult').value)
         tp = self.get_parameter('terrain_path').value
@@ -60,6 +74,10 @@ class WorldInterface(Node):
         self.gz = GzNode()
         self.wrench_pub = self.gz.advertise(f'/world/{self.world}/wrench/persistent', EntityWrench)
         self.clear_pub = self.gz.advertise(f'/world/{self.world}/wrench/clear', Entity)
+        self.sim_t = 0.0                   # Gazebo simulated time, s (jolt timing)
+        self._last_clock = -1.0
+        self.clock_pub = self.create_publisher(Clock, '/clock', QoSProfile(depth=10))
+        self.create_subscription(Clock, GZ_CLOCK_TOPIC, self._on_gz_clock, QoSProfile(depth=50))
         self.paths: dict[str, np.ndarray] = {}
         self.poses: dict[str, tuple] = {}
         self.roll: dict[str, float] = {}
@@ -74,6 +92,13 @@ class WorldInterface(Node):
         self.create_subscription(String, '/world/command', self._on_cmd, 10)
         self._slide = 0
         self.get_logger().info(f'world interface ready for world "{self.world}" (g={self.g})')
+
+    def _on_gz_clock(self, msg: Clock):
+        t = msg.clock.sec + msg.clock.nanosec * 1e-9
+        self.sim_t = t
+        if t - self._last_clock >= CLOCK_PERIOD_S - 1e-9 or t < self._last_clock:
+            self._last_clock = t
+            self.clock_pub.publish(msg)
 
     def _on_path(self, robot, msg: Path):
         self.paths[robot] = np.array([[p.pose.position.x, p.pose.position.y] for p in msg.poses]).reshape(-1, 2)
@@ -100,6 +125,22 @@ class WorldInterface(Node):
             threading.Thread(target=self._rockslide, args=(cmd.get('robot', 'rover_0'),), daemon=True).start()
         elif op == 'jolt':
             self._jolt(cmd.get('robot', 'rover_0'))
+        elif op == 'set_speed':
+            threading.Thread(target=self._set_speed, args=(cmd.get('speed', 1.0),), daemon=True).start()
+
+    def _set_speed(self, speed):
+        from gz.msgs10.boolean_pb2 import Boolean
+        from gz.msgs10.physics_pb2 import Physics
+        try:
+            speed = min(4.0, max(0.1, float(speed)))
+        except (TypeError, ValueError):
+            self._emit({'op': 'set_speed', 'ok': False, 'detail': f'bad speed {speed!r}'})
+            return
+        req = Physics(max_step_size=self.step_s, real_time_factor=speed)
+        ok, rep = self.gz.request(f'/world/{self.world}/set_physics', req, Physics, Boolean, 3000)
+        ok = bool(ok and rep.data)
+        self.get_logger().info(f'simulation speed → {speed:.2f}x: {"ok" if ok else "set_physics failed"}')
+        self._emit({'op': 'set_speed', 'ok': ok, 'speed': speed})
 
     def _rockslide(self, robot: str):
         from gz.msgs10.boolean_pb2 import Boolean
@@ -139,19 +180,20 @@ class WorldInterface(Node):
         msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z = force
         msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z = torque
         roll0 = self.roll.get(robot, 0.0)
-        t0 = time.time()
+        t0, w0 = self.sim_t, time.monotonic()
         self.wrench_pub.publish(msg)
         peak = 0.0
-        while time.time() - t0 < JOLT['max_duration_s']:
+        # the cut-off is in simulated time; the wall-clock guard only matters if Gazebo stops publishing its clock
+        while self.sim_t - t0 < JOLT['max_duration_s'] and time.monotonic() - w0 < 10.0:
             r = abs(self.roll.get(robot, 0.0))
             peak = max(peak, r)
             if r >= self.cut_deg:
                 break
-            time.sleep(0.004)
+            time.sleep(0.002)
         for _ in range(3):
             self.clear_pub.publish(ent)
         self.get_logger().info(f'jolt {robot}: torque {np.round(torque, 0)} released at roll {peak:.1f} '
-                               f'(cut {self.cut_deg:.1f}, start {roll0:.1f}) after {time.time() - t0:.2f}s')
+                               f'(cut {self.cut_deg:.1f}, start {roll0:.1f}) after {self.sim_t - t0:.2f} s sim')
         self._emit({'op': 'jolt', 'ok': True, 'robot': robot, 'release_roll_deg': round(peak, 1)})
         self._jolting.discard(robot)
 

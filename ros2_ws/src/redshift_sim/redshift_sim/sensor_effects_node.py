@@ -41,7 +41,7 @@ class SensorEffects(Node):
         self.level = 0.0
         self.until = 0.0
         self.seismic_until = 0.0
-        self._last_t = time.monotonic()
+        self._last_t = self.now_s()
         self.pub_img = self.create_publisher(Image, f'/{r}/camera/image', qos_profile_sensor_data)
         self.pub_depth = self.create_publisher(Image, f'/{r}/camera/depth', qos_profile_sensor_data)
         self.pub_imu = self.create_publisher(Imu, f'/{r}/imu', qos_profile_sensor_data)
@@ -57,36 +57,40 @@ class SensorEffects(Node):
         self.create_timer(0.1, self.tick)
         self._particles = self.rng.random((60, 4)).astype(np.float32)
 
+    def now_s(self) -> float:
+        """Simulated time (use_sim_time): durations and ramps follow the simulation speed."""
+        return self.get_clock().now().nanoseconds * 1e-9
+
     # ------------------------------------------------------------------ control
     def on_cmd(self, msg: String):
         try:
             cmd = json.loads(msg.data)
         except json.JSONDecodeError:
             return
-        now = time.time()
+        now = self.now_s()
         if cmd.get('op') == 'anomaly':
             self.target = float(np.clip(cmd.get('dust_level', 0.85), 0.0, 1.0))
-            self.until = now + float(cmd.get('duration_s', 25.0))
+            dur = float(cmd.get('duration_s', 25.0))
+            self.until = now + dur
             self.seismic_until = now + float(cmd.get('seismic_s', 4.0))
             if self.publish_env:
                 self.events.publish(String(data=json.dumps({'op': 'anomaly', 'ok': True, 'dust_level': self.target,
-                                                            'until_t': self.until, 't': now})))
+                                                            'duration_s': dur, 't': time.time()})))
         elif cmd.get('op') == 'clear_anomaly':
             self.until = now
             self.seismic_until = now
 
     def tick(self):
-        now = time.time()
-        t = time.monotonic()
-        dt = t - self._last_t
-        self._last_t = t
+        now = self.now_s()
+        dt = max(0.0, now - self._last_t)
+        self._last_t = now
         goal = self.target if now < self.until else 0.0
         step = dt / RAMP_S
         self.level = min(goal, self.level + step) if goal > self.level else max(goal, self.level - step)
         if self.publish_env:
             self.env_pub.publish(String(data=json.dumps({'dust_level': round(self.level, 3),
                                                          'seismic': now < self.seismic_until,
-                                                         'until_t': self.until if now < self.until else None})))
+                                                         'remaining_s': round(self.until - now, 1) if now < self.until else None})))
 
     # ------------------------------------------------------------------ streams
     def on_image(self, msg: Image):
@@ -163,10 +167,10 @@ class SensorEffects(Node):
         self.pub_pts.publish(out)
 
     def on_imu(self, msg: Imu):
-        if time.time() >= self.seismic_until:
+        t = self.now_s()
+        if t >= self.seismic_until:
             self.pub_imu.publish(msg)
             return
-        t = time.time()
         a = msg.linear_acceleration
         w = msg.angular_velocity
         n = self.rng.normal(0, 1.0, 6)

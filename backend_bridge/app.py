@@ -85,6 +85,8 @@ class Hub:
         self.mgr: MissionManager | None = None
         self.link_error: str | None = None
         self._bg: set[asyncio.Task] = set()
+        self.speed = 1.0                     # target sim speed (real-time factor) of the current mission
+        self._sim0: tuple[float | None, float | None] = (None, None)   # (running_since, sim time when it began)
 
     # ------------------------------------------------------------------ outbound (never blocks the caller)
     def attach(self, ws: WebSocket, camera: str) -> Client:
@@ -140,6 +142,9 @@ class Hub:
         return dict(type='status', **self.mgr.status_dict())
 
     async def on_status(self):
+        m = self.mgr
+        if m.status == 'running' and self.link and self._sim0[0] != m.running_since:
+            self._sim0 = (m.running_since, self.link.sim_clock()[0])    # mission clock starts now, in sim time
         self.broadcast(self.status_msg())
 
     async def on_log(self, line: str):
@@ -152,6 +157,8 @@ class Hub:
     def prepare(self, cfg: MissionConfig):
         """Called by the mission manager after the previous mission is gone and before the new one launches, so no
         stale message from the old fleet lands in (and falsely 'readies') the new caches."""
+        self.speed = cfg.sim_speed
+        self._sim0 = (None, None)
         if self.link:
             self.link.set_fleet(cfg.robots, self._specs(cfg))
 
@@ -173,12 +180,26 @@ class Hub:
             except Exception:  # noqa: BLE001
                 log.exception('failed to forward %s', msg.get('type'))
 
+    def mission_elapsed(self, sim_t: float | None) -> float:
+        """Mission time since 'running', in simulated seconds (wall seconds until /clock arrives)."""
+        since = self.mgr.running_since
+        if not since:
+            return 0.0
+        if sim_t is not None and (self._sim0[0] != since or self._sim0[1] is None or sim_t < self._sim0[1]):
+            self._sim0 = (since, sim_t)          # latch the sim time at which this mission began running
+        if sim_t is None or self._sim0[1] is None:
+            return time.time() - since
+        return sim_t - self._sim0[1]
+
     def mission_dict(self) -> dict:
         st = self.link.stats if self.link else {}
         env = self.link.env if self.link else {}
+        sim_t, rtf = self.link.sim_clock() if self.link else (None, None)
         m = self.mgr
         return {'status': m.status, 'backend': m.backend,
-                'elapsed_s': round(time.time() - m.running_since, 1) if m.running_since else 0.0,
+                'elapsed_s': round(self.mission_elapsed(sim_t), 1),
+                'sim_time_s': None if sim_t is None else round(sim_t, 2),
+                'sim_speed': self.speed, 'rtf': None if rtf is None else round(rtf, 2),
                 'percent_mapped': float(st.get('percent', 0.0)), 'science_found': len(st.get('science', [])),
                 'hazard_cells': int(st.get('hazard_cells', 0)),
                 'env': {'dust_level': float(env.get('dust_level', 0.0)), 'seismic': bool(env.get('seismic', False))},
@@ -251,6 +272,11 @@ class Hub:
 class RobotBody(BaseModel):
     model_config = ConfigDict(extra='ignore')
     robot: str | None = None
+
+
+class SpeedBody(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    speed: float = Field(..., ge=0.25, le=3.0)
 
 
 class AnomalyBody(BaseModel):
@@ -391,6 +417,22 @@ async def api_tip(request: Request):
         return {'ok': False, 'detail': msg}
     res = hub.command({'op': 'jolt', 'robot': r})
     return res if not res['ok'] else {'ok': True, 'detail': f'Subsidence jolt applied to {r} chassis'}
+
+
+@app.post('/api/sim/speed')
+async def api_speed(request: Request):
+    body, err = await parse_body(request, SpeedBody)
+    if err:
+        return err
+    m = hub.mgr
+    if m.status not in ('running', 'degraded') or not m.config:
+        return {'ok': False, 'detail': 'No running mission'}
+    res = hub.command({'op': 'set_speed', 'speed': body.speed})
+    if not res['ok']:
+        return res
+    hub.speed = body.speed
+    m.config = m.config.model_copy(update={'sim_speed': body.speed})
+    return {'ok': True, 'speed': body.speed, 'detail': f'Simulation speed set to {body.speed:g}×'}
 
 
 @app.websocket('/ws')

@@ -14,6 +14,7 @@ from redshift_sim.world_builder import SECTORS, robot_names
 SectorId = Literal['small', 'medium', 'large']
 EdgeProfileId = Literal['orin_nano_15w', 'orin_nx_25w', 'agx_orin_60w', 'rpi5_8w']
 SECTOR_LABELS = {'small': 'Small', 'medium': 'Medium', 'large': 'Large'}
+SPEED_CHOICES = (0.5, 1.0, 1.5, 2.0)
 
 
 class Fleet(BaseModel):
@@ -31,6 +32,7 @@ class MissionConfig(BaseModel):
     sim_backend: Literal['gazebo', 'mock'] = 'gazebo'
     seed: int = Field(42, ge=0, le=2**31 - 1)
     gazebo_gui: bool = False
+    sim_speed: float = Field(1.0, ge=0.25, le=3.0)     # target real-time factor; also changeable live
 
     @property
     def robots(self) -> list[str]:
@@ -51,6 +53,7 @@ def options() -> dict:
         'edge_profiles': [{k: v for k, v in p.as_dict().items()} for p in PROFILES.values()],
         'backends': [{'id': 'gazebo', 'label': 'Gazebo Harmonic', 'available': gazebo_available()},
                      {'id': 'mock', 'label': 'Mock physics', 'available': True}],
+        'sim_speed': {'choices': list(SPEED_CHOICES), 'min': 0.25, 'max': 3.0, 'default': d.sim_speed},
         'defaults': d.model_dump(),
     }
 

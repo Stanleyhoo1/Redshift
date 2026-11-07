@@ -8,7 +8,7 @@ import yaml
 
 from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC, rover_sdf, scout_sdf
 from redshift_sim.terrain_gen import Terrain
-from redshift_sim.world_builder import WORLD_NAME, build_world, robot_names
+from redshift_sim.world_builder import GZ_CLOCK_TOPIC, STEP_S, WORLD_NAME, build_world, robot_names
 
 CFG = {'sector': 'small', 'gravity_g': 2.2, 'fleet': {'rovers': 2, 'drones': 1}, 'seed': 3}
 
@@ -41,6 +41,16 @@ def test_world_sdf_parses_with_gravity_and_models(built):
             'gz::sim::systems::Imu', 'gz::sim::systems::ApplyLinkWrench'} <= plugins
 
 
+def test_world_physics_paced_by_sim_speed(tmp_path):
+    for speed, expect in ((None, 1.0), (2.0, 2.0), (0.5, 0.5)):
+        cfg = dict(CFG) if speed is None else dict(CFG, sim_speed=speed)
+        meta = build_world(cfg, tmp_path / f's{speed}')
+        phys = ET.parse(meta['world_path']).getroot().find('world/physics')
+        assert float(phys.find('real_time_factor').text) == pytest.approx(expect)
+        assert float(phys.find('max_step_size').text) == pytest.approx(STEP_S)
+        assert meta['sim_speed'] == pytest.approx(expect) and meta['max_step_s'] == pytest.approx(STEP_S)
+
+
 def test_heightmap_png(built):
     meta, _ = built
     img = cv2.imread(meta['heightmap_path'], cv2.IMREAD_UNCHANGED)
@@ -62,6 +72,8 @@ def test_bridge_yaml(built):
             '/rover_0/imu_raw', '/rover_0/odom', '/rover_0/wheel_odom', '/rover_0/cmd_vel'} <= raw
     cmd = [e for e in entries if e['ros_topic_name'] == '/rover_0/cmd_vel'][0]
     assert cmd['direction'] == 'ROS_TO_GZ'
+    clock = [e for e in entries if e['gz_topic_name'] == '/clock']
+    assert len(clock) == 1 and clock[0]['ros_topic_name'] == GZ_CLOCK_TOPIC and clock[0]['direction'] == 'GZ_TO_ROS'
 
 
 def test_spawn_poses_sit_on_terrain(built):

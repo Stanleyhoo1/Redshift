@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
+from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import CameraInfo, Image, Imu, PointCloud2, PointField
 from std_msgs.msg import String
 
@@ -31,9 +33,12 @@ from .mock_dynamics import RoverSim, ScoutSim
 from .mock_render import Scene, camera_frame, camera_intrinsics, camera_rotation, lidar_scan, rpy_matrix
 from .robot_models import ROVER_SPEC, SCOUT_SPEC
 from .scene_events import rockslide_layout
+from .sim_pacing import SimPacer
 from .terrain_gen import Terrain
 
-PHYSICS_HZ = 100.0
+PHYSICS_HZ = 100.0          # wall-clock rate of the physics thread; simulated time advances speed × faster
+IMU_HZ = 100.0              # simulated-time rates, as in the Gazebo models
+CLOCK_PERIOD_S = 0.01       # /clock granularity (simulated), same as the Gazebo republisher
 ODOM_HZ = 30.0
 WHEEL_ODOM_HZ = 20.0
 LIDAR_HZ = 10.0
@@ -96,7 +101,7 @@ class MockWorld(Node):
     def __init__(self):
         super().__init__('mock_world')
         for k, v in (('terrain_path', ''), ('robots', ['rover_0', 'scout_0']), ('g_mult', 2.2), ('spawn_json', '{}'),
-                     ('specs_json', '{}'), ('render_scale', 0.5)):
+                     ('specs_json', '{}'), ('render_scale', 0.5), ('sim_speed', 1.0)):
             self.declare_parameter(k, v)
         gp = self.get_parameter
         self.g = float(gp('g_mult').value)
@@ -112,7 +117,6 @@ class MockWorld(Node):
         specs = json.loads(gp('specs_json').value or '{}')
         self.physics_group = MutuallyExclusiveCallbackGroup()
         self.cmd_group = self.physics_group               # commands mutate the scene: same thread as physics
-        self.sensor_group = MutuallyExclusiveCallbackGroup()
         self.lock = threading.Lock()                      # guards robot state snapshots
         self.robots: list[Robot] = []
         for r in gp('robots').value:
@@ -124,15 +128,30 @@ class MockWorld(Node):
             self.robots.append(Robot(self, r, spec, sp))
         self.events = self.create_publisher(String, '/world/events', 10)
         self.create_subscription(String, '/world/command', self.on_command, 10, callback_group=self.cmd_group)
-        self.t0 = time.monotonic()
-        self.sim_t = 0.0
+        # this node is the clock source: simulated time is paced by SimPacer (lockstep with the renderers) and
+        # published on /clock; every other node runs with use_sim_time
+        self.pacer = SimPacer(float(gp('sim_speed').value))
+        self.by_name = {rb.name: rb for rb in self.robots}
+        for k, rb in enumerate(self.robots):
+            if rb.rover:
+                self.pacer.add_sensor((rb.name, 'lidar'), 1.0 / LIDAR_HZ, phase=0.05 * k)
+            self.pacer.add_sensor((rb.name, 'cam'), 1.0 / rb.cam_hz, phase=0.02 + 0.05 * k)
+        self.clock_pub = self.create_publisher(Clock, '/clock', QoSProfile(depth=10))
+        self._last_clock = -1.0
         self._last = time.monotonic()
-        self._due = {}                                    # (robot, sensor) → next sim time
+        self._due = {}                                    # (robot, stream) → next simulated time
         self._slide = 0
+        self._jobs = {'lidar': queue.Queue(), 'cam': queue.Queue()}
+        for kind in self._jobs:                           # renderers run beside physics (numpy releases the GIL)
+            threading.Thread(target=self._render_loop, args=(kind,), name=f'render_{kind}', daemon=True).start()
         self.create_timer(1.0 / PHYSICS_HZ, self.physics, callback_group=self.physics_group)
-        self.create_timer(0.005, self.sensors, callback_group=self.sensor_group)
         self.get_logger().info(f'mock world ready: {len(terr.rocks)} boulders, {len(terr.science)} crystals, '
-                               f'g={self.g}, robots={[r.name for r in self.robots]}, render_scale={self.render_scale}')
+                               f'g={self.g}, robots={[r.name for r in self.robots]}, render_scale={self.render_scale}, '
+                               f'speed={self.pacer.speed:.2f}x')
+
+    @property
+    def sim_t(self) -> float:
+        return self.pacer.t
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -154,13 +173,24 @@ class MockWorld(Node):
             return True
         return False
 
-    # ------------------------------------------------------------------ physics thread (100 Hz)
+    # ------------------------------------------------------------------ physics thread (100 Hz wall)
     def physics(self):
         now = time.monotonic()
-        dt = min(0.05, max(1e-4, now - self._last))
+        wall_dt = now - self._last
         self._last = now
-        self.sim_t = now - self.t0
-        t = self.sim_t
+        for dt, due in self.pacer.steps(wall_dt):
+            t = self.pacer.t
+            if dt > 0.0:
+                self._step(dt, t)
+            for name, kind in due:                        # sample the frame at exactly its due time
+                rb = self.by_name[name]
+                with self.lock:
+                    s = rb.state
+                self._jobs[kind].put((rb, s, t))
+        if self.pacer.t > self._last_clock:
+            self._publish_clock(self.pacer.t)
+
+    def _step(self, dt: float, t: float):
         self.scene.update(t)
         stamp = self.stamp(t)
         for rb in self.robots:
@@ -171,11 +201,18 @@ class MockWorld(Node):
             for ev in (rb.sim.pop_events() if rb.rover else ()):
                 self.get_logger().info(f'jolt {rb.name}: released at roll {ev["release_roll_deg"]:.1f} deg')
                 self.emit(ev)
-            self.publish_imu(rb, s, stamp)
+            if self._due_now((rb.name, 'imu'), 1.0 / IMU_HZ, t):
+                self.publish_imu(rb, s, stamp)
             if self._due_now((rb.name, 'odom'), 1.0 / ODOM_HZ, t):
                 self.publish_odom(rb, s, stamp)
             if rb.rover and self._due_now((rb.name, 'wheel'), 1.0 / WHEEL_ODOM_HZ, t):
                 self.publish_wheel(rb, s, stamp)
+        if t - self._last_clock >= CLOCK_PERIOD_S - 1e-9:
+            self._publish_clock(t)
+
+    def _publish_clock(self, t: float):
+        self._last_clock = t
+        self.clock_pub.publish(Clock(clock=self.stamp(t)))
 
     def publish_imu(self, rb: Robot, s: dict, stamp):
         m = Imu()
@@ -237,24 +274,37 @@ class MockWorld(Node):
                 self.emit({'op': 'jolt', 'ok': False, 'robot': cmd.get('robot'), 'detail': 'unknown rover'})
                 return
             rb.sim.start_jolt()
+        elif op == 'set_speed':
+            try:
+                speed = self.pacer.set_speed(float(cmd.get('speed', 1.0)))
+            except (TypeError, ValueError):
+                self.emit({'op': 'set_speed', 'ok': False, 'detail': f'bad speed {cmd.get("speed")!r}'})
+                return
+            self.get_logger().info(f'simulation speed set to {speed:.2f}x')
+            self.emit({'op': 'set_speed', 'ok': True, 'speed': speed})
 
-    # ------------------------------------------------------------------ sensor thread
-    def sensors(self):
-        t = time.monotonic() - self.t0
-        for k, rb in enumerate(self.robots):
-            if rb.rover and self._due_now((rb.name, 'lidar'), 1.0 / LIDAR_HZ, t, phase=0.05 * k):
-                self.publish_lidar(rb)
-            if self._due_now((rb.name, 'cam'), 1.0 / rb.cam_hz, t, phase=0.02 + 0.05 * k):
-                self.publish_camera(rb)
+    # ------------------------------------------------------------------ render threads
+    def _render_loop(self, kind: str):
+        jobs = self._jobs[kind]
+        while rclpy.ok():
+            try:
+                rb, s, t = jobs.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                (self.publish_lidar if kind == 'lidar' else self.publish_camera)(rb, s, t)
+            except Exception as e:  # noqa: BLE001 - a bad frame must not stall the clock forever
+                self.get_logger().warn(f'{kind} render failed for {rb.name}: {e}')
+            finally:
+                self.pacer.done((rb.name, kind))
 
-    def _pose(self, rb: Robot):
-        with self.lock:
-            s = rb.state
-        return s, np.array([s['x'], s['y'], s['z']]), rpy_matrix(s['roll'], s['pitch'], s['yaw'])
+    @staticmethod
+    def _pose(s: dict):
+        return np.array([s['x'], s['y'], s['z']]), rpy_matrix(s['roll'], s['pitch'], s['yaw'])
 
-    def publish_lidar(self, rb: Robot):
-        s, pos, R = self._pose(rb)
-        stamp = self.stamp(time.monotonic() - self.t0)
+    def publish_lidar(self, rb: Robot, s: dict, t: float):
+        pos, R = self._pose(s)
+        stamp = self.stamp(t)
         pts = lidar_scan(self.scene, pos + R @ np.asarray(rb.spec['lidar_xyz']), R, rb.spec)
         h, w = pts.shape[:2]
         arr = np.zeros(h * w, CLOUD_DTYPE)
@@ -267,9 +317,9 @@ class MockWorld(Node):
         m.data = arr.tobytes()
         rb.pub_cloud.publish(m)
 
-    def publish_camera(self, rb: Robot):
-        s, pos, R = self._pose(rb)
-        stamp = self.stamp(time.monotonic() - self.t0)
+    def publish_camera(self, rb: Robot, s: dict, t: float):
+        pos, R = self._pose(s)
+        stamp = self.stamp(t)
         sp = rb.spec
         Rc = camera_rotation(R, sp['camera_pitch_rad'])
         rgb, depth = camera_frame(self.scene, pos + R @ np.asarray(sp['camera_xyz']), Rc, sp['camera_w'],

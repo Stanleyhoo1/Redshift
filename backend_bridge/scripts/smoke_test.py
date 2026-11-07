@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """End-to-end smoke test of a running backend (the same REST + WebSocket traffic the web UI produces).
 
-    python3 backend_bridge/scripts/smoke_test.py [--url http://127.0.0.1:8000] [--backend mock|gazebo]
+    python3 backend_bridge/scripts/smoke_test.py [--url http://127.0.0.1:8000] [--backend mock|gazebo] [--speed 1.0]
 
 Deploys a mission, checks telemetry / camera / LiDAR / map streams and exploration progress, then runs the three
 unscripted changes (rockslide, dust anomaly, tip/slip jolt) and checks the agents' traced responses, and finally
 aborts and checks no simulator process is left. Exit code 0 = every check passed.
+
+--speed runs the mission at that simulation speed and also checks the achieved real-time factor, that mission time
+follows simulated time, and a live speed change. Timeouts are behavioural (simulated) seconds, so below 1× they are
+stretched to wall time; above 1× they are left as they are.
 """
 from __future__ import annotations
 
@@ -95,13 +99,28 @@ class Smoke:
         async for raw in ws:
             self.s.feed(json.loads(raw))
 
-    async def run(self, backend: str, sector: str, rover: str = 'rover_0') -> bool:
-        print(f'Redshift smoke test against {self.url} (backend={backend}, sector={sector})', flush=True)
+    def mission(self) -> dict:
+        return (self.s.telemetry or {}).get('mission') or {}
+
+    async def rtf_settled(self, target: float, timeout: float):
+        """Wait until the achieved real-time factor is within 15 % of target; returns the last value seen."""
+        seen = {'rtf': None}
+
+        def ok():
+            seen['rtf'] = self.mission().get('rtf')
+            return seen['rtf'] is not None and abs(seen['rtf'] - target) <= 0.15 * target
+        await self.wait(ok, timeout, poll=0.25)
+        return seen['rtf']
+
+    async def run(self, backend: str, sector: str, rover: str = 'rover_0', speed: float = 1.0) -> bool:
+        print(f'Redshift smoke test against {self.url} (backend={backend}, sector={sector}, speed={speed:g}×)', flush=True)
+        k = 1.0 / min(speed, 1.0)            # stretch simulated-time timeouts to wall time below 1×
         async with websockets.connect(self.url.replace('http', 'ws', 1) + '/ws', max_size=2**24) as ws:
             reader = asyncio.create_task(self.ws_reader(ws))
             await ws.send(json.dumps({'type': 'select_camera', 'robot': rover}))
             r = await self.http.post('/api/mission/deploy', json={'sector': sector, 'gravity_g': 2.2, 'sim_backend': backend,
-                                                                   'fleet': {'rovers': 1, 'drones': 1}, 'seed': 42})
+                                                                   'fleet': {'rovers': 1, 'drones': 1}, 'seed': 42,
+                                                                   'sim_speed': speed})
             self.check('deploy accepted', r.status_code == 200 and r.json().get('ok'), r.text[:120])
             _, dt = await self.wait(lambda: self.s.status.get('status') == 'running', 150 if backend == 'gazebo' else 90)
             st = self.s.status
@@ -113,41 +132,48 @@ class Smoke:
                 return False
             f = (st.get('config') or {}).get('fleet') or {'rovers': 1, 'drones': 1}
             robots = [f'rover_{i}' for i in range(f['rovers'])] + [f'scout_{i}' for i in range(f['drones'])]
-            _, dt = await self.wait(lambda: all(self.robot(x).get('state') not in (None, 'BOOT') for x in robots), 40)
+            _, dt = await self.wait(lambda: all(self.robot(x).get('state') not in (None, 'BOOT') for x in robots), 40 * k)
             self.check('telemetry for every robot', all(self.robot(x) for x in robots),
                        ', '.join(f'{x}:{self.robot(x).get("state")}' for x in robots))
-            await self.wait(lambda: self.s.counts.get('camera') and self.s.counts.get('lidar') and self.s.counts.get('map'), 20)
+            await self.wait(lambda: self.s.counts.get('camera') and self.s.counts.get('lidar') and self.s.counts.get('map'), 20 * k)
             self.check('camera / lidar / map streams', all(self.s.counts.get(k) for k in ('camera', 'lidar', 'map')),
                        str({k: self.s.counts.get(k, 0) for k in ('telemetry', 'camera', 'lidar', 'map', 'trace')}))
-            p0 = self.s.telemetry['mission']['percent_mapped']
-            await asyncio.sleep(25)
-            p1 = self.s.telemetry['mission']['percent_mapped']
-            self.check('exploration progress', p1 - p0 >= 3.0, f'{p0:.1f}% → {p1:.1f}% in 25 s')
+            rtf = await self.rtf_settled(speed, 10)
+            self.check('simulation paced at the requested speed', rtf is not None and rtf >= 0.75 * speed,
+                       f'target {speed:g}×, achieved RTF {rtf}')
+            m0, w0 = self.mission(), time.monotonic()
+            await asyncio.sleep(25 * k)
+            m1, w1 = self.mission(), time.monotonic()
+            p0, p1 = m0['percent_mapped'], m1['percent_mapped']
+            self.check('exploration progress', p1 - p0 >= 3.0, f'{p0:.1f}% → {p1:.1f}% in {25 * k:.0f} s')
+            rate, rtf = (m1['elapsed_s'] - m0['elapsed_s']) / (w1 - w0), m1.get('rtf') or 0.0
+            self.check('mission clock runs on simulated time', rtf > 0 and abs(rate - rtf) <= 0.2 * rtf,
+                       f'T+ advanced {rate:.2f} s per s, RTF {rtf:.2f}')
 
             # ---- unscripted change 1: rockslide across the planned path
-            await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING' and len(self.robot(rover).get('path') or []) > 5, 40)
+            await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING' and len(self.robot(rover).get('path') or []) > 5, 40 * k)
             before = self.robot(rover)
             t = time.time()
             r = (await self.http.post('/api/inject/rockslide', json={'robot': rover})).json()
             self.check('rockslide injected', r.get('ok'), r.get('detail', ''))
-            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('path_blocked',)), 12)
+            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('path_blocked',)), 12 * k)
             self.check('rockslide → REPLANNING trace', tr is not None,
                        f'{dt:.1f} s: {tr["input"]}' if tr else self.rockslide_diag(t, rover, before))
-            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('replanned',)), 15)
+            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('replanned',)), 15 * k)
             self.check('re-planned route', tr is not None, f'{dt:.1f} s: {tr["action"] if tr else ""}')
             ev = next((e for e in self.s.events if e.get('op') == 'spawn_rockslide' and e.get('t', 0) >= t - 1), None)
             self.check('rockslide world event', ev is not None and len(ev.get('rocks', [])) > 0)
 
             # ---- unscripted change 2: dust/seismic anomaly
-            await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING', 30)
+            await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING', 30 * k)
             t = time.time()
             r = (await self.http.post('/api/inject/anomaly', json={'dust_level': 0.85, 'duration_s': 15})).json()
             self.check('anomaly injected', r.get('ok'), r.get('detail', ''))
-            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('caution_enter',)), 10)
-            mode, _ = await self.wait(lambda: self.robot(rover).get('mode') == 'LIDAR_ONLY', 3)   # 5 Hz state lag
+            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('caution_enter',)), 10 * k)
+            mode, _ = await self.wait(lambda: self.robot(rover).get('mode') == 'LIDAR_ONLY', 3 * k)   # 5 Hz state lag
             self.check('dust → CAUTION / LIDAR_ONLY', tr is not None and bool(mode),
                        f'{dt:.1f} s: {tr["input"] if tr else ""}')
-            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('caution_exit',)), 40)
+            tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('caution_exit',)), 40 * k)
             rs = self.robot(rover)
             self.check('dust clears → fused navigation restored', tr is not None, f'{dt:.1f} s after inject' + (
                 '' if tr else f"; now state={rs.get('state')} mode={rs.get('mode')} uncertainty={rs.get('uncertainty')} "
@@ -155,7 +181,7 @@ class Smoke:
                 f"{[x['kind'] for x in self.s.traces if x['robot'] == rover and x['t'] >= t - 0.5][:10]}"))
 
             # ---- failure: tip/slip jolt → safe-hold recovery
-            await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING', 30)
+            await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING', 30 * k)
             before = self.robot(rover)
             t = time.time()
             r = (await self.http.post('/api/inject/tip', json={'robot': rover})).json()
@@ -171,7 +197,7 @@ class Smoke:
                      ('scan_complete', 60), ('resume', 5)]
             for kind, tmo in chain:
                 pred = safe_hold_seen if kind == 'safe_hold' else (lambda kind=kind: self.trace_after(t, rover, (kind,)))
-                tr, dt = await self.wait(pred, tmo, poll=0.05)
+                tr, dt = await self.wait(pred, tmo * k, poll=0.05)
                 detail = f'{time.time() - t:.1f} s: {tr["input"]}' if tr else f'{time.time() - t:.1f} s: '
                 if tr is None and kind == 'safe_hold':
                     ev = next((e for e in self.s.events if e.get('op') == 'jolt' and e.get('t', 0) >= t - 1), None)
@@ -183,6 +209,14 @@ class Smoke:
                     break
             perm = self.s.map_stats.get('permanent_hazards', [])
             self.check('permanent hazard on /planet_map', len(perm) > 0, str(perm[:2]))
+
+            # ---- live speed change mid-mission
+            alt = 0.5 * speed if speed > 0.75 else 2.0 * speed     # a target every backend can reach (mock ≈ 1.1× max)
+            r = (await self.http.post('/api/sim/speed', json={'speed': alt})).json()
+            ev, _ = await self.wait(lambda: next((e for e in self.s.events if e.get('op') == 'set_speed'), None), 5)
+            rtf = await self.rtf_settled(alt, 8) if r.get('ok') else None
+            self.check('live speed change', bool(r.get('ok')) and bool(ev and ev.get('ok')) and rtf is not None
+                       and abs(rtf - alt) <= 0.15 * alt, f"{r.get('detail', r)}; achieved RTF {rtf}")
 
             ids = [tr['id'] for tr in self.s.traces]
             self.check('trace ids unique', len(ids) == len(set(ids)), f'{len(ids)} traces')
@@ -204,8 +238,9 @@ def main():
     ap.add_argument('--url', default='http://127.0.0.1:8000')
     ap.add_argument('--backend', choices=('mock', 'gazebo'), default='mock')
     ap.add_argument('--sector', choices=('small', 'medium', 'large'), default='medium')
+    ap.add_argument('--speed', type=float, default=1.0, help='simulation speed (real-time factor), 0.25–3')
     a = ap.parse_args()
-    ok = asyncio.run(Smoke(a.url).run(a.backend, a.sector))
+    ok = asyncio.run(Smoke(a.url).run(a.backend, a.sector, speed=a.speed))
     sys.exit(0 if ok else 1)
 
 

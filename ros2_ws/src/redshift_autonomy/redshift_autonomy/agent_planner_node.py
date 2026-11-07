@@ -48,7 +48,6 @@ class MapView:
         self.origin = (-size_m / 2.0, -size_m / 2.0)
         self.cls = np.zeros((self.n, self.n), np.uint8)
         self.elev = np.full((self.n, self.n), np.nan, np.float32)
-        self.stamp = 0.0
         self.version = 0
         self._slope = None
         self._slope_v = -1
@@ -60,7 +59,6 @@ class MapView:
     def set_layers(self, img: np.ndarray):
         self.cls = np.rint(img[..., 1].astype(np.float32) / 40.0).astype(np.uint8)
         self.version += 1
-        self.stamp = time.monotonic()
 
     @property
     def known(self):
@@ -89,6 +87,11 @@ class MapView:
 
 
 class AgentBase(Node):
+    def now_s(self) -> float:
+        """Simulated seconds (use_sim_time). Every duration, timeout and rate in the agents uses this, so behaviour
+        is identical at any simulation speed; message 't' fields stay wall-clock epoch for the UI."""
+        return self.get_clock().now().nanoseconds * 1e-9
+
     def __init__(self, name: str):
         super().__init__(name)
         for k, v in (('robot', 'rover_0'), ('robot_type', 'rover'), ('spec_json', '{}'), ('robots', ['rover_0']),
@@ -135,7 +138,7 @@ class AgentBase(Node):
     def on_det(self, m: String):
         try:
             self.det = json.loads(m.data)
-            self.det_t = time.monotonic()
+            self.det_t = self.now_s()
         except json.JSONDecodeError:
             return
         self._science_traces()
@@ -158,10 +161,10 @@ class AgentBase(Node):
         except json.JSONDecodeError:
             return
         if d.get('robot') != self.robot and d.get('goal'):
-            self.claims[d['robot']] = (tuple(d['goal']), time.monotonic())
+            self.claims[d['robot']] = (tuple(d['goal']), self.now_s())
 
     def other_claims(self):
-        now = time.monotonic()
+        now = self.now_s()
         return [g for r, (g, t) in self.claims.items() if now - t < 15.0]
 
     # ------------------------------------------------------------------ outputs
@@ -176,7 +179,7 @@ class AgentBase(Node):
 
     def trace(self, kind, sensors, inp, reasoning, conf, action, severity='info', latency_ms=None, force=False):
         t = self.fsm.tb.make(kind, self.tb_state(), sensors, inp, reasoning, conf, action, severity,
-                             latency_ms=latency_ms, now=time.time(), force=force)
+                             latency_ms=latency_ms, now=self.now_s(), force=force)
         if t:
             self.emit([t])
 
@@ -199,7 +202,7 @@ class AgentBase(Node):
         self.pub_path.publish(msg)
 
     def perception_ms(self) -> tuple[float, float]:
-        if not self.det or time.monotonic() - self.det_t > 3.0:
+        if not self.det or self.now_s() - self.det_t > 3.0:
             return 0.0, 0.0
         return float(sum(self.det.get('stage_ms', {}).values())), float(self.det.get('perception_hz', 0.0))
 
@@ -208,7 +211,7 @@ class AgentBase(Node):
         m_ms = float(self.map_stats.get('mapping_ms', {}).get(self.robot, 0.0))
         host = {'perception': p_ms, 'planner': self.planner_ms, 'mapping': m_ms}
         hz = {'perception': p_hz, 'planner': LOOP_HZ, 'mapping': self.mapping_hz}
-        st = self.edge.update(host, hz)
+        st = self.edge.update(host, hz, now=self.now_s())
         unc = (self.det or {}).get('uncertainty', {}).get('score')
         out = {'robot': self.robot, 'profile': st.profile, 'device': self.profile.device,
                'host_ms': {k: round(v, 2) for k, v in host.items()}, 'device_ms': round(st.device_ms, 1),
@@ -267,24 +270,24 @@ class RoverAgent(AgentBase):
         self.blocked = False
         self.blocked_info = ('', ('LIDAR', 'MAP'), 0.9)
         self._last_map_v = -1
-        self._last_replan = 0.0
-        self._last_fail_replan = 0.0
+        self._last_replan = -1e9
+        self._last_fail_replan = -1e9
         self._own_marks: list = []
         self._marks_mask = None
         self._marks_n = 0
         b = int(round(BORDER_M / self.map.res))
         self._border = np.ones((self.map.n, self.map.n), bool)
         self._border[b:-b, b:-b] = False
-        self._last_select = 0.0
+        self._last_select = -1e9
         self.scan_complete = None
         self.out = None
         self.cmd = (0.0, 0.0)
         self.rev_idx = 0
-        self._drive_since = time.monotonic()
+        self._drive_since = self.now_s()
         self._last_drive = 'stop'
         self._mode_sent = None
         self._started = False
-        self._t_boot = time.monotonic()
+        self._t_boot = self.now_s()
         self.create_subscription(Imu, f'/{r}/imu', self.on_imu, SENSOR_QOS)
         self.create_subscription(Odometry, f'/{r}/wheel_odom', self.on_wheel, SENSOR_QOS)
         self.create_subscription(String, '/fleet/scan_complete', self.on_scan_complete, 10)
@@ -311,7 +314,7 @@ class RoverAgent(AgentBase):
 
     def on_odom(self, m: Odometry):
         super().on_odom(m)
-        self._vhist.append((time.monotonic(), self.pose[0], self.pose[1]))
+        self._vhist.append((self.now_s(), self.pose[0], self.pose[1]))
 
     def on_scan_complete(self, m: String):
         try:
@@ -320,7 +323,7 @@ class RoverAgent(AgentBase):
             pass
 
     def _update_slip(self):
-        now = time.monotonic()
+        now = self.now_s()
         steady = now - self._drive_since > 1.2 and self._last_drive == 'follow'
         if len(self._vhist) >= 4 and steady and abs(self.v_wheel) > 0.15:
             t0, x0, y0 = self._vhist[0]
@@ -390,7 +393,7 @@ class RoverAgent(AgentBase):
     def select_goal(self) -> bool:
         """Frontier exploration with fleet claims; falls back to unvisited science targets."""
         m = self.map
-        now = time.monotonic()
+        now = self.now_s()
         known = m.known
         free = known & ~self._lethal_core() & ~self._border
         fr_all = find_frontiers(known, free, min_size=4, tile_m=8.0, res=m.res)
@@ -496,7 +499,7 @@ class RoverAgent(AgentBase):
                 ('LIDAR', 'MAP'), 0.88)
 
     def replan(self, visible: bool) -> bool:
-        now = time.monotonic()
+        now = self.now_s()
         old_len = self._remaining_m()
         if self.goal_rc is not None:
             path, st, _ = self._plan(self.goal_rc)
@@ -520,8 +523,8 @@ class RoverAgent(AgentBase):
     # ------------------------------------------------------------------ control loop
     def tick(self):
         t_start = time.perf_counter()
-        now = time.time()
-        mono = time.monotonic()
+        now = self.now_s()               # simulated seconds: every duration below follows the sim speed
+        mono = now
         if self.pose is None or not self.map.ready:
             return
         if not self._started:
@@ -608,7 +611,7 @@ class RoverAgent(AgentBase):
 
     def drive(self, out):
         if out.drive != self._last_drive:
-            self._drive_since = time.monotonic()
+            self._drive_since = self.now_s()
             self._last_drive = out.drive
             self.rev_idx = 0
         x, y, yaw = self.pose
@@ -720,7 +723,7 @@ class ScoutAgent(AgentBase):
 
     def on_odom(self, m: Odometry):
         super().on_odom(m)
-        now = time.monotonic()
+        now = self.now_s()
         if self._z_prev is not None and now > self._z_prev[0]:
             self.vz = 0.7 * self.vz + 0.3 * (self.z - self._z_prev[1]) / (now - self._z_prev[0])
         self._z_prev = (now, self.z)
@@ -748,7 +751,7 @@ class ScoutAgent(AgentBase):
 
     def pick_target(self):
         m = self.map
-        now = time.monotonic()
+        now = self.now_s()
         if m.ready and self.pose is not None:
             known = m.known
             fr = find_frontiers(known, known, min_size=6, tile_m=16.0, res=m.res)
@@ -785,7 +788,7 @@ class ScoutAgent(AgentBase):
         t_start = time.perf_counter()
         if self.pose is None:
             return
-        now = time.time()
+        now = self.now_s()
         x, y, yaw = self.pose
         inp = ScoutInputs(now=now, pose=(x, y, self.z), altitude_agl=self.agl, goal_reached=self.goal_reached,
                           scan_request=self.pending_req, frontiers_left=self.frontiers_left)
