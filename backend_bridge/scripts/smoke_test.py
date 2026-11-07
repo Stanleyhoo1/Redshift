@@ -16,8 +16,13 @@ import subprocess
 import sys
 import time
 
+from pathlib import Path
+
 import httpx
 import websockets
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend_bridge.mission_manager import CLEANUP_PATTERNS  # noqa: E402
 
 
 class Stream:
@@ -153,8 +158,8 @@ class Smoke:
             await self.wait(lambda: self.s.status.get('status') == 'stopped', 30)
             self.check('abort → stopped', self.s.status.get('status') == 'stopped')
             reader.cancel()
-        left = subprocess.run(['pgrep', '-f', '^gz sim|^/opt/ros/jazzy/lib/ros_gz_bridge/parameter_bridge'],
-                              capture_output=True, text=True).stdout.split()
+        left = sorted({pid for pat in CLEANUP_PATTERNS for pid in subprocess.run(
+            ['pgrep', '-f', pat], capture_output=True, text=True).stdout.split()})
         self.check('no simulator processes left', not left, ' '.join(left))
         failed = [n for n, ok, _ in self.results if not ok]
         print(f'\n{len(self.results) - len(failed)}/{len(self.results)} checks passed in '

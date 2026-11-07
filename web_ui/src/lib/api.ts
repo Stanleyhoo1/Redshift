@@ -35,9 +35,8 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
       body = null
     }
     if (!res.ok) {
-      const detail =
-        body && typeof body === 'object' && 'detail' in body ? String((body as { detail: unknown }).detail) : text
-      throw new ApiError(detail || `HTTP ${res.status}`, res.status)
+      const raw = body && typeof body === 'object' && 'detail' in body ? (body as { detail: unknown }).detail : text
+      throw new ApiError(formatDetail(raw) || `HTTP ${res.status}`, res.status)
     }
     return body as T
   } catch (e) {
@@ -50,6 +49,24 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
   } finally {
     clearTimeout(timer)
   }
+}
+
+/** FastAPI/pydantic validation errors arrive as a list of {loc, msg}; show them as text, not [object Object]. */
+export function formatDetail(detail: unknown): string {
+  if (detail == null) return ''
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d) => {
+        if (d && typeof d === 'object' && 'msg' in d) {
+          const loc = Array.isArray((d as { loc?: unknown }).loc) ? (d as { loc: unknown[] }).loc.filter((x) => x !== 'body') : []
+          return `${loc.length ? loc.join('.') + ': ' : ''}${String((d as { msg: unknown }).msg)}`
+        }
+        return typeof d === 'string' ? d : JSON.stringify(d)
+      })
+      .join('; ')
+  }
+  return typeof detail === 'object' ? JSON.stringify(detail) : String(detail)
 }
 
 const post = <T>(path: string, body: unknown = {}) =>

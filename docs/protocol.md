@@ -141,7 +141,17 @@ RGB8, height = width = grid cells, **pixel row i = grid row i (row 0 = southmost
 sector ∈ `small (50 m @ 0.5 m) | medium (100 m @ 0.5 m) | large (200 m @ 1.0 m)`;
 edge_profile ∈ `orin_nano_15w | orin_nx_25w | agx_orin_60w | rpi5_8w`; sim_backend ∈ `gazebo | mock`.
 
-Mission status values: `idle | launching | running | degraded | failed | stopped`.
+Mission status values: `idle | launching | running | degraded | failed | stopped`. A mission that is `degraded`
+only because a subsystem was late returns to `running` when it arrives.
+
+Checklist readiness (first arrival per mission): `gazebo`/`bridge`/`mock_world` = any robot's odom ·
+`sensor_effects` = a clean `/<r>/camera/image` frame from **every** robot · `perception` = detections from every robot ·
+`mapping` = `/planet_map/stats` · `<robot>` = its odom + agent_state. On the Gazebo backend the watchdog falls back to the
+mock world if `sensor_effects` is still missing after 45 s, or if the launch (or `gz_sim` / the bridge / the world
+interface) exits while launching.
+
+Errors: an invalid body → HTTP 422 `{ok:false, detail:"field: message; …", errors:[pydantic errors]}`. A state-changing
+request (POST) or a `/ws` upgrade whose `Origin` is neither localhost nor this server's own origin → 403 / close 1008.
 
 ## 7. WebSocket `/ws`
 
@@ -159,3 +169,6 @@ Server → client (JSON text frames):
 - `{"type":"event","event":{…§4 event, or {op:"scan_request"|"scan_complete"|"hazard_mark"|"fallback", …}}}` — immediately.
 
 Client → server: `{"type":"select_camera","robot":"scout_0"}`.
+
+Frames are strict JSON: non-finite numbers are sent as `null`. Each client has its own bounded queue; a client more than
+240 frames behind, or whose socket blocks a send for 2 s, is closed with code 1013 and is expected to reconnect.

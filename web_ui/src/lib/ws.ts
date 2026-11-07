@@ -4,6 +4,7 @@ import type { SelectCameraMsg, ServerMsg } from './types'
 
 const MIN_DELAY = 400
 const MAX_DELAY = 8000
+let dropped = 0 // unparsable frames (the backend sends strict JSON, so this should stay 0)
 
 class WsClient {
   private sock: WebSocket | null = null
@@ -53,7 +54,9 @@ class WsClient {
       let msg: ServerMsg
       try {
         msg = JSON.parse(ev.data)
-      } catch {
+      } catch (e) {
+        dropped += 1
+        if (dropped === 1 || dropped % 100 === 0) console.warn(`[ws] dropped ${dropped} unparsable frame(s)`, e)
         return
       }
       try {

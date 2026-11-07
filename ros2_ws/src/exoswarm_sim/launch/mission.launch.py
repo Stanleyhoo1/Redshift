@@ -39,7 +39,7 @@ def _setup(context):
                                    name='gz_sim', output='screen'))
         if cfg.get('gazebo_gui'):
             acts.append(ExecuteProcess(cmd=['gz', 'sim', '-g', '-v', '1'], name='gz_gui', output='log'))
-        acts.append(Node(package='ros_gz_bridge', executable='parameter_bridge', name='gz_bridge', output='log',
+        acts.append(Node(package='ros_gz_bridge', executable='parameter_bridge', name='redshift_gz_bridge', output='log',
                          parameters=[{'config_file': meta['bridge_path']}]))
         acts.append(Node(package='exoswarm_sim', executable='world_interface_node', name='world_interface',
                          output='screen', parameters=[{'world_name': meta['world_name'], 'terrain_path': meta['terrain_path'],

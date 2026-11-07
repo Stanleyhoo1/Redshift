@@ -565,6 +565,9 @@ class RoverAgent(AgentBase):
         self.out = out
         self.emit(out.traces)
         self._slope_trace(inp)
+        if out.drive == 'stop' and self.cmd != (0.0, 0.0):
+            self.cmd = (0.0, 0.0)          # halt before the (possibly long) A* below, not after it
+            self.send_cmd(0.0, 0.0)
 
         for a in out.actions:
             if a['type'] == 'hazard_mark':

@@ -107,7 +107,7 @@ const TraceRow = memo(function TraceRow({ t }: { t: TraceEntry }) {
         </Step>
         <Step label="Act" node="arrow" color={sev}>
           <span className="text-[13px] leading-snug font-[620] text-bone">{t.action}</span>
-          {t.latency_ms !== undefined && <span className="num ml-2 text-[11px] whitespace-nowrap text-dim">{fmt(t.latency_ms, 0)} ms</span>}
+          {t.latency_ms != null && <span className="num ml-2 text-[11px] whitespace-nowrap text-dim">{fmt(t.latency_ms, 0)} ms</span>}
         </Step>
       </div>
     </li>

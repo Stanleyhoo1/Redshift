@@ -14,6 +14,7 @@ import numpy as np
 
 from . import _paths  # noqa: F401
 from .encoders import RobotCache, downsample_path
+from .mission_manager import readiness_from_marks
 
 try:
     import rclpy
@@ -109,6 +110,10 @@ class RosLink:
                 n.create_subscription(CompressedImage, f'/{r}/perception/annotated/compressed',
                                       lambda m, c=c: self._on_jpeg(c, m), SENSOR_QOS),
                 n.create_subscription(Path, f'/{r}/planned_path', lambda m, c=c: self._on_path(c, m), 10),
+                # proof that the simulator renders: a clean (post sensor-effects) camera frame. raw=True skips
+                # deserialising the pixels; only the arrival is recorded.
+                n.create_subscription(Image, f'/{r}/camera/image', lambda _m, c=c: self._on_frame(c), SENSOR_QOS,
+                                      raw=True),
             ]
             if c.rtype == 'rover':
                 subs.append(n.create_subscription(PointCloud2, f'/{r}/lidar/points',
@@ -127,6 +132,11 @@ class RosLink:
             c.pose = {'x': p.position.x, 'y': p.position.y, 'z': p.position.z, 'roll': r, 'pitch': pt, 'yaw': y}
             c.trail.add(p.position.x, p.position.y)
             self._mark(c, 'odom')
+
+    def _on_frame(self, c: RobotCache):
+        if 'frame' not in c.first:
+            with self.lock:
+                self._mark(c, 'frame')
 
     def _on_imu(self, c: RobotCache, m):
         r, p, _ = quat_to_rpy(m.orientation)
@@ -204,19 +214,10 @@ class RosLink:
     # ------------------------------------------------------------------ queries (asyncio thread)
     def readiness(self, backend: str) -> set:
         """Checklist keys whose data has arrived (see mission_manager.checklist_keys)."""
-        ready = set()
         with self.lock:
-            caches = list(self.robots.values())
-            if any('odom' in c.first for c in caches):
-                ready |= {'gazebo', 'bridge'} if backend == 'gazebo' else {'mock_world'}
-            if 'env' in self.first_global:
-                ready.add('sensor_effects')
-            if caches and all('detections' in c.first for c in caches):
-                ready.add('perception')
-            if 'stats' in self.first_global:
-                ready.add('mapping')
-            ready |= {c.name for c in caches if 'agent_state' in c.first and 'odom' in c.first}
-        return ready
+            marks = {r: dict(c.first) for r, c in self.robots.items()}
+            glob = dict(self.first_global)
+        return readiness_from_marks(backend, marks, glob)
 
     def lidar_cloud(self, robot: str):
         with self.lock:

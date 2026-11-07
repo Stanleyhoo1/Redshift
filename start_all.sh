@@ -76,7 +76,9 @@ check_port() {
 PIDS=()
 cleanup() {
   local why="$1" p alive
-  trap - INT TERM EXIT
+  set +e                                         # every step below must run, whatever an earlier one returned
+  trap '' INT TERM                               # a second Ctrl+C must not cut the teardown short
+  trap - EXIT
   say "shutting down"
   # On Ctrl+C the terminal already delivered SIGINT to the backend; a second one would make uvicorn
   # force-exit before its shutdown hook has aborted the mission.

@@ -121,7 +121,7 @@ export interface TraceEntry {
   confidence: number
   action: string
   severity: Severity
-  latency_ms?: number
+  latency_ms?: number | null
 }
 
 // §3.4 Edge telemetry

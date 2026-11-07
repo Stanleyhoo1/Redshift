@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from backend_bridge.config_schema import MissionConfig
-from backend_bridge.mission_manager import MissionManager, checklist_keys, tidy_log_line
+from backend_bridge.mission_manager import MissionManager, checklist_keys, readiness_from_marks, tidy_log_line
 
 FAKE = r'''
 import sys, time, signal
@@ -91,6 +91,111 @@ def test_gazebo_watchdog_falls_back_to_mock(tmp_path):
         assert rec.events and rec.events[0]['op'] == 'fallback' and rec.events[0]['to'] == 'mock'
         assert any('falling back to mock' in ln for ln in rec.logs)
         assert 'mock_world' in mgr.checklist and 'gazebo' not in mgr.checklist
+        await mgr.abort()
+    asyncio.run(go())
+
+
+def gazebo_without_rendering(cfg):
+    """What RosLink sees when gz-sim runs but its rendering sensors never produce frames: odom/IMU flow, the
+    sensor-effects env timer publishes, planners report state - but no camera frame ever arrives."""
+    if cfg.sim_backend == 'mock':
+        return set(checklist_keys(cfg))
+    marks = {r: {'odom': 1.0, 'agent_state': 1.0} for r in cfg.robots}
+    return readiness_from_marks('gazebo', marks, {'env': 1.0})
+
+
+def test_gazebo_watchdog_fires_when_only_env_and_odom_arrive(tmp_path):
+    async def go():
+        mgr, rec = make(tmp_path, ready=gazebo_without_rendering, gazebo_timeout_s=0.4)
+        await mgr.deploy(MissionConfig(sim_backend='gazebo'))
+        await wait_for(lambda: mgr.status == 'running' and mgr.backend == 'mock')
+        assert rec.events and rec.events[0]['op'] == 'fallback'
+        await mgr.abort()
+    asyncio.run(go())
+
+
+def test_readiness_from_marks():
+    robots = {'rover_0': {'odom': 1, 'agent_state': 1}, 'scout_0': {'odom': 1}}
+    assert readiness_from_marks('gazebo', robots, {'env': 1}) == {'gazebo', 'bridge', 'rover_0'}
+    robots['rover_0']['frame'] = 1
+    assert 'sensor_effects' not in readiness_from_marks('gazebo', robots, {})      # every robot needs a frame
+    robots['scout_0'].update(frame=1, detections=1, agent_state=1)
+    robots['rover_0']['detections'] = 1
+    assert readiness_from_marks('mock', robots, {'stats': 1}) == \
+        {'mock_world', 'sensor_effects', 'perception', 'mapping', 'rover_0', 'scout_0'}
+    assert readiness_from_marks('mock', {}, {}) == set()
+
+
+def test_gazebo_launch_exit_while_launching_falls_back(tmp_path):
+    def ready(cfg):
+        return set(checklist_keys(cfg)) if cfg.sim_backend == 'mock' else set()
+
+    async def go():
+        rec = Rec()
+
+        async def noop(*_):
+            pass
+
+        async def on_event(ev):
+            rec.events.append(ev)
+
+        mgr = MissionManager(tmp_path / 'runtime', noop, noop, on_event, readiness=ready, cleanup_patterns=(),
+                             launch_cmd=lambda p: [sys.executable, '-c', FAKE, str(p), 'crash' if 'sim_backend: gazebo' in
+                                                   p.read_text() else 'run'], gazebo_timeout_s=30)
+        await mgr.deploy(MissionConfig(sim_backend='gazebo'))
+        await wait_for(lambda: mgr.status == 'running' and mgr.backend == 'mock')
+        assert rec.events[0]['op'] == 'fallback' and 'exited' in rec.events[0]['reason']
+        await mgr.abort()
+    asyncio.run(go())
+
+
+def test_abort_during_pending_fallback_does_not_start_mock(tmp_path):
+    async def go():
+        mgr, rec = make(tmp_path, ready=gazebo_without_rendering, gazebo_timeout_s=0.3)
+        await mgr.deploy(MissionConfig(sim_backend='gazebo'))
+        async with mgr._lock:                      # hold the lock so the watchdog's fallback has to queue behind it
+            await wait_for(lambda: mgr._fallback_task is not None)
+            await mgr._stop(silent=False)
+        await asyncio.sleep(0.5)
+        assert mgr.status == 'stopped' and mgr.backend == 'gazebo' and mgr.proc is None
+    asyncio.run(go())
+
+
+def test_degraded_recovers_when_late_subsystem_arrives(tmp_path):
+    late = {'ok': False}
+
+    def ready(cfg):
+        keys = set(checklist_keys(cfg))
+        return keys if late['ok'] else keys - {'mapping'}
+
+    async def go():
+        mgr, rec = make(tmp_path, ready=ready, ready_timeout_s=0.3)
+        await mgr.deploy(MissionConfig(sim_backend='mock'))
+        await wait_for(lambda: mgr.status == 'degraded')
+        late['ok'] = True
+        await wait_for(lambda: mgr.status == 'running')
+        assert mgr.running_since is not None and mgr.detail is None
+        await mgr.abort()
+    asyncio.run(go())
+
+
+def test_overlong_output_line_does_not_kill_pump(tmp_path):
+    long_fake = FAKE.replace('mode = sys.argv[2]', 'print("x" * 300000, flush=True)\nprint("[mission-test] after", flush=True)\nmode = sys.argv[2]')
+
+    async def go():
+        rec = Rec()
+
+        async def noop(*_):
+            pass
+
+        async def on_log(line):
+            rec.logs.append(line)
+
+        mgr = MissionManager(tmp_path / 'runtime', noop, on_log, noop, readiness=lambda cfg: set(),
+                             launch_cmd=lambda p: [sys.executable, '-c', long_fake, str(p), 'run'], cleanup_patterns=())
+        await mgr.deploy(MissionConfig(sim_backend='mock'))
+        await wait_for(lambda: any('after' in ln for ln in rec.logs))
+        assert mgr.status == 'launching'
         await mgr.abort()
     asyncio.run(go())
 
