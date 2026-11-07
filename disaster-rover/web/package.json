@@ -1,0 +1,26 @@
+{
+  "name": "disaster-rover-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "sim": "tsx scripts/run-sim.ts",
+    "sim:ros": "tsx scripts/run-ros.ts",
+    "bench": "tsx scripts/bench.ts",
+    "test:rules": "tsx scripts/test-rules.ts"
+  },
+  "dependencies": {
+    "roslib": "1.4.1",
+    "three": "0.169.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.9.0",
+    "@types/three": "0.169.0",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vite": "5.4.11"
+  }
+}

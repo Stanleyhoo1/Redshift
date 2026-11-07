@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Disaster Rover</title>
+  <link rel="stylesheet" href="./ui/style.css" />
+</head>
+<body>
+  <aside id="left" class="panel">
+    <h1>Disaster Rover</h1>
+    <section>
+      <h2>Disasters</h2>
+      <div id="disasters"></div>
+      <label class="row"><input type="checkbox" id="random" /> Random timing</label>
+    </section>
+    <section>
+      <h2>Mission</h2>
+      <label class="row">Seed <input type="number" id="seed" value="3" min="1" max="99999" /></label>
+      <label class="row">Duration (s) <input type="number" id="duration" value="180" min="30" max="1200" /></label>
+      <label class="row">Speed <select id="speed"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+      <div class="row btns"><button id="start">Start</button><button id="pause">Pause</button><button id="reset">Reset</button></div>
+    </section>
+    <section>
+      <h2>Chaos panel <small>trigger now</small></h2>
+      <div id="chaos" class="btns wrap"></div>
+    </section>
+    <section>
+      <h2>Brain</h2>
+      <div class="row seg" id="brainSel">
+        <label><input type="radio" name="brain" value="ros" /> ROS 2</label>
+        <label><input type="radio" name="brain" value="local" checked /> Local TS</label>
+        <label><input type="radio" name="brain" value="manual" /> Manual (WASD)</label>
+      </div>
+      <div id="rosStatus" class="status">rosbridge: not connected</div>
+      <label class="row"><input type="text" id="rosUrl" value="ws://localhost:9090" /></label>
+      <label class="row"><input type="checkbox" id="agent" /> Agent: Gemma 4 mission commander</label>
+      <div id="agentStatus" class="status">Agent off, utility only</div>
+    </section>
+    <section>
+      <h2>View</h2>
+      <label class="row"><input type="checkbox" id="tLidar" checked /> LiDAR rays</label>
+      <label class="row"><input type="checkbox" id="tHaz" /> Hazard overlay (brain belief)</label>
+      <label class="row"><input type="checkbox" id="tFog" checked /> Fog of war</label>
+      <label class="row"><input type="checkbox" id="tPath" checked /> Planned path</label>
+      <label class="row"><input type="checkbox" id="tCam" checked /> Onboard camera</label>
+    </section>
+  </aside>
+  <main id="view">
+    <canvas id="c"></canvas>
+    <div id="banner" class="hidden"></div>
+    <div id="overlay"></div>
+    <div id="hint">drag: orbit · wheel: zoom · WASD: drive (manual) · P: drop probe</div>
+  </main>
+  <aside id="right" class="panel">
+    <section>
+      <h2>Rover</h2>
+      <div id="status" class="grid2"></div>
+    </section>
+    <section>
+      <h2>Brain's hazard map <small>(what the rover knows)</small></h2>
+      <canvas id="minimap" width="220" height="220"></canvas>
+      <div class="legend"><span class="sw" style="background:#3a7bd5"></span>water <span class="sw" style="background:#ff5a1f"></span>heat <span class="sw" style="background:#b58b5a"></span>rubble <span class="sw" style="background:#b04dff"></span>wind <span class="sw" style="background:#ffd23f"></span>predicted 30 s</div>
+    </section>
+    <section>
+      <h2>Agent</h2>
+      <div id="agentPanel" class="log small"></div>
+    </section>
+    <section class="grow">
+      <h2>Decision log</h2>
+      <div id="log" class="log"></div>
+    </section>
+    <section>
+      <h2>World events <small>(ground truth, not visible to brain)</small></h2>
+      <div id="events" class="log small"></div>
+    </section>
+  </aside>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>
