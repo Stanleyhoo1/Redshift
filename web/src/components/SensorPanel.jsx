@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { simStore, useSim } from '../state/store.js'
 import { sampleGround } from '../state/simState.js'
-import { fetchCameraFrame } from '../net/connection.js'
+import { camDown, fetchCameraFrame } from '../net/connection.js'
 import { fixed } from '../lib/format.js'
 import { HAZARD, SIGNAL, kindStyle } from '../lib/theme.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { Battery, StatePill, brainLevel, fmtMs } from './RoverBits.jsx'
+import { PlannerRow } from './Planner.jsx'
 import { reducedMotion } from '../scene/sceneConstants.js'
 
 const num = (v) => typeof v === 'number' && Number.isFinite(v)
@@ -13,15 +14,11 @@ const CAM_W = 320
 const CAM_H = 240
 const CAM_PERIOD = 250 // ms between frame starts: about 4 per second
 const CAM_RETRY_NET = 4000 // no connection: try again soon
-const CAM_RETRY_DOWN = 30000 // 503 / 404: rendering is off on that machine, rarely comes back
-
-// Shared by every rover: when the sim says it cannot render, do not ask again for a
-// while (each refused request is also a console line in the browser).
-const camDown = { until: 0, problem: null }
+export const CAM_RETRY_DOWN = 30000 // 503 / 404: rendering is off on that machine, rarely comes back
 
 // ---------------------------------------------------------------- camera
 
-function cameraProblem(err) {
+export function cameraProblem(err) {
   if (err.status === 404) return { title: 'Camera unavailable', sub: 'This rover has no camera feed' }
   if (err.status === 0) return { title: 'Camera unavailable', sub: 'No connection to the sim' }
   if (err.status === 503) return { title: 'Camera unavailable', sub: err.message && !/^HTTP/.test(err.message) ? err.message : 'Rendering is off on this machine' }
@@ -165,7 +162,8 @@ const bandOf = (dz) => {
 
 // Top-down view of the latest sweep, rover at the centre facing up. The dashed ring is
 // the current effective range (sensors.lidar_range): it shrinks in a dust storm.
-function LidarRadar({ roverId, size }) {
+// Also shown on a clarification card when the rover's camera is unavailable.
+export function LidarRadar({ roverId, size, showRange = true }) {
   const canvas = useRef(null)
   const st = useRef({ ring: null, nominal: 8, scan: null, prev: null, prevPose: null, pose: null, last: 0 })
 
@@ -317,7 +315,7 @@ function LidarRadar({ roverId, size }) {
       ctx.stroke()
       ctx.fill()
 
-      if (!hasData) return
+      if (!hasData || !showRange) return
       // Range label on the ring
       ctx.font = '600 11px "Archivo Variable", system-ui, sans-serif'
       ctx.textAlign = 'left'
@@ -333,7 +331,7 @@ function LidarRadar({ roverId, size }) {
     }
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
-  }, [roverId, size])
+  }, [roverId, size, showRange])
 
   return <canvas ref={canvas} className="sp-radar-canvas" style={{ width: size, height: size }} aria-hidden="true" />
 }
@@ -577,6 +575,7 @@ export function SensorPanel({ roverId, onClose }) {
   const budget = useSim((s) => s.fleet.budget_ms)
   const cycle = useSim((s) => s.fleet.cycle_ms)
   const limit = useSim((s) => s.limit.current)
+  const planner = useSim((s) => s.planner)
   const ref = useHudRect('sensors')
   const radarSize = useRadarSize()
   if (!meta) return null
@@ -597,11 +596,14 @@ export function SensorPanel({ roverId, onClose }) {
       {rover ? (
         <>
           <div className="sp-body">
-            <CameraFeed key={roverId} roverId={roverId} />
-            <RadarBlock key={roverId} rover={rover} size={radarSize} />
+            <CameraFeed key={`cam:${roverId}`} roverId={roverId} />
+            <RadarBlock key={`radar:${roverId}`} rover={rover} size={radarSize} />
             <Readouts rover={rover} limit={limit} />
           </div>
-          <BrainRow brain={rover.brain} budget={budget} cycle={cycle} />
+          <div className="sp-brains">
+            <BrainRow brain={rover.brain} budget={budget} cycle={cycle} />
+            {planner && <PlannerRow planner={planner} />}
+          </div>
         </>
       ) : (
         <p className="sp-empty">Waiting for telemetry from {meta.name}.</p>

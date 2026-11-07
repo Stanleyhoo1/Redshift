@@ -5,6 +5,7 @@
 // immutably, so React selectors see a new object when (and only when) it changed.
 
 export const MAX_EVENTS = 200
+export const MAX_CHAT = 200
 export const TRAIL_POINTS = 200
 export const FAR_PAST = -1e6
 export const DEFAULT_ROVER_COLORS = ['#ff7a45', '#ffd23f', '#ff5fa2', '#7cf29a', '#b39dff', '#4dd0e1', '#f4f4f4', '#ffa8a8']
@@ -24,6 +25,13 @@ export function emptyState() {
     events: [], // newest first, each with a client-side `key`
     fleet: {},
     hazards: [], // v2: full list from the latest tick (may stay empty with older sims)
+    // v3 (stay empty or null with older sims)
+    v3: false, // the sim has sent planner, chat or requests at least once
+    planner: null, // local Gemma status
+    chat: [], // oldest first, each with a client-side `key`
+    chatSeq: 0,
+    chatInitSeq: 0, // messages with a key above this arrived live
+    requests: [], // open clarification questions, each with a wall-clock `deadline`
     limit: { current: null, initial: null, prev: null, changedAt: null },
     t: 0,
     terrain: null,
@@ -225,9 +233,96 @@ function keyEvents(list, seq) {
       level: EVENT_LEVELS.has(e.level) ? e.level : 'info',
       msg: e.msg == null ? '' : String(e.msg),
       at: isXY(e.at) ? [e.at[0], e.at[1]] : null,
+      source: EVENT_SOURCES.has(e.source) ? e.source : 'rules', // v3: missing means rules
     })
   }
   return { events: out, seq }
+}
+
+const EVENT_SOURCES = new Set(['rules', 'gemma', 'operator'])
+const CHAT_KINDS = new Set(['command', 'ack', 'refuse', 'question', 'answer', 'info'])
+
+// v3 chat messages, keyed like events. Unknown kinds read as info.
+function keyChat(list, seq) {
+  const out = []
+  for (const m of Array.isArray(list) ? list : []) {
+    if (!isObj(m) || m.text == null || m.text === '') continue
+    seq++
+    out.push({
+      key: seq,
+      id: m.id == null ? null : String(m.id),
+      t: num(m.t, 0),
+      from: m.from == null ? 'fleet' : String(m.from),
+      to: m.to == null ? null : String(m.to),
+      text: String(m.text),
+      kind: CHAT_KINDS.has(m.kind) ? m.kind : 'info',
+      source: m.source === 'gemma' || m.source === 'rules' ? m.source : null,
+      request_id: m.request_id == null ? null : String(m.request_id),
+    })
+  }
+  return { chat: out, seq }
+}
+
+const sameChat = (a, b) => (a.id !== null && b.id !== null ? a.id === b.id : a.t === b.t && a.from === b.from && a.text === b.text)
+
+// v3 planner status: the protocol's fields, numbers or null. Same object when unchanged.
+function sanitizePlanner(p, prev) {
+  if (!isObj(p)) return null
+  const n = (v) => num(v, null)
+  const next = {
+    model: p.model == null ? null : String(p.model),
+    state: typeof p.state === 'string' && p.state ? p.state : p.online ? 'ready' : 'offline',
+    online: !!p.online,
+    calls: n(p.calls),
+    ok: n(p.ok),
+    fallbacks: n(p.fallbacks),
+    avg_ms: n(p.avg_ms),
+    p95_ms: n(p.p95_ms),
+    last_ms: n(p.last_ms),
+    budget_ms: n(p.budget_ms),
+    over_budget: n(p.over_budget),
+    asked_operator: n(p.asked_operator), // not in the protocol; shown when a sim sends it
+    detail: typeof p.detail === 'string' && p.detail ? p.detail : null,
+  }
+  return prev && JSON.stringify(prev) === JSON.stringify(next) ? prev : next
+}
+
+// v3 open requests. `expires_in` is wall seconds left when the message was sent; it is
+// turned into a client-side deadline (performance.now() seconds). Network and main-thread
+// delays only ever make a fresh estimate late, so the earliest one is kept (a jump of
+// more than 2 s later is taken as the sim extending the time).
+// `total` estimates the full countdown, so the bar starts full even for a late joiner.
+export function sanitizeRequests(list, prev, now, simT, speed) {
+  if (!Array.isArray(list)) return prev
+  const old = new Map(prev.map((q) => [q.id, q]))
+  const out = []
+  for (const q of list) {
+    if (!isObj(q) || q.id == null) continue
+    const id = String(q.id)
+    const was = old.get(id)
+    const options = (Array.isArray(q.options) ? q.options : [])
+      .filter((o) => (isObj(o) && o.id != null) || typeof o === 'string')
+      .map((o) => (typeof o === 'string' ? { id: o, label: o } : { id: String(o.id), label: o.label == null ? String(o.id) : String(o.label) }))
+    const left = num(q.expires_in, null)
+    let deadline = left === null ? null : now + Math.max(0, left)
+    if (was && was.deadline !== null && deadline !== null && deadline > was.deadline - 0.05 && deadline < was.deadline + 2) deadline = was.deadline
+    const t = num(q.t, simT)
+    const elapsed = speed > 0 ? Math.max(0, (simT - t) / speed) : 0
+    const total = was?.total ?? (left === null ? null : Math.max(1, Math.min(left + elapsed, left + 120)))
+    const next = {
+      id,
+      rover: q.rover == null ? null : String(q.rover),
+      t,
+      question: q.question == null ? '' : String(q.question),
+      options,
+      default: q.default == null ? null : String(q.default),
+      image: typeof q.image === 'string' && q.image ? q.image : null,
+      deadline,
+      total,
+    }
+    out.push(was && JSON.stringify(was) === JSON.stringify(next) ? was : next)
+  }
+  return out.length === prev.length && out.every((q, k) => q === prev[k]) ? prev : out
 }
 
 function limitFromFleet(fleet, prevLimit, now, detectChange) {
@@ -331,7 +426,33 @@ export function applyInit(prev, msg, now) {
   s.limit = limitFromFleet(s.fleet, s.limit, now, false)
   s.hazards = sanitizeHazards(msg.hazards)
   s.t = num(msg.t, s.events[0]?.t ?? 0)
+  s.chatSeq = prev?.chatSeq ?? 0 // keys keep growing across inits
+  s.chatInitSeq = s.chatSeq
+  applyV3(s, s, msg, now, true)
   return s
+}
+
+// v3 fields, shared by init and tick. Each one may be missing (older sims).
+function applyV3(s, prev, msg, now, isInit) {
+  if ('planner' in msg || 'chat' in msg || 'requests' in msg) s.v3 = true
+  if ('planner' in msg) s.planner = sanitizePlanner(msg.planner, prev.planner)
+  if (Array.isArray(msg.chat)) {
+    if (isInit) {
+      const keyed = keyChat(msg.chat.slice(-50), prev.chatSeq)
+      s.chat = keyed.chat
+      s.chatSeq = keyed.seq
+      s.chatInitSeq = keyed.seq
+    } else if (msg.chat.length) {
+      const keyed = keyChat(msg.chat, prev.chatSeq)
+      // A client that joins between two ticks can get a message both in init and in the next tick.
+      const recent = prev.chat.slice(-60)
+      const fresh = keyed.chat.filter((m) => !recent.some((r) => sameChat(r, m)))
+      s.chatSeq = keyed.seq
+      if (fresh.length) s.chat = prev.chat.concat(fresh).slice(-MAX_CHAT)
+    }
+  }
+  const speed = Number.isFinite(s.fleet?.sim_speed) && s.fleet.sim_speed > 0 ? s.fleet.sim_speed : 1
+  if (Array.isArray(msg.requests)) s.requests = sanitizeRequests(msg.requests, prev.requests, now, s.t, speed)
 }
 
 export function applyTick(prev, msg, now) {
@@ -386,6 +507,7 @@ export function applyTick(prev, msg, now) {
     const next = sanitizeHazards(msg.hazards)
     s.hazards = JSON.stringify(next) === JSON.stringify(prev.hazards) ? prev.hazards : next
   }
+  applyV3(s, prev, msg, now, false)
   return s
 }
 

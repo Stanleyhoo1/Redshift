@@ -1,7 +1,8 @@
 """Weighted A* (8-connected) on the map grid.
 
 Step cost = distance * multiplier. The multiplier is 1 + k * slope / limit for known samples,
-infinite above the current learned slope limit, on learned obstacles and on soft ground, and
+infinite above the current learned slope limit, on learned obstacles, on soft ground and in areas the
+operator put off limits, and
 raised for unknown samples (optimism: paths may run into the unknown and get replanned as it is
 revealed; a rover that cannot see far raises this a lot to stay on mapped ground).
 
@@ -40,7 +41,7 @@ def cost_grid(fmap: FleetMap, limit_deg: float, k_slope: float = 1.0, unknown_co
     """Per-sample cost multiplier (float64, shape ny x nx). inf = impassable."""
     known = fmap.known
     slope = fmap.slope
-    bad = (known & ((slope > limit_deg) | fmap.blocked)) | fmap.soft
+    bad = (known & ((slope > limit_deg) | fmap.blocked)) | fmap.soft | fmap.avoid
     mult = np.where(known, 1.0 + k_slope * slope / max(limit_deg, 1.0), 1.0 + unknown_cost)
     # soft inflation: samples touching an impassable sample cost more (keeps wheels off rock edges)
     p = np.zeros((fmap.ny + 2, fmap.nx + 2), bool)

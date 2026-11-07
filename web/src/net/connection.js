@@ -45,7 +45,11 @@ export function startConnection() {
       const msg = parseMessage(ev.data)
       if (!msg) return
       dispatchSim(msg)
-      if (msg && msg.type === 'init') loadTruth(simStore.get().gen)
+      if (msg && msg.type === 'init') {
+        loadTruth(simStore.get().gen)
+        // Request ids may start again after a reset: forget answers to the old ones.
+        if (Object.keys(appStore.get().answers).length) appStore.patch({ answers: {} })
+      }
     }
     sock.onclose = () => {
       if (ws !== sock) return
@@ -133,10 +137,25 @@ export async function postHazard(type, rover) {
   return j.hazard || null
 }
 
+// Shared by every camera view (sensor panel, clarification cards): when the sim says it
+// cannot render, do not ask again for a while (each refused request is also a console
+// line in the browser).
+export const camDown = { until: 0, problem: null }
+
+// The same URL with a cache-busting parameter (kept relative when it is same-origin).
+export function freshUrl(url) {
+  const u = new URL(url, location.href)
+  u.searchParams.set('_', String(Date.now()))
+  return u.origin === location.origin ? u.pathname + u.search : u.href
+}
+
 // One frame from GET /api/camera/{id}.jpg. Resolves with a Blob, or throws an Error
 // whose `status` is the HTTP status (0 for a network failure).
-export async function fetchCameraFrame(id, view, w, h, signal) {
-  const url = `/api/camera/${encodeURIComponent(id)}.jpg?view=${view}&w=${w}&h=${h}&_=${Date.now()}`
+export function fetchCameraFrame(id, view, w, h, signal) {
+  return fetchImage(`/api/camera/${encodeURIComponent(id)}.jpg?view=${view}&w=${w}&h=${h}&_=${Date.now()}`, signal)
+}
+
+export async function fetchImage(url, signal) {
   let res
   try {
     res = await fetch(url, { cache: 'no-store', signal })
@@ -150,6 +169,39 @@ export async function fetchCameraFrame(id, view, w, h, signal) {
     throw Object.assign(new Error(j.error || j.detail || `HTTP ${res.status}`), { status: res.status })
   }
   return res.blob()
+}
+
+// POST helper for the v3 endpoints. Resolves with the JSON body, or throws an Error with
+// the server's own error text and the HTTP `status` (0 when the sim is unreachable).
+async function postJson(path, body, fallbackMsg) {
+  let res
+  try {
+    res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  } catch {
+    throw Object.assign(new Error('Could not reach the sim'), { status: 0 })
+  }
+  const j = parseMessage(await res.text().catch(() => '')) || {}
+  if (!res.ok || j.ok === false) {
+    const detail = Array.isArray(j.detail) ? j.detail[0]?.msg : j.detail
+    let text = j.error || (typeof detail === 'string' ? detail : '')
+    if (/^not found$/i.test(text)) text = '' // a route the sim does not have (older protocol)
+    throw Object.assign(new Error(text || fallbackMsg(res.status)), { status: res.status, own: !!text })
+  }
+  return j
+}
+
+// POST /api/chat (PROTOCOL.md, version 3). The server echoes the message in `chat`.
+export function postChat(text, rover) {
+  return postJson('/api/chat', rover ? { text, rover } : { text }, (status) =>
+    status === 404 || status === 405 ? 'This sim does not support operator chat yet' : `Message refused (HTTP ${status})`,
+  )
+}
+
+// POST /api/answer: 404 unknown request, 409 already expired or answered.
+export function postAnswer(id, option) {
+  return postJson('/api/answer', { id, option }, (status) =>
+    status === 409 ? 'Too late: this question already closed' : status === 404 ? 'The sim no longer has this question' : `Answer refused (HTTP ${status})`,
+  )
 }
 
 export async function resetSim(seed) {

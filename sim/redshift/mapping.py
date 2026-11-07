@@ -62,6 +62,7 @@ class FleetMap:
         self.changed_t = np.full(shape, -1e9, np.float32)   # when a sample was last overwritten
         self.near_chg_t = np.full(shape, -1e9, np.float32)  # when a sample's neighbour last changed
         self.soft = np.zeros(shape, bool)             # soft ground reported by the fleet
+        self.avoid = np.zeros(shape, bool)            # areas the operator put off limits (known or not)
         self.scan_seq = 0
         self.changes = 0                              # samples overwritten so far
         self.sent_h = np.full(shape, np.nan, np.float32)
@@ -345,6 +346,19 @@ class FleetMap:
         self.version += 1
         return int(self.soft[j0:j1 + 1, i0:i1 + 1].sum()) - before
 
+    def mark_avoid(self, x: float, y: float, radius: float) -> int:
+        """Operator "avoid this area": impassable for every rover, mapped or not. Returns new samples."""
+        i, j = self.ij(x, y)
+        k = int(math.ceil(radius / self.res))
+        j0, j1 = max(0, j - k), min(self.ny - 1, j + k)
+        i0, i1 = max(0, i - k), min(self.nx - 1, i + k)
+        yy, xx = np.mgrid[j0:j1 + 1, i0:i1 + 1]
+        m = (xx - i) ** 2 + (yy - j) ** 2 <= (radius / self.res) ** 2 + 1e-6
+        before = int(self.avoid[j0:j1 + 1, i0:i1 + 1].sum())
+        self.avoid[j0:j1 + 1, i0:i1 + 1] |= m
+        self.version += 1
+        return int(self.avoid[j0:j1 + 1, i0:i1 + 1].sum()) - before
+
     def recently_changed(self, i: int, j: int, since: float, r: int = 1, min_count: int = 1) -> bool:
         """Were at least min_count samples within r cells of (i, j) overwritten by change detection
         after `since`?"""
@@ -352,7 +366,7 @@ class FleetMap:
         return int((win >= since).sum()) >= min_count
 
     def traversable(self, limit_deg: float) -> np.ndarray:
-        return self.known & (self.slope <= limit_deg) & ~self.blocked & ~self.soft
+        return self.known & (self.slope <= limit_deg) & ~self.blocked & ~self.soft & ~self.avoid
 
     # ------------------------------------------------------------------ deltas for the protocol
     def take_changed_cells(self) -> list:

@@ -30,6 +30,9 @@ export const simStore = createStore(emptyState())
 export const appStore = createStore({
   conn: 'connecting', // connecting | open | reconnecting
   truth: null, // { gen, nx, ny, res, ox, oy, heights: Float32Array, targets } or { gen, error }
+  // v3: answers this client sent to clarification requests, by request id:
+  // { state: 'pending' | 'sent' | 'error', option, error, status, at }
+  answers: {},
 })
 
 export function dispatchSim(msg) {

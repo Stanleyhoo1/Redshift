@@ -81,6 +81,7 @@ FLEET = {"rovers": [{"id": "r1", "name": "Rover 1", "color": "#ff7a45", "x": 3.2
 
 COMMANDS = [
     ("rover 2 go to 10, -5", ("go_to", "r2")),
+    ("rover 2, go check out the area north of the lander", ("explore_direction", "r2")),
     ("send the orange one back home", ("return_home", "r1")),
     ("everyone stop", ("hold", "all")),
     ("r3, explore towards the north east", ("explore_direction", "r3")),

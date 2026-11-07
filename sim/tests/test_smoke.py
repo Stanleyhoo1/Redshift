@@ -20,16 +20,19 @@ from redshift.sim import Simulation  # noqa: E402
 SIM_SECONDS = 400.0
 MSG_EVERY = 0.6        # sim seconds between tick messages (5 Hz at 3x real time)
 
-# protocol v1 keys plus the "Version 2 additions" (hazards, sensors, edge budget)
-INIT_KEYS = {"type", "world", "map", "lander", "rovers", "known", "targets", "events", "fleet", "hazards"}
-TICK_KEYS = {"type", "t", "rovers", "cells", "frontiers", "targets", "events", "fleet", "hazards"}
+# protocol v1 keys plus the "Version 2 additions" (hazards, sensors, edge budget) and the "Version 3
+# additions" (planner, chat, requests; checked in detail in test_brain.py)
+INIT_KEYS = {"type", "world", "map", "lander", "rovers", "known", "targets", "events", "fleet", "hazards",
+             "planner", "chat", "requests"}
+TICK_KEYS = {"type", "t", "rovers", "cells", "frontiers", "targets", "events", "fleet", "hazards",
+             "planner", "chat", "requests"}
 ROVER_KEYS = {"id", "x", "y", "z", "yaw", "speed", "battery", "state", "goal", "path", "target_id",
               "sensors", "scan", "brain"}
 SENSOR_KEYS = {"lidar_range", "lidar_hits", "pitch", "roll", "wheel_speed", "ground_speed", "slip", "motor_load",
                "spectro"}
 BRAIN_KEYS = {"last_ms", "avg_ms", "peak_ms", "over"}
 TARGET_KEYS = {"id", "x", "y", "kind", "status", "found_by", "found_t"}
-EVENT_KEYS = {"t", "rover", "level", "msg"}           # plus an optional "at": [x, y]
+EVENT_KEYS = {"t", "rover", "level", "msg"}           # plus optional "at": [x, y] and "source" (v3)
 FLEET_KEYS = {"explored_pct", "slope_limit_deg", "slope_limit_initial_deg", "targets_found", "targets_total",
               "sim_speed", "budget_ms", "cycle_ms", "soft_zones"}
 STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle", "fault"}
@@ -98,7 +101,8 @@ def _check_cells(cells, nx, ny):
 
 def _check_events(events):
     for e in events:
-        assert EVENT_KEYS <= set(e) <= EVENT_KEYS | {"at"}, e
+        assert EVENT_KEYS <= set(e) <= EVENT_KEYS | {"at", "source"}, e
+        assert e.get("source", "rules") in ("rules", "gemma", "operator"), e
         assert e["level"] in LEVELS, e
         assert isinstance(e["msg"], str) and e["msg"], e
         assert EM_DASH not in e["msg"], e
@@ -207,6 +211,7 @@ def test_messages_match_protocol():
         f = m["fleet"]
         assert f["budget_ms"] == cfg.brain_budget_ms and f["cycle_ms"] == 200.0 and isinstance(f["soft_zones"], list)
         assert m["hazards"] == []          # nothing triggered in this run
+        assert m["planner"]["state"] == "disabled" and m["chat"] == [] and m["requests"] == []   # rules only
 
 
 def test_no_false_hazard_reactions():

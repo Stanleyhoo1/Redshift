@@ -4,9 +4,13 @@ One call to step() advances physics by one agent period (1 / agent_hz sim second
 rover's decision tick. One rover per cycle (rotating) is on "fleet duty" and also refreshes the
 shared frontiers and reachability, so that shared work counts toward a rover's compute budget.
 The server calls step() from a background thread; the CLI below runs it flat out and can script
-hazards:
+hazards and operator messages:
 
     python -m redshift.sim --seconds 300 [--seed N] [--hazard rockfall@60] [--hazard sand@120:r1]
+    GEMMA_FAKE=1 python -m redshift.sim --gemma --seconds 200 --say "40:rover 2 explore north"
+
+Tier 2 (advisor.py: Gemma advice, operator chat, clarification questions) is attached as
+self.advisor; without a planner it is off and the rovers run on the rules alone.
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ import time
 import mujoco
 import numpy as np
 
+from .advisor import Advisor
 from .config import ROVER_COLORS, Config
 from .fleet import Fleet
 from .hazards import HazardError, HazardManager
@@ -38,7 +43,9 @@ def dock_spots(cfg: Config, n: int) -> list:
 
 
 class Simulation:
-    def __init__(self, cfg: Config | None = None):
+    def __init__(self, cfg: Config | None = None, planner=None, frame_source=None, wait_for_gemma: bool = False):
+        """planner: a gemma.GemmaPlanner for tier 2 (None: rules only, chat through the keyword
+        parser). frame_source(rover_id) -> JPEG bytes, for Gemma's anomaly checks (worker thread)."""
         self.cfg = cfg if cfg is not None else Config.from_env()
         cfg = self.cfg
         self.terrain = Terrain(cfg)
@@ -62,6 +69,7 @@ class Simulation:
         self.fleet.rovers = self.rovers
         self.hazards = HazardManager(self)
         self.fleet.hazards = self.hazards
+        self.advisor = Advisor(self, planner, frame_source, wait_for_gemma=wait_for_gemma)
 
         # per rover motor energy bookkeeping (actuator ids and wheel dof ids, shape n x 4)
         self._act = np.array([r.acts for r in self.rovers], dtype=np.int64).reshape(n, 4)
@@ -122,6 +130,7 @@ class Simulation:
             r = self.rovers[(s0 + k) % n]
             r.tick(t, self.agent_dt, float(energy[r.idx]), duty=(k == 0))
             energy[r.idx] = 0.0
+        self.advisor.update(t)
         self.ticks += 1
         c2 = time.perf_counter()
         self.prof["physics"] += c1 - c0
@@ -221,6 +230,9 @@ class Simulation:
             "events": evs,
             "fleet": self.fleet.stats(),
             "hazards": self.hazards.to_msgs(self.t),
+            "planner": self.advisor.planner_msg(),
+            "chat": self.advisor.init_chat(),
+            "requests": self.advisor.requests_msg(),
         }
 
     def tick_message(self) -> dict:
@@ -237,7 +249,14 @@ class Simulation:
             "events": self._new_events(),
             "fleet": self.fleet.stats(),
             "hazards": self.hazards.to_msgs(self.t),
+            "planner": self.advisor.planner_msg(),
+            "chat": self.advisor.new_chat(),
+            "requests": self.advisor.requests_msg(),
         }
+
+    def close(self) -> None:
+        """Stop tier 2's worker thread (the shared Gemma planner itself keeps running)."""
+        self.advisor.close()
 
     def truth_heights(self) -> np.ndarray:
         """True heights: terrain, rocks and any rockfall boulders."""
@@ -309,6 +328,10 @@ def main(argv=None) -> int:
                     help="cap planning by counted A* expansions instead of the wall clock (repeatable runs)")
     ap.add_argument("--budget-ms", type=float, default=None, help="brain budget per rover per cycle (default: "
                                                                   "BRAIN_BUDGET_MS or 40)")
+    ap.add_argument("--gemma", action="store_true",
+                    help="attach the Gemma planner from the GEMMA_* env vars (GEMMA_FAKE=1 for the fake model)")
+    ap.add_argument("--say", action="append", default=[], metavar="T:TEXT",
+                    help="operator chat message at sim time T, e.g. '40:rover 2 explore north' (repeatable)")
     args = ap.parse_args(argv)
     try:
         plan = sorted((parse_hazard(h) for h in args.hazard), key=lambda h: h[1])
@@ -325,9 +348,20 @@ def main(argv=None) -> int:
     if args.budget_ms is not None:
         overrides["brain_budget_ms"] = max(1.0, args.budget_ms)
     cfg = Config.from_env(**overrides)
+    try:
+        says = sorted(((float(s.split(":", 1)[0]), s.split(":", 1)[1]) for s in args.say), key=lambda x: x[0])
+    except (ValueError, IndexError):
+        ap.error("--say must look like SECONDS:TEXT")
+    planner = None
+    if args.gemma:
+        from .gemma import get_planner
+        planner = get_planner()
+        planner.wait_ready(5.0)
+        print(f"Gemma planner: {planner.stats()['state']} ({planner.stats()['model']}, "
+              f"{planner.stats()['backend']})")
 
     w0 = time.perf_counter()
-    sim = Simulation(cfg)
+    sim = Simulation(cfg, planner=planner)
     build_s = time.perf_counter() - w0
     print(f"Redshift sim: seed {cfg.seed}, {cfg.num_rovers} rovers, {cfg.gravity_g:g} g, map {cfg.map_size:g} m, "
           f"{len(sim.terrain.targets)} targets (built in {build_s:.2f} s)")
@@ -339,6 +373,8 @@ def main(argv=None) -> int:
     try:
         while sim.t < args.seconds - 1e-9:
             sim.step()
+            while says and sim.t >= says[0][0]:
+                sim.advisor.operator_message(says.pop(0)[1])
             for hp in list(pending):
                 if sim.t >= hp[3]:
                     try:
@@ -395,13 +431,24 @@ def main(argv=None) -> int:
         a = np.array(sizes)
         print(f"  tick size           median {np.median(a) / 1024:.1f} KB, p95 {np.percentile(a, 95) / 1024:.1f} KB, "
               f"max {a.max() / 1024:.1f} KB ({len(a)} ticks)")
+    pm = sim.advisor.planner_msg()
+    print(f"  gemma               {pm['state']}, {pm['calls']} calls, {pm['ok']} ok, {pm['fallbacks']} fallbacks, "
+          f"avg {pm['avg_ms']:.0f} ms, p95 {pm['p95_ms']:.0f} ms (budget {pm['budget_ms']:.0f} ms)")
     if not args.quiet:
         print("")
         print("Event log")
         for e in sim.fleet.events:
             who = e["rover"] or "fleet"
             at = f"  @({e['at'][0]:.0f}, {e['at'][1]:.0f})" if "at" in e else ""
-            print(f"  [{e['t']:7.1f}] {e['level']:9s} {who:5s} {e['msg']}{at}")
+            src = f" [{e['source']}]" if "source" in e else ""
+            print(f"  [{e['t']:7.1f}] {e['level']:9s} {who:5s} {e['msg']}{at}{src}")
+        if sim.advisor.chat:
+            print("")
+            print("Chat")
+            for m in sim.advisor.chat:
+                src = f" [{m['source']}]" if m["source"] else ""
+                print(f"  [{m['t']:7.1f}] {m['from']:8s} {m['kind']:8s} {m['text']}{src}")
+    sim.close()
     return 0
 
 

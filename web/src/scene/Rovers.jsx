@@ -90,6 +90,7 @@ function Rover({ meta, selected, onSelect }) {
   const sel = useRef()
   const state = useSim((s) => s.rovers[meta.id]?.state)
   const faulted = state === 'fault'
+  const asking = useSim((s) => s.requests.some((q) => q.rover === meta.id)) // v3: waiting for the operator
   // drei <Html> picks its DOM container once R3F has connected its events; mounting it
   // earlier makes it unmount and remount its own React root (a React error in dev).
   const labelsReady = useThree((s) => !!s.events.connected)
@@ -195,10 +196,15 @@ function Rover({ meta, selected, onSelect }) {
       <sprite ref={sign} material={faultMats.sign} position={[0, 3.55, 0]} scale={1.15} visible={false} renderOrder={10} />
       {labelsReady && (
         <Html position={[0, 2.5, 0]} center zIndexRange={[12, 0]} style={{ pointerEvents: 'none' }}>
-          <button type="button" className="rover-tag" data-selected={selected || undefined} data-fault={faulted || undefined} onClick={() => onSelect?.(meta.id)} title={`Show ${meta.name}'s sensors`}>
+          <button type="button" className="rover-tag" data-selected={selected || undefined} data-fault={faulted || undefined} data-ask={(asking && !faulted) || undefined} onClick={() => onSelect?.(meta.id)} title={`Show ${meta.name}'s sensors`}>
             <span className="dot" style={{ background: meta.color }} />
             {meta.name}
             {faulted && <span className="rover-tag-fault">Fault</span>}
+            {asking && !faulted && (
+              <span className="rover-tag-ask" title="Waiting for your answer">
+                ?
+              </span>
+            )}
           </button>
         </Html>
       )}

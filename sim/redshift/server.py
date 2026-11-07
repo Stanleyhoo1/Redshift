@@ -5,6 +5,11 @@ The Simulation runs in a background thread paced to SIM_SPEED x real time. An as
 first. Everything that touches the simulation holds one lock. POST /api/hazard changes the world
 (rockfall, sand, dust storm, rover fault); GET /api/camera/{rover_id}.jpg comes from camera.py.
 
+Tier 2 (protocol v3): the shared Gemma planner (gemma.get_planner()) is created when the server
+starts and loads the model in the background (about 40 s the first time), so it is warm before the
+rovers need it. POST /api/chat and POST /api/answer go to sim.advisor (advisor.py). A reset cancels
+questions still queued for Gemma about the old world.
+
     uvicorn redshift.server:app --port 8000           (what Docker runs)
     python -m redshift.server [--viewer] [--port 8000] (native run, optional MuJoCo viewer)
 """
@@ -27,6 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from .config import Config
+from .gemma import close_planner, get_planner
 from .hazards import TYPES as HAZARD_TYPES
 from .hazards import HazardError
 from .sim import Simulation
@@ -71,12 +77,15 @@ def dumps(obj) -> str:
 
 # ====================================================================== simulation thread
 class SimRunner:
-    """Owns one Simulation and the thread that steps it in real time (times sim_speed)."""
+    """Owns one Simulation and the thread that steps it in real time (times sim_speed).
+    planner: the Gemma planner for tier 2 (default: the server's shared one, if it started one;
+    otherwise none, so the rovers run on the rules alone)."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, planner=None):
         self.cfg = cfg
-        self.sim = Simulation(cfg)
         self.lock = threading.Lock()
+        planner = planner if planner is not None else state.planner
+        self.sim = Simulation(cfg, planner=planner, frame_source=self._frame if planner is not None else None)
         self._wait_lock = threading.Lock()
         self._waiting = 0
         self._stop = threading.Event()
@@ -99,6 +108,15 @@ class SimRunner:
         finally:
             self.lock.release()
 
+    def _frame(self, rover_id: str):
+        """Camera frame for Gemma (advisor worker thread only, never the sim thread): rendered on the
+        camera render thread, which holds the sim lock just for the scene update."""
+        try:
+            from . import camera
+        except Exception:               # noqa: BLE001 (no OpenGL here: Gemma gets the numbers only)
+            return None
+        return camera.render_jpeg(self.sim, rover_id, "fpv", 320, 240, runner=self)
+
     def start(self) -> None:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="redshift-sim", daemon=True)
@@ -109,6 +127,7 @@ class SimRunner:
         if self._thread is not None:
             self._thread.join(timeout)
             self._thread = None
+        self.sim.close()
 
     def _run(self) -> None:
         sim, speed = self.sim, max(self.cfg.sim_speed, 0.01)
@@ -180,6 +199,7 @@ class Client:
 class AppState:
     def __init__(self):
         self.runner: SimRunner | None = None
+        self.planner = None            # shared Gemma planner (tier 2), made at server start
         self.clients: set = set()
         self.reset_lock: asyncio.Lock | None = None
         self.broadcaster: asyncio.Task | None = None
@@ -230,6 +250,8 @@ async def restart_sim(seed: int) -> None:
         cfg = (old.cfg if old is not None else Config.from_env()).with_seed(seed)
         if old is not None:
             await asyncio.to_thread(old.stop)
+        if state.planner is not None:
+            state.planner.cancel()     # drop questions about the old world
         new = await asyncio.to_thread(SimRunner, cfg)
         # swap and re-init every client in one go (no await), so nobody sees the new sim's ticks first
         state.runner = new
@@ -268,21 +290,43 @@ async def auto_reset_loop() -> None:
             _log("auto reset failed:\n" + traceback.format_exc())
 
 
+async def planner_watch() -> None:
+    """Log the Gemma planner's state changes (warming, ready, offline) so the console shows them."""
+    last = None
+    while True:
+        await asyncio.sleep(1.0)
+        p = state.planner
+        if p is None:
+            continue
+        st = p.stats()
+        key = (st["state"], st["model"])
+        if key != last:
+            last = key
+            extra = f", warm-up {st['warmup_ms'] / 1000:.1f} s" if st["state"] == "ready" and st["warmup_ms"] else ""
+            _log(f"gemma planner {st['state']}: {st['model']}{extra}. {st['detail'] or ''}".rstrip())
+
+
 # ====================================================================== app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = Config.from_env()
     state.reset_lock = asyncio.Lock()
+    # Gemma first: its monitor thread finds Ollama and loads the model in the background right away
+    state.planner = get_planner()
+    st = state.planner.stats()
+    _log(f"gemma planner: {st['state']}, model {st['requested_model']} via {st['backend']} {st['url']} "
+         f"(budget {st['budget_ms']:.0f} ms per call)")
     state.runner = await asyncio.to_thread(SimRunner, cfg)
     state.runner.start()
     _log(f"simulation running: seed {cfg.seed}, {cfg.num_rovers} rovers, {cfg.gravity_g:g} g, "
          f"map {cfg.map_size:g} m, {cfg.sim_speed:g}x real time")
+    watch = asyncio.create_task(planner_watch())
     state.broadcaster = asyncio.create_task(broadcast_loop())
     auto = asyncio.create_task(auto_reset_loop()) if AUTO_RESET_S > 0 else None
     try:
         yield
     finally:
-        for task in (state.broadcaster, auto):
+        for task in (state.broadcaster, auto, watch):
             if task is None:
                 continue
             task.cancel()
@@ -293,6 +337,9 @@ async def lifespan(app: FastAPI):
         runner, state.runner = state.runner, None
         if runner is not None:
             await asyncio.to_thread(runner.stop)
+        if state.planner is not None:
+            state.planner = None
+            await asyncio.to_thread(close_planner)
 
 
 app = FastAPI(title="Redshift sim", lifespan=lifespan)
@@ -309,7 +356,7 @@ except Exception as _e:  # noqa: BLE001
 @app.get("/")
 async def root():
     return PlainTextResponse("Redshift sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, "
-                             "/api/hazard, /api/camera/{rover_id}.jpg.\n")
+                             "/api/hazard, /api/chat, /api/answer, /api/camera/{rover_id}.jpg.\n")
 
 
 @app.get("/api/health")
@@ -376,6 +423,68 @@ async def hazard(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     _log(f"hazard {h['id']}: {h['type']}" + (f" on {h['rover']}" if h.get("rover") else ""))
     return {"ok": True, "hazard": h}
+
+
+async def _json_body(request: Request):
+    body = (await request.body()).strip()
+    try:
+        data = json.loads(body) if body else {}
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+@app.post("/api/chat")
+async def chat(request: Request):
+    """Operator message: {"text": "...", "rover": "r2"} (rover optional). Posted to the chat at once;
+    Gemma (or the keyword parser) interprets it in the background and the rover answers in the chat."""
+    runner = state.runner
+    if runner is None:
+        return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    data = await _json_body(request)
+    if data is None:
+        return JSONResponse({"ok": False, "error": 'Body must be JSON like {"text": "rover 2 explore north"}'},
+                            status_code=400)
+    text, rover = data.get("text"), data.get("rover")
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({"ok": False, "error": "text must not be empty"}, status_code=400)
+    if rover is not None and not isinstance(rover, str):
+        return JSONResponse({"ok": False, "error": "rover must be a rover id like \"r2\""}, status_code=400)
+
+    def post():
+        with runner.locked() as sim:
+            hint = rover if rover in {r.id for r in sim.rovers} else None
+            return sim.advisor.operator_message(text, hint)
+
+    cid = await asyncio.to_thread(post)
+    return {"ok": True, "id": cid}
+
+
+@app.post("/api/answer")
+async def answer(request: Request):
+    """Operator answer to a clarification request: {"id": "q3", "option": "reroute"}."""
+    runner = state.runner
+    if runner is None:
+        return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    data = await _json_body(request)
+    if data is None or not isinstance(data.get("id"), str) or not isinstance(data.get("option"), str):
+        return JSONResponse({"ok": False, "error": 'Body must be JSON like {"id": "q3", "option": "reroute"}'},
+                            status_code=400)
+
+    def give():
+        with runner.locked() as sim:
+            return sim.advisor.answer(data["id"], data["option"])
+
+    status = await asyncio.to_thread(give)
+    if status == "ok":
+        return {"ok": True}
+    if status == "unknown":
+        return JSONResponse({"ok": False, "error": f"unknown request {data['id']!r}"}, status_code=404)
+    if status == "closed":
+        return JSONResponse({"ok": False, "error": f"request {data['id']} already expired or was answered"},
+                            status_code=409)
+    return JSONResponse({"ok": False, "error": f"option {data['option']!r} is not one of this request's options"},
+                        status_code=400)
 
 
 @app.websocket("/ws")

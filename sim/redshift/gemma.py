@@ -88,7 +88,7 @@ __all__ = [
     "GemmaPlanner", "OllamaBackend", "FakeBackend", "GemmaError", "GemmaTimeout", "GemmaOffline",
     "make_choice_request", "make_interpretation_request", "make_command_request", "build_prompt",
     "build_schema", "validate", "run_request", "parse_command", "cited_numbers", "render_readings",
-    "colour_name", "latency_summary", "estimate_tokens", "get_planner", "planner_from_env",
+    "colour_name", "latency_summary", "estimate_tokens", "get_planner", "planner_from_env", "close_planner",
 ]
 
 DEFAULT_URL = "http://host.docker.internal:11434"    # Ollama on the host, seen from Docker Desktop
@@ -128,10 +128,12 @@ SYSTEM_CHOICE = SYSTEM_BASE + (
 )
 SYSTEM_INTERPRET = SYSTEM_BASE + (
     "Its sensors flagged an anomaly. Use the camera image if there is one and the readings. "
-    "Classify the cause, pick one action from the options, and give a confidence from 0 to 1. "
+    "Classify the cause, pick one option, give a confidence from 0 to 1. "
+    "Soft ground or wheel slip means back_out. New rocks on the path mean reroute. "
+    "Dust or low visibility means proceed_slowly. "
     "If you cannot tell what it is, give a low confidence and choose ask_operator. "
     "Reply with JSON only: classification, reason, action, confidence. "
-    "The reason has at most 25 words and must quote at least one reading exactly as written, number and unit. "
+    "The reason has at most 25 words and must quote a reading exactly as written, number and unit. "
     'Example reason: "slip 52% while ground speed 0.05 m/s: the wheels spin in soft ground."'
 )
 SYSTEM_COMMAND = (
@@ -141,8 +143,10 @@ SYSTEM_COMMAND = (
     "unclear (ask one short question). "
     "rover is an id from the rover list, all, or none if the message names no rover; match names, numbers "
     "and colours to ids ('rover 2' is r2, 'the orange one' is the orange rover). "
+    "A direction or area without coordinates (north, north of the lander) means explore_direction. "
+    "go_to needs coordinates from the message or the lists, never the rover's own position. "
     "Use only numbers and ids from the message or the lists. Put 0 or none in fields the command does not use. "
-    "If the message is ambiguous, choose unclear and ask in question. "
+    "If the message is ambiguous, choose unclear and ask in question; otherwise question is empty. "
     "ack is one short sentence confirming the command. Reply with JSON only."
 )
 
@@ -409,7 +413,8 @@ def render_readings(d: dict) -> str:
 
 # a number not glued to a letter, digit, underscore or dot on its left: "f2", "r1", "t3" are ids
 _NUM_RE = re.compile(r"(?<![A-Za-z0-9_.])[-+]?\d+(?:\.\d+)?")
-_NO_NUMBERS_KEYS = {"rover", "id", "kind", "options", "classes", "type", "name", "colour", "color"}
+# keys whose numbers are not inputs a reason may cite or a coordinate may use (ids, the map edges)
+_NO_NUMBERS_KEYS = {"rover", "id", "kind", "options", "classes", "type", "name", "colour", "color", "bounds"}
 
 
 def numbers_in_text(text: str) -> list:
@@ -629,6 +634,12 @@ def _fleet_context(ctx: dict) -> dict:
         out["lander"] = [compact(float(lander[0])), compact(float(lander[1]))]
     if isinstance(ctx.get("map_size"), (int, float)):
         out["map_size"] = compact(ctx["map_size"])
+    b = ctx.get("bounds")            # [xmin, ymin, xmax, ymax] in m
+    if isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b):
+        out["bounds"] = [compact(float(v)) for v in b]
+    elif isinstance(out.get("map_size"), (int, float)):
+        h = out["map_size"] / 2.0
+        out["bounds"] = [compact(-h), compact(-h), compact(h), compact(h)]
     return out
 
 
@@ -671,8 +682,17 @@ def _command_prompt(req: Request) -> str:
             bits.append(f"at ({t_['x']:g}, {t_['y']:g})")
         tg.append(" ".join(bits))
     lines.append("Known targets: " + ("; ".join(tg) if tg else "none"))
+    where = []
     if "lander" in ctx:
-        lines.append(f"Lander at ({ctx['lander'][0]:g}, {ctx['lander'][1]:g}).")
+        where.append(f"Lander at ({ctx['lander'][0]:g}, {ctx['lander'][1]:g}).")
+    if "bounds" in ctx:
+        x0, y0, x1, y1 = ctx["bounds"]
+        if (x0, x1) == (y0, y1):
+            where.append(f"Map x and y {x0:g} to {x1:g} m, +x east, +y north.")
+        else:
+            where.append(f"Map x {x0:g} to {x1:g} m, y {y0:g} to {y1:g} m, +x east, +y north.")
+    if where:
+        lines.append(" ".join(where))
     lines.append("Give one command.")
     return "\n".join(lines)
 
@@ -981,6 +1001,46 @@ def _number(data: dict, key: str) -> float:
     return f
 
 
+_LABEL_RE = re.compile(r"^\s*(?:ack|ok|question|answer|reply|response)\s*[:=\-]+\s*", re.I)
+OWN_POSITION_M = 2.0       # a go_to this close to the rover's own position is not a real destination
+
+
+def _strip_label(s: str) -> str:
+    """'ack: Rover 2 is going north.' -> 'Rover 2 is going north.' (small models echo field names)."""
+    s = str(s or "")
+    for _ in range(2):
+        s = _LABEL_RE.sub("", s)
+    return s.strip()
+
+
+def _fix_go_to(req: Request, cmd: dict, data: dict) -> dict:
+    """Post-check a go_to. Small models sometimes answer 'go check out the area north of the lander'
+    with go_to at the rover's own position (a number they saw in the fleet list). If the message names
+    a direction and gives no coordinates, or the point is within 2 m of the rover itself, the operator
+    meant explore_direction; without a direction the command is unclear."""
+    if cmd.get("type") != "go_to":
+        return cmd
+    low = (req.text or "").lower()
+    rovers = (req.payload.get("fleet") or {}).get("rovers", [])
+    _, cleaned, _ = _resolve_rover(low, rovers)
+    explicit = len(numbers_in_text(_TARGET_RE.sub(" ", cleaned))) >= 2
+    d = str(data.get("direction") or "").strip().lower().replace(" ", "-").replace("_", "-")
+    d = {"northeast": "north-east", "northwest": "north-west", "southeast": "south-east",
+         "southwest": "south-west"}.get(d, d)
+    if d not in DIRECTIONS:
+        m = _DIR_RE.search(cleaned)
+        d = _norm_direction(m) if m else None
+    rv = cmd.get("rover")
+    own = next((r for r in rovers if r.get("id") == rv and "x" in r and "y" in r), None)
+    at_self = own is not None and math.hypot(cmd["x"] - own["x"], cmd["y"] - own["y"]) <= OWN_POSITION_M
+    if d and (at_self or not explicit):
+        return {"type": "explore_direction", "rover": rv, "direction": d}
+    if at_self:
+        who = rv or "the rover"
+        return {"type": "unclear", "question": f"Where should {who} go? Give x, y or a direction."}
+    return cmd
+
+
 def _validate_command(req: Request, data: dict, min_confidence: float, model: str) -> Result:
     def bad(msg: str) -> Result:
         return fallback(req, f"invalid answer: {msg}", model=model)
@@ -1041,7 +1101,12 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             cmd = {"type": "unclear", "question": q}
     except ValueError as e:
         return bad(str(e))
-    ack = _clean_text(data.get("ack") or "") or command_ack(cmd)
+    cmd = _fix_go_to(req, cmd, data)
+    if cmd["type"] == "unclear":
+        cmd["question"] = _strip_label(cmd["question"]) or _HELP
+    ack = _strip_label(_clean_text(data.get("ack") or ""))
+    if not ack or cmd["type"] != typ:
+        ack = command_ack(cmd)
     if cmd["type"] == "unclear":
         ack = cmd["question"]
     res = Result(ok=True, kind="command", source="gemma", rover_id="operator", t=req.t, ticket=req.ticket,
@@ -1356,9 +1421,10 @@ class FakeBackend(Backend):
         bits = [why]
         if frac is not None:
             bits.append(f"battery {frac * 100:.0f}%")
-        summ = " ".join(pick["summary"].split()[:10])
-        if summ:
-            bits.append(summ)
+        # quote the summary's numbers that matter (cells, slope, battery after return or on arrival)
+        parts = [p.strip() for p in pick["summary"].split(",")]
+        keep = [p for p in parts if re.search(r"cells|slope|battery", p)] or parts[:2]
+        bits.extend(keep[:3])
         return {"reason": ", ".join(bits), "choice": pick["id"], "confidence": 0.8}
 
     def _interpret(self, req: Request) -> dict:
@@ -1772,3 +1838,12 @@ def get_planner() -> GemmaPlanner:
         if _SHARED is None:
             _SHARED = planner_from_env()
         return _SHARED
+
+
+def close_planner(timeout: float = 1.0) -> None:
+    """Stop the process-wide planner's threads and forget it (server shutdown)."""
+    global _SHARED
+    with _SHARED_LOCK:
+        p, _SHARED = _SHARED, None
+    if p is not None:
+        p.close(timeout)
