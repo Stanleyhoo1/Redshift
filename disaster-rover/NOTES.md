@@ -65,3 +65,12 @@
 - Probes standing in water double as flood gauges (their DSM sample is the water surface).
 - Survival is unchanged with/without probes: they are an early-warning network for people (the mission), not a survival aid for the rover. Their cost is time spent driving to good spots instead of exploring.
 - Water reflex escape = back to last dry fix. Near fire, shallow water tolerance is 0.28 m (hard limit 0.5), escape planning avoids > 0.22 m.
+
+## Agent (M8)
+- Gemma supports native Ollama tool calling (`message.tool_calls`); a JSON-in-text fallback parser handles models that answer in prose+JSON. Anything else is logged as IGNORED (unparsable) and changes nothing.
+- The brain validates (it owns the sensed map and the planner); the agent node only proposes. Same rule code path for both brains (rules.ts / rules.py).
+- Accepted calls become a goal that biases utility scores (+0.35 explore for go_to/survey, >=0.62 place_probe / hold, +0.4 high_ground). They never bypass safety reflexes, and goals expire (60 s; hold = its seconds).
+- Measured latency is much lower than the 23 s in the brief once warm: Ollama caches the long, identical system-prompt + tools prefix (prompt ~510 tokens, ~45 output tokens). Cold first call ~21 s.
+- Headless agent runs are latency-faithful: sim time is not allowed to run ahead of wall time while a request is in flight, so the rover keeps driving on the utility brain for exactly as long as Gemma really takes.
+- Observed LLM mistakes the rule set catches: re-proposing a probe 3-5 m from one just placed; placing a probe on a riverside spot the brain predicts will flood within 30 s.
+- `pkill -f <pattern>` inside a command that also contains the pattern kills its own shell (exit 144). Stop and start ROS in separate commands.

@@ -11,6 +11,7 @@ const seed = +(a.seed ?? 1), duration = +(a.duration ?? 180), intensity = +(a.in
 const sim = new Sim({ seed, duration, disasters: disasterConfig(a.disasters, intensity, a.random === 'true'), flat: a.flat === 'true' });
 const brain = await makeBrain(a.brain ?? 'local', a, sim);
 const quiet = a.quiet === 'true' || a.json === 'true';
+const realtime = a.realtime === 'true';
 const t0 = performance.now();
 let brainMs = 0, ticks = 0, lastEvent = 0;
 
@@ -25,6 +26,8 @@ while (!sim.done) {
     if (!quiet && out.agent_log) console.log(`[${sim.t.toFixed(1).padStart(6)}] ${out.agent_log}`);
   }
   sim.step();
+  // --realtime: never run ahead of the wall clock (for the ROS agent, whose LLM latency is wall time)
+  if (realtime) { const ahead = sim.t - (performance.now() - t0) / 1000; if (ahead > 0.02) await new Promise(r => setTimeout(r, ahead * 1000)); }
   if (!quiet) for (; lastEvent < sim.dis.events.length; lastEvent++) { const e = sim.dis.events[lastEvent]; console.log(`[${e.t.toFixed(1).padStart(6)}] *** ${e.text}`); }
 }
 await brain.close?.();

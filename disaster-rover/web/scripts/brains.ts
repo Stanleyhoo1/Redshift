@@ -4,6 +4,7 @@ import { RosLite } from '../bridge/roslite';
 import { SENSOR_TOPICS, OUT_TOPICS } from '../bridge/topics';
 import { WanderBrain } from '../brain/types';
 import { LocalBrain } from '../brain/brain';
+import { AgentClient } from '../brain/agent';
 import type { Sim } from '../sim/sim';
 
 export interface RunnerBrain {
@@ -17,7 +18,23 @@ export async function makeBrain(kind: string, args: Record<string, string>, _sim
   if (kind === 'wander') return new WanderBrain();
   if (kind === 'local') {
     const b = new LocalBrain(); b.noProbes = args['no-probes'] === 'true';
-    return Object.assign(b, { stats: () => ({ probeWarnings: b.probeWarnings }) });
+    if (args.agent !== 'true') return Object.assign(b, { stats: () => ({ probeWarnings: b.probeWarnings }) });
+    // utility brain + Gemma 4 commander, latency-faithful (sim time never outruns an in-flight LLM request)
+    const agent = new AgentClient(); agent.enabled = true;
+    if (args.ollama) agent.url = args.ollama;
+    return {
+      name: 'local-ts + gemma4 agent',
+      async tick(f: SensorFrame) {
+        const t = JSON.parse(f.rover_status.data).t;
+        await agent.syncWait(t);
+        const out = b.tick(f);
+        const line = agent.step(b, t);
+        if (line) out.agent_log = line;
+        return out;
+      },
+      async close() { if (agent.inFlight) await Promise.race([agent.inFlight, new Promise(r => setTimeout(r, 100))]); },
+      stats: () => ({ probeWarnings: b.probeWarnings, ...agent.stats() }),
+    };
   }
   if (kind === 'ros') { const b = new RosBrain(); await b.connect(args.url ?? 'ws://localhost:9090'); return b; }
   throw new Error(`unknown brain ${kind}`);
