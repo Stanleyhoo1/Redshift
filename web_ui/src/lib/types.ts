@@ -35,6 +35,8 @@ export interface MissionConfig {
   sim_backend: SimBackend
   seed: number
   gazebo_gui: boolean
+  /** target simulated seconds per wall second; changeable live via POST /api/sim/speed */
+  sim_speed: number
 }
 
 // §6 GET /api/options
@@ -71,6 +73,7 @@ export interface Options {
   fleet: { rovers: RangeOption; drones: RangeOption }
   edge_profiles: EdgeProfileOption[]
   backends: BackendOption[]
+  sim_speed: { choices: number[]; min: number; max: number; default: number }
   defaults: MissionConfig
 }
 
@@ -183,7 +186,14 @@ export interface MissionEnv {
 export interface MissionTelemetry {
   status: MissionStatus
   backend: SimBackend | string
+  /** mission time since 'running', in simulated seconds */
   elapsed_s: number
+  /** simulator clock (s); null until /clock is seen */
+  sim_time_s?: number | null
+  /** target speed (real-time factor) */
+  sim_speed?: number
+  /** achieved real-time factor over the last ~2 s; 0 when the clock has stalled */
+  rtf?: number | null
   percent_mapped: number
   science_found: number
   hazard_cells: number

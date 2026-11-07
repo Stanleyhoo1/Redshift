@@ -44,6 +44,7 @@ class Hub:
         self.clients: dict[WebSocket, dict] = {}
         self.task: asyncio.Task | None = None
         self.t_run = 0.0
+        self.speed = 1.0     # UI dev only: scales motion; event timers stay on wall time
         self.pending_rocks: list = []
         self.rng = np.random.default_rng(3)
 
@@ -70,6 +71,7 @@ class Hub:
         await self.abort(silent=True)
         self.config = {**OPTIONS["defaults"], **cfg}
         self.backend = self.config["sim_backend"]
+        self.speed = float(self.config.get("sim_speed") or 1.0)
         f = self.config["fleet"]
         robots = [f"rover_{i}" for i in range(int(f.get("rovers", 1)))] + [f"scout_{i}" for i in range(int(f.get("drones", 1)))]
         world_key = "gazebo" if self.backend == "gazebo" else "mock_world"
@@ -133,7 +135,7 @@ class Hub:
             nxt = time.perf_counter()
             while True:
                 now = time.time()
-                self._step(dt, now)
+                self._step(dt * self.speed, now)
                 await self._emit(tick, now)
                 tick += 1
                 nxt += dt
@@ -243,6 +245,7 @@ class Hub:
         w = self.world
         st = w.stats()
         mission = {"status": self.status, "backend": self.backend, "elapsed_s": round(now - self.t_run, 1), "percent_mapped": st["percent"],
+                   "sim_speed": self.speed, "rtf": self.speed, "sim_time_s": round(now - self.t_run, 2),
                    "science_found": len(w.found_science), "hazard_cells": st["hazard_cells"],
                    "env": {"dust_level": w.env["dust_level"], "seismic": w.env["seismic"]}, "config": self.config}
         await self.broadcast({"type": "telemetry", "t": round(now, 3), "mission": mission, "robots": {a.id: self.robot_json(a) for a in self.rovers + self.scouts}})
@@ -356,6 +359,18 @@ def build_app(hub: Hub) -> FastAPI:
     @app.post("/api/inject/tip")
     async def tip(body: dict | None = None):
         return JSONResponse(hub.inject_tip((body or {}).get("robot")))
+
+    @app.post("/api/sim/speed")
+    async def sim_speed(body: dict | None = None):
+        x = (body or {}).get("speed")
+        if not isinstance(x, (int, float)) or not 0.25 <= x <= 3.0:
+            return JSONResponse({"ok": False, "detail": "speed must be 0.25–3.0"}, status_code=422)
+        if hub.status not in ("running", "degraded"):
+            return JSONResponse({"ok": False, "detail": "No running mission"})
+        hub.speed = float(x)
+        if hub.config:
+            hub.config["sim_speed"] = hub.speed
+        return JSONResponse({"ok": True, "speed": hub.speed, "detail": f"Simulation speed set to {hub.speed:g}×"})
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket):

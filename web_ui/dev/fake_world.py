@@ -35,7 +35,8 @@ OPTIONS = {
         {"id": "rpi5_8w", "label": "Raspberry Pi 5", "device": "Raspberry Pi 5 (8 GB)", "watts_idle": 3, "watts_max": 8, "perf_scale": 5.0, "perception_hz_max": 5, "max_expansions": 30000},
     ],
     "backends": [{"id": "gazebo", "label": "Gazebo Harmonic", "available": True}, {"id": "mock", "label": "Mock physics", "available": True}],
-    "defaults": {"sector": "medium", "gravity_g": 2.2, "fleet": {"rovers": 1, "drones": 1}, "edge_profile": "orin_nano_15w", "sim_backend": "gazebo", "seed": 42, "gazebo_gui": False},
+    "defaults": {"sector": "medium", "gravity_g": 2.2, "fleet": {"rovers": 1, "drones": 1}, "edge_profile": "orin_nano_15w", "sim_backend": "gazebo", "seed": 42, "gazebo_gui": False, "sim_speed": 1.0},
+    "sim_speed": {"choices": [0.5, 1.0, 1.5, 2.0], "min": 0.25, "max": 3.0, "default": 1.0},
 }
 
 

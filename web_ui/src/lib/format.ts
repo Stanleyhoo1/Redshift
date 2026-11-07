@@ -59,3 +59,8 @@ export function checklistLabel(key: string): string {
   if (/^(rover|scout)_\d+$/.test(key)) return `${robotName(key)} online`
   return kindLabel(key)
 }
+
+/** 0.5 → "0.5×", 1 → "1×" */
+export function fmtSpeed(x: number): string {
+  return `${Number(x.toFixed(2))}×`
+}

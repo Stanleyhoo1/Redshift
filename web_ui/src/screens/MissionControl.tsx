@@ -11,6 +11,7 @@ import { ImuAttitude } from '../panels/ImuAttitude'
 import { InjectBar } from '../panels/InjectBar'
 import { LidarRadar } from '../panels/LidarRadar'
 import { MissionProgress } from '../panels/MissionProgress'
+import { SimSpeed } from '../panels/SimSpeed'
 
 const Globe = lazy(() => import('../globe/Globe'))
 
@@ -128,6 +129,7 @@ function TopBar() {
         </span>
         <span className="num ml-2 text-[14px] text-bone">T+{fmtElapsed(mission?.elapsed_s ?? 0)}</span>
       </div>
+      <SimSpeed />
       <div className="num hidden items-baseline gap-4 text-[12.5px] text-haze xl:flex">
         <span>
           <span className="text-bone">{g.toFixed(1)} g</span> gravity

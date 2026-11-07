@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { fmtSpeed } from '../../lib/format'
 import type { BackendOption, EdgeProfileOption, RangeOption, SectorOption } from '../../lib/types'
 
 export function Field({ title, hint, children }: { title: string; hint?: ReactNode; children: ReactNode }) {
@@ -172,6 +173,28 @@ export function BackendPicker({ backends, value, onChange }: { backends: Backend
             <span className="block text-[12px] text-dim">
               {!b.available ? 'Not installed' : b.id === 'gazebo' ? 'Full physics and rendered sensors' : 'Lightweight kinematic fallback'}
             </span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+export function SpeedPicker({ choices, value, onChange }: { choices: number[]; value: number; onChange: (speed: number) => void }) {
+  return (
+    <div className="grid grid-cols-4 rounded-[3px] border border-rule bg-bay p-1" role="radiogroup" aria-label="Simulation speed">
+      {choices.map((x) => {
+        const on = Math.abs(x - value) < 1e-6
+        return (
+          <button
+            key={x}
+            type="button"
+            role="radio"
+            aria-checked={on}
+            onClick={() => onChange(x)}
+            className={`num rounded-[2px] px-2 py-1.5 text-[15px] font-[650] transition-colors ${on ? 'bg-bay-2 text-bone shadow-[inset_0_0_0_1px_var(--color-hb)]' : 'text-haze hover:text-bone'}`}
+          >
+            {fmtSpeed(x)}
           </button>
         )
       })}

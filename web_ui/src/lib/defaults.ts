@@ -10,6 +10,7 @@ export const DEFAULT_CONFIG: MissionConfig = {
   sim_backend: 'gazebo',
   seed: 42,
   gazebo_gui: false,
+  sim_speed: 1.0,
 }
 
 export const DEFAULT_OPTIONS: Options = {
@@ -30,6 +31,7 @@ export const DEFAULT_OPTIONS: Options = {
     { id: 'gazebo', label: 'Gazebo Harmonic', available: true },
     { id: 'mock', label: 'Mock physics', available: true },
   ],
+  sim_speed: { choices: [0.5, 1.0, 1.5, 2.0], min: 0.25, max: 3.0, default: 1.0 },
   defaults: DEFAULT_CONFIG,
 }
 

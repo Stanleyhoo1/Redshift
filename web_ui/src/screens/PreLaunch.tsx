@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api'
-import { DEFAULT_CONFIG } from '../lib/defaults'
+import { DEFAULT_CONFIG, DEFAULT_OPTIONS } from '../lib/defaults'
+import { fmtSpeed } from '../lib/format'
 import { useStore } from '../lib/store'
 import type { MissionConfig } from '../lib/types'
-import { BackendPicker, EdgePicker, Field, SectorPicker, Stepper } from './prelaunch/ConfigFields'
+import { BackendPicker, EdgePicker, Field, SectorPicker, SpeedPicker, Stepper } from './prelaunch/ConfigFields'
 import { GravityControl, Wordmark } from './prelaunch/GravityControl'
 import { usePhysicsPreview } from './prelaunch/usePhysicsPreview'
 
@@ -30,13 +31,15 @@ export default function PreLaunch() {
   const sector = options.sectors.find((s) => s.id === cfg.sector)
   const profile = options.edge_profiles.find((p) => p.id === cfg.edge_profile)
   const backend = options.backends.find((b) => b.id === cfg.sim_backend)
+  const speed = cfg.sim_speed ?? 1
+  const speeds = options.sim_speed?.choices ?? DEFAULT_OPTIONS.sim_speed.choices
 
   const summary = useMemo(() => {
     const r = cfg.fleet.rovers
     const d = cfg.fleet.drones
     const fleet = `${r} rover${r === 1 ? '' : 's'}${d ? ` and ${d} scout${d === 1 ? '' : 's'}` : ''}`
-    return `${sector?.label ?? cfg.sector} sector at ${cfg.gravity_g.toFixed(1)} g with ${fleet} on ${profile?.label ?? cfg.edge_profile}, simulated in ${backend?.label ?? cfg.sim_backend}.`
-  }, [cfg, sector, profile, backend])
+    return `${sector?.label ?? cfg.sector} sector at ${cfg.gravity_g.toFixed(1)} g with ${fleet} on ${profile?.label ?? cfg.edge_profile}, simulated in ${backend?.label ?? cfg.sim_backend}${speed === 1 ? '' : ` at ${fmtSpeed(speed)} speed`}.`
+  }, [cfg, sector, profile, backend, speed])
 
   const deploy = async () => {
     setDeploying(true)
@@ -100,6 +103,19 @@ export default function PreLaunch() {
 
         <Field title="Simulation">
           <BackendPicker backends={options.backends} value={cfg.sim_backend} onChange={(sim_backend) => update({ sim_backend })} />
+          <div className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-1.5">
+            <span className="text-[13px] text-haze">Speed</span>
+            <SpeedPicker choices={speeds} value={speed} onChange={(sim_speed) => update({ sim_speed })} />
+            <p className="col-start-2 text-[12px] text-dim">
+              Simulated seconds per real second. Physics, sensors and autonomy all run on simulation time, so the mission plays out the same,
+              only faster or slower. You can also change it during the mission.
+            </p>
+            {cfg.sim_backend === 'mock' && speed > 1 && (
+              <p className="col-start-2 text-[12px] text-nad">
+                Mock physics renders its sensors on the CPU and tops out near 1.1–1.5×, so it will run below this target. Gazebo reaches 2×.
+              </p>
+            )}
+          </div>
           <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-2">
             <label className="flex items-center gap-2 text-[13px] text-haze">
               Terrain seed

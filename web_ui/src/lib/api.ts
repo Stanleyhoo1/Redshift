@@ -83,4 +83,5 @@ export const api = {
   injectAnomaly: (body: { dust_level?: number; duration_s?: number } = {}) =>
     post<OkResponse>('/api/inject/anomaly', body),
   injectTip: (robot?: string) => post<OkResponse>('/api/inject/tip', robot ? { robot } : {}),
+  setSpeed: (speed: number) => post<OkResponse & { speed?: number }>('/api/sim/speed', { speed }),
 }

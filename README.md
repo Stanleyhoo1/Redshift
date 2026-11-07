@@ -37,6 +37,20 @@ Missions are launched from the UI. Ctrl+C aborts the running mission and reaps e
 | `--ui-demo` | no ROS needed: serve the UI against the scripted fake backend in `web_ui/dev/` |
 | `--port N`, `--host H` | bind elsewhere (`--host 0.0.0.0` to reach it from another machine) |
 
+### Simulation speed
+
+Pick **0.5× / 1× / 1.5× / 2×** on the pre-launch screen, or switch it live from the Mission Control top bar, which
+also shows the achieved real-time factor (`RTF`, amber when the simulator can't keep up). Every autonomy node runs on
+simulated time (`use_sim_time`, `/clock`). So holds, timeouts, dedup windows and sensor rates are counted in simulated
+seconds, and a mission plays out the same way at any speed, only faster or slower. 2× is handy for recording; 0.5× for
+watching a recovery closely.
+
+- **Gazebo** paces physics with its `real_time_factor`; a live change goes through `/world/redshift/set_physics`. With
+  1 rover + 1 scout and the full autonomy stack it holds 2× (measured 1.8–2.05).
+- **The mock world** is a lockstep clock: time waits for any sensor frame still rendering, so sensor rates hold per
+  simulated second and an overloaded renderer slows the clock instead of dropping frames. Its numpy rendering is
+  CPU-bound, so it tops out near 1.1–1.5×.
+
 ## The 60-second demo
 
 | Time | Action | What you see |
@@ -113,7 +127,7 @@ Missions are launched from the UI. Ctrl+C aborts the running mission and reaps e
 **Gazebo Harmonic** is the primary backend: DART physics with Bullet collision, `gpu_lidar`, RGB-D and IMU sensors, DiffDrive and VelocityControl. Rockslide and jolt commands run through gz-transport.
 
 **The mock world** is the fallback. The backend switches to it automatically if Gazebo has not delivered a camera frame from every robot within 45 s, or if a Gazebo process exits during start-up. You can also pick it in the UI. It:
-- renders the same terrain with vectorized numpy ray casting (camera ≈ 30 ms, LiDAR ≈ 11 ms per frame);
+- renders the same terrain with vectorized numpy ray casting (camera ≈ 30 ms, LiDAR ≈ 12 ms per frame);
 - reuses the same physics model for torque stalls;
 - runs the jolt as a closed-loop roll mode.
 
@@ -132,10 +146,11 @@ Without Gazebo, `start_all.sh` warns and only the mock backend works. Without RO
 ## Testing
 
 ```bash
-python3 -m pytest -q                                   # 129 unit tests: autonomy, sim, backend
+python3 -m pytest -q                                   # 145 unit tests: autonomy, sim, backend
 (cd web_ui && npm run typecheck && npm test)           # TypeScript + 20 vitest tests
 python3 backend_bridge/scripts/smoke_test.py --backend mock     # end-to-end against a running backend
 python3 backend_bridge/scripts/smoke_test.py --backend gazebo
+python3 backend_bridge/scripts/smoke_test.py --backend gazebo --speed 2     # same mission at 2× simulation speed
 ```
 
 The smoke test drives the same REST and WebSocket traffic as the UI:
@@ -143,10 +158,13 @@ The smoke test drives the same REST and WebSocket traffic as the UI:
 2. rockslide → `path_blocked` + `replanned`;
 3. dust → CAUTION / LiDAR-only, then recovery;
 4. tip → `safe_hold`, `recovery_reverse`, `hazard_marked`, `scout_tasked`, `scan_complete`, `resume`, and a permanent hazard on the map;
-5. unique trace ids;
-6. abort, with no simulator process left.
+5. the achieved real-time factor matches `--speed`, mission time follows simulated time, and a live speed change takes effect;
+6. unique trace ids;
+7. abort, with no simulator process left.
 
-Latest runs: 23/23 on mock in five consecutive runs, and 24/24 on Gazebo, which has one extra check (no fallback to mock). Typical Gazebo timings: running in about 4–5 s; rockslide → `path_blocked` in about 1 s; tip → `safe_hold` in 0.3 s and `resume` after about 31 s.
+Timeouts are in simulated seconds: below 1× they are stretched to wall time.
+
+Latest runs: Gazebo 27/27 at 1× (82 s) and 27/27 at 2× (58 s), with the same decision sequence at both speeds; mock 26/26 at 1× and 0.5×. Gazebo has one extra check (no fallback to mock). Typical Gazebo timings at 1×: running in about 5 s; rockslide → `path_blocked` in about 1 s; tip → `safe_hold` in 0.5 s and `resume` after about 30 s (15 s of wall time at 2×).
 
 One earlier Gazebo run missed `safe_hold` after the jolt. The same jolt then passed 6/6 when repeated on its own. When a rockslide, dust or jolt check fails, the smoke test now prints the rover's state, the world event and what it traced, so a repeat can be diagnosed.
 
@@ -168,6 +186,7 @@ web_ui/                               React + Three.js Mission Control; dev/ hol
 
 - **The page doesn't load from the Windows browser.** WSL2 forwards `localhost` by default. If yours doesn't, run `./start_all.sh --host 0.0.0.0` and use the WSL IP address.
 - **"port 8000 is already in use".** A previous run is still up. Run `./stop_all.sh`, or pass `--port`.
+- **The RTF readout is amber / below the chosen speed.** The simulator can't render that fast on this machine (see *Simulation speed*). The mission still runs correctly, only slower than requested.
 - **Gazebo is slow or never produces frames.** The backend falls back to the mock world after 45 s without camera frames (or at once if Gazebo exits during start-up), and says so in the boot log and as an event. Choose *Mock physics* in the UI to skip Gazebo entirely.
 - **`npm` resolves to `/mnt/c/...`.** That is the Windows npm. `start_all.sh` prefers the newest nvm Node; install one with `nvm install 22`.
 - **Simulator processes are left over after a crash.** Run `./stop_all.sh`. Its patterns only match this checkout's `runtime/` world and `install/` nodes, the `redshift_sim` launch and the bridge's `redshift_gz_bridge` node, so other Gazebo or ROS work on the machine is left alone.
