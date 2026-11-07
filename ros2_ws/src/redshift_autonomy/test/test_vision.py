@@ -170,6 +170,16 @@ def test_lidar_quality_and_baseline():
     assert 0.3 < c < 0.85
 
 
+def test_solid_obstacle_close_by_is_not_mistaken_for_dust_backscatter():
+    base = LidarBaseline()
+    for _ in range(3):
+        base.update(lidar_quality(organized_scan()))
+    rock = base.confidence(lidar_quality(organized_scan(obstacle_x=1.2)))   # boulder face 1.2 m away, ~100° wide
+    assert rock > 0.85
+    dusty = base.confidence(lidar_quality(organized_scan(backscatter=0.06)))  # same sensor, scattered near returns
+    assert dusty < rock - 0.1
+
+
 def test_lidar_corridor_finds_obstacle_and_slope():
     pts = organized_scan(obstacle_x=6.0).reshape(-1, 3)
     pts = pts[np.isfinite(pts).all(axis=1)] + np.array([0, 0, 1.0])   # base frame: ground z = 0

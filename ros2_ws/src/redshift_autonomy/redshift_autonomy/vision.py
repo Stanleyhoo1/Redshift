@@ -272,20 +272,37 @@ class ImageQualityBaseline:
         return float(np.clip(0.5 * s + 0.3 * c + 0.2 * n, 0.0, 1.0))
 
 
+NEAR_FIELD_M = 2.0
+
+
+def _isolated(mask: np.ndarray) -> np.ndarray:
+    """Cells of an organized (rings, samples) mask with no set neighbour along the scan (wrapping) or across rings."""
+    nb = np.roll(mask, 1, axis=1) | np.roll(mask, -1, axis=1)
+    nb[1:] |= mask[:-1]
+    nb[:-1] |= mask[1:]
+    return mask & ~nb
+
+
 def lidar_quality(points) -> dict:
+    """Scan statistics for LidarBaseline. near_ratio counts near-field returns that look like dust backscatter: in an
+    organized scan only isolated ones, because a real surface close by (a boulder beside the route) returns a
+    contiguous patch, while backscatter is sparse single beams."""
     P = np.asarray(points, dtype=np.float64)
     organized = P.ndim == 3
     flat = P.reshape(-1, 3)
     fin = np.isfinite(flat).all(axis=1)
     r = np.linalg.norm(flat[fin], axis=1)
     rough = 0.0
+    near = float((r < NEAR_FIELD_M).mean()) if len(r) else 0.0
     if organized and P.shape[1] >= 3:
         R = np.linalg.norm(P, axis=-1)
         d = np.abs(R[:, 1:-1] - 0.5 * (R[:, :-2] + R[:, 2:]))
         d = d[np.isfinite(d)]
         rough = float(np.median(d)) if len(d) else 0.0
-    return {'return_ratio': float(fin.mean()) if len(fin) else 0.0,
-            'near_ratio': float((r < 2.0).mean()) if len(r) else 0.0,
+        with np.errstate(invalid='ignore'):
+            near_mask = np.isfinite(R) & (R < NEAR_FIELD_M)
+        near = float(_isolated(near_mask).sum() / max(1, int(fin.sum())))
+    return {'return_ratio': float(fin.mean()) if len(fin) else 0.0, 'near_ratio': near,
             'roughness': rough, 'n': int(fin.sum())}
 
 
