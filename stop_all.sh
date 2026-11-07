@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stop Redshift: abort the running mission through the backend, stop the backend / Vite, and reap any
 # simulator or autonomy process left behind. Every pattern is anchored and names this checkout (runtime/ or
-# install/ path, the exoswarm_sim package or the bridge's unique node name), so unrelated Gazebo/ROS work is safe.
+# install/ path, the redshift_sim package or the bridge's unique node name), so unrelated Gazebo/ROS work is safe.
 #
 #   ./stop_all.sh [--port 8000] [--quiet] [--leftovers-only]
 set -uo pipefail
@@ -20,8 +20,8 @@ done
 say() { (( QUIET )) || printf '\033[1;35m[redshift]\033[0m %s\n' "$*"; }
 
 SIM_PATTERNS=(
-  "^ros2 launch exoswarm_sim"
-  "^/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch exoswarm_sim"
+  "^ros2 launch redshift_sim"
+  "^/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch redshift_sim"
   "^gz sim .*$ROOT/runtime/"
   "^/opt/ros/jazzy/lib/ros_gz_bridge/parameter_bridge .*__node:=redshift_gz_bridge"
   "^/usr/bin/python3 $ROOT/ros2_ws/install/"

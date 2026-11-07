@@ -1,6 +1,6 @@
 """Redshift mission bring-up.
 
-    ros2 launch exoswarm_sim mission.launch.py config:=/abs/path/mission_config.yaml [autonomy:=true]
+    ros2 launch redshift_sim mission.launch.py config:=/abs/path/mission_config.yaml [autonomy:=true]
 
 The config is a MissionConfig (docs/protocol.md §6) plus optional `runtime_dir`. The world (SDF,
 heightmap, terrain.npz, bridge.yaml) is generated into runtime_dir, then either Gazebo Harmonic
@@ -16,8 +16,8 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, Opaqu
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-from exoswarm_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
-from exoswarm_sim.world_builder import SECTORS, build_world
+from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
+from redshift_sim.world_builder import SECTORS, build_world
 
 
 def _setup(context):
@@ -41,30 +41,30 @@ def _setup(context):
             acts.append(ExecuteProcess(cmd=['gz', 'sim', '-g', '-v', '1'], name='gz_gui', output='log'))
         acts.append(Node(package='ros_gz_bridge', executable='parameter_bridge', name='redshift_gz_bridge', output='log',
                          parameters=[{'config_file': meta['bridge_path']}]))
-        acts.append(Node(package='exoswarm_sim', executable='world_interface_node', name='world_interface',
+        acts.append(Node(package='redshift_sim', executable='world_interface_node', name='world_interface',
                          output='screen', parameters=[{'world_name': meta['world_name'], 'terrain_path': meta['terrain_path'],
                                                        'g_mult': g, 'robots': robots}]))
     else:
-        acts.append(Node(package='exoswarm_sim', executable='mock_world_node', name='mock_world', output='screen',
+        acts.append(Node(package='redshift_sim', executable='mock_world_node', name='mock_world', output='screen',
                          parameters=[{'terrain_path': meta['terrain_path'], 'robots': robots, 'g_mult': g,
                                       'spawn_json': json.dumps(meta['spawn']), 'specs_json': json.dumps(specs)}]))
 
     for r in robots:
         rtype = 'rover' if r.startswith('rover') else 'scout'
-        acts.append(Node(package='exoswarm_sim', executable='sensor_effects_node', name=f'{r}_sensor_effects',
+        acts.append(Node(package='redshift_sim', executable='sensor_effects_node', name=f'{r}_sensor_effects',
                          output='log', parameters=[{'robot': r, 'robot_type': rtype,
                                                     'publish_env': r == robots[0]}]))
 
     if autonomy:
         common = {'g_mult': g, 'edge_profile': edge, 'size_m': size_m, 'map_res': res}
-        acts.append(Node(package='exoswarm_autonomy', executable='mapping_coordinator_node', name='mapping_coordinator',
+        acts.append(Node(package='redshift_autonomy', executable='mapping_coordinator_node', name='mapping_coordinator',
                          output='screen', parameters=[dict(common, robots=robots, specs_json=json.dumps(specs))]))
         for r in robots:
             rtype = 'rover' if r.startswith('rover') else 'scout'
             p = dict(common, robot=r, robot_type=rtype, spec_json=json.dumps(specs[r]), robots=robots)
-            acts.append(Node(package='exoswarm_autonomy', executable='perception_node', name=f'{r}_perception',
+            acts.append(Node(package='redshift_autonomy', executable='perception_node', name=f'{r}_perception',
                              output='screen', parameters=[p]))
-            acts.append(Node(package='exoswarm_autonomy', executable='agent_planner_node', name=f'{r}_planner',
+            acts.append(Node(package='redshift_autonomy', executable='agent_planner_node', name=f'{r}_planner',
                              output='screen', parameters=[p]))
     return acts
 

@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from exoswarm_autonomy.vision import (CameraModel, ImageQualityBaseline, LidarBaseline, annotate,
+from redshift_autonomy.vision import (CameraModel, ImageQualityBaseline, LidarBaseline, annotate,
                                       camera_points_body, detect_objects, fuse_uncertainty, image_quality,
                                       lidar_corridor, lidar_quality)
 

@@ -13,7 +13,7 @@ import math
 
 import numpy as np
 
-from exoswarm_autonomy.physics_model import RoverPhysics
+from redshift_autonomy.physics_model import RoverPhysics
 
 from .mock_render import rpy_matrix
 from .scene_events import JOLT

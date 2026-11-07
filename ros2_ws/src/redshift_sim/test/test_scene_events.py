@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from exoswarm_sim.scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_layout
+from redshift_sim.scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_layout
 
 
 def test_rockslide_lies_ahead_on_path_and_across_it():

@@ -7,9 +7,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import _paths  # noqa: F401
-from exoswarm_autonomy.edge_budget import PROFILES
-from exoswarm_autonomy.physics_model import RoverPhysics
-from exoswarm_sim.world_builder import SECTORS, robot_names
+from redshift_autonomy.edge_budget import PROFILES
+from redshift_autonomy.physics_model import RoverPhysics
+from redshift_sim.world_builder import SECTORS, robot_names
 
 SectorId = Literal['small', 'medium', 'large']
 EdgeProfileId = Literal['orin_nano_15w', 'orin_nx_25w', 'agx_orin_60w', 'rpi5_8w']

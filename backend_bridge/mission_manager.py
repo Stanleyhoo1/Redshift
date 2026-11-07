@@ -1,4 +1,4 @@
-"""Mission lifecycle: writes the runtime config, runs `ros2 launch exoswarm_sim mission.launch.py` in its own
+"""Mission lifecycle: writes the runtime config, runs `ros2 launch redshift_sim mission.launch.py` in its own
 process group, streams its output as the boot log, tracks subsystem readiness, falls back from Gazebo to the mock
 world when Gazebo produces no sensor data, and tears everything down on abort."""
 from __future__ import annotations
@@ -82,7 +82,7 @@ def tidy_log_line(raw: str) -> str | None:
 
 
 def default_launch_cmd(config_path: Path) -> list[str]:
-    return ['ros2', 'launch', 'exoswarm_sim', 'mission.launch.py', f'config:={config_path}']
+    return ['ros2', 'launch', 'redshift_sim', 'mission.launch.py', f'config:={config_path}']
 
 
 class MissionManager:

@@ -37,17 +37,17 @@ Reference snippets for plugin syntax: `/opt/ros/jazzy/opt/gz_sim_vendor/share/gz
 1. **One topic contract, two world backends.** `sim_backend: gazebo | mock`. The mock world node publishes exactly the raw topics the gz bridge would (`image_raw`, `depth_raw`, `lidar/points_raw`, `imu_raw`, `odom`, `wheel_odom`) and obeys the same `/world/command` JSON ops. Autonomy and backend never know which is running. Backend auto-falls back to mock if Gazebo yields no camera frames within 45 s (logged as a trace).
 2. **World is generated per deploy**, not mutated at runtime: DEPLOY writes `runtime/world.sdf` with `<gravity>0 0 -9.81·g</gravity>`, a procedurally generated 16-bit heightmap PNG, regolith texture, boulders, craters, science crystals, and the robots embedded at spawn poses (no spawn race). The same seeded `Terrain` drives the mock world.
 3. **No ground truth in autonomy.** Perception, mapping and planning consume only (degraded) sensor topics + odometry pose. Uncertainty is *computed from sensor data statistics*, never read from the dust flag. (Pose = OdometryPublisher, presented as "VIO/odometry"; optional drift noise param, default 0.)
-4. **Dust/seismic is an environment model** (`sensor_effects_node`, in exoswarm_sim) sitting between raw sensors and autonomy: haze/blur/noise on RGB, dropout + range clipping on depth, dropout + range noise + dust backscatter on LiDAR, vibration on IMU.
+4. **Dust/seismic is an environment model** (`sensor_effects_node`, in redshift_sim) sitting between raw sensors and autonomy: haze/blur/noise on RGB, dropout + range clipping on depth, dropout + range noise + dust backscatter on LiDAR, vibration on IMU.
 5. **Gravity is physically grounded and shared.** `physics_model.py` computes the traversability limit from drive torque, Mohr-Coulomb soil traction and static tip angle; the same τ_max is written into the Gazebo wheel joint `<effort>` limit so the simulated rover physically stalls where the planner says it can't climb.
 6. **JSON-over-`std_msgs/String`** for traces, detections, agent state, fleet coordination and world commands (schemas in `docs/protocol.md` + `trace.py`); standard typed msgs for sensors, maps (`nav_msgs/OccupancyGrid`), paths (`nav_msgs/Path`), cmd_vel (`geometry_msgs/Twist`). Avoids a CMake interface package; the backend forwards JSON straight to the UI.
 7. **Map to browser as a PNG layer image** (R = normalized elevation, G = class, B = reveal age) at 2–4 Hz; the globe shader decodes it. Camera frames are JPEGs encoded once in the perception node.
 8. **Everything local**: fonts bundled via `@fontsource`, no CDNs, no cloud calls.
-9. **Dependency direction:** `exoswarm_sim` may import `exoswarm_autonomy.physics_model` (mock stall model); `exoswarm_autonomy` never imports `exoswarm_sim` — robot geometry/extrinsics (`ROBOT_SPECS` in `robot_models.py`) reach autonomy nodes as ROS params set by the launch file. The backend imports both (physics preview, option catalogs).
+9. **Dependency direction:** `redshift_sim` may import `redshift_autonomy.physics_model` (mock stall model); `redshift_autonomy` never imports `redshift_sim` — robot geometry/extrinsics (`ROBOT_SPECS` in `robot_models.py`) reach autonomy nodes as ROS params set by the launch file. The backend imports both (physics preview, option catalogs).
 
 ## Architecture & data flow
 
 ```
- Web UI (React/R3F) ──REST /api/*──►  FastAPI backend ──spawns──► ros2 launch exoswarm_sim mission.launch.py config:=runtime/mission_config.yaml
+ Web UI (React/R3F) ──REST /api/*──►  FastAPI backend ──spawns──► ros2 launch redshift_sim mission.launch.py config:=runtime/mission_config.yaml
         ▲  one WebSocket /ws               │ rclpy RosLink (bg thread)                 │
         └──────────── telemetry/camera/lidar/map/trace/event ◄────────────────────────┤
                                                                                        ▼
@@ -105,20 +105,20 @@ Dedup same (robot, kind) within 2 s unless content changes.
 ```
 start_all.sh · stop_all.sh · README.md · .gitignore · runtime/ (generated, ignored)
 docs/protocol.md · docs/superpowers/plans/2026-11-07-redshift-fleet.md (copy of this plan)
-ros2_ws/src/exoswarm_sim/            (ament_python)
-  exoswarm_sim/terrain_gen.py         seeded heightfield + features (pure)
-  exoswarm_sim/robot_models.py        rover/scout SDF + ROBOT_SPECS (geometry, extrinsics, τ_max) (pure)
-  exoswarm_sim/world_builder.py       world.sdf + heightmap/texture PNGs + bridge YAML from config (pure)
-  exoswarm_sim/scene_events.py        rockslide layout, jolt profile (pure)
-  exoswarm_sim/mock_render.py         vectorized raycast lidar/depth/RGB on heightfield+rocks (pure)
-  exoswarm_sim/mock_world_node.py     kinematics, roll dynamics, sensor publishing, /world/command
-  exoswarm_sim/world_interface_node.py  Gazebo /world/command impl via gz.transport13
-  exoswarm_sim/sensor_effects_node.py dust/seismic layer
+ros2_ws/src/redshift_sim/            (ament_python)
+  redshift_sim/terrain_gen.py         seeded heightfield + features (pure)
+  redshift_sim/robot_models.py        rover/scout SDF + ROBOT_SPECS (geometry, extrinsics, τ_max) (pure)
+  redshift_sim/world_builder.py       world.sdf + heightmap/texture PNGs + bridge YAML from config (pure)
+  redshift_sim/scene_events.py        rockslide layout, jolt profile (pure)
+  redshift_sim/mock_render.py         vectorized raycast lidar/depth/RGB on heightfield+rocks (pure)
+  redshift_sim/mock_world_node.py     kinematics, roll dynamics, sensor publishing, /world/command
+  redshift_sim/world_interface_node.py  Gazebo /world/command impl via gz.transport13
+  redshift_sim/sensor_effects_node.py dust/seismic layer
   launch/mission.launch.py            config yaml → gazebo|mock branch + bridges + autonomy nodes
   test/test_{terrain_gen,world_builder,scene_events,mock_render}.py
-ros2_ws/src/exoswarm_autonomy/       (ament_python)
-  exoswarm_autonomy/{physics_model,edge_budget,grid_map,planning,agent_fsm,vision,trace}.py   (pure)
-  exoswarm_autonomy/{perception_node,mapping_coordinator_node,agent_planner_node}.py
+ros2_ws/src/redshift_autonomy/       (ament_python)
+  redshift_autonomy/{physics_model,edge_budget,grid_map,planning,agent_fsm,vision,trace}.py   (pure)
+  redshift_autonomy/{perception_node,mapping_coordinator_node,agent_planner_node}.py
   test/test_{physics_model,edge_budget,grid_map,planning,agent_fsm,vision,trace}.py
 backend_bridge/  app.py · ros_link.py · mission_manager.py · encoders.py · config_schema.py
                  tests/test_{config_schema,encoders,mission_manager}.py · scripts/smoke_test.py
@@ -134,7 +134,7 @@ web_ui/          package.json (exact pins) · vite.config.ts (proxy /api,/ws →
 Work on branch `feat/redshift-fleet`; commit at the end of every task (message ends with the Co-Authored-By trailer). Run pure tests with `python3 -m pytest ros2_ws/src/<pkg>/test -q`.
 
 ### Phase 0 — Scaffold
-- [ ] **T1 Scaffold & contracts.** Create branch, dir tree, both `package.xml`/`setup.py`/`setup.cfg`/`resource` markers (entry points for every node), `.gitignore` (build/ install/ log/ runtime/ node_modules/ dist/), `docs/protocol.md` (the Contracts section verbatim), plan copy, README stub. Verify: `cd ros2_ws && colcon build --symlink-install` succeeds; `ros2 pkg list | grep exoswarm` shows both.
+- [ ] **T1 Scaffold & contracts.** Create branch, dir tree, both `package.xml`/`setup.py`/`setup.cfg`/`resource` markers (entry points for every node), `.gitignore` (build/ install/ log/ runtime/ node_modules/ dist/), `docs/protocol.md` (the Contracts section verbatim), plan copy, README stub. Verify: `cd ros2_ws && colcon build --symlink-install` succeeds; `ros2 pkg list | grep redshift` shows both.
 
 ### Phase 1 — Pure core (TDD: write tests → see fail → implement → pass → commit)
 - [ ] **T2 `physics_model.py`.** Tests: θ_max(1.0) ∈ [35, 39] and limiting factor `slip`; θ_max(2.2) ∈ [15.5, 18] and factor `drive_torque`; monotonic decrease 1.0→3.0; tip_alarm(2.2) ≈ 28.8 ± 1; speed_limit(2.2) < speed_limit(1.0); energy uphill > flat. API: `RoverPhysics.from_spec(spec)`, `.limits(g) -> Limits(max_slope_deg, factor, drive, slip, tip, tip_alarm_deg, v_max)`, `.energy_per_m(g, dh, d)`.
@@ -180,7 +180,7 @@ Work on branch `feat/redshift-fleet`; commit at the end of every task (message e
 
 ## Verification (end-to-end)
 
-1. `python3 -m pytest ros2_ws/src/exoswarm_sim/test ros2_ws/src/exoswarm_autonomy/test backend_bridge/tests -q` → all pass.
+1. `python3 -m pytest ros2_ws/src/redshift_sim/test ros2_ws/src/redshift_autonomy/test backend_bridge/tests -q` → all pass.
 2. `cd ros2_ws && colcon build --symlink-install` clean; `cd web_ui && npm run build && npx tsc --noEmit && npx vitest run` clean.
 3. `./start_all.sh` then `python3 backend_bridge/scripts/smoke_test.py --backend mock` and `--backend gazebo` → both exit 0 (assertion list in T22).
 4. Manual demo pass in the browser at http://localhost:8000: config → deploy → globe fog lifts → rockslide reroute visible in camera bbox + trace + path line → dust ⇒ CAUTION/LIDAR-ONLY with uncertainty gauge rising → tip ⇒ SAFE_HOLD, reverse, red permanent hazard on globe, drone scan cone, RESUMING.

@@ -1,7 +1,7 @@
 from glob import glob
 from setuptools import find_packages, setup
 
-package_name = 'exoswarm_autonomy'
+package_name = 'redshift_autonomy'
 
 setup(
     name=package_name,
@@ -21,9 +21,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'perception_node = exoswarm_autonomy.perception_node:main',
-            'mapping_coordinator_node = exoswarm_autonomy.mapping_coordinator_node:main',
-            'agent_planner_node = exoswarm_autonomy.agent_planner_node:main',
+            'perception_node = redshift_autonomy.perception_node:main',
+            'mapping_coordinator_node = redshift_autonomy.mapping_coordinator_node:main',
+            'agent_planner_node = redshift_autonomy.agent_planner_node:main',
         ],
     },
 )

@@ -3,8 +3,8 @@ import math
 import numpy as np
 import pytest
 
-from exoswarm_autonomy.physics_model import RoverPhysics
-from exoswarm_autonomy.planning import (astar, build_costmap, find_frontiers, path_blocked,
+from redshift_autonomy.physics_model import RoverPhysics
+from redshift_autonomy.planning import (astar, build_costmap, find_frontiers, path_blocked,
                                         pure_pursuit, score_frontiers)
 
 RES = 0.5

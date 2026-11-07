@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from exoswarm_autonomy.physics_model import RoverPhysics, RoverSpec
+from redshift_autonomy.physics_model import RoverPhysics, RoverSpec
 
 
 @pytest.fixture

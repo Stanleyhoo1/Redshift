@@ -5,10 +5,10 @@ import cv2
 import numpy as np
 import pytest
 
-from exoswarm_sim.mock_render import (LIDAR_SHAPE, Scene, camera_frame, camera_intrinsics, camera_rotation,
+from redshift_sim.mock_render import (LIDAR_SHAPE, Scene, camera_frame, camera_intrinsics, camera_rotation,
                                       lidar_scan, rpy_matrix)
-from exoswarm_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
-from exoswarm_sim.terrain_gen import generate_terrain
+from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
+from redshift_sim.terrain_gen import generate_terrain
 
 
 def flat_scene(size=60.0, n=121, **kw):

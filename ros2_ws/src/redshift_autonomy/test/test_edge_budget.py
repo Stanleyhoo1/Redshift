@@ -1,6 +1,6 @@
 import pytest
 
-from exoswarm_autonomy.edge_budget import PROFILES, EdgeBudget
+from redshift_autonomy.edge_budget import PROFILES, EdgeBudget
 
 
 def test_profile_catalog():

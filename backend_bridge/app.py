@@ -22,7 +22,7 @@ from .config_schema import MissionConfig, options, physics_preview
 from .encoders import lidar_points_body, png_b64, robot_telemetry
 from .mission_manager import ROOT, MissionManager
 from .ros_link import HAVE_ROS, RosLink
-from exoswarm_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
+from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
 
 log = logging.getLogger('redshift')
 DIST = ROOT / 'web_ui' / 'dist'

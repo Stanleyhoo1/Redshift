@@ -29,7 +29,7 @@ try:
 except ImportError:          # lets the app start (and say so) without a sourced ROS environment
     HAVE_ROS = False
 
-from exoswarm_autonomy.ros_utils import cloud_to_numpy, quat_to_rpy
+from redshift_autonomy.ros_utils import cloud_to_numpy, quat_to_rpy
 
 MAP_QOS = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
                      durability=QoSDurabilityPolicy.TRANSIENT_LOCAL) if HAVE_ROS else None

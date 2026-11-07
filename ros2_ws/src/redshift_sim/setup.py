@@ -1,7 +1,7 @@
 from glob import glob
 from setuptools import find_packages, setup
 
-package_name = 'exoswarm_sim'
+package_name = 'redshift_sim'
 
 setup(
     name=package_name,
@@ -22,9 +22,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'mock_world_node = exoswarm_sim.mock_world_node:main',
-            'world_interface_node = exoswarm_sim.world_interface_node:main',
-            'sensor_effects_node = exoswarm_sim.sensor_effects_node:main',
+            'mock_world_node = redshift_sim.mock_world_node:main',
+            'world_interface_node = redshift_sim.world_interface_node:main',
+            'sensor_effects_node = redshift_sim.sensor_effects_node:main',
         ],
     },
 )

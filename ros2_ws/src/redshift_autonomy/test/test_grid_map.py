@@ -3,9 +3,9 @@ import math
 import numpy as np
 import pytest
 
-from exoswarm_autonomy.grid_map import (CAUTION, FREE, HAZARD, OBSTACLE, PERMANENT, SCIENCE, UNKNOWN,
+from redshift_autonomy.grid_map import (CAUTION, FREE, HAZARD, OBSTACLE, PERMANENT, SCIENCE, UNKNOWN,
                                         GlobalMap)
-from exoswarm_autonomy.physics_model import RoverPhysics
+from redshift_autonomy.physics_model import RoverPhysics
 
 
 def lim(g):

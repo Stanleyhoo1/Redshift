@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from exoswarm_sim.terrain_gen import SECTOR_GRID_N, generate_terrain
+from redshift_sim.terrain_gen import SECTOR_GRID_N, generate_terrain
 
 
 @pytest.fixture(scope='module')
@@ -76,7 +76,7 @@ def test_height_at_matches_vertices_and_interpolates(terr):
 def test_npz_roundtrip(tmp_path, terr):
     p = tmp_path / 't.npz'
     terr.save(p)
-    from exoswarm_sim.terrain_gen import Terrain
+    from redshift_sim.terrain_gen import Terrain
     t2 = Terrain.load(p)
     assert np.array_equal(t2.heights, terr.heights)
     assert t2.rocks == terr.rocks and t2.spawn_xy == terr.spawn_xy

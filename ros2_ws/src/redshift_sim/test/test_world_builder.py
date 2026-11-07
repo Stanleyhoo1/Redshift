@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import yaml
 
-from exoswarm_sim.robot_models import ROVER_SPEC, SCOUT_SPEC, rover_sdf, scout_sdf
-from exoswarm_sim.terrain_gen import Terrain
-from exoswarm_sim.world_builder import WORLD_NAME, build_world, robot_names
+from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC, rover_sdf, scout_sdf
+from redshift_sim.terrain_gen import Terrain
+from redshift_sim.world_builder import WORLD_NAME, build_world, robot_names
 
 CFG = {'sector': 'small', 'gravity_g': 2.2, 'fleet': {'rovers': 2, 'drones': 1}, 'seed': 3}
 

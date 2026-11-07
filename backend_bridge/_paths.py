@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-for pkg in ('exoswarm_autonomy', 'exoswarm_sim'):
+for pkg in ('redshift_autonomy', 'redshift_sim'):
     p = str(ROOT / 'ros2_ws' / 'src' / pkg)
     if p not in sys.path:
         sys.path.append(p)

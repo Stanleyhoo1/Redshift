@@ -3,10 +3,10 @@ import math
 import numpy as np
 import pytest
 
-from exoswarm_sim.mock_dynamics import RoverSim, ScoutSim
-from exoswarm_sim.mock_render import Scene
-from exoswarm_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
-from exoswarm_autonomy.physics_model import RoverPhysics
+from redshift_sim.mock_dynamics import RoverSim, ScoutSim
+from redshift_sim.mock_render import Scene
+from redshift_sim.robot_models import ROVER_SPEC, SCOUT_SPEC
+from redshift_autonomy.physics_model import RoverPhysics
 
 DT = 0.01
 

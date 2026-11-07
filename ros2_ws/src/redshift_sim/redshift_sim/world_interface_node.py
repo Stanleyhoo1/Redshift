@@ -17,7 +17,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu
 from std_msgs.msg import String
 
-from exoswarm_autonomy.physics_model import RoverPhysics
+from redshift_autonomy.physics_model import RoverPhysics
 
 from .scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_layout
 from .terrain_gen import Terrain

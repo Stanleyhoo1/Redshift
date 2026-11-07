@@ -1,8 +1,8 @@
 import pytest
 
-from exoswarm_autonomy.agent_fsm import RoverFSM, RoverInputs, ScoutFSM, ScoutInputs
-from exoswarm_autonomy.physics_model import RoverPhysics
-from exoswarm_autonomy.trace import TraceBuilder
+from redshift_autonomy.agent_fsm import RoverFSM, RoverInputs, ScoutFSM, ScoutInputs
+from redshift_autonomy.physics_model import RoverPhysics
+from redshift_autonomy.trace import TraceBuilder
 
 LIM = RoverPhysics().limits(2.2)
 TRACE_KEYS = {'id', 't', 'robot', 'state', 'kind', 'sensors', 'input', 'reasoning', 'confidence',
