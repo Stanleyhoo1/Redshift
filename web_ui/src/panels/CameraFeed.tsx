@@ -20,6 +20,7 @@ export function CameraFeed() {
     <Panel
       title="Perception camera"
       sensors={isScout ? ['CAM'] : ['CAM', 'DEPTH']}
+      chipsFrom={380}
       right={
         <div role="tablist" aria-label="Camera source" className="flex gap-0.5">
           {ids.map((id) => {

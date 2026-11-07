@@ -16,3 +16,5 @@ web_ui/dist/
 # misc
 *.log
 .DS_Store
+# local UI screenshots (curated copies live in docs/media)
+web_ui/dev/screenshots/

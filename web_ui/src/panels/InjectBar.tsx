@@ -31,24 +31,27 @@ export function InjectBar() {
   const rover = target && rovers.includes(target) ? target : rovers[0]
 
   return (
-    <div className="pointer-events-auto rounded-[3px] border border-rule-2 bg-void/88 p-2.5 shadow-[0_18px_50px_-20px_rgba(0,0,0,0.8)] backdrop-blur-md">
-      <div className="mb-2 flex items-center justify-between gap-3 px-1">
-        <h2 className="font-cond text-[19px] leading-none font-[800] text-bone">Inject unscripted change</h2>
-        <div className="flex items-center gap-1.5 text-[12px] text-haze">
-          Target
-          {rovers.map((r) => (
-            <button
-              key={r}
-              onClick={() => setTarget(r)}
-              className={`rounded-[2px] px-2 py-0.5 font-[650] ${r === rover ? 'bg-bay-2 text-bone shadow-[inset_0_0_0_1px_var(--color-rule-2)]' : 'text-dim hover:text-haze'}`}
-            >
-              {robotName(r)}
-            </button>
-          ))}
-          {!rovers.length && <span className="text-dim">no rover online</span>}
+    <div className="@container pointer-events-auto rounded-[3px] border border-rule-2 bg-void/88 p-2.5 shadow-[0_18px_50px_-20px_rgba(0,0,0,0.8)] backdrop-blur-md">
+      <div className="grid grid-cols-3 items-start gap-2 @min-[860px]:grid-cols-[150px_repeat(3,minmax(0,1fr))]">
+        {/* wide: a title block left of the buttons; narrow: one header line above them */}
+        <div className="col-span-3 flex items-baseline justify-between gap-3 px-0.5 @min-[860px]:col-span-1 @min-[860px]:min-h-[60px] @min-[860px]:flex-col @min-[860px]:items-start @min-[860px]:justify-between @min-[860px]:gap-1.5 @min-[860px]:px-0 @min-[860px]:pr-1">
+          <h2 className="font-cond text-[17px] leading-[1.02] font-[800] text-bone @min-[860px]:text-[19px]">Inject unscripted change</h2>
+          <div className="flex flex-wrap items-center gap-1 text-[11.5px] text-haze">
+            {rovers.length > 1 ? 'Target' : null}
+            {rovers.length > 1 &&
+              rovers.map((r) => (
+                <button
+                  key={r}
+                  onClick={() => setTarget(r)}
+                  className={`rounded-[2px] px-1.5 py-0.5 font-[650] ${r === rover ? 'bg-bay-2 text-bone shadow-[inset_0_0_0_1px_var(--color-rule-2)]' : 'text-dim hover:text-haze'}`}
+                >
+                  {robotName(r)}
+                </button>
+              ))}
+            {rovers.length === 1 && <span>Target: {robotName(rovers[0])}</span>}
+            {!rovers.length && <span className="text-dim">No rover online</span>}
+          </div>
         </div>
-      </div>
-      <div className="grid grid-cols-3 gap-2">
         <InjectButton
           kind="rockslide"
           title="Spawn Meteor / Rockslide Ahead"
@@ -126,14 +129,14 @@ function InjectButton({
         type="button"
         onClick={fire}
         disabled={disabled || busy || cooling}
-        className="group relative flex min-h-[64px] items-center gap-3 overflow-hidden rounded-[3px] border px-3 py-2 text-left transition-colors disabled:opacity-55"
+        className="group relative flex min-h-[60px] items-center gap-2.5 overflow-hidden rounded-[3px] border px-3 py-1.5 text-left transition-colors disabled:opacity-55"
         style={{ borderColor: `${color}88`, backgroundColor: `${color}14` }}
       >
-        <span className="shrink-0" style={{ color }}>
+        <span className="hidden shrink-0 @min-[700px]:block" style={{ color }}>
           {icon}
         </span>
         <span className="min-w-0">
-          <span className="font-semi-cond block text-[15px] leading-tight font-[780] text-bone">{busy ? 'Injecting…' : title}</span>
+          <span className="font-semi-cond block text-[14.5px] leading-[1.1] font-[780] text-bone">{busy ? 'Injecting…' : title}</span>
           <span className="block truncate text-[11.5px] text-haze">{cooling ? `Ready again in ${Math.ceil(remaining / 1000)} s` : sub}</span>
         </span>
         <span className="absolute inset-0 opacity-0 transition-opacity group-enabled:group-hover:opacity-100" style={{ boxShadow: `inset 0 0 0 1px ${color}` }} />

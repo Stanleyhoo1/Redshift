@@ -1,4 +1,4 @@
-import { useFrame } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { localFrame, metresToUnits } from '../lib/geo'
@@ -48,21 +48,25 @@ function Meteor({ rec }: { rec: EventRecord }) {
   const L = useSectorSize()
   const map = useStore((s) => s.map)
   const born = rec.receivedAt
+  const camera = useThree((s) => s.camera)
   const { impact, start } = useMemo(() => {
     const impact = surfacePoint(map, ev.impact[0], ev.impact[1], L, 0.003)
-    const { east, north, up } = localFrame(ev.impact[0], ev.impact[1], L)
+    const { up } = localFrame(ev.impact[0], ev.impact[1], L)
+    // streak in from the upper left of the current view, out of the sky above the impact
+    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0)
+    const camUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1)
     const start = impact
       .clone()
-      .add(new THREE.Vector3(...up).multiplyScalar(0.95))
-      .add(new THREE.Vector3(...east).multiplyScalar(-0.55))
-      .add(new THREE.Vector3(...north).multiplyScalar(0.35))
+      .add(new THREE.Vector3(...up).multiplyScalar(0.25))
+      .add(camUp.multiplyScalar(0.5))
+      .add(right.multiplyScalar(-0.42))
     return { impact, start }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ev, L])
   const quat = useMemo(() => surfaceQuaternion(ev.impact[0], ev.impact[1], 0, L), [ev, L])
   const trailPos = useMemo(() => new Float32Array(6), [])
   const [trailArr, setTrailArr] = useState<Float32Array | null>(null)
-  const trail = useFatLine(trailArr, null, { color: '#ffd9a8', width: 3, additive: true, depthTest: false })
+  const trail = useFatLine(trailArr, null, { color: '#ffd9a8', width: 5, additive: true, depthTest: false })
   const head = useRef<THREE.Sprite>(null)
   const wave = useRef<THREE.Mesh>(null)
   const wave2 = useRef<THREE.Mesh>(null)
@@ -78,11 +82,11 @@ function Meteor({ rec }: { rec: EventRecord }) {
     const fall = Math.min(1, t / FALL_S)
     const e = fall * fall * fall // accelerating
     cur.lerpVectors(start, impact, e)
-    tail.lerpVectors(start, impact, Math.max(0, e - 0.28))
+    tail.lerpVectors(start, impact, Math.max(0, e - 0.4))
     if (head.current) {
       head.current.visible = fall < 1
       head.current.position.copy(cur)
-      head.current.scale.setScalar(0.05 + 0.05 * e)
+      head.current.scale.setScalar(0.08 + 0.06 * e)
     }
     if (fall < 1) {
       trailPos.set([tail.x, tail.y, tail.z, cur.x, cur.y, cur.z])
@@ -103,7 +107,7 @@ function Meteor({ rec }: { rec: EventRecord }) {
     if (flash.current) {
       const f = (t - FALL_S) / 0.6
       flash.current.visible = f >= 0 && f <= 1
-      flash.current.scale.setScalar(0.08 + 0.22 * f)
+      flash.current.scale.setScalar(0.1 + 0.3 * f)
       flashMat.opacity = Math.max(0, 1 - f)
     }
     if (rocks.current) rocks.current.visible = t > FALL_S && t < ROCK_TTL_S

@@ -88,7 +88,7 @@ def generate_terrain(size_m: float, res: float, seed: int) -> Terrain:
     ang = rng.uniform(0, math.pi)
     off = rng.uniform(-0.1, 0.25) * size_m
     dist = X * math.cos(ang) + Y * math.sin(ang) - off
-    h += 0.06 * size_m * np.exp(-0.5 * (dist / (0.035 * size_m)) ** 2)
+    h += 0.035 * size_m * np.exp(-0.5 * (dist / (0.045 * size_m)) ** 2)
     # craters
     for _ in range(3):
         cx, cy = rng.uniform(-0.35, 0.35, 2) * size_m
@@ -126,11 +126,20 @@ def albedo_texture(t: Terrain, px_m: float) -> np.ndarray:
     shade = np.clip(nrm @ np.array([-0.5, 0.55, 0.68]) / 0.98, 0, 1)
     e = (h - h.min()) / (h.max() - h.min() + 1e-6)
     rng = np.random.default_rng(7)
-    grain = cv2.GaussianBlur(rng.standard_normal((m, m)).astype(np.float32), (0, 0), 1.2)
+
+    def band(sigma_m: float) -> np.ndarray:
+        z = cv2.GaussianBlur(rng.standard_normal((m, m)).astype(np.float32), (0, 0), max(0.8, sigma_m / px_m))
+        return z / (z.std() + 1e-6)
+
+    grain = band(0.12) * 0.5 + band(0.45) * 0.9 + band(1.8) * 1.4 + band(6.0) * 1.2
     lo, mid, hi = np.array([40, 34, 60.0]), np.array([38, 70, 160.0]), np.array([90, 150, 215.0])  # BGR
     col = np.where(e[..., None] < 0.55, lo + (mid - lo) * (e[..., None] / 0.55), mid + (hi - mid) * ((e[..., None] - 0.55) / 0.45))
-    col = col * (0.45 + 0.75 * shade[..., None]) + grain[..., None] * 9
+    col = col * (0.45 + 0.75 * shade[..., None]) * (1 + 0.07 * grain[..., None]) + grain[..., None] * 6
     img = np.clip(col, 0, 255).astype(np.uint8)
+    for _ in range(m * m // 900):  # pebbles give the camera a sense of motion
+        p = (int(rng.integers(0, m)), int(rng.integers(0, m)))
+        rad = int(rng.integers(1, max(2, int(0.18 / px_m))))
+        cv2.circle(img, p, rad, (int(rng.integers(22, 34)), int(rng.integers(30, 44)), int(rng.integers(58, 84))), -1, cv2.LINE_AA)
     w2p = lambda x, y: (int((x + t.size_m / 2) / px_m), int((y + t.size_m / 2) / px_m))
     for x, y, r in t.rocks:
         cv2.circle(img, w2p(x, y), max(2, int(r / px_m)), (78, 72, 84), -1, cv2.LINE_AA)
@@ -164,6 +173,12 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
     mx = ((wx + t.size_m / 2) / px_m).astype(np.float32)
     my = ((wy + t.size_m / 2) / px_m).astype(np.float32)
     ground = cv2.remap(tex, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+    # world-anchored grit (hash noise at 3 cm and 12 cm) keeps the near field sharp as the rover moves
+    def grit(cell: float) -> np.ndarray:
+        ix, iy = np.floor(wx / cell), np.floor(wy / cell)
+        return np.modf(np.sin(ix * 12.9898 + iy * 78.233) * 43758.5453)[0] % 1.0
+    near = np.clip(1.0 - d / 14.0, 0, 1)[..., None]
+    ground *= 1 + near * ((grit(0.03) - 0.5) * 0.28 + (grit(0.12) - 0.5) * 0.22)[..., None]
     sky_top, sky_hor = np.array([150, 170, 214.0]), np.array([92, 128, 196.0])
     k = np.clip((v + H / 2) / H, 0, 1)[..., None]
     sky = sky_top * (1 - k) + sky_hor * k
@@ -173,12 +188,14 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
 
     # boulders (3-D-ish ellipses) + perception boxes burned into the frame
     boxes = []
+    seen = []
     for x, y, r in rocks:
         dx, dy = x - pose["x"], y - pose["y"]
         fwd = dx * math.cos(yaw) + dy * math.sin(yaw)
         lat = -dx * math.sin(yaw) + dy * math.cos(yaw)
-        if fwd < 1.5 or fwd > 22 or abs(math.atan2(lat, fwd)) > hfov / 2:
-            continue
+        if 1.5 <= fwd <= 22 and abs(math.atan2(lat, fwd)) <= hfov / 2:
+            seen.append((fwd, lat, r))
+    for fwd, lat, r in sorted(seen, reverse=True):  # paint far to near
         cx = W / 2 - f * lat / fwd
         base = H / 2 - f * math.tan(math.atan(-cam_h / fwd) - pitch)
         rad = f * r / fwd
@@ -195,17 +212,25 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
     if seismic:
         img = np.roll(img, int(rng.integers(-4, 5)), axis=1)
 
-    for bx, by, bw, bh, rng_m, conf in boxes:
+    labels = []  # placed label rects, nearest rock first, so labels never pile up
+    for bx, by, bw, bh, rng_m, conf in sorted(boxes, key=lambda b: b[4]):
         if mode == "LIDAR_ONLY":
             conf *= 0.55
         col = (56, 178, 255)
         p0, p1 = (int(bx), int(by)), (int(bx + bw), int(by + bh))
         cv2.rectangle(img, p0, p1, col, 1, cv2.LINE_AA)
-        cv2.putText(img, f"ROCK {conf:.2f} {rng_m:.1f}m", (p0[0], max(10, p0[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.33, col, 1, cv2.LINE_AA)
+        text = f"ROCK {conf:.2f}  {rng_m:.1f} m"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.33, 1)
+        tx = int(min(max(2, p0[0]), W - tw - 2))
+        ty = p0[1] - 4 if p0[1] - 4 - th > 2 else p1[1] + th + 4
+        rect = (tx - 2, ty - th - 2, tx + tw + 2, ty + 3)
+        if len(labels) >= 4 or any(not (rect[2] < q[0] or rect[0] > q[2] or rect[3] < q[1] or rect[1] > q[3]) for q in labels):
+            continue
+        labels.append(rect)
+        cv2.putText(img, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.33, col, 1, cv2.LINE_AA)
     # corridor overlay + HUD
     cv2.line(img, (W // 2 - 40, H - 1), (W // 2 - 14, int(H * 0.62)), (255, 195, 76), 1, cv2.LINE_AA)
     cv2.line(img, (W // 2 + 40, H - 1), (W // 2 + 14, int(H * 0.62)), (255, 195, 76), 1, cv2.LINE_AA)
-    cv2.putText(img, f"{label} {mode} unc {unc:.2f}", (6, H - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (235, 231, 236), 1, cv2.LINE_AA)
     return img
 
 
@@ -242,7 +267,6 @@ def scout_camera(tex: np.ndarray, px_m: float, size_m: float, pose: dict, scienc
         cv2.drawMarker(img, (W // 2, H // 2), (230, 242, 92), cv2.MARKER_CROSS, 26, 1, cv2.LINE_AA)
         cv2.circle(img, (W // 2, H // 2), 46, (230, 242, 92), 1, cv2.LINE_AA)
         cv2.putText(img, "SLOPE SCAN", (W // 2 - 32, H // 2 + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 242, 92), 1, cv2.LINE_AA)
-    cv2.putText(img, f"{label} NADIR 12m AGL", (6, H - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (235, 231, 236), 1, cv2.LINE_AA)
     return img
 
 

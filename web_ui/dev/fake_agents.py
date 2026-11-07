@@ -5,6 +5,7 @@ import math
 
 import numpy as np
 
+from fake_render import CLS_OBSTACLE, CLS_PERMANENT
 from fake_world import World
 
 
@@ -48,8 +49,15 @@ class Agent:
         tx, ty = self.path[min(1, len(self.path) - 1)] if len(self.path) > 1 else self.path[0]
         want = math.atan2(ty - self.y, tx - self.x) + (math.pi if reverse else 0.0)
         err = wrap(want - self.yaw)
-        self.yaw = wrap(self.yaw + max(-1.4 * dt, min(1.4 * dt, err)))
-        self.speed = v * max(0.25, math.cos(err))
+        rate = 3.0 if self.kind == "scout" else 1.4
+        self.yaw = wrap(self.yaw + max(-rate * dt, min(rate * dt, err)))
+        if self.kind == "scout":
+            # a multirotor yaws on the spot instead of looping round a waypoint, and brakes into the last one
+            end = self.path[-1]
+            v = min(v, 1.0 + 1.5 * math.hypot(end[0] - self.x, end[1] - self.y))
+            self.speed = v * max(0.0, math.cos(err)) ** 2
+        else:
+            self.speed = v * max(0.25, math.cos(err))
         sgn = -1.0 if reverse else 1.0
         self.x += sgn * self.speed * math.cos(self.yaw) * dt
         self.y += sgn * self.speed * math.sin(self.yaw) * dt
@@ -69,7 +77,8 @@ class Rover(Agent):
         self.breadcrumbs: list = [[x, y]]
         self.jolt_t: float | None = None
         self.jolt_xy: list | None = None
-        self.pending_block: float | None = None
+        self.seen_rocks = 0
+        self.replan_t = 0.0
         self.scan_id = 0
         self.prev_roll = 0.0
         self.caution_since: float | None = None
@@ -127,14 +136,14 @@ class Rover(Agent):
                 self._new_goal(w, now, scouts)
         elif st in ("EXPLORING", "CAUTION"):
             self._caution_logic(w, now)
-            if self.pending_block is not None and now >= self.pending_block:
-                self.pending_block = None
-                if w.path_blocked(self.path, 40):
-                    self._replan(w, now)
-                    return
-            if w.path_blocked(self.path, 12):
+            fresh_rocks = w.rock_version != self.seen_rocks
+            blocker = w.path_blocked(self.path, 14) if (fresh_rocks or now - self.replan_t > 3.0) else 0
+            if blocker == CLS_OBSTACLE and fresh_rocks:
+                self.seen_rocks = w.rock_version
                 self._replan(w, now)
                 return
+            if blocker:  # newly mapped slope / no-go cells: reroute on the move
+                self._reroute(w, now, blocker)
             v = v_lim * (0.35 if self.state == "CAUTION" else 0.78)
             if self.follow(dt, v) and now - self.goal_t > 1.0:
                 self.goal_t = now
@@ -144,7 +153,11 @@ class Rover(Agent):
                 self.last_safe = [round(self.x, 2), round(self.y, 2)]
         elif st == "REPLANNING":
             self.speed = 0.0
-            if now - self.state_t > 1.4:
+            if now - self.state_t > 1.2 and not getattr(self, "_replanned", False):
+                self._replanned = True
+                self._finish_replan(w, now)
+            if now - self.state_t > 2.2:
+                self._replanned = False
                 self.set_state("CAUTION" if w.env["dust_level"] > 0 else "EXPLORING", now)
         elif st == "SAFE_HOLD":
             self.speed = 0.0
@@ -158,9 +171,9 @@ class Rover(Agent):
                 w.trace(self.id, "RECOVERY_REVERSE", "recovery_reverse", ["ODOM", "IMU", "MAP"],
                         f"Roll settled to {self.roll:.1f}°; {len(self.breadcrumbs)} breadcrumbs logged",
                         f"Last safe cell ({tgt[0]:.1f}, {tgt[1]:.1f}) is {d:.1f} m back along the driven track",
-                        0.93, f"Reversing {d:.1f} m along breadcrumbs at 0.30 m/s", "warn")
+                        0.93, f"Reversing {d:.1f} m along breadcrumbs at 0.50 m/s", "warn")
         elif st == "RECOVERY_REVERSE":
-            if self.follow(dt, 0.3, reverse=True):
+            if self.follow(dt, 0.5, reverse=True):
                 xy = self.jolt_xy or [self.x, self.y]
                 w.perm.append([xy[0], xy[1], 2.5])
                 w.refresh_truth()
@@ -200,7 +213,7 @@ class Rover(Agent):
             if now - self.caution_since > 0.5:
                 self.set_state("CAUTION", now)
                 self.mode = "LIDAR_ONLY"
-                self.extra_ms = 9.0
+                self.extra_ms = 5.0
                 w.trace(self.id, "CAUTION", "caution_enter", ["CAM", "LIDAR", "IMU"],
                         f"Camera sharpness −64 %, contrast 0.19; LiDAR returns {int(100 - 30 * w.env['dust_level'])} % with near-field backscatter",
                         f"Fused uncertainty {self.unc:.2f} > 0.45 for 0.5 s; camera confidence {max(0.05, 0.9 - self.unc):.2f} < 0.40",
@@ -231,25 +244,47 @@ class Rover(Agent):
                 float(w.rng.uniform(0.78, 0.92)), f"Driving to frontier at {0.78 * w.limits['v_max']:.2f} m/s")
 
     def _replan(self, w: World, now: float):
-        old_len = len(self.path) * 0.8
+        """Blocked: stop and announce. The new route is computed in REPLANNING after 1.2 s."""
         self.set_state("REPLANNING", now)
         self.speed = 0.0
-        goal = tuple(self.goal) if self.goal else (self.x, self.y)
         w.trace(self.id, "REPLANNING", "path_blocked", ["LIDAR", "CAM"],
                 f"Boulder field {float(w.rng.uniform(5.5, 7.5)):.1f} m ahead across path ({int(w.rng.integers(4, 7))} objects)",
                 f"Corridor occupancy {float(w.rng.uniform(0.7, 0.9)):.2f}; step height {float(w.rng.uniform(0.7, 1.0)):.1f} m > 0.30 m clearance",
                 0.91, "Stop and re-plan A* around the obstacle", "warn", 41.7)
-        self.path = w.plan((self.x, self.y), goal)
-        if not self.path:
+
+    def _reroute(self, w: World, now: float, blocker: int):
+        old = len(self.path) * 0.8
+        goal = tuple(self.goal) if self.goal else (self.x, self.y)
+        path = w.plan((self.x, self.y), goal)
+        self.replan_t = now
+        if not path:
+            self._new_goal(w, now, [])
+            return
+        self.path = path
+        what = {CLS_PERMANENT: "No-go zone", CLS_OBSTACLE: "Boulder"}.get(blocker, f"Slope above {w.limits['max_slope_deg']:.1f}°")
+        w.trace(self.id, self.state, "replanned", ["LIDAR", "MAP"],
+                f"{what} newly mapped across the planned route",
+                f"Lethal at {w.g:.1f} g; cheaper to detour than to stop", 0.87,
+                f"Re-planned on the move ({len(path) * 0.8 - old:+.1f} m)", "info", 24.0)
+
+    def _finish_replan(self, w: World, now: float):
+        old_len = len(self.path) * 0.8
+        goal = tuple(self.goal) if self.goal else (self.x, self.y)
+        path = w.plan((self.x, self.y), goal)
+        if not path:
             g = w.frontier_goal(self.x, self.y, self.yaw + math.pi / 2, [])
             if g:
                 self.goal = [round(g[0], 1), round(g[1], 1)]
-                self.path = w.plan((self.x, self.y), g)
+                path = w.plan((self.x, self.y), g)
+        self.path = path
+        self.replan_t = now
+        self.seen_rocks = w.rock_version
         self.extra_ms = 12.0
+        d = len(path) * 0.8 - old_len
         w.trace(self.id, "REPLANNING", "replanned", ["MAP", "EDGE"],
-                f"{len(self.path)} waypoints; lethal cells dilated 0.6 m",
-                f"Detour {len(self.path) * 0.8 - old_len:+.1f} m vs blocked route; within {w.profile_id} expansion budget",
-                0.89, f"Re-planned A* around obstacle (+{abs(len(self.path) * 0.8 - old_len):.1f} m, {int(w.rng.integers(900, 1800))} nodes, 38 ms)", "info", 38.0)
+                f"{len(path)} waypoints; lethal cells dilated 0.6 m",
+                f"Detour {d:+.1f} m vs blocked route; within the {w.profile_id} expansion budget",
+                0.89, f"Re-planned A* around obstacle ({d:+.1f} m, {int(w.rng.integers(900, 1800))} nodes, 38 ms)", "info", 38.0)
 
 
 class Scout(Agent):
@@ -278,7 +313,7 @@ class Scout(Agent):
         self.set_state("FLY_TO_SCAN", now)
         w.trace(self.id, "FLY_TO_SCAN", "scout_tasked", ["FLEET", "ODOM"],
                 f"Scan request #{sid} from {robot} at ({xy[0]:.1f}, {xy[1]:.1f})",
-                f"Pausing survey lane {self.lane_i // 2 + 1}; {math.hypot(xy[0] - self.x, xy[1] - self.y):.0f} m transit at 9 m/s",
+                f"Pausing survey lane {self.lane_i // 2 + 1}; {math.hypot(xy[0] - self.x, xy[1] - self.y):.0f} m transit at 12 m/s",
                 0.95, "Flying to the tip site for a nadir slope scan")
 
     def step(self, w: World, dt: float, now: float, rovers: list):
@@ -301,7 +336,7 @@ class Scout(Agent):
             if self.follow(dt, 3.0):
                 self._next_lane(w)
         elif st == "FLY_TO_SCAN":
-            if self.follow(dt, 9.0):
+            if self.follow(dt, 12.0):
                 self.set_state("SCANNING", now)
                 self.orbit_c = tuple(self.req["xy"]) if self.req else (self.x, self.y)
         elif st == "SCANNING":

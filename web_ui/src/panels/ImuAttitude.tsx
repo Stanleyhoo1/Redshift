@@ -16,18 +16,14 @@ export function ImuAttitude() {
   const tone = worst >= alarm ? C.ha : worst >= 0.7 * alarm ? C.nad : C.bone
 
   return (
-    <Panel title="IMU attitude" sensors={['IMU']} bodyClass="flex flex-col p-2.5 gap-2">
-      <div className="flex items-center gap-3">
+    <Panel title="IMU" sensors={['IMU']} chipsFrom={185} right={<span className="num text-[11.5px] text-ha">alarm ±{fmt(alarm, 1)}°</span>} bodyClass="flex flex-col justify-between gap-1.5 px-2.5 pt-1.5 pb-2">
+      <div className="flex justify-center">
         <Horizon roll={roll} pitch={pitch} alarm={alarm} />
-        <dl className="grid min-w-0 flex-1 gap-1.5 text-[12px]">
-          <Readout label="Roll" value={roll} color={Math.abs(roll) >= 0.7 * alarm ? tone : C.bone} />
-          <Readout label="Pitch" value={pitch} color={Math.abs(pitch) >= 0.7 * alarm ? tone : C.bone} />
-          <div className="flex items-baseline justify-between gap-2 pt-0.5">
-            <dt className="text-dim">Tip alarm</dt>
-            <dd className="num text-ha">±{fmt(alarm, 1)}°</dd>
-          </div>
-        </dl>
       </div>
+      <dl className="grid grid-cols-2 gap-2 text-[12px]">
+        <Readout label="Roll" value={roll} color={Math.abs(roll) >= 0.7 * alarm ? tone : C.bone} />
+        <Readout label="Pitch" value={pitch} color={Math.abs(pitch) >= 0.7 * alarm ? tone : C.bone} />
+      </dl>
       <Sparkline robot={sel} alarm={alarm} />
     </Panel>
   )
@@ -35,9 +31,9 @@ export function ImuAttitude() {
 
 function Readout({ label, value, color }: { label: string; value: number; color: string }) {
   return (
-    <div className="flex items-baseline justify-between gap-2">
-      <dt className="text-haze">{label}</dt>
-      <dd className="font-semi-cond num text-[19px] leading-none font-[750]" style={{ color }}>
+    <div className="flex min-w-0 flex-col gap-0.5 border-b border-rule/70 pb-1 @min-[180px]:flex-row @min-[180px]:items-baseline @min-[180px]:justify-between @min-[180px]:gap-1.5">
+      <dt className="text-[11px] text-haze @min-[180px]:text-[12px]">{label}</dt>
+      <dd className="font-semi-cond num text-[16px] leading-none font-[750] @min-[180px]:text-[18px]" style={{ color }}>
         {value >= 0 ? '+' : '−'}
         {fmt(Math.abs(value), 1)}°
       </dd>
@@ -59,7 +55,7 @@ function Horizon({ roll, pitch, alarm }: { roll: number; pitch: number; alarm: n
   const off = Math.max(-40, Math.min(40, pitch)) * PITCH_PX_PER_DEG
   const lim = Math.min(80, alarm + 25)
   return (
-    <svg viewBox="-70 -70 140 140" className="h-[124px] w-[124px] shrink-0" role="img" aria-label={`Roll ${roll.toFixed(1)}°, pitch ${pitch.toFixed(1)}°`}>
+    <svg viewBox="-70 -70 140 140" className="h-[96px] w-[96px] shrink-0 @min-[180px]:h-[148px] @min-[180px]:w-[148px]" role="img" aria-label={`Roll ${roll.toFixed(1)}°, pitch ${pitch.toFixed(1)}°`}>
       <defs>
         <clipPath id="hz-clip">
           <circle r={R} />
@@ -110,15 +106,15 @@ function Sparkline({ robot, alarm }: { robot: string | null; alarm: number }) {
   const alarmY = H - (alarm / top) * H
   return (
     <div>
-      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="h-10 w-full" aria-hidden>
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="h-8 w-full @min-[180px]:h-10" aria-hidden>
         <rect x={0} y={0} width={W} height={alarmY} fill={C.ha} fillOpacity={0.08} />
         <line x1={0} x2={W} y1={alarmY} y2={alarmY} stroke={C.ha} strokeDasharray="3 3" strokeWidth={1} vectorEffect="non-scaling-stroke" />
         <polyline points={pitch} fill="none" stroke={C.hb} strokeWidth={1.2} vectorEffect="non-scaling-stroke" />
         <polyline points={roll} fill="none" stroke={C.bone} strokeWidth={1.4} vectorEffect="non-scaling-stroke" />
       </svg>
-      <div className="flex justify-between text-[10.5px] text-dim">
+      <div className="hidden justify-between text-[10.5px] text-dim @min-[180px]:flex">
         <span>
-          <span className="text-bone">|roll|</span> <span className="text-hb">|pitch|</span> last 20 s
+          <span className="text-bone">roll</span> <span className="text-hb">pitch</span>, last 20 s
         </span>
         <span className="text-ha/80">alarm</span>
       </div>

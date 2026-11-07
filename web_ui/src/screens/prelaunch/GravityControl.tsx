@@ -11,24 +11,31 @@ interface Props {
   live: boolean
 }
 
-/** Wordmark that gets heavier and narrower as gravity rises — the type carries the planet. */
+/**
+ * Wordmark crushed by gravity: as g rises it gets squatter, heavier and wider, while its size is
+ * solved (container query units) so it always spans the column. Archivo caps ≈ 0.70 em wide at 100 %.
+ */
 export function Wordmark({ g, min, max }: { g: number; min: number; max: number }) {
   const t = Math.max(0, Math.min(1, (g - min) / (max - min || 1)))
+  const stretch = 70 + 42 * t
   return (
-    <h1
-      aria-label="Redshift"
-      className="select-none leading-[0.8] tracking-[-0.01em] text-bone"
-      style={{
-        fontSize: 'clamp(96px, 9.2vw, 176px)',
-        fontStretch: `${112 - 50 * t}%`,
-        fontWeight: Math.round(520 + 380 * t),
-        transform: `scaleY(${1 - 0.18 * t})`,
-        transformOrigin: '0 100%',
-        transition: 'font-stretch 220ms ease-out, font-weight 220ms ease-out, transform 220ms ease-out',
-      }}
-    >
-      REDSHIFT
-    </h1>
+    <div style={{ containerType: 'inline-size' }}>
+      <h1
+        aria-label="Redshift"
+        className="select-none whitespace-nowrap leading-[0.78] text-bone"
+        style={{
+          fontSize: `min(184px, calc(100cqw / ${((5.72 * stretch) / 100).toFixed(3)}))`,
+          fontStretch: `${stretch}%`,
+          fontWeight: Math.round(480 + 420 * t),
+          letterSpacing: `${(-0.01 + 0.015 * t).toFixed(3)}em`,
+          transform: `scaleY(${(1.08 - 0.36 * t).toFixed(3)})`,
+          transformOrigin: '0 100%',
+          transition: 'font-size 240ms ease-out, font-stretch 240ms ease-out, font-weight 240ms ease-out, transform 240ms ease-out',
+        }}
+      >
+        REDSHIFT
+      </h1>
+    </div>
   )
 }
 
@@ -68,10 +75,13 @@ export function GravityControl({ g, min, max, step, onChange, preview, live }: P
           {ticks.map((v) => {
             const left = ((v - min) / (max - min)) * 100
             const major = Math.abs(v * 2 - Math.round(v * 2)) < 1e-6
+            const edge = left < 1 ? 'left' : left > 99 ? 'right' : 'mid'
+            const shift = edge === 'left' ? '' : edge === 'right' ? '-translate-x-full' : '-translate-x-1/2'
+            const align = edge === 'left' ? 'text-left' : edge === 'right' ? 'text-right' : 'text-center'
             return (
-              <span key={v} className="absolute top-0 -translate-x-1/2" style={{ left: `${left}%` }}>
-                <span className={`mx-auto block w-px ${major ? 'h-2 bg-haze/70' : 'h-1 bg-rule-2'}`} />
-                {major && <span className="mt-0.5 block">{v === 1 ? '1.0 Earth' : v.toFixed(1)}</span>}
+              <span key={v} className={`absolute top-0 ${shift} ${align}`} style={{ left: `${left}%` }}>
+                <span className={`block w-px ${major ? 'h-2 bg-haze/70' : 'h-1 bg-rule-2'} ${edge === 'left' ? '' : edge === 'right' ? 'ml-auto' : 'mx-auto'}`} />
+                {major && <span className="mt-0.5 block whitespace-nowrap">{v === 1 ? '1.0 Earth' : v.toFixed(1)}</span>}
               </span>
             )
           })}
@@ -80,7 +90,7 @@ export function GravityControl({ g, min, max, step, onChange, preview, live }: P
 
       <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-6">
         <SlopeDiagram p={preview} />
-        <dl className="grid min-w-[200px] gap-3 text-[13px]">
+        <dl className="grid min-w-[172px] gap-3 text-[13px]">
           <Stat label="Max climbable slope" value={`${fmt(preview.max_slope_deg, 1)}°`} strong />
           <Stat label="Limited by" value={FACTOR_LABEL[preview.factor] ?? preview.factor} />
           <Stat label="Tip alarm" value={`${fmt(preview.tip_alarm_deg, 1)}°`} tone="text-ha" />
@@ -128,7 +138,7 @@ function SlopeDiagram({ p }: { p: PhysicsPreview }) {
     return `M ${ox + r} ${oy} A ${r} ${r} 0 0 0 ${x} ${y}`
   }
   return (
-    <svg viewBox="0 0 440 236" className="w-full" role="img" aria-label={`Maximum climbable slope ${p.max_slope_deg.toFixed(1)} degrees`}>
+    <svg viewBox="8 0 384 236" className="w-full max-w-[400px]" role="img" aria-label={`Maximum climbable slope ${p.max_slope_deg.toFixed(1)} degrees`}>
       <defs>
         <linearGradient id="wedge" x1="0" y1="1" x2="1" y2="0">
           <stop offset="0" stopColor="#b5482a" stopOpacity="0.85" />
@@ -144,15 +154,18 @@ function SlopeDiagram({ p }: { p: PhysicsPreview }) {
         return (
           <g key={l.key}>
             <line x1={ox} y1={oy} x2={x} y2={y} stroke={active ? '#ece7f5' : '#6e6797'} strokeWidth={active ? 1.5 : 1} />
-            <text x={lx} y={ly + 4} fontSize="11" fill={active ? '#ece7f5' : '#a39cc8'} fontWeight={active ? 700 : 400}>
+            <text x={lx} y={ly + 4} fontSize="13" fill={active ? '#ece7f5' : '#a39cc8'} fontWeight={active ? 700 : 400}>
               {l.label} {l.deg.toFixed(1)}°
             </text>
           </g>
         )
       })}
       <line x1={ox} y1={oy} x2={ax} y2={ay} stroke="#ff4a5c" strokeWidth="1.25" strokeDasharray="4 4" />
+      <text x={ax + 6} y={ay + 4} fontSize="13" fill="#ff4a5c">
+        Tip alarm {p.tip_alarm_deg.toFixed(1)}°
+      </text>
       <path d={arc(p.max_slope_deg, 58)} fill="none" stroke="#ece7f5" strokeWidth="1" />
-      <text {...labelAt(pt(p.max_slope_deg / 2, 70))} fontSize="13" fontWeight="700" fill="#ece7f5">
+      <text {...labelAt(pt(p.max_slope_deg / 2, 70))} fontSize="15" fontWeight="700" fill="#ece7f5">
         {p.max_slope_deg.toFixed(1)}°
       </text>
       <g transform={`translate(${rx} ${ry}) rotate(${-p.max_slope_deg})`}>

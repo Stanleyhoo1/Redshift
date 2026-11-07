@@ -21,8 +21,8 @@ export function PlanetFog() {
         fragmentShader: ATMO_FRAGMENT,
         uniforms: {
           uColor: { value: new THREE.Color('#ff6a55') },
-          uPower: { value: 3.2 },
-          uStrength: { value: 0.95 },
+          uPower: { value: 3.6 },
+          uStrength: { value: 0.6 },
           uBack: { value: 0 },
         },
         transparent: true,
@@ -38,8 +38,8 @@ export function PlanetFog() {
         fragmentShader: ATMO_FRAGMENT,
         uniforms: {
           uColor: { value: new THREE.Color('#d2405a') },
-          uPower: { value: 2.6 },
-          uStrength: { value: 0.75 },
+          uPower: { value: 2.4 },
+          uStrength: { value: 0.55 },
           uBack: { value: 1 },
         },
         side: THREE.BackSide,

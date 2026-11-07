@@ -9,10 +9,15 @@ import { PlanetFog } from './PlanetFog'
 import { markerPositions, RobotMarkers } from './RobotMarkers'
 import { SectorPatch } from './SectorPatch'
 
-const HOME_TARGET = new THREE.Vector3(0, 0.02, 0.62)
-const HOME_CAMERA = new THREE.Vector3(0, 0.62, 3.0)
-const IDLE_AFTER_MS = 7000
-const SWAY_RAD = 0.32
+// Orbit the planet centre; the target sits slightly below it so the globe rides above the inject bar.
+const HOME_TARGET = new THREE.Vector3(0, -0.14, 0)
+const HOME_CAMERA = new THREE.Vector3(0, 0.12, 3.95)
+const HOME_DIST = 3.55
+const FLEET_BIAS = 0.7 // idle framing leans from the sector centre towards the selected robot
+const IDLE_AFTER_MS = 10000
+const SWAY_RAD = 0.1
+const Z = new THREE.Vector3(0, 0, 1)
+const NO_TURN = new THREE.Quaternion()
 
 export default function Globe() {
   return (
@@ -39,10 +44,11 @@ function CameraRig() {
   const camera = useThree((s) => s.camera)
   const lastInput = useRef(0)
   const swayPhase = useRef(0)
-  const swayApplied = useRef(0)
   const shake = useMemo(() => new THREE.Vector3(), [])
   const tmp = useMemo(() => new THREE.Vector3(), [])
   const axis = useMemo(() => new THREE.Vector3(0, 1, 0), [])
+  const focus = useMemo(() => new THREE.Vector3(), [])
+  const turn = useMemo(() => new THREE.Quaternion(), [])
 
   useEffect(() => {
     const c = controls.current
@@ -51,7 +57,6 @@ function CameraRig() {
     c.update()
     const onStart = () => {
       lastInput.current = performance.now()
-      swayApplied.current = 0 // user takes over from wherever the sway left the camera
     }
     c.addEventListener('start', onStart)
     return () => c.removeEventListener('start', onStart)
@@ -65,9 +70,7 @@ function CameraRig() {
       const c = controls.current
       if (!c) return
       useStore.getState().setFollow(false)
-      c.target.copy(HOME_TARGET)
-      camera.position.copy(HOME_CAMERA)
-      swayApplied.current = 0
+      lastInput.current = 0 // hand the camera straight back to the idle framing
       c.update()
     }
     el.addEventListener('dblclick', reset)
@@ -89,16 +92,26 @@ function CameraRig() {
       c.target.add(tmp)
       camera.position.add(tmp)
       const off = camera.position.clone().sub(c.target)
-      const want = 1.05
+      const want = 1.0
       off.setLength(off.length() + (want - off.length()) * k)
       camera.position.copy(c.target).add(off)
     } else if (performance.now() - lastInput.current > IDLE_AFTER_MS) {
-      // idle sway around the patch (not a full spin, so the sector stays in view)
-      swayPhase.current += dt * 0.11
-      const want = SWAY_RAD * Math.sin(swayPhase.current)
-      const d = want - swayApplied.current
-      swayApplied.current = want
-      tmp.copy(camera.position).sub(c.target).applyAxisAngle(axis, d)
+      // idle framing: face a point between the sector centre and the fleet, with a gentle sway
+      swayPhase.current += dt * 0.09
+      const sel = st.selectedRobot ? markerPositions.get(st.selectedRobot) : undefined
+      focus.set(0, 0, 0)
+      if (sel) focus.copy(sel)
+      else for (const p of markerPositions.values()) focus.add(p)
+      if (focus.lengthSq() > 1e-6) focus.normalize().lerp(Z, 1 - FLEET_BIAS).normalize()
+      else focus.copy(Z)
+      focus.applyAxisAngle(axis, SWAY_RAD * Math.sin(swayPhase.current))
+      const k = 1 - Math.exp(-dt * 1.1)
+      c.target.lerp(HOME_TARGET, k)
+      tmp.copy(camera.position).sub(c.target)
+      const len = tmp.length()
+      turn.setFromUnitVectors(tmp.divideScalar(len), focus)
+      turn.slerp(NO_TURN, 1 - k) // take only a k-sized step of the turn
+      tmp.applyQuaternion(turn).multiplyScalar(len + (HOME_DIST - len) * k)
       camera.position.copy(c.target).add(tmp)
     }
 
@@ -118,7 +131,7 @@ function CameraRig() {
       dampingFactor={0.08}
       rotateSpeed={0.5}
       zoomSpeed={0.7}
-      minDistance={1.25}
+      minDistance={1.45}
       maxDistance={7}
       enablePan
     />

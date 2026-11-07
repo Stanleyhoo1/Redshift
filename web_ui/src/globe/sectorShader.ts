@@ -166,8 +166,9 @@ void main() {
   vec3 col;
 
   if (cls < 0.5) {
-    col = fogColor(dir, uTime);
-    col += vec3(0.06, 0.07, 0.12) * cellLine + vec3(0.07, 0.09, 0.15) * majorLine;
+    // unexplored sector: the planet's fog with a cool tint and survey grid, so the target region reads
+    col = fogColor(dir, uTime) * vec3(0.96, 1.0, 1.12) + vec3(0.012, 0.018, 0.04);
+    col += vec3(0.05, 0.065, 0.11) * cellLine + vec3(0.07, 0.1, 0.17) * majorLine;
   } else {
     float e = m.r;
     vec2 tx = 1.0 / uCells;
@@ -183,9 +184,9 @@ void main() {
 
     float pulse = 0.5 + 0.5 * sin(uTime * 5.0);
     if (cls > 1.5 && cls < 2.5) {            // caution
-      col = mix(col, vec3(1.0, 0.7, 0.22), 0.42);
+      col = mix(col, vec3(1.0, 0.7, 0.22), 0.34);
     } else if (cls > 2.5 && cls < 3.5) {     // hazard (slope / step)
-      col = mix(col, vec3(1.0, 0.29, 0.36), 0.5 + 0.25 * pulse);
+      col = mix(col, vec3(0.95, 0.24, 0.32), 0.34 + 0.16 * pulse);
     } else if (cls > 3.5 && cls < 4.5) {     // permanent hazard, hatched
       float hatch = step(0.5, fract((cellCoord.x + cellCoord.y) * 0.5));
       col = mix(vec3(0.42, 0.04, 0.1), vec3(0.85, 0.12, 0.22), hatch * (0.6 + 0.4 * pulse));
@@ -202,8 +203,9 @@ void main() {
   // sector border
   vec2 edge = min(vUv, 1.0 - vUv);
   float ed = min(edge.x, edge.y);
-  float border = 1.0 - smoothstep(0.0, 0.0035, ed);
-  col = mix(col, vec3(0.3, 0.76, 1.0), border * 0.8);
+  float border = 1.0 - smoothstep(0.0, 0.004, ed);
+  float halo = (1.0 - smoothstep(0.0, 0.03, ed)) * 0.12;
+  col = mix(col, vec3(0.3, 0.76, 1.0), border * 0.85) + vec3(0.1, 0.25, 0.4) * halo;
   gl_FragColor = vec4(col, 1.0);
 }
 `
@@ -232,7 +234,7 @@ void main() {
   float n = fbm(p) * 0.75 + fbm(p * 2.7 - uTime * 0.3) * 0.25;
   vec2 edge = min(vUv, 1.0 - vUv);
   float fade = smoothstep(0.0, 0.12, min(edge.x, edge.y));
-  float a = clamp(uLevel * (0.25 + 0.75 * smoothstep(0.3, 0.75, n)) * fade, 0.0, 1.0) * 0.72;
+  float a = clamp(uLevel * (0.2 + 0.8 * smoothstep(0.35, 0.8, n)) * fade, 0.0, 1.0) * 0.55;
   gl_FragColor = vec4(mix(vec3(0.62, 0.42, 0.24), vec3(0.85, 0.62, 0.38), n), a);
 }
 `

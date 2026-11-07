@@ -19,6 +19,25 @@ PROFILES = {
 }
 LETHAL = (CLS_HAZARD, CLS_PERMANENT, CLS_OBSTACLE)
 
+# GET /api/options (docs/protocol.md)
+OPTIONS = {
+    "sectors": [
+        {"id": "small", "label": "Small", "size_m": 50, "res_m": 0.5, "cells": 100},
+        {"id": "medium", "label": "Medium", "size_m": 100, "res_m": 0.5, "cells": 200},
+        {"id": "large", "label": "Large", "size_m": 200, "res_m": 1.0, "cells": 200},
+    ],
+    "gravity": {"min": 1.0, "max": 3.0, "step": 0.1, "default": 2.2},
+    "fleet": {"rovers": {"min": 1, "max": 2, "default": 1}, "drones": {"min": 0, "max": 1, "default": 1}},
+    "edge_profiles": [
+        {"id": "orin_nano_15w", "label": "Orin Nano 15 W", "device": "NVIDIA Jetson Orin Nano", "watts_idle": 5, "watts_max": 15, "perf_scale": 2.6, "perception_hz_max": 10, "max_expansions": 60000},
+        {"id": "orin_nx_25w", "label": "Orin NX 25 W", "device": "NVIDIA Jetson Orin NX", "watts_idle": 7, "watts_max": 25, "perf_scale": 1.6, "perception_hz_max": 15, "max_expansions": 120000},
+        {"id": "agx_orin_60w", "label": "AGX Orin 60 W", "device": "NVIDIA Jetson AGX Orin", "watts_idle": 15, "watts_max": 60, "perf_scale": 0.9, "perception_hz_max": 20, "max_expansions": 250000},
+        {"id": "rpi5_8w", "label": "Raspberry Pi 5", "device": "Raspberry Pi 5 (8 GB)", "watts_idle": 3, "watts_max": 8, "perf_scale": 5.0, "perception_hz_max": 5, "max_expansions": 30000},
+    ],
+    "backends": [{"id": "gazebo", "label": "Gazebo Harmonic", "available": True}, {"id": "mock", "label": "Mock physics", "available": True}],
+    "defaults": {"sector": "medium", "gravity_g": 2.2, "fleet": {"rovers": 1, "drones": 1}, "edge_profile": "orin_nano_15w", "sim_backend": "gazebo", "seed": 42, "gazebo_gui": False},
+}
+
 
 class World:
     def __init__(self, config: dict):
@@ -39,6 +58,7 @@ class World:
         self.cls = np.zeros((n, n), np.uint8)  # what the fleet knows
         self.seen_t = np.full((n, n), np.inf, np.float64)
         self.rocks = list(self.terrain.rocks)
+        self.rock_version = 0
         self.perm: list[list[float]] = []
         self.found_science: list[list[float]] = []
         self.env = {"dust_level": 0.0, "seismic": False, "until_t": 0.0, "seismic_until": 0.0}
@@ -157,7 +177,10 @@ class World:
             c = came[c]
         cells.reverse()
         pts = [start] + [((j + 0.5) * cs - L / 2, (i + 0.5) * cs - L / 2) for i, j in cells[1:-1]] + [goal]
-        return self._resample(self._smooth(pts), 0.8)
+        smooth = self._resample(self._smooth(pts), 0.8)
+        if not self.path_blocked(smooth, len(smooth), skip_m=1.0):
+            return smooth
+        return self._resample(pts, 0.8)  # corner-cutting hit something: keep the cell-centre route
 
     @staticmethod
     def _smooth(pts: list) -> list:
@@ -180,12 +203,18 @@ class World:
                 out.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
         return [[round(x, 2), round(y, 2)] for x, y in out][:150]
 
-    def path_blocked(self, path: list, ahead: int = 30) -> bool:
+    def path_blocked(self, path: list, ahead: int = 30, skip_m: float = 2.0) -> int:
+        """Class code of the first lethal cell on the path ahead (0 = clear)."""
+        if not path:
+            return 0
+        x0, y0 = path[0]
         for x, y in path[1:ahead]:
+            if math.hypot(x - x0, y - y0) < skip_m:
+                continue
             i, j = self.terrain.cell(x, y)
             if self.cls[i, j] in LETHAL:
-                return True
-        return False
+                return int(self.cls[i, j])
+        return 0
 
     def frontier_goal(self, x: float, y: float, yaw: float, avoid: list) -> tuple | None:
         lethal, known = self._coarse()

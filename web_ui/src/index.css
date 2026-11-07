@@ -27,7 +27,7 @@
 
 @keyframes row-in {
   0% {
-    opacity: 0;
+    opacity: 0.35;
     transform: translateY(-10px);
     background-color: color-mix(in oklab, var(--row-tint, #4cc3ff) 28%, transparent);
   }

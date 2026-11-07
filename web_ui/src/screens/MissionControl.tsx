@@ -74,7 +74,6 @@ function GlobeStage() {
           <InjectBar />
         </div>
       </div>
-      <p className="pointer-events-none absolute right-3 bottom-[118px] text-[11px] text-dim/80">Drag to orbit, scroll to zoom, double-click to reset</p>
     </section>
   )
 }
@@ -99,6 +98,7 @@ function MapLegend() {
           {label}
         </li>
       ))}
+      <li className="mt-1 max-w-[150px] border-t border-rule pt-1.5 text-[10.5px] leading-snug text-dim">Drag to orbit, scroll to zoom, double-click to reset</li>
     </ul>
   )
 }

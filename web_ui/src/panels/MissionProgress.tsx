@@ -43,11 +43,11 @@ export function MissionProgress() {
 
 function Count({ label, value, color }: { label: string; value: number; color: string }) {
   return (
-    <div className="min-w-0">
+    <div className="flex min-w-0 flex-col-reverse">
+      <dt className="mt-0.5 text-haze">{label}</dt>
       <dd className="font-semi-cond num text-[22px] leading-none font-[780]" style={{ color }}>
         {value.toLocaleString()}
       </dd>
-      <dt className="mt-0.5 text-haze">{label}</dt>
     </div>
   )
 }

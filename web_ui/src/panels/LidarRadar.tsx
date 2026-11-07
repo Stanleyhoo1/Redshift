@@ -161,9 +161,12 @@ export function LidarRadar() {
   }, [w, h, dpr])
 
   return (
-    <Panel title="LiDAR, top down" sensors={['LIDAR', 'MAP']} right={<span className="num text-[11.5px] text-dim">{pts} pts</span>} bodyClass="p-1.5">
+    <Panel title="LiDAR" sensors={['LIDAR', 'MAP']} chipsFrom={205} right={<span className="num text-[11.5px] text-dim">{robot?.type === 'scout' ? 'map only' : `${pts} pts`}</span>} bodyClass="p-1.5">
       <div ref={wrapRef} className="relative h-full min-h-[150px] w-full">
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" aria-label={`LiDAR returns around ${robot ? robot.type : 'robot'}`} />
+        {robot?.type === 'scout' && (
+          <p className="absolute inset-x-0 bottom-0 text-center text-[11px] text-dim">The scout carries no LiDAR: local map only</p>
+        )}
       </div>
     </Panel>
   )

@@ -56,7 +56,7 @@ export default function PreLaunch() {
     <main className="relative grid h-full grid-cols-[minmax(0,44fr)_minmax(0,56fr)] overflow-hidden max-lg:grid-cols-1 max-lg:overflow-y-auto">
       <PlanetLimb g={cfg.gravity_g} />
 
-      <section className="relative z-10 flex min-h-0 flex-col justify-between gap-8 px-[clamp(24px,4vw,72px)] pt-[clamp(28px,5vh,64px)] pb-10">
+      <section className="relative z-10 flex min-h-0 flex-col justify-between gap-8 px-[clamp(24px,4vw,72px)] pt-[clamp(28px,5vh,64px)] pb-[15vh]">
         <header>
           <p className="mb-6 text-[13px] text-haze">Agentverse 2026, Robotics track</p>
           <Wordmark g={cfg.gravity_g} min={options.gravity.min} max={options.gravity.max} />
@@ -77,7 +77,7 @@ export default function PreLaunch() {
         </div>
       </section>
 
-      <section className="relative z-10 flex min-h-0 flex-col gap-6 overflow-y-auto border-l border-rule bg-void/70 px-[clamp(24px,3.2vw,56px)] pt-[clamp(28px,5vh,64px)] pb-8 backdrop-blur-[2px] scroll-thin max-lg:border-l-0 max-lg:border-t">
+      <section className="relative z-10 flex min-h-0 flex-col gap-[clamp(14px,2.4vh,24px)] overflow-y-auto border-l border-rule bg-void/70 px-[clamp(24px,3.2vw,56px)] pt-[clamp(28px,5vh,64px)] pb-8 backdrop-blur-[2px] scroll-thin max-lg:border-l-0 max-lg:border-t">
         <div className="flex items-baseline justify-between gap-4">
           <h2 className="font-cond text-[30px] leading-none font-[800] text-bone">Configure the mission</h2>
           <ConnectionNote live={optionsLive} conn={conn} />
@@ -126,7 +126,8 @@ export default function PreLaunch() {
           </div>
         </Field>
 
-        <div className="mt-auto pt-2">
+        {/* the deploy action stays pinned in view when the form is taller than the screen */}
+        <div className="sticky bottom-0 -mx-[clamp(24px,3.2vw,56px)] mt-auto -mb-8 bg-[rgba(22,19,43,0.94)] px-[clamp(24px,3.2vw,56px)] pt-3 pb-8 before:pointer-events-none before:absolute before:inset-x-0 before:-top-8 before:h-8 before:bg-[linear-gradient(to_top,rgba(22,19,43,0.94),rgba(22,19,43,0))] before:content-['']">
           <p className="mb-3 max-w-[70ch] text-[13px] text-haze">{summary}</p>
           <button
             type="button"
@@ -170,7 +171,7 @@ function PlanetLimb({ g }: { g: number }) {
       <div
         className="absolute left-[-30%] h-[200vh] w-[105%] rounded-[50%]"
         style={{
-          top: `${70 - 4 * t}vh`,
+          top: `${88 - 3 * t}vh`,
           background: 'radial-gradient(ellipse at 50% 0%, #6a2a1c 0%, #3a1a22 22%, #1e1530 48%, #16132b 70%)',
           boxShadow: `0 -2px 0 0 rgba(255,74,92,${0.35 + 0.3 * t}), 0 -30px 90px -10px rgba(181,72,42,${0.25 + 0.25 * t})`,
           transition: 'top 300ms ease-out, box-shadow 300ms ease-out',

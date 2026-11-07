@@ -22,27 +22,9 @@ from fastapi.staticfiles import StaticFiles
 
 from fake_agents import Rover, Scout
 from fake_render import b64_jpeg, lidar_points, map_png_b64, physics_preview, rover_camera, scout_camera
-from fake_world import World
+from fake_world import OPTIONS, World
 
 DIST = Path(__file__).resolve().parent.parent / "dist"
-
-OPTIONS = {
-    "sectors": [
-        {"id": "small", "label": "Small", "size_m": 50, "res_m": 0.5, "cells": 100},
-        {"id": "medium", "label": "Medium", "size_m": 100, "res_m": 0.5, "cells": 200},
-        {"id": "large", "label": "Large", "size_m": 200, "res_m": 1.0, "cells": 200},
-    ],
-    "gravity": {"min": 1.0, "max": 3.0, "step": 0.1, "default": 2.2},
-    "fleet": {"rovers": {"min": 1, "max": 2, "default": 1}, "drones": {"min": 0, "max": 1, "default": 1}},
-    "edge_profiles": [
-        {"id": "orin_nano_15w", "label": "Orin Nano 15 W", "device": "NVIDIA Jetson Orin Nano", "watts_idle": 5, "watts_max": 15, "perf_scale": 2.6, "perception_hz_max": 10, "max_expansions": 60000},
-        {"id": "orin_nx_25w", "label": "Orin NX 25 W", "device": "NVIDIA Jetson Orin NX", "watts_idle": 7, "watts_max": 25, "perf_scale": 1.6, "perception_hz_max": 15, "max_expansions": 120000},
-        {"id": "agx_orin_60w", "label": "AGX Orin 60 W", "device": "NVIDIA Jetson AGX Orin", "watts_idle": 15, "watts_max": 60, "perf_scale": 0.9, "perception_hz_max": 20, "max_expansions": 250000},
-        {"id": "rpi5_8w", "label": "Raspberry Pi 5", "device": "Raspberry Pi 5 (8 GB)", "watts_idle": 3, "watts_max": 8, "perf_scale": 5.0, "perception_hz_max": 5, "max_expansions": 30000},
-    ],
-    "backends": [{"id": "gazebo", "label": "Gazebo Harmonic", "available": True}, {"id": "mock", "label": "Mock physics", "available": True}],
-    "defaults": {"sector": "medium", "gravity_g": 2.2, "fleet": {"rovers": 1, "drones": 1}, "edge_profile": "orin_nano_15w", "sim_backend": "gazebo", "seed": 42, "gazebo_gui": False},
-}
 
 
 class Hub:
@@ -62,6 +44,7 @@ class Hub:
         self.clients: dict[WebSocket, dict] = {}
         self.task: asyncio.Task | None = None
         self.t_run = 0.0
+        self.pending_rocks: list = []
         self.rng = np.random.default_rng(3)
 
     # ---- outbound ------------------------------------------------------------------------
@@ -103,6 +86,7 @@ class Hub:
             except (asyncio.CancelledError, Exception):
                 pass
         self.task, self.world = None, None
+        self.pending_rocks = []
         if not silent and self.status != "idle":
             await self.set_status("stopped", "Mission aborted by operator")
 
@@ -167,6 +151,12 @@ class Hub:
         if env["dust_level"] > 0 and now > env["until_t"]:
             env["dust_level"] = 0.0
         env["seismic"] = now < env.get("seismic_until", 0)
+        for item in [p for p in self.pending_rocks if p[0] <= now]:
+            self.pending_rocks.remove(item)
+            w.rocks.extend(item[1])
+            w.rock_version += 1
+            w.refresh_truth()
+            w.reveal(item[2][0], item[2][1], 4.5, now)
         for r in self.rovers:
             r.step(w, dt, now, self.scouts)
             _, found = w.reveal(r.x, r.y, 11.0 if env["dust_level"] == 0 else 7.0, now)
@@ -185,12 +175,19 @@ class Hub:
             e = w.edge(a.id, a.extra_ms, a.throttle, a.unc)
             a._edge = e
             a.extra_ms = max(0.0, a.extra_ms - dt * 2) if a.mode == "FUSED" else a.extra_ms
-            if e["load_pct"] > 90 and a.throttle < 2:
+            over = e["load_pct"] > 90
+            under = e["load_pct"] < 60
+            a._over = (getattr(a, "_over", 0.0) + dt) if over else 0.0
+            a._under = (getattr(a, "_under", 0.0) + dt) if under else 0.0
+            cool = now - getattr(a, "_thr_t", 0.0) > 4.0
+            if a._over > 1.0 and cool and a.throttle < 2:
                 a.throttle += 1
+                a._thr_t = now
                 w.trace(a.id, a.state, "edge_throttle", ["EDGE"], f"Compute load {e['load_pct']:.0f} % of {w.profile_id} budget, {e['power_w']:.1f} W",
                         "Load > 90 %: perception rate must drop to keep the control loop at 10 Hz", 0.95, f"Perception throttled −25 % to {e['perception_hz'] * 0.75:.1f} Hz", "warn")
-            elif e["load_pct"] < 60 and a.throttle > 0:
+            elif a._under > 1.5 and cool and a.throttle > 0:
                 a.throttle -= 1
+                a._thr_t = now
                 w.trace(a.id, a.state, "edge_throttle", ["EDGE"], f"Compute load {e['load_pct']:.0f} %", "Load < 60 %: headroom restored", 0.93, "Perception rate restored")
 
     def _narrate(self, now: float):
@@ -298,13 +295,10 @@ class Hub:
         tx, ty = ((r.path[k + 1][0] - r.path[k][0]), (r.path[k + 1][1] - r.path[k][1])) if 0 <= k < len(r.path) - 1 else (math.cos(r.yaw), math.sin(r.yaw))
         n = math.hypot(tx, ty) or 1.0
         px, py = -ty / n, tx / n
-        rocks = [[round(cx + px * o + float(w.rng.normal(0, 0.4)), 2), round(cy + py * o + float(w.rng.normal(0, 0.4)), 2), round(float(w.rng.uniform(0.5, 1.0)), 2)]
-                 for o in np.linspace(-3.5, 3.5, 6)]
-        w.rocks.extend(rocks)
-        w.refresh_truth()
-        w.reveal(cx, cy, 4.5, time.time())
+        rocks = [[round(cx + px * o + float(w.rng.normal(0, 0.15)), 2), round(cy + py * o + float(w.rng.normal(0, 0.15)), 2), round(float(w.rng.uniform(0.65, 1.0)), 2)]
+                 for o in np.linspace(-3.5, 3.5, 7)]
         w.event({"op": "spawn_rockslide", "ok": True, "robot": r.id, "impact": [round(cx, 2), round(cy, 2)], "rocks": rocks})
-        r.pending_block = time.time() + 1.2
+        self.pending_rocks.append((time.time() + 1.1, rocks, (cx, cy)))
         return {"ok": True, "detail": f"Rockslide of {len(rocks)} boulders 7 m ahead of {r.id}"}
 
     def inject_anomaly(self, dust: float | None, duration: float | None) -> dict:

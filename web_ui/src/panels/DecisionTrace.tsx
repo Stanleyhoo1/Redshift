@@ -87,7 +87,7 @@ const TraceRow = memo(function TraceRow({ t }: { t: TraceEntry }) {
           {kindLabel(t.kind)}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-1.5" title={`confidence ${conf.toFixed(2)}`}>
-          <span className="relative h-1.5 w-10 rounded-full bg-rule">
+          <span className="relative hidden h-1.5 w-10 rounded-full bg-rule @min-[430px]:block">
             <span className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${conf * 100}%`, backgroundColor: sev }} />
           </span>
           <span className="num w-7 text-right text-[11.5px] text-haze">{conf.toFixed(2)}</span>
@@ -107,7 +107,7 @@ const TraceRow = memo(function TraceRow({ t }: { t: TraceEntry }) {
         </Step>
         <Step label="Act" node="arrow" color={sev}>
           <span className="text-[13px] leading-snug font-[620] text-bone">{t.action}</span>
-          {t.latency_ms !== undefined && <span className="num ml-2 text-[11px] text-dim">{fmt(t.latency_ms, 0)} ms</span>}
+          {t.latency_ms !== undefined && <span className="num ml-2 text-[11px] whitespace-nowrap text-dim">{fmt(t.latency_ms, 0)} ms</span>}
         </Step>
       </div>
     </li>
