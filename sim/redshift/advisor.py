@@ -22,6 +22,10 @@ the rovers safe. Tier 2 only advises, on other threads, and the rules check ever
 4. Operator chat. POST /api/chat text goes to Gemma (or the keyword parser when Gemma is offline);
    the rules check the command (A* within the slope limit, battery there and back) and either run
    it or refuse with numbers. One reply per command in the chat.
+5. Lifeforms. When a rover starts observing a moving LiDAR track, its camera frame and the track
+   numbers go to Gemma, which says whether it is a lifeform, gives a short label and an action. The
+   first sighting after start or reset (and later ones only when Gemma is unsure) asks the operator:
+   follow it, observe from here (the default: it never gets closer) or keep exploring.
 
 Nothing here ever waits for the model in the 5 Hz loop: submits and polls take microseconds.
 """
@@ -44,14 +48,20 @@ PARKED = ("idle", "charging", "fault")
 DRIVING = ("exploring", "investigating", "returning")
 
 INTERP_OPTIONS = ["reroute", "back_out", "proceed_slowly", "wait"]
-RULE_REACTION = {"new_obstacle": "reroute", "slip": "back_out", "low_visibility": "proceed_slowly"}
-ANOMALY_NAME = {"new_obstacle": "new rocks on the path", "slip": "wheel slip", "low_visibility": "low visibility"}
+RULE_REACTION = {"new_obstacle": "reroute", "slip": "back_out", "low_visibility": "proceed_slowly",
+                 "no_returns": "reroute"}
+ANOMALY_NAME = {"new_obstacle": "new rocks on the path", "slip": "wheel slip", "low_visibility": "low visibility",
+                "no_returns": "a hole in the LiDAR returns"}
 # options offered to the operator (only safe ones), first = default = the safest
 QUESTION_OPTIONS = {
     "new_obstacle": [("reroute", "Go around"), ("proceed_slowly", "Approach slowly"), ("wait", "Wait")],
     "slip": [("back_out", "Back out and go around"), ("wait", "Stop and wait")],
     "low_visibility": [("wait", "Wait for it to clear"), ("proceed_slowly", "Go on slowly")],
+    "no_returns": [("reroute", "Mark it and go around"), ("proceed_slowly", "Approach slowly for a closer look"),
+                   ("wait", "Wait")],
 }
+LIFE_OPTIONS = [("follow", "Follow it"), ("observe_here", "Observe from here"), ("keep_exploring", "Keep exploring")]
+LIFE_DEFAULT = "observe_here"     # the safest: it never gets closer
 DIRS = {"north": (0.0, 1.0), "south": (0.0, -1.0), "east": (1.0, 0.0), "west": (-1.0, 0.0),
         "north-east": (0.7071, 0.7071), "north-west": (-0.7071, 0.7071),
         "south-east": (0.7071, -0.7071), "south-west": (-0.7071, -0.7071)}
@@ -134,6 +144,7 @@ class Advisor:
         self.last_agree: dict = {}
         self.last_question: dict = {}
         self.first_pending = bool(self.cfg.operator_ask_first)
+        self.first_life_pending = True               # the first lifeform sighting always asks the operator
         self._done: list = []                        # (job, ticket) from the worker
         self._mu = threading.Lock()
         self._jobs: queue.Queue = queue.Queue()
@@ -265,7 +276,7 @@ class Advisor:
                     self.home_after.discard(rover.id)
                     if rover.state in ("exploring", "investigating"):
                         rover._go_home(t, "operator")
-            if rover.held and (rover.state in ("exploring", "investigating") or (
+            if rover.held and (rover.state in ("exploring", "investigating", "observing") or (
                     rover.state == "returning" and rover.return_reason not in ("battery", "range", "complete"))):
                 self._enter_hold(rover, t)
             if rover.id in self.go_jobs:
@@ -312,14 +323,14 @@ class Advisor:
             job.cands.append(c)
             job.to_plan.append(c)
         k, d = f.unclaimed_target(t, rover)
-        if k is not None and not rover.degraded and d < 45.0:
+        if k is not None and not rover.degraded and d < 45.0 and rover.tube_verdict(f.targets[k]) is None:
             ts = f.targets[k]
             need = rover.energy_for_distance(1.3 * d + 1.3 * math.hypot(ts.spec.x, ts.spec.y))
             if rover.battery > need + rover.battery_margin + 0.05:
                 c = {"id": ts.spec.id, "kind": "target", "goal": (ts.spec.x, ts.spec.y), "path": None, "tidx": k}
                 job.cands.append(c)
                 job.to_plan.append(c)
-        if rover.battery < 0.6:
+        if rover.battery < 0.6 or (rover.samples and rover.free_tubes() <= 0):
             job.cands.append({"id": "home", "kind": "return", "goal": rover.dock, "path": []})
         if len(job.cands) < 2:
             return                         # nothing to choose between
@@ -367,15 +378,18 @@ class Advisor:
             if c["kind"] == "return":
                 hd = rover.home_dist if rover.home_dist is not None else 1.5 * d
                 arr = (rover.battery - rover.energy_for_distance(hd)) * 100.0
-                c["label"] = "the lander to recharge"
-                c["summary"] = f"lander {where}, battery on arrival {arr:.0f}%, then recharge"
+                full = len(rover.samples)
+                c["label"] = "the lander to recharge" + (f" and cache {full} samples" if full else "")
+                c["summary"] = (f"lander {where}, battery on arrival {arr:.0f}%, then recharge"
+                                + (f", cache {full} samples ({rover.free_tubes()} tubes free now)" if full else ""))
             else:
                 after = (rover.battery - rover.energy_for_distance(c["plen"] + 1.3 * math.hypot(gx, gy))) * 100.0
                 tail = f"path {c['plen']:.0f} m, slope max {c['smax']:.0f} deg, battery after return {after:.0f}%"
                 if c["kind"] == "target":
                     ts = self.fleet.targets[c["tidx"]]
                     c["label"] = f"sample {ts.spec.id} ({KIND_LABEL[ts.spec.kind]}) {where}"
-                    c["summary"] = f"{KIND_LABEL[ts.spec.kind]} {ts.spec.id} {where}, {tail}"
+                    c["summary"] = (f"{KIND_LABEL[ts.spec.kind]} {ts.spec.id} {where}, value {ts.spec.est_value}/10 "
+                                    f"(estimate), {rover.free_tubes()} tubes free, {tail}")
                 else:
                     c["label"] = f"frontier {where}"
                     c["summary"] = f"frontier {where}, {c['size']} cells, {tail}"
@@ -456,8 +470,9 @@ class Advisor:
         if not self.active or rover.state in PARKED:
             return
         kind = a["kind"]
-        first = self.first_pending
-        self.first_pending = False
+        first = self.first_pending and kind != "no_returns"   # water: Gemma looks, the operator only if Gemma is unsure
+        if first:
+            self.first_pending = False
         facts = dict(a)
         job = {"rover": rover.id, "kind": kind, "t": float(a["t"]), "at": tuple(a["at"]), "first": first,
                "anomaly": self._anomaly_payload(rover, facts), "perception": self._perception(rover),
@@ -492,6 +507,14 @@ class Advisor:
         if kind == "slip":
             return {"type": "wheel_slip", "slip": a.get("slip", rover.slip), "wheel_speed": a.get("wheel_speed"),
                     "ground_speed": a.get("ground_speed"), "detail": "wheels spinning, rover barely moving"}
+        if kind == "no_returns":
+            out = {"type": "no_returns", "distance": a.get("dist", 0.0), "rays_missing": a.get("rays", 0),
+                   "detail": "no LiDAR returns where flat ground was expected straight ahead"}
+            if a.get("camera_liquid_pct") is not None:
+                out["camera_liquid_pct"] = a["camera_liquid_pct"]
+            if a.get("edge_spread") is not None:
+                out["edge_spread"] = a["edge_spread"]
+            return out
         return {"type": "low_visibility", "lidar_range": a.get("lidar_range", rover.lidar_eff),
                 "nominal_range": self.cfg.lidar_range, "detail": "no LiDAR returns from far away"}
 
@@ -519,8 +542,11 @@ class Advisor:
         job["image"] = bool(jpeg)
         if jpeg:
             self.frames += 1
-        tk = self.planner.submit_interpretation(job["rover"], job["t"], job["perception"], job["anomaly"], jpeg,
-                                                INTERP_OPTIONS, default=RULE_REACTION[job["kind"]])
+        if job.get("type") == "describe":
+            tk = self.planner.submit_description(job["rover"], job["t"], job["perception"], job["obs"], jpeg)
+        else:
+            tk = self.planner.submit_interpretation(job["rover"], job["t"], job["perception"], job["anomaly"], jpeg,
+                                                    INTERP_OPTIONS, default=RULE_REACTION[job["kind"]])
         if self.wait_for_gemma:
             self._wait(tk)
         with self._mu:
@@ -538,7 +564,10 @@ class Advisor:
                     continue               # still thinking (or the camera is slow)
             with self._mu:
                 self._done.remove(item)
-            self._on_interpretation(job, res, t)
+            if job.get("type") == "describe":
+                self._on_description(job, res, t)
+            else:
+                self._on_interpretation(job, res, t)
 
     def _on_interpretation(self, job: dict, res, t: float) -> None:
         rover = self._rover(job["rover"])
@@ -549,6 +578,7 @@ class Advisor:
         wants = job["first"] or (ok and (res.action == "ask_operator" or res.confidence < self.cfg.operator_ask_below))
         ask = wants and self._can_ask(rover, t, job["first"])
         if ok:
+            job["gemma_class"] = res.classification
             label = res.classification.replace("_", " ")
             src = "camera and sensors" if job["image"] else "sensors"
             head = (f"{rid} Gemma ({src}, {res.latency_ms / 1000.0:.1f} s): "
@@ -603,6 +633,20 @@ class Advisor:
                 return f"backing out of the soft ground first ({slip}), then waiting {WAIT_S:.0f} s", "apply"
             rover.pause_until = t + WAIT_S
             return f"waiting {WAIT_S:.0f} s", "apply"
+        if kind == "no_returns":
+            at = job["at"]
+            if action == "reroute":
+                if job.get("gemma_class") == "liquid" and rover.mark_water_here(t, at, "gemma"):
+                    return "marking it as water for the fleet and going around", "apply"
+                if self.fleet.water_zone_at(at[0], at[1], margin=0.5) is not None:
+                    return "it is marked as water, going around", "agree"
+                return "keeping off it and staying on mapped ground", "agree"
+            if action == "proceed_slowly":
+                rover.crawl_until, rover.crawl_v = t + SLOW_S, self.cfg.caution_v
+                return (f"approaching slowly ({self.cfg.caution_v:.1f} m/s for {SLOW_S:.0f} s) on mapped ground; the "
+                        f"water sensor stops me if it is liquid"), "apply"
+            rover.pause_until = t + WAIT_S
+            return f"waiting {WAIT_S:.0f} s", "apply"
         if action == "wait":               # low visibility
             rover.pause_until, rover.pause_dust = t + DUST_WAIT_S, True
             return f"waiting up to {DUST_WAIT_S:.0f} s for the dust to clear", "apply"
@@ -632,6 +676,11 @@ class Advisor:
         elif kind == "slip":
             q = (f"My wheels spin but I barely move (slip {a.get('slip', 0.0) * 100:.0f}%, ground speed "
                  f"{a.get('ground_speed', 0.0):.2f} m/s). Backing out now.")
+        elif kind == "no_returns":
+            cam = (f" Camera: {a['camera_liquid_pct']:.0f}% of the lower view is blue."
+                   if a.get("camera_liquid_pct") is not None else "")
+            q = (f"My LiDAR gets no returns {a.get('dist', 0.0):.0f} m ahead where ground should be "
+                 f"({a.get('rays', 0)} rays).{cam}")
         else:
             q = f"My LiDAR only reaches {a.get('lidar_range', 0.0):.0f} m (normally {self.cfg.lidar_range:.0f} m)."
         if res is not None:
@@ -681,7 +730,10 @@ class Advisor:
         self.say("operator", t, labels[option], "answer", to=rid, source=None, request_id=qid)
         if rover is None:
             return "ok"
-        phrase, _ = self._apply_action(rover, q["kind"], option, t, q["job"])
+        if q["kind"] == "lifeform":
+            phrase = self._apply_life(rover, option, t, q)
+        else:
+            phrase, _ = self._apply_action(rover, q["kind"], option, t, q["job"])
         self.say(rid, t, f"{rid}: {phrase}, thanks.", "ack", request_id=qid)
         self._log(t, "info", f"{rid} operator chose '{labels[option]}': {phrase}.", rid, at=q["job"]["at"],
                   source="operator")
@@ -691,12 +743,125 @@ class Advisor:
         q, rover = self._close(q["id"], "expired", t)
         rid, label = q["rover"], dict(q["options"])[q["default"]]
         if rover is not None:
-            self._apply_action(rover, q["kind"], q["default"], t, q["job"])
+            if q["kind"] == "lifeform":
+                self._apply_life(rover, q["default"], t, q)
+            else:
+                self._apply_action(rover, q["kind"], q["default"], t, q["job"])
         secs = self.cfg.operator_timeout_s
         self.say(rid, t, f"{rid}: no reply in {secs:.0f} s, taking the safe option: {label.lower()}.", "info",
                  request_id=q["id"])
         self._log(t, "info", f"{rid} no operator reply in {secs:.0f} s. Taking the safe option: {label.lower()}.",
                   rid, at=q["job"]["at"])
+
+    # ================================================================== 5. lifeforms
+    def on_sighting(self, rover, tr, t: float) -> bool:
+        """A rover started observing a moving track. Hand Gemma the camera frame and the numbers; the
+        answer (or the operator) decides follow / observe from here / stop. Returns True if tier 2
+        will decide, False to leave it to the rules (tier 2 switched off)."""
+        if not self.active:
+            return False
+        first = self.first_life_pending
+        self.first_life_pending = False
+        px, py = tr.predict(t)
+        d = math.hypot(px - rover.x, py - rover.y)
+        bearing = math.degrees(math.atan2(math.sin(math.atan2(py - rover.y, px - rover.x) - rover.yaw),
+                                          math.cos(math.atan2(py - rover.y, px - rover.x) - rover.yaw)))
+        obs = {"distance": round(d, 1), "speed": round(tr.speed, 2), "size": round(tr.size, 1),
+               "bearing_deg": round(bearing, 0), "seen_for_s": round(t - tr.t0, 1)}
+        job = {"type": "describe", "rover": rover.id, "track": tr.id, "t": float(t), "at": (px, py), "first": first,
+               "obs": obs, "perception": self._perception(rover), "wall": self.clock(), "image": False}
+        if not self.planner.online:
+            with self._mu:
+                self._done.append((job, None))      # rules alone: ask about the first one, follow the rest
+            return True
+        if self.wait_for_gemma:
+            self._run_job(job)
+            return True
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._worker_loop, name="advisor-eyes", daemon=True)
+            self._worker.start()
+        self._jobs.put(job)
+        return True
+
+    def _on_description(self, job: dict, res, t: float) -> None:
+        rover = self._rover(job["rover"])
+        f = self.fleet
+        tr = f.tracker.get(job["track"])         # follows a merge into an older track
+        if rover is None or rover.obs is None or tr is None or rover.obs["track"] != tr.id:
+            return                               # the observation already ended
+        ok = res is not None and res.ok
+        unsure = ok and (res.action == "ask_operator" or res.confidence < self.cfg.operator_ask_below)
+        ask = (job["first"] or unsure) and self._can_ask(rover, t, job["first"])
+        sd = self.cfg.observe_standoff
+        if ok:
+            tr.label = res.label
+            life = res.classification == "lifeform"
+            if life and not unsure:
+                rover.obs["life"] = True
+                f.confirm_lifeform(tr, t)
+            src = "camera" if job["image"] else "track numbers"
+            head = (f"{rover.id} Gemma ({src}, {res.latency_ms / 1000.0:.1f} s): {res.label} "
+                    f"(confidence {res.confidence:.2f}). {_quote(res.reason)}")
+            if ask:
+                tail = "Asking the operator; watching from here meanwhile."
+            elif res.action == "ignore" and not life:
+                tail = "Not a lifeform. Resuming exploration."
+            elif res.action == "approach" or (life and res.action != "observe"):
+                tail = f"Approaching to {sd:.0f} m to observe."
+            else:
+                tail = "Watching from here."
+            f.log(t, "discovery" if life else "info", f"{head} {tail}", rover.id, at=job["at"], source="gemma")
+        elif res is not None and res.error and not res.error.startswith(("gemma ", "cancelled", "superseded")):
+            f.log(t, "info", f"{rover.id} no usable answer from Gemma about track {tr.id} "
+                             f"({res.error.split(':')[0]}). The rules decide.", rover.id, at=job["at"])
+        if ask:
+            self._open_life_request(rover, tr, job, res if ok else None, t)
+            rover.set_obs_mode(t, "here")
+        elif ok and res.action == "ignore" and res.classification != "lifeform":
+            rover.set_obs_mode(t, "stop")
+        elif ok and res.action == "observe" or unsure:
+            rover.set_obs_mode(t, "here")
+        else:
+            rover.set_obs_mode(t, "follow")
+
+    def _open_life_request(self, rover, tr, job: dict, res, t: float) -> None:
+        from .fleet import compass
+        self.req_seq += 1
+        qid = f"q{self.req_seq}"
+        px, py = tr.predict(t)
+        d = math.hypot(px - rover.x, py - rover.y)
+        guess = f" Gemma thinks: {res.label} (confidence {res.confidence:.2f})." if res is not None else ""
+        question = (f"Possible lifeform {d:.0f} m {compass(px - rover.x, py - rover.y)} (LiDAR track {tr.id}, "
+                    f"{tr.speed:.1f} m/s, about {tr.size:.1f} m).{guess} Follow it or keep exploring?")
+        q = {"id": qid, "rover": rover.id, "t": round(t, 1), "question": question, "options": LIFE_OPTIONS,
+             "default": LIFE_DEFAULT, "deadline": self.clock() + self.cfg.operator_timeout_s,
+             "image": f"/api/camera/{rover.id}.jpg?view=fpv", "kind": "lifeform", "job": job}
+        self.requests[qid] = q
+        self.last_question[rover.id] = t
+        self.say(rover.id, t, f"{rover.id}: {question}", "question", source="gemma" if res is not None else "rules",
+                 request_id=qid)
+        if res is None:
+            self.fleet.log(t, "info", f"{rover.id} first lifeform sighting: asking the operator. Watching from here "
+                                      f"meanwhile.", rover.id, at=(px, py))
+
+    def _apply_life(self, rover, option: str, t: float, q: dict) -> str:
+        job = q["job"]
+        tr = self.fleet.tracker.get(job["track"])
+        if rover.obs is None or tr is None or rover.obs["track"] != tr.id:
+            return "the observation already ended"
+        sd = self.cfg.observe_standoff
+        if option == "follow":
+            rover.set_obs_mode(t, "follow")
+            return f"following it at about {sd:.0f} m, never closer than {self.cfg.observe_min_dist:.0f} m"
+        if option == "keep_exploring":
+            for k in rover.obs["seen"]:
+                tr = self.fleet.tracker.get(k)
+                if tr is not None:
+                    tr.ignored = True
+            rover.set_obs_mode(t, "stop")
+            return "back to exploring, leaving it alone"
+        rover.set_obs_mode(t, "here")
+        return "watching from here, I will not get closer"
 
     # ================================================================== 4. operator chat
     def operator_message(self, text: str, rover_hint: str | None = None) -> str:
@@ -781,6 +946,8 @@ class Advisor:
         r.pause_until = min(r.pause_until, t)
         self._cancel_go(r.id, t, why)
         self.choices.pop(r.id, None)
+        if r.state == "observing":
+            r.end_observing(t, "operator")
         if r.target_idx is not None:
             r._drop_target(t, why)
         if r.state in ("idle", "charging") or (r.state == "returning" and r.return_reason not in ("battery", "range")):
@@ -937,9 +1104,10 @@ class Advisor:
 
         if rid is None:
             ok = [r for r in f.rovers if self._busy_reason(r) is None and r.state != "recovering"
-                  and r.battery > need(r)]
+                  and r.battery > need(r) and r.free_tubes() > 0]
             if not ok:
-                self._reply("fleet", t, f"No rover can reach {tid} and get back right now.", "refuse", "rules")
+                self._reply("fleet", t, f"No rover can reach {tid} and get back with a free sample tube right now.",
+                            "refuse", "rules")
                 return
             rid = min(ok, key=lambda r: math.hypot(tx - r.x, ty - r.y)).id
         r = self._rover(rid)
@@ -949,6 +1117,10 @@ class Advisor:
             self._reply(rid, t, f"{rid}: can't, {busy}.", "refuse", "rules")
             return
         d = math.hypot(tx - r.x, ty - r.y)
+        if r.free_tubes() <= 0 and r.target_idx != k:
+            self._reply(rid, t, f"{rid}: can't, all {r.capacity} sample tubes are full. They go to the lander cache "
+                                f"on my next return (say 'return home').", "refuse", "rules")
+            return
         if r.battery < need(r):
             self._reply(rid, t, f"{rid}: can't, battery {r.battery * 100:.0f}% would not get me to {tid} ({d:.0f} m) "
                                 f"and back.", "refuse", "rules")
@@ -960,7 +1132,8 @@ class Advisor:
         r.state = "exploring"
         ts.status, ts.investigator = "investigating", rid
         r.start_investigation(t, k)
-        self._reply(rid, t, f"{rid}: going to sample {tid} ({KIND_LABEL[ts.spec.kind]}), {d:.0f} m away.", "ack", src)
+        self._reply(rid, t, f"{rid}: going to sample {tid} ({KIND_LABEL[ts.spec.kind]}), {d:.0f} m away, "
+                            f"{r.free_tubes()} of {r.capacity} tubes free.", "ack", src)
         self._log(t, "info", f"{rid} heading to sample {tid} for the operator, {d:.0f} m.", rid, at=(tx, ty),
                   source="operator")
 
@@ -1069,7 +1242,7 @@ class Advisor:
         self.fleet.map.mark_avoid(x, y, radius)
         self.fleet.invalidate_costs()
         self.fleet.frontiers_t = -1e9
-        self.fleet.reach_t = -1e9
+        self.fleet.refresh_reach()
         for r in self.sim.rovers:
             r.plan_t = -1e9
         self._reply("fleet", t, f"Marked ({x:g}, {y:g}) radius {radius:g} m as off limits. All rovers will plan "

@@ -5,10 +5,11 @@ import { Sidebar } from './components/Sidebar.jsx'
 import { ViewControls } from './components/ViewControls.jsx'
 import { Legend } from './components/Legend.jsx'
 import { SensorPanel } from './components/SensorPanel.jsx'
-import { DustBanner, DustHaze, HazardPanel } from './components/HazardPanel.jsx'
+import { DustBanner, DustHaze, HazardPanel, PlacementHint } from './components/HazardPanel.jsx'
 import { RequestCards } from './components/RequestCards.jsx'
 import { startConnection, wsUrl } from './net/connection.js'
-import { simStore, useApp, useSim } from './state/store.js'
+import { appStore, simStore, useApp, useSim } from './state/store.js'
+import { stopPlacing } from './lib/placement.js'
 
 function Waiting() {
   const ready = useSim((s) => s.ready)
@@ -38,10 +39,10 @@ function ConnBanner() {
   )
 }
 
-const TOGGLE_KEYS = { r: 'reality', f: 'frontiers', p: 'paths', s: 'slope', l: 'lidar' }
+const TOGGLE_KEYS = { r: 'reality', f: 'frontiers', p: 'paths', s: 'slope', l: 'lidar', b: 'life' }
 
 export default function App() {
-  const [view, setView] = useState({ reality: false, frontiers: true, paths: true, slope: true, lidar: true })
+  const [view, setView] = useState({ reality: false, frontiers: true, paths: true, slope: true, lidar: true, life: true })
   const [follow, setFollow] = useState(null)
   const [selected, setSelected] = useState(null) // rover whose sensor panel is open
   const [overview, setOverview] = useState(0) // bump to glide the camera back to the overview
@@ -82,6 +83,12 @@ export default function App() {
     setFocus({ x: e.at[0], y: e.at[1], key: `${e.key}:${performance.now()}`, hazard: e.level === 'hazard' })
   }, [])
 
+  // A new world: forget the picked sample.
+  const gen = useSim((s) => s.gen)
+  useEffect(() => {
+    if (appStore.get().pickedTarget) appStore.patch({ pickedTarget: null })
+  }, [gen])
+
   useEffect(() => startConnection(), [])
 
   // After a reset the followed or selected rover may no longer exist.
@@ -101,7 +108,10 @@ export default function App() {
         const key = TOGGLE_KEYS[k]
         setView((v) => ({ ...v, [key]: !v[key] }))
       } else if (k === 'escape') {
-        if (selectedRef.current) setSelected(null)
+        // Esc first cancels hazard placement, then closes the panel, then the overview.
+        if (appStore.get().placing) stopPlacing()
+        else if (appStore.get().pickedTarget) appStore.patch({ pickedTarget: null })
+        else if (selectedRef.current) setSelected(null)
         else goOverview()
       } else if (k === '0') {
         goOverview()
@@ -126,13 +136,14 @@ export default function App() {
         <ViewControls view={view} setView={setView} follow={follow} onSelect={show} onOverview={goOverview} />
         <div className="hud-top">
           <HazardPanel />
+          <PlacementHint />
           <RequestCards onSelect={show} />
           <div className="banners">
             <ConnBanner />
             <DustBanner />
           </div>
         </div>
-        {selected ? <SensorPanel roverId={selected} onClose={closePanel} /> : <Legend slopeColors={view.slope} frontiers={view.frontiers} />}
+        {selected ? <SensorPanel roverId={selected} onClose={closePanel} /> : <Legend slopeColors={view.slope} frontiers={view.frontiers} life={view.life} />}
         <Waiting />
       </main>
       <Sidebar follow={follow} selected={selected} onSelect={select} onFocusEvent={focusEvent} />

@@ -27,6 +27,7 @@ from .advisor import Advisor
 from .config import ROVER_COLORS, Config
 from .fleet import Fleet
 from .hazards import HazardError, HazardManager
+from .lifeforms import LifeformManager
 from .mapping import FleetMap
 from .rover import Rover
 from .terrain import Terrain
@@ -69,6 +70,9 @@ class Simulation:
         self.fleet.rovers = self.rovers
         self.hazards = HazardManager(self)
         self.fleet.hazards = self.hazards
+        self.lifeforms = LifeformManager(self)
+        self.camera_ok = None           # rules' camera checks: None = not tried yet, False = no OpenGL here
+        self._features_sent = -1
         self.advisor = Advisor(self, planner, frame_source, wait_for_gemma=wait_for_gemma)
 
         # per rover motor energy bookkeeping (actuator ids and wheel dof ids, shape n x 4)
@@ -111,8 +115,9 @@ class Simulation:
         hz = self.hazards
         c0 = time.perf_counter()
         hz.update_physics(t_start)
+        self.lifeforms.step(t_start, self.agent_dt)
         for _ in range(self.steps_per_tick):
-            if hz.drops:
+            if hz.drops or hz.falls:
                 hz.animate(float(d.time))
             mujoco.mj_step(m, d)
             f = d.actuator_force[act]
@@ -214,8 +219,9 @@ class Simulation:
         """Full state for a newly connected client. Events stop at the tick cursor so that the
         next tick message carries exactly the events this message does not."""
         cfg = self.cfg
-        truth = self.terrain.truth_heights
+        truth = self.terrain.truth_nospire          # colour scale: terrain and rocks, not the tall spires
         evs = [Fleet.public_event(e) for e in self.fleet.events if e["_seq"] <= self._event_cursor][-50:]
+        self._features_sent = self.hazards.features_version
         return {
             "type": "init",
             "world": {"name": cfg.world_name, "gravity": round(cfg.gravity, 2),
@@ -223,6 +229,9 @@ class Simulation:
             "map": {"nx": cfg.nx, "ny": cfg.ny, "res": cfg.res,
                     "origin": [float(cfg.origin[0]), float(cfg.origin[1])],
                     "min_h": round(float(truth.min()), 2), "max_h": round(float(truth.max()), 2)},
+            "features": self.features_msg(),
+            "lifeforms": self.lifeforms.to_msgs(),
+            "tracks": self.fleet.tracker.to_msgs(),
             "lander": {"x": 0.0, "y": 0.0, "radius": float(cfg.lander_radius)},
             "rovers": [{"id": r.id, "name": r.name, "color": r.color} for r in self.rovers],
             "known": {"cells": self.map.all_cells()},
@@ -237,8 +246,9 @@ class Simulation:
 
     def tick_message(self) -> dict:
         """Deltas since the previous tick message (cells and events), plus full rover, frontier,
-        target and fleet state. Each call consumes the deltas, so build it once per broadcast."""
-        return {
+        target and fleet state. Each call consumes the deltas, so build it once per broadcast. An updated
+        `features` object is included only in the tick after it changed (a spire fell)."""
+        msg = {
             "type": "tick",
             "t": round(self.t, 1),
             "rovers": [r.to_msg() for r in self.rovers],
@@ -252,7 +262,21 @@ class Simulation:
             "planner": self.advisor.planner_msg(),
             "chat": self.advisor.new_chat(),
             "requests": self.advisor.requests_msg(),
+            "lifeforms": self.lifeforms.to_msgs(),
+            "tracks": self.fleet.tracker.to_msgs(),
         }
+        if self._features_sent != self.hazards.features_version:
+            self._features_sent = self.hazards.features_version
+            msg["features"] = self.features_msg()
+        return msg
+
+    def features_msg(self) -> dict:
+        """Ground truth of the static features (protocol v4): water outlines and spires."""
+        standing = self.hazards.spire_standing
+        return {"water": [w.to_msg() for w in self.terrain.water],
+                "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
+                            "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
+                           for sp in self.hazards.all_spires()]}
 
     def close(self) -> None:
         """Stop tier 2's worker thread (the shared Gemma planner itself keeps running)."""
@@ -289,6 +313,10 @@ class Simulation:
             "targets_total": len(f.targets),
             "targets_found": sum(1 for ts in f.targets if ts.status is not None),
             "targets_sampled": sum(1 for ts in f.targets if ts.status == "sampled"),
+            "samples_cached": f.samples_cached,
+            "science_score": f.science_score,
+            "water_zones": len(f.water_zones),
+            "lifeforms_seen": f.lifeforms_seen,
             "events": f.event_seq,
             "flips": self.flips,
             "complete": f.complete,
@@ -307,10 +335,16 @@ class Simulation:
 
 
 def parse_hazard(spec: str):
-    """'rockfall@60', 'sand@120:r1' -> (type, sim time, rover id or None)."""
+    """'rockfall@60', 'sand@120:r1', 'spire_fall@150:12,-30' -> (type, sim time, rover id or None,
+    point (x, y) or None)."""
     kind, _, rest = spec.partition("@")
-    when, _, rover = rest.partition(":")
-    return kind.strip(), float(when or 0.0), (rover.strip() or None)
+    when, _, who = rest.partition(":")
+    who = who.strip()
+    point = None
+    if "," in who:
+        x, y = who.split(",", 1)
+        point, who = (float(x), float(y)), ""
+    return kind.strip(), float(when or 0.0), (who or None), point
 
 
 def main(argv=None) -> int:
@@ -320,9 +354,10 @@ def main(argv=None) -> int:
     ap.add_argument("--rovers", type=int, default=None, help="number of rovers (default: NUM_ROVERS or 3)")
     ap.add_argument("--report-every", type=float, default=60.0, help="progress line every N sim seconds (0 = off)")
     ap.add_argument("--quiet", action="store_true", help="do not print the event log")
-    ap.add_argument("--hazard", action="append", default=[], metavar="TYPE@T[:ROVER]",
+    ap.add_argument("--hazard", action="append", default=[], metavar="TYPE@T[:ROVER|:X,Y]",
                     help="trigger a hazard at sim time T, e.g. rockfall@60, sand@120:r1, dust_storm@200, "
-                         "rover_fault@260:r3 (repeatable; retried for up to 60 s if it cannot be placed)")
+                         "rover_fault@260:r3, lifeform@60, spire_fall@150, rockfall@90:12,-30 (a point) "
+                         "(repeatable; retried for up to 60 s if it cannot be placed)")
     ap.add_argument("--ticks", action="store_true", help="build a tick message every 0.6 sim s and report its size")
     ap.add_argument("--model-clock", action="store_true",
                     help="cap planning by counted A* expansions instead of the wall clock (repeatable runs)")
@@ -367,7 +402,7 @@ def main(argv=None) -> int:
           f"{len(sim.terrain.targets)} targets (built in {build_s:.2f} s)")
     w1 = time.perf_counter()
     next_report = args.report_every if args.report_every > 0 else float("inf")
-    pending = [[k, when, rover, when] for (k, when, rover) in plan]    # last field: next try
+    pending = [[k, when, rover, when, pt] for (k, when, rover, pt) in plan]    # [3]: next try
     sizes = []
     next_msg = 0.6
     try:
@@ -378,7 +413,8 @@ def main(argv=None) -> int:
             for hp in list(pending):
                 if sim.t >= hp[3]:
                     try:
-                        h = sim.hazards.trigger(hp[0], hp[2])
+                        pt = hp[4]
+                        h = sim.hazards.trigger(hp[0], hp[2], *(pt if pt is not None else (None, None)))
                         print(f"  t={sim.t:6.1f}s hazard {h['id']} {h['type']}"
                               f"{' on ' + h['rover'] if h.get('rover') else ''}", flush=True)
                         pending.remove(hp)
@@ -410,6 +446,9 @@ def main(argv=None) -> int:
     print(f"  slope limit         {s['slope_limit_deg']:.1f} deg (started at {cfg.slope_limit_initial_deg:.0f}, "
           f"steepest climb seen {s['best_climb_deg']:.1f})")
     print(f"  targets             {s['targets_found']} found, {s['targets_sampled']} sampled, of {s['targets_total']}")
+    print(f"  samples cached      {s['samples_cached']}, science score {s['science_score']}")
+    print(f"  water zones         {s['water_zones']} (lakes and rivers in the world: {len(sim.terrain.water)})")
+    print(f"  lifeforms seen      {s['lifeforms_seen']} (creatures in the world: {len(sim.lifeforms.creatures)})")
     print(f"  events              {s['events']}")
     print(f"  self-rights         {s['flips']}")
     print(f"  physics glitches    {sim.glitches}")

@@ -4,7 +4,7 @@
 
 The rovers drive themselves with fast hand-written rules and A* path planning. Gemma adds a
 second opinion that runs **on your own machine** (no cloud, no link to Earth, just like a real
-rover). It does three jobs:
+rover). It does four jobs:
 
 1. **Choose.** When a rover picks a new goal (at most every 20 s, or when it reaches one), the rules
    list a few safe options: two or three frontiers with the A* path length, the steepest slope on
@@ -16,6 +16,10 @@ rover). It does three jobs:
 3. **Understand you.** You type "rover 2 go to 10, -5" or "send the orange one home" and Gemma
    turns it into a command the rules can check and run. If the message is unclear it asks back.
    A keyword parser does the same job when Gemma is offline.
+4. **Describe what moves.** When the LiDAR tracker sees something moving on its own, Gemma looks at
+   the camera picture and the track numbers (distance, speed, size) and says whether it is a
+   lifeform, gives a short label ("possible lifeform, six legs, about 1.2 m") and what to do:
+   approach (to watch from about 6 m), observe from here, or ignore.
 
 ## The two tiers
 
@@ -34,7 +38,8 @@ back off) on top of what the rules already did.
 
 - The rules **never wait** for Gemma. Asking and checking for an answer take about 0.1 ms.
 - If Gemma is slow (no answer in 4 s), offline, still loading, or answers something invalid, the
-  rules' choice simply stands. Typed commands then go through the keyword parser.
+  rules' choice simply stands. Typed commands then go through the keyword parser. A lifeform
+  sighting then follows the rules (approach carefully), and the first one still asks the operator.
 - Every accepted Gemma answer must quote at least one number the rover actually measured (the
   code checks this), so every decision can be traced back to sensor input. Events that came from
   Gemma carry `"source": "gemma"`; the ones from typed commands carry `"source": "operator"`.
@@ -47,6 +52,8 @@ back off) on top of what the rules already did.
 | New rocks on the path | slow to 0.3 m/s, replan around them | camera + numbers: what is it, what to do | reroute: agrees (and gives the rocks a little extra room). Wait or go slowly: applied. Low confidence: question to the operator |
 | Wheel slip (soft ground) | stop, mark the soft zone for everyone, back out | same | back out: agrees. "Proceed slowly": refused, `Safety rule wins: no driving on into soft ground` |
 | LiDAR range drops (dust) | slow down, then 0.4 m/s on mapped ground only | same | go slowly: agrees. Wait: stands still until the dust clears (at most 30 s) |
+| LiDAR gets no returns ahead, camera sees blue (`no_returns`) | slow down, mark the lake for the fleet, replan around it | camera + numbers (missing rays, distance, share of blue pixels) | "liquid" + reroute: agrees (and marks the water if the rules had not). A hole the camera says is not liquid is a drop-off: the rules just slow down and keep to mapped ground, Gemma is not asked |
+| Something moves (a LiDAR track) | stop and turn to face it | camera + track numbers: lifeform or not, short label, action | approach: follow at about 6 m (never closer than 4 m). Observe: watch from here. Ignore (not a lifeform): back to exploring. Unsure (or the first sighting): question to the operator |
 | Operator types a message | post it in the chat | turn it into a command | the rules check it (A* within the slope limit, battery there and back) and run it, or refuse with numbers |
 
 The camera picture is grabbed by a small worker thread through the camera's render thread
@@ -78,6 +85,28 @@ then press the rockfall button in the UI (or `curl -X POST localhost:8000/api/ha
 '{"type": "rockfall"}'`). The rover that sees the rocks asks within a few seconds. Answer in the UI
 (`POST /api/answer {"id": "q1", "option": "reroute"}`) or let it time out. After a reset the next
 first anomaly asks again. To make every anomaly ask, set `OPERATOR_ASK_BELOW=1.01`.
+
+### Lifeform questions
+
+The first lifeform sighting after start or reset always asks (and later ones only when Gemma's
+confidence is under 0.75):
+
+```
+r3: Possible lifeform 8 m north (LiDAR track k2, 0.3 m/s, about 1.2 m). Gemma thinks: possible
+lifeform, six legs, about 1.2 m (confidence 0.80). Follow it or keep exploring?
+[Follow it]  [Observe from here] (default)  [Keep exploring]
+```
+
+While it waits, the rover watches from where it is. "Observe from here" is the safe default: the
+rover never gets closer. No answer in 20 s: it takes that. Demo: `curl -X POST
+localhost:8000/api/hazard -d '{"type": "lifeform"}'` (or click a spot with x and y).
+
+### Goal choice with samples
+
+Target options quote the spectrometer's value estimate and the free tubes, so Gemma can weigh them:
+`sample t3 (mineral outcrop) 12 m north-east, value 8/10 (estimate), 2 tubes free, path 14 m, slope
+max 9 deg, battery after return 51%`. With full tubes, "return to the lander to cache the samples"
+is an option.
 
 ### Typed commands
 
@@ -143,6 +172,8 @@ the sim container reaches the Ollama running on your PC.
   `gemma planner ready: gemma4:e2b, warm-up 39.0 s` (or `offline` with the reason).
 - **No Ollama at all:** `GEMMA_FAKE=1 docker compose up --build` (or `GEMMA_FAKE=1` for a native run)
   uses the fake model: fixed rules and a 0.5 s delay, the whole pipeline without a GPU.
+  The fake cannot see the picture: it calls a hole "liquid" when the rules' camera check found blue,
+  and something moving a "possible lifeform" when it moves on its own and is animal sized.
 
 **Warm-up.** The server creates the planner when it starts, before the rovers need it. It checks
 Ollama (`GET /api/tags`, every 15 s) and sends one tiny warm-up request so the model is loaded
@@ -163,8 +194,8 @@ drops questions still queued about the old world.
 - The rules' share of tier 2 (planning the candidate goals and operator trips) does count toward
   the 40 ms and is planned in slices like every other plan.
 - Load: 3 rovers ask about every 20 to 30 sim seconds; at `SIM_SPEED=3` that is one choice call
-  every 2 to 3 wall seconds at about 0.3 s each, plus the odd anomaly or command. One call runs at a
-  time; typed commands go first, then anomalies, then choices.
+  every 2 to 3 wall seconds at about 0.3 s each, plus the odd anomaly, sighting or command. One call
+  runs at a time; typed commands go first, then anomalies, then lifeform descriptions, then choices.
 - Prompts are small (under 400 tokens plus the picture), answers short (JSON only, temperature 0,
   thinking off).
 
@@ -218,8 +249,11 @@ gp.stats(); gp.cancel()                # status badge; drop queued questions (on
 
 `res.ok` is True only for a valid Gemma answer; otherwise `res.source == "fallback"` and the result
 carries the caller's default (or the keyword parser's command). Choices: `res.choice`, `res.reason`,
-`res.confidence`. Interpretations: `res.classification` (rock, steep_slope, soft_ground, dust,
-other_rover, crater_edge, clear, unknown), `res.action`, `res.model_action`. Commands:
+`res.confidence`. Interpretations: `res.classification` (rock, steep_slope, soft_ground, dust, liquid,
+other_rover, crater_edge, clear, unknown), `res.action`, `res.model_action`. Descriptions
+(`gp.submit_description(rover, t, perception, observation, jpeg)`): `res.classification` (lifeform,
+rock, other_rover, dust, unknown), `res.label`, `res.action` (approach, observe, ignore, or
+ask_operator when unsure). Commands:
 `res.command` (`go_to`, `explore_direction`, `sample_target`, `return_home`, `hold`, `resume`,
 `avoid_area`, `unclear` with `question`).
 

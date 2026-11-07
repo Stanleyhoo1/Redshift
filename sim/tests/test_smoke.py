@@ -1,4 +1,4 @@
-"""Headless smoke test: about 400 sim seconds with the default world (seed 42).
+"""Headless smoke test: about 400 sim seconds with the default world (seed 42, 120 m map).
 
 Run with `python -m pytest -q tests/` (add -s to see the event log) or `python tests/test_smoke.py`.
 The simulation runs once and every test checks a different part of the result.
@@ -20,22 +20,25 @@ from redshift.sim import Simulation  # noqa: E402
 SIM_SECONDS = 400.0
 MSG_EVERY = 0.6        # sim seconds between tick messages (5 Hz at 3x real time)
 
-# protocol v1 keys plus the "Version 2 additions" (hazards, sensors, edge budget) and the "Version 3
-# additions" (planner, chat, requests; checked in detail in test_brain.py)
+# protocol v1 keys plus the "Version 2 additions" (hazards, sensors, edge budget), the "Version 3
+# additions" (planner, chat, requests; checked in detail in test_brain.py) and the "Version 4 / 4b
+# additions" (features, lifeforms, tracks, samples; checked in detail in test_v4.py)
 INIT_KEYS = {"type", "world", "map", "lander", "rovers", "known", "targets", "events", "fleet", "hazards",
-             "planner", "chat", "requests"}
+             "planner", "chat", "requests", "features", "lifeforms", "tracks"}
 TICK_KEYS = {"type", "t", "rovers", "cells", "frontiers", "targets", "events", "fleet", "hazards",
-             "planner", "chat", "requests"}
+             "planner", "chat", "requests", "lifeforms", "tracks"}          # plus "features" when it changed
 ROVER_KEYS = {"id", "x", "y", "z", "yaw", "speed", "battery", "state", "goal", "path", "target_id",
-              "sensors", "scan", "brain"}
+              "sensors", "scan", "brain", "track_id", "samples", "capacity"}   # plus "sampling" while sampling
 SENSOR_KEYS = {"lidar_range", "lidar_hits", "pitch", "roll", "wheel_speed", "ground_speed", "slip", "motor_load",
                "spectro"}
 BRAIN_KEYS = {"last_ms", "avg_ms", "peak_ms", "over"}
-TARGET_KEYS = {"id", "x", "y", "kind", "status", "found_by", "found_t"}
+TARGET_KEYS = {"id", "x", "y", "kind", "status", "found_by", "found_t", "instrument", "value", "analysis",
+               "carried_by", "cached"}
 EVENT_KEYS = {"t", "rover", "level", "msg"}           # plus optional "at": [x, y] and "source" (v3)
 FLEET_KEYS = {"explored_pct", "slope_limit_deg", "slope_limit_initial_deg", "targets_found", "targets_total",
-              "sim_speed", "budget_ms", "cycle_ms", "soft_zones"}
-STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle", "fault"}
+              "sim_speed", "budget_ms", "cycle_ms", "soft_zones", "water_zones", "lifeforms_seen", "samples_cached",
+              "samples_carried", "science_score"}
+STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle", "fault", "observing"}
 LEVELS = {"info", "warn", "discovery", "hazard"}
 EM_DASH = chr(0x2014)   # banned everywhere in this project
 
@@ -189,11 +192,11 @@ def test_messages_match_protocol():
     assert len(R.ticks) > 100
     for m in R.ticks:
         json.dumps(m, allow_nan=False)
-        assert set(m) == TICK_KEYS, set(m) ^ TICK_KEYS
+        assert TICK_KEYS <= set(m) <= TICK_KEYS | {"features"}, set(m) ^ TICK_KEYS
         assert m["type"] == "tick" and math.isfinite(m["t"])
         assert len(m["rovers"]) == cfg.num_rovers
         for r in m["rovers"]:
-            assert set(r) == ROVER_KEYS, set(r) ^ ROVER_KEYS
+            assert ROVER_KEYS <= set(r) <= ROVER_KEYS | {"sampling"}, set(r) ^ ROVER_KEYS
             assert r["state"] in STATES, r["state"]
             assert 0.0 <= r["battery"] <= 1.0
             assert r["goal"] is None or (len(r["goal"]) == 2 and all(math.isfinite(v) for v in r["goal"]))
@@ -205,7 +208,7 @@ def test_messages_match_protocol():
             assert len(f) == 3 and isinstance(f[2], int) and f[2] > 0, f
         for t in m["targets"]:
             assert set(t) == TARGET_KEYS, t
-            assert t["status"] in ("found", "investigating", "sampled") and t["kind"] in ("mineral", "ice", "vent")
+            assert t["status"] in ("found", "investigating", "sampled") and t["kind"] in ("mineral", "ice", "vent", "trace")
         _check_events(m["events"])
         assert set(m["fleet"]) == FLEET_KEYS
         f = m["fleet"]
@@ -261,7 +264,8 @@ def test_truth_payload():
     cfg = R.sim.cfg
     assert set(p) == {"nx", "ny", "res", "origin", "heights", "targets"}
     assert len(p["heights"]) == cfg.nx * cfg.ny and all(math.isfinite(h) for h in p["heights"])
-    assert len(p["targets"]) == len(R.sim.terrain.targets) and 6 <= len(p["targets"]) <= 9
+    lo, hi = (6, 9) if cfg.map_size <= 80 else (12, 24)     # more targets (and traces) on the 120 m map
+    assert len(p["targets"]) == len(R.sim.terrain.targets) and lo <= len(p["targets"]) <= hi
     for t in p["targets"]:
         assert set(t) == {"id", "x", "y", "kind"}
     json.loads(R.sim.truth_json())

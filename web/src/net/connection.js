@@ -113,10 +113,15 @@ export async function loadTruth(gen) {
   }
 }
 
-// POST /api/hazard (PROTOCOL.md, version 2). Resolves with the server's hazard, or
-// throws an Error carrying the server's own error text (HTTP 400) when it refuses.
-export async function postHazard(type, rover) {
+// POST /api/hazard (PROTOCOL.md, version 2; `at` = [x, y] for version 4 point and click).
+// Resolves with the server's hazard, or throws an Error carrying the server's own error
+// text (HTTP 400) when it refuses.
+export async function postHazard(type, rover, at = null) {
   const body = rover ? { type, rover } : { type }
+  if (at) {
+    body.x = at[0]
+    body.y = at[1]
+  }
   let res
   try {
     res = await fetch('/api/hazard', {

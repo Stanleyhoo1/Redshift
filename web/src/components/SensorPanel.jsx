@@ -3,9 +3,10 @@ import { simStore, useSim } from '../state/store.js'
 import { sampleGround } from '../state/simState.js'
 import { camDown, fetchCameraFrame } from '../net/connection.js'
 import { fixed } from '../lib/format.js'
-import { HAZARD, SIGNAL, kindStyle } from '../lib/theme.js'
+import { HAZARD, SIGNAL, instrumentStyle, kindStyle } from '../lib/theme.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { Battery, StatePill, brainLevel, fmtMs } from './RoverBits.jsx'
+import { InstrumentIcon, Tubes } from './SampleBits.jsx'
 import { PlannerRow } from './Planner.jsx'
 import { reducedMotion } from '../scene/sceneConstants.js'
 
@@ -495,6 +496,9 @@ function Readouts({ rover, limit }) {
           <span className="sp-v sp-num">{num(s?.motor_load) ? `${Math.round(s.motor_load * 100)}%` : '--'}</span>
         </div>
       </div>
+      {rover.sampling ? (
+        <InstrumentRow sampling={rover.sampling} targets={targets} tubes={rover.samples} capacity={rover.capacity} />
+      ) : (
       <div className="sp-row sp-spectro">
         <span className="sp-k">Spectro</span>
         {spectro ? (
@@ -506,6 +510,33 @@ function Readouts({ rover, limit }) {
         ) : (
           <span className="sp-v sp-dim">{s ? 'Nothing in range' : '--'}</span>
         )}
+      </div>
+      )}
+    </div>
+  )
+}
+
+// v4b: the instrument running on a target: progress and what it is doing.
+function InstrumentRow({ sampling, targets, tubes, capacity }) {
+  const ins = instrumentStyle(sampling.instrument)
+  const t = targets.find((x) => x.id === sampling.target)
+  const ks = t ? kindStyle(t.kind) : null
+  const pct = Math.round(sampling.progress * 100)
+  const tube = Array.isArray(tubes) && Number.isFinite(capacity) ? `, tube ${Math.min(capacity, tubes.length + 1)} of ${capacity}` : ''
+  return (
+    <div className="sp-instr" style={{ '--c': ks?.color || 'var(--signal)' }}>
+      <div className="sp-row sp-row-bar">
+        <span className="sp-k sp-instr-k">
+          <InstrumentIcon kind={sampling.instrument} />
+          {ins.label}
+        </span>
+        <Bar value={sampling.progress} level="instr" />
+        <span className="sp-v sp-num">{pct}%</span>
+      </div>
+      <div className="sp-instr-sub">
+        {ins.verb}
+        {t ? ` at the ${ks.label.toLowerCase()} ${t.id}` : ''}
+        {tube}
       </div>
     </div>
   )
@@ -576,6 +607,7 @@ export function SensorPanel({ roverId, onClose }) {
   const cycle = useSim((s) => s.fleet.cycle_ms)
   const limit = useSim((s) => s.limit.current)
   const planner = useSim((s) => s.planner)
+  const targets = useSim((s) => s.targets)
   const ref = useHudRect('sensors')
   const radarSize = useRadarSize()
   if (!meta) return null
@@ -586,6 +618,7 @@ export function SensorPanel({ roverId, onClose }) {
         <h2 className="sp-name">{meta.name}</h2>
         <StatePill rover={rover} hazards={hazards} />
         <Battery value={rover?.battery} charging={rover?.state === 'charging'} />
+        {rover?.capacity && <Tubes samples={rover.samples} capacity={rover.capacity} targets={targets} />}
         <span className="sp-title">Live sensors</span>
         <button type="button" className="sp-close" onClick={onClose} title="Close (Esc)" aria-label="Close the sensor panel">
           <svg viewBox="0 0 12 12" aria-hidden="true">

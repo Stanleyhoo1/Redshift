@@ -2,13 +2,17 @@
 
 Geom groups:
   0 terrain heightfield tiles
-  1 rocks, rockfall boulders and lander pad (seen by LiDAR)
-  2 science target markers (no collision, seen by the spectrometer rays)
+  1 rocks, rockfall boulders, alien spires and the lander pad (seen by LiDAR, solid)
+  2 science target markers and lifeforms (no collision, seen by LiDAR rays)
   3 rovers (excluded from every LiDAR scan)
-  5 invisible walls just outside the map edge (keep rovers on the map, not seen by LiDAR)
+  4 lander ring and the invisible walls just outside the map edge (not seen by LiDAR)
+  5 liquid surfaces of lakes and rivers (semi-transparent, no collision; LiDAR rays that hit them
+    get no return)
 
-Rockfall boulders are mocap bodies parked far below the map until hazards.py drops them in.
-Each rover carries a simulated IMU (framequat + gyro on a site at the chassis centre).
+Rockfall boulders are mocap bodies parked far below the map until hazards.py drops them in. Spires
+are mocap bodies too (origin at the base) so a spire_fall can topple one by rotating it, and a few
+spare spires wait below the map for "drop a new spire here". Lifeforms are mocap bodies moved by
+lifeforms.py. Each rover carries a simulated IMU (framequat + gyro on a site at the chassis centre).
 """
 from __future__ import annotations
 
@@ -24,12 +28,20 @@ GROUP_TERRAIN = 0
 GROUP_ROCK = 1
 GROUP_TARGET = 2
 GROUP_ROVER = 3
-GROUP_WALL = 5
+GROUP_WALL = 4
+GROUP_WATER = 5
+
+SPIRE_RGBA = "0.88 0.22 0.5 1"       # magenta crystal, far from every target colour and the ground
+SPIRE_CORE_RGBA = "1.0 0.55 0.8 1"
+WATER_RGBA = "0.12 0.32 0.78 0.82"   # deep blue, semi-transparent
+LIFE_RGBA = "0.22 0.74 0.52 1"       # teal green grazers with darker legs and back plates
+LIFE_DARK_RGBA = "0.1 0.4 0.3 1"
 
 TARGET_RGBA = {          # same colours as the dashboard: mineral #b48cff, ice #a8d4ff, vent #ff8a3d
     "mineral": "0.706 0.549 1.0 1",
     "ice": "0.659 0.831 1.0 1",
     "vent": "1.0 0.541 0.239 1",
+    "trace": "0.55 1.0 0.15 1",     # lime green: organic traces near the herds (far from the teal grazers)
 }
 
 BOULDER_PARK_Z = -60.0     # hidden boulders wait this far below the lowest terrain
@@ -157,6 +169,52 @@ class World:
     target_geom_ids: dict      # geom id -> target index
     rover_geom_range: dict     # rover id -> (first geom id, last geom id)
     boulders: list             # [(mocap id, geom id, (sx, sy, sz))] hidden rockfall boulders
+    spires: list = None        # [(mocap id, [geom ids])] per terrain spire, then the spare ones
+    water_gids: np.ndarray = None   # liquid surface geoms (LiDAR: no return)
+    life_mocap: list = None    # mocap id per creature (lifeforms.py order)
+    life_gids: np.ndarray = None    # every creature geom (LiDAR hits go to the motion tracker)
+
+
+def spire_body_xml(name: str, x: float, y: float, z: float, height: float, radius: float, sides: list) -> str:
+    """A crystal spire whose body origin is its base (so toppling = rotating the body)."""
+    r = radius
+    parts = [f'<body name="{name}" mocap="true" pos="{x:.3f} {y:.3f} {z:.3f}">',
+             f'<geom name="{name}_g0" type="capsule" fromto="0 0 {r:.3f} 0 0 {max(height - r, r + 0.05):.3f}" '
+             f'size="{r:.3f}" rgba="{SPIRE_RGBA}" group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/>',
+             f'<geom name="{name}_g1" type="capsule" fromto="0 0 {0.55 * height:.3f} 0 0 {max(height - 0.4 * r, 0.6 * height):.3f}" '
+             f'size="{0.6 * r:.3f}" rgba="{SPIRE_CORE_RGBA}" group="{GROUP_ROCK}" contype="0" conaffinity="0"/>']
+    for k, (az, lean, length, sr) in enumerate(sides):
+        x1 = math.sin(lean) * length * math.cos(az)
+        y1 = math.sin(lean) * length * math.sin(az)
+        z1 = math.cos(lean) * length
+        parts.append(f'<geom name="{name}_g{k + 2}" type="capsule" fromto="0 0 {sr:.3f} {x1:.3f} {y1:.3f} {z1 + sr:.3f}" '
+                     f'size="{sr:.3f}" rgba="{SPIRE_RGBA}" group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/>')
+    parts.append('</body>')
+    return "".join(parts)
+
+
+def creature_body_xml(name: str, x: float, y: float, z: float, yaw: float, size: float) -> str:
+    """A six-legged grazer, about `size` m long: body, head, three back plates, six legs. Body origin
+    at the ground under its middle. Group 2: LiDAR sees it, nothing collides with it."""
+    s_ = size / 1.2
+    hz = 0.5 * s_
+    g = f'group="{GROUP_TARGET}" contype="0" conaffinity="0"'
+    parts = [f'<body name="{name}" mocap="true" pos="{x:.3f} {y:.3f} {z:.3f}" quat="{_yaw_quat(yaw)}">',
+             f'<geom name="{name}_body" type="ellipsoid" size="{0.5 * s_:.3f} {0.26 * s_:.3f} {0.2 * s_:.3f}" '
+             f'pos="0 0 {hz:.3f}" material="life" {g}/>',
+             f'<geom name="{name}_head" type="sphere" size="{0.15 * s_:.3f}" pos="{0.55 * s_:.3f} 0 {hz + 0.07 * s_:.3f}" '
+             f'material="life" {g}/>']
+    for k, px in enumerate((-0.28, 0.0, 0.28)):
+        parts.append(f'<geom name="{name}_plate{k}" type="ellipsoid" size="{0.13 * s_:.3f} {0.2 * s_:.3f} {0.06 * s_:.3f}" '
+                     f'pos="{px * s_:.3f} 0 {hz + 0.17 * s_:.3f}" material="life_dark" {g}/>')
+    for px in (-0.3, 0.0, 0.3):
+        for side in (1, -1):
+            parts.append(f'<geom name="{name}_leg{"l" if side > 0 else "r"}{int((px + 0.3) * 10)}" type="capsule" '
+                         f'fromto="{px * s_:.3f} {side * 0.18 * s_:.3f} {hz - 0.05 * s_:.3f} '
+                         f'{(px + 0.06) * s_:.3f} {side * 0.38 * s_:.3f} 0.03" size="{0.035 * s_:.3f}" '
+                         f'material="life_dark" {g}/>')
+    parts.append('</body>')
+    return "".join(parts)
 
 
 def _tile_spans(n: int, tile: int) -> list:
@@ -235,6 +293,22 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
             f'rgba="{TARGET_RGBA[t.kind]}" group="{GROUP_TARGET}" contype="0" conaffinity="0"/>'
         )
 
+    # liquid surfaces: a flat disc (lake) or flat boxes (river) at the water level. The guard ring
+    # around each one keeps the ground above the level, so only the liquid itself shows.
+    water_names = []
+    for w in getattr(terrain, "water", []):
+        if w.kind == "lake":
+            water_names.append(f"water_{w.id}")
+            geoms.append(f'<geom name="water_{w.id}" type="cylinder" size="{w.radius:.3f} 0.01" '
+                         f'pos="{w.cx:.3f} {w.cy:.3f} {w.level - 0.01:.4f}" rgba="{WATER_RGBA}" '
+                         f'group="{GROUP_WATER}" contype="0" conaffinity="0"/>')
+        else:
+            for k, (bx, by, hl, hw, yaw) in enumerate(w.boxes or []):
+                water_names.append(f"water_{w.id}_{k}")
+                geoms.append(f'<geom name="water_{w.id}_{k}" type="box" size="{hl:.3f} {hw:.3f} 0.01" '
+                             f'pos="{bx:.3f} {by:.3f} {w.level - 0.01 - 0.0007 * k:.4f}" euler="0 0 {yaw:.4f}" '
+                             f'rgba="{WATER_RGBA}" group="{GROUP_WATER}" contype="0" conaffinity="0"/>')
+
     bodies, actuators, sensors, rover_ids = [], [], [], []
     z0 = rover_spawn_height(cfg)
     for (rid, x, y, yaw, color) in rover_spawns:
@@ -255,6 +329,27 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
             f'group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/></body>'
         )
 
+    # alien spires (mocap, origin at the base) and spare ones parked below the map
+    spire_names = []
+    spires = list(getattr(terrain, "spires", []))
+    for sp in spires:
+        spire_names.append(f"spire_{sp.id}")
+        bodies.append(spire_body_xml(f"spire_{sp.id}", sp.x, sp.y, sp.z, sp.height, sp.radius, sp.sides))
+    if spires or cfg.spires:
+        for k in range(cfg.reserve_spires):
+            name = f"spire_spare{k}"
+            spire_names.append(name)
+            bodies.append(spire_body_xml(name, 20.0 + 3.0 * k, 0.0, park_z, 3.0, 0.32,
+                                         [(0.5, 0.45, 0.8, 0.18), (2.9, 0.5, 0.6, 0.16)]))
+
+    # lifeforms (lifeforms.py moves them)
+    life_names = []
+    for h in getattr(terrain, "herds", []):
+        for k, (x, y, yaw, size, _speed) in enumerate(h.members):
+            name = f"life_{h.id}_{k}"
+            life_names.append(name)
+            bodies.append(creature_body_xml(name, x, y, float(terrain.height_at(x, y)), yaw, size))
+
     span = cfg.map_size
     xml = f"""
 <mujoco model="redshift">
@@ -273,6 +368,8 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
     <texture name="groundtex" type="2d" builtin="checker" rgb1="0.62 0.36 0.24" rgb2="0.58 0.33 0.22" width="256" height="256" mark="random" random="0.08" markrgb="0.5 0.3 0.2"/>
     <material name="ground" texture="groundtex" texrepeat="1 1" texuniform="true" reflectance="0.0"/>
     <material name="rock" rgba="0.35 0.3 0.28 1"/>
+    <material name="life" rgba="{LIFE_RGBA}" specular="0" shininess="0"/>
+    <material name="life_dark" rgba="{LIFE_DARK_RGBA}" specular="0" shininess="0"/>
     {''.join(assets)}
   </asset>
   <worldbody>
@@ -320,4 +417,21 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
         gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"boulder_{k}")
         boulders.append((int(model.body_mocapid[bid]), int(gid), size))
 
-    return World(model, data, tiles, rover_ids, target_geom_ids, rover_geom_range, boulders)
+    def body_geoms(bname):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, bname)
+        return bid, [g for g in range(model.ngeom) if model.geom_bodyid[g] == bid]
+
+    spire_info = []
+    for name in spire_names:
+        bid, gids = body_geoms(name)
+        spire_info.append((int(model.body_mocapid[bid]), gids))
+    water_gids = np.array(sorted(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n) for n in water_names),
+                          dtype=np.int32)
+    life_mocap, life_g = [], []
+    for name in life_names:
+        bid, gids = body_geoms(name)
+        life_mocap.append(int(model.body_mocapid[bid]))
+        life_g += gids
+    return World(model, data, tiles, rover_ids, target_geom_ids, rover_geom_range, boulders,
+                 spires=spire_info, water_gids=water_gids, life_mocap=life_mocap,
+                 life_gids=np.array(sorted(life_g), dtype=np.int32))

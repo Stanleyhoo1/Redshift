@@ -10,7 +10,18 @@ Sensors (all the rover knows about the world):
   bumper         three short rays at the nose (mj_ray)
   position       ground truth, treated as GPS-like localisation (no SLAM)
 
-States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault.
+  water sensor   a wetness probe on the chassis belly (only matters if the rover ever drives into liquid)
+  camera         mast camera (camera.py), used by the rules for a quick colour check of a LiDAR hole
+
+States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault, observing.
+
+LiDAR returns are split three ways: liquid gives no return at all (water shows up as a hole in the
+map); hits on creatures go to the fleet's motion tracker (tracker.py; a stated simplification, a real
+rover would separate them by scan-to-map differencing); everything else builds the map. A hole where
+the ground should have answered (several steep rays straight ahead with nothing back) is an anomaly
+("no_returns"): the rover slows down and takes a camera picture. Blue liquid in the lower half of
+the picture means a lake: the fleet marks it impassable and replans. Otherwise it is a drop-off and
+the rover keeps to mapped ground.
 
 Each decision cycle is timed (the "brain": map integration, frontier logic, planning, state machine;
 not the simulated sensor hardware or physics) and planning stops when the cycle's share of the
@@ -39,18 +50,33 @@ from .planner import PENDING, downsample, path_length
 from .terrain import KIND_LABEL
 from .world import GROUP_ROCK
 
-LIDAR_GROUPS = np.array([1, 1, 1, 0, 0, 0], np.uint8)   # terrain, rocks, targets; never rovers (group 3)
+LIDAR_GROUPS = np.array([1, 1, 1, 0, 0, 1], np.uint8)   # terrain, rocks, targets and creatures, liquid; never
+                                                         # rovers (3) or the walls (4)
 BUMPER_GROUPS = np.array([0, 1, 0, 0, 0, 0], np.uint8)  # rocks only
-DRIVING = ("exploring", "investigating", "returning")
+DRIVING = ("exploring", "investigating", "returning", "observing")
 PARKED = ("idle", "charging", "fault")
-ANOMALY_KINDS = ("new_obstacle", "slip", "low_visibility")
-ANOMALY_TYPE = {"new_obstacle": "new_obstacle", "slip": "wheel_slip", "low_visibility": "low_visibility"}
-CAUTION_S = {"new_obstacle": 3.0, "slip": 1.0, "low_visibility": 3.0}   # how long the cautious slowdown lasts
+ANOMALY_KINDS = ("new_obstacle", "slip", "low_visibility", "no_returns")
+ANOMALY_TYPE = {"new_obstacle": "new_obstacle", "slip": "wheel_slip", "low_visibility": "low_visibility",
+                "no_returns": "no_returns"}
+CAUTION_S = {"new_obstacle": 3.0, "slip": 1.0, "low_visibility": 3.0, "no_returns": 4.0}   # cautious slowdown
+HOLE_MIN_RAYS = 7          # missing steep returns straight ahead before a hole counts
+HOLE_FRONT = math.radians(35.0)   # only straight ahead (inside the camera's view)
+LIQUID_MIN_PCT = 3.0       # blue liquid in at least this share of the lower camera image
+CREATURE_STOP_M = 3.5      # any rover stops if a tracked creature is this close ahead
+VERB = {"drill": "drilled a core from", "scoop": "scooped ice from", "sniffer": "sniffed the gas at",
+        "swab": "swabbed the trace at"}
 BRAKE_KV = 400.0       # wheel brake stiffness while the motor controller is down (normal servo: motor_kv)
 
 
 def wrap(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _camera_frame(sim, rid: str):
+    """A small mast camera picture (camera hardware: rendered in this thread with its own GL context)."""
+    from . import camera
+    return camera._local_renderer().frame(None, sim, rid, "fpv", 160, 120, depth=False, hide_groups=(3, 4),
+                                          smooth=False)
 
 
 class Rover:
@@ -125,7 +151,7 @@ class Rover:
         self.last_xy = None
         self.cmd_v = 0.0
         self.cmd_w = 0.0
-        self.e_per_m = self.cfg.battery_motor_k * 45.0      # battery fraction per metre (motor), learned
+        self.e_per_m = self.cfg.battery_motor_k * 45.0 / self.cfg.battery_capacity   # battery per metre (motor), learned
         self.e_acc_drain = 0.0
         self.e_acc_dist = 0.0
         self.home_dist = None
@@ -204,6 +230,18 @@ class Rover:
         self.pause_dust = False            # the wait ends early when visibility comes back
         self.crawl_until = -1e9            # creep at crawl_v until then (a question is open)
         self.crawl_v = 0.25
+
+        # water, lifeforms and samples (protocol v4 / v4b)
+        self.hole_prev = None              # (x, y) of a hole candidate in the previous sweep
+        self.hole_last_t = -1e9
+        self.ext_last_t = -1e9
+        self.water_entry = None            # (x, y) where the water sensor got wet
+        self.obs = None                    # observation of a lifeform track (state "observing")
+        self.last_backoff_t = -1e9
+        self.samples: list = []            # target indices in the sample tubes
+        self.capacity = int(self.cfg.sample_capacity)
+        self.sampling = None               # {"tidx", "instrument", "t0", "dur"} while an instrument runs
+        self.cache_note_t = -1e9
 
         # charging telemetry (the lander's panels can be dusty)
         self.battery_margin = self.cfg.battery_margin
@@ -320,12 +358,13 @@ class Rover:
                 loads[w] += abs(float(self._f6[0]))
         return loads
 
-    def _hw_call(self, fn, *args):
-        """Run simulated sensor hardware (ray casts) outside the brain's compute budget."""
+    def _hw_call(self, fn, *args, **kw):
+        """Run simulated sensor hardware (ray casts, camera renders) outside the brain's compute budget."""
         c = time.perf_counter()
-        out = fn(*args)
-        self._hw += time.perf_counter() - c
-        return out
+        try:
+            return fn(*args, **kw)
+        finally:
+            self._hw += time.perf_counter() - c
 
     def scan(self, t: float) -> None:
         """One LiDAR sweep (one mj_multiRay call). The head is gimballed: it yaws with the rover but
@@ -348,12 +387,16 @@ class Rover:
         gid = self.ray_gid
         dist = self.ray_dist
         hit = (gid >= 0) & (dist >= 0) & (dist <= rng_max)
+        wg = self.sim.world.water_gids
+        if wg is not None and len(wg):
+            hit &= ~np.isin(gid, wg)       # liquid absorbs the beam or glances it away: no return
         drop, sigma = hz.lidar_noise() if hz is not None else (0.0, 0.0)
         if drop > 0.0:                     # dust: lost returns and noisy ranges
             hit &= self.rng.uniform(size=self.nray) >= drop
             dist = dist + self.rng.normal(0.0, sigma, self.nray)
             hit &= (dist > 0.05) & (dist <= rng_max)
         self.lidar_hits = int(hit.sum())
+        returned = hit.copy()              # anything that echoed back (ground, rocks, markers, creatures)
         tmap = self.sim.world.target_geom_ids
         self.spectro = None
         if tmap:
@@ -367,6 +410,13 @@ class Rover:
                 self.fleet.on_target_seen(t, self, tidx, float(dist[k]))
             self.spectro = best
             hit &= ~is_t
+        lg = self.sim.world.life_gids
+        if lg is not None and len(lg):
+            is_l = hit & np.isin(gid, lg)
+            if is_l.any():                 # creature returns go to the motion tracker, not the map
+                k = np.flatnonzero(is_l)
+                self.fleet.tracker.add_scan(self.id, pnt[None, :] + vec[k] * dist[k, None], t)
+                hit &= ~is_l
         idx = np.flatnonzero(hit)
         # how far the ground and rocks still echo back (visibility); target markers are ignored, the
         # head can pass right through one when the rover drives over a target
@@ -379,6 +429,216 @@ class Rover:
         else:
             self.scan_pts = np.zeros((0, 3))
             self.scan_changes = 0
+        if not self.degraded and self.state not in PARKED:
+            self._check_holes(t, pnt, vec, el, az, returned, dist)
+
+    # ================================================================== holes in the LiDAR returns (liquid?)
+    def _ground_z(self) -> float:
+        m = self.fleet.map
+        i, j = m.ij(self.x, self.y)
+        return float(m.h[j, i]) if m.known[j, i] else self.z - 0.2
+
+    def _check_holes(self, t, pnt, vec, el, az, returned, dist) -> None:
+        """Steep rays straight ahead that should have hit the ground inside the LiDAR range but came
+        back empty: a hole (liquid, or a drop-off). In each column the ground line through its two
+        farthest steep returns is extended; a missing ray only counts if it would meet that line
+        within range (so a downslope that falls away from the beam is not a hole). The expected ground
+        points of missing rays become no-return evidence in the map; a hole in two sweeps in a row
+        is an anomaly."""
+        cfg = self.cfg
+        nom = cfg.lidar_range
+        if not self.far_hist or self.far_hist[-1] < 0.75 * nom:
+            self.hole_prev = None          # no far returns anywhere: dust, not a hole
+            return
+        n_el, n_az = len(el), self.n_az
+        steep = np.flatnonzero(el < math.radians(-9.0))
+        if len(steep) < 3:
+            return
+        rel = np.angle(np.exp(1j * (az - self.yaw)))
+        cols = np.flatnonzero(np.abs(rel) < HOLE_FRONT)
+        R = returned.reshape(n_el, n_az)[np.ix_(steep, cols)]
+        miss = ~R
+        if int(miss.sum()) < HOLE_MIN_RAYS:
+            self.hole_prev = None
+            return
+        V = vec.reshape(n_el, n_az, 3)[np.ix_(steep, cols)]
+        D = dist.reshape(n_el, n_az)[np.ix_(steep, cols)]
+        hor = np.hypot(V[..., 0], V[..., 1]) * D            # horizontal distance of each return
+        Z = pnt[2] + V[..., 2] * D
+        # two farthest returns per column -> ground line z = z1 + (h - h1) * g
+        Hm = np.where(R, hor, -1.0)
+        order = np.argsort(-Hm, axis=0)
+        ci = np.arange(len(cols))
+        i1, i2 = order[0], order[1]
+        ok2 = (Hm[i1, ci] > 0.5) & (Hm[i2, ci] > 0.3) & (Hm[i1, ci] - Hm[i2, ci] > 0.3)
+        h1, z1 = Hm[i1, ci], Z[i1, ci]
+        g = np.where(ok2, (z1 - Z[i2, ci]) / np.maximum(Hm[i1, ci] - Hm[i2, ci], 1e-3), 0.0)
+        g = np.clip(g, -0.6, 0.6)
+        ground = self._ground_z()
+        flat = ~ok2
+        h1 = np.where(flat, 0.0, h1)
+        z1 = np.where(flat, ground, z1)
+        tan_el = np.tan(el[steep])[:, None]
+        denom = tan_el - g[None, :]
+        hx = (z1[None, :] - h1[None, :] * g[None, :] - pnt[2]) / np.where(np.abs(denom) > 1e-3, denom, -1e-3)
+        reach = nom * np.cos(el[steep])[:, None] - 0.6
+        expect = (denom < -0.03) & (hx > np.maximum(h1[None, :], 1.0) + 0.2) & (hx < reach)
+        cosel = np.cos(el[steep])[:, None, None]
+        P = pnt[None, None, :] + V * (hx[..., None] / np.maximum(cosel, 1e-3))
+        half = (cfg.nx - 1) * cfg.res / 2.0 - 1.0
+        inside = (np.abs(P[..., 0]) < half) & (np.abs(P[..., 1]) < half)
+        mask = miss & expect & inside
+        n = int(mask.sum())
+        if n == 0:
+            self.hole_prev = None
+            return
+        pts = P[mask][:, :2]
+        self.fleet.map.add_noret(pts)
+        steep12 = (el[steep] < math.radians(-11.0))[:, None]
+        if n < HOLE_MIN_RAYS or len(set(np.nonzero(mask)[1].tolist())) < 3 or not (mask & steep12).any():
+            self.hole_prev = None
+            return
+        f = self.fleet
+        new = np.array([p for p in pts if f.water_zone_at(p[0], p[1], margin=0.4) is None])
+        if len(new) < 4:
+            self.hole_prev = None          # all of it is water we already know
+            return
+        cx, cy = float(new[:, 0].mean()), float(new[:, 1].mean())
+        if f.water_zones and len(new) >= 5 and min(f.water_zone_gap(p[0], p[1]) for p in new) < 2.5:
+            if t - self.ext_last_t > 1.0:  # more of a lake we already know: extend it quietly
+                self.ext_last_t = t
+                f.add_water_zone(t, self, *self._fit_zone(new), quiet=True)
+            return
+        if f.dropoff_near(cx, cy, t) or t - self.hole_last_t < 6.0:
+            return
+        prev, self.hole_prev = self.hole_prev, (cx, cy)
+        if prev is None or math.hypot(prev[0] - cx, prev[1] - cy) > 3.0:
+            return                         # needs two sweeps in a row
+        self.hole_prev = None
+        self.hole_last_t = t
+        hc = sorted(set(np.nonzero(mask)[1].tolist()))
+        edge = z1[hc][~flat[hc]]
+        spread = float(edge.std()) if len(edge) >= 3 else None
+        self._on_hole(t, (cx, cy), n, new, spread)
+
+    @staticmethod
+    def _fit_zone(pts: np.ndarray) -> tuple:
+        cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+        r = float(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy).max()) + 0.8
+        return cx, cy, min(6.0, max(1.5, r))
+
+    def camera_liquid_pct(self):
+        """Share (%) of the lower part of a small mast camera picture that shows blue liquid, or None if
+        the camera cannot render here. The render is camera hardware (outside the brain budget); the
+        colour check is perception (inside it)."""
+        if getattr(self.sim, "camera_ok", True) is False:
+            return None
+        try:
+            fr = self._hw_call(_camera_frame, self.sim, self.id)
+        except Exception:                  # noqa: BLE001 (no OpenGL here: LiDAR only)
+            self.sim.camera_ok = False
+            return None
+        rgb = fr.rgb[int(0.45 * fr.rgb.shape[0]):].astype(np.float32)
+        r_, g_, b_ = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+        blue = (b_ > 45.0) & (b_ > 1.8 * r_) & (b_ > 1.25 * g_)
+        return round(100.0 * float(blue.mean()), 1)
+
+    def _on_hole(self, t: float, at: tuple, rays: int, pts: np.ndarray, spread) -> None:
+        """A hole ahead in two sweeps: slow down, look with the camera, and decide liquid or drop-off."""
+        d = math.hypot(at[0] - self.x, at[1] - self.y)
+        pct = self.camera_liquid_pct()
+        details = {"at": at, "dist": round(d, 1), "rays": int(rays)}
+        if pct is not None:
+            details["camera_liquid_pct"] = pct
+        if spread is not None:
+            details["edge_spread"] = round(spread, 2)
+        liquid = pct is not None and pct >= LIQUID_MIN_PCT
+        flat_guess = pct is None and spread is not None and spread < 0.08
+        f = self.fleet
+        if liquid or flat_guess:
+            self.on_anomaly(t, "no_returns", details, f"Slowing to {self.cfg.caution_v:.1f} m/s to look.")
+            zx, zy, zr = self._fit_zone(pts)
+            f.add_water_zone(t, self, zx, zy, zr)
+            if liquid:
+                msg = (f"{self.id} LiDAR gets no returns {d:.0f} m ahead and the camera shows a liquid surface "
+                       f"({pct:.0f}% of the lower view is blue). Marking a lake and routing around it.")
+            else:
+                msg = (f"{self.id} LiDAR gets no returns {d:.0f} m ahead and the hole has a flat, level edge "
+                       f"(spread {spread:.2f} m; no camera here). Probably liquid: marking it and routing around it.")
+            f.log(t, "discovery", msg, self.id, at=(zx, zy))
+            self._replan_now(t)
+            self.plan_t = -1e9
+        else:                              # a drop-off: just slow down and keep to mapped ground
+            self.caution_until = t + CAUTION_S["no_returns"]
+            self.caution_v = self.cfg.caution_v
+            f.dropoffs.append((at[0], at[1], t))
+            seen = "no liquid" if pct is not None else "nothing (no camera here)"
+            f.log(t, "info", f"{self.id} LiDAR gets no returns {d:.0f} m ahead but the camera shows {seen}. "
+                             f"Treating it as a drop-off and keeping to mapped ground.", self.id, at=at)
+
+    def mark_water_here(self, t: float, at, source: str = "rules") -> bool:
+        """Mark a hole around `at` as water (tier 2 or the operator may ask for it). True if new."""
+        f = self.fleet
+        if f.water_zone_at(at[0], at[1], margin=0.5) is not None:
+            return False
+        f.add_water_zone(t, self, at[0], at[1], 3.0, source=source)
+        self._replan_now(t)
+        self.plan_t = -1e9
+        return True
+
+    def _check_immersion(self, t: float) -> bool:
+        """Failsafe: the belly probe is wet (the chassis is below a liquid surface). Stop, mark the water
+        for the fleet and back out the way we came."""
+        w = self.sim.terrain.water_at(self.x, self.y)
+        if w is None:
+            return False
+        depth = w.level - (self.z - self.cfg.chassis_half[2])
+        if depth <= 0.0 or (self.state == "recovering" and self.rec_phase == "water"):
+            return False
+        f = self.fleet
+        ax, ay = self.x + 1.5 * math.cos(self.yaw), self.y + 1.5 * math.sin(self.yaw)
+        f.add_water_zone(t, self, ax, ay, 2.5)
+        f.log(t, "warn", f"{self.id} water sensor wet: chassis {depth:.2f} m under a liquid surface. Stopping, "
+                         f"marking it for the fleet and backing out.", self.id, at=(self.x, self.y))
+        if self.state != "recovering":
+            self.prev_state = self.state
+        if self.state == "observing":
+            self.end_observing(t, "water", quiet=True)
+            self.prev_state = "exploring"
+        self.state = "recovering"
+        self.rec_phase = "water"
+        self.water_entry = (self.x, self.y)
+        self.sand_t0 = t
+        self.escape = list(reversed(self.trail))
+        self.path = []
+        self.searches.clear()
+        self.hist.clear()
+        self._set_cmd(0.0, 0.0)
+        return True
+
+    def _water_escape(self, t: float) -> None:
+        dry = self.sim.terrain.water_at(self.x, self.y) is None
+        ex, ey = self.water_entry if self.water_entry is not None else (self.x, self.y)
+        if (dry and math.hypot(self.x - ex, self.y - ey) > 1.2) or t - self.sand_t0 > 40.0:
+            self._set_cmd(0.0, 0.0)
+            self.rec_phase = None
+            self.state = self.prev_state if self.prev_state in ("exploring", "investigating", "returning") else "exploring"
+            self.stall_cooldown = t + 2.0
+            self.plan_t = -1e9
+            self.next_goal_try = t
+            self.goal = self.goal if self.state != "exploring" else None
+            self.hist.clear()
+            self.fleet.log(t, "info", f"{self.id} out of the water and dry. Planning around it.", self.id,
+                           at=(self.x, self.y))
+            return
+        while self.escape and math.hypot(self.escape[0][0] - self.x, self.escape[0][1] - self.y) < 0.7:
+            self.escape.pop(0)
+        if self.escape:
+            tx, ty = self.escape[0]
+        else:
+            tx, ty = self.x - 1.5 * math.cos(self.yaw), self.y - 1.5 * math.sin(self.yaw)
+        e = wrap(math.atan2(ty - self.y, tx - self.x) - (self.yaw + math.pi))
+        self._set_cmd(-0.3 * max(0.4, math.cos(e)), max(-0.6, min(0.6, 1.5 * e)))
 
     def bumper(self):
         """Three short rays from the chassis nose at wheel height: rocks right ahead?"""
@@ -436,9 +696,16 @@ class Rover:
         self.anomaly_log.append(a)
         self.caution_until = t + CAUTION_S[kind]
         self.caution_v = 0.0 if kind == "slip" else self.cfg.caution_v
-        if kind == "new_obstacle":
+        if kind == "new_obstacle" and details.get("shape") == "long":
+            seen = (f"{self.id} sees a new long, low obstacle across its path {details.get('dist', 0.0):.0f} m ahead "
+                    f"(LiDAR: about {details.get('length', 0.0):.1f} m long, {details.get('height', 0.0):.1f} m tall, "
+                    f"{details.get('cells', 0)} map cells changed).")
+        elif kind == "new_obstacle":
             seen = (f"{self.id} sees new rocks blocking its path {details.get('dist', 0.0):.0f} m ahead "
                     f"(LiDAR, {details.get('cells', 0)} map cells changed).")
+        elif kind == "no_returns":
+            seen = (f"{self.id} LiDAR gets no returns {details.get('dist', 0.0):.0f} m ahead where ground was "
+                    f"expected ({details.get('rays', 0)} rays).")
         elif kind == "slip":
             seen = f"{self.id} wheels spinning but not moving (slip {details.get('slip', 0.0) * 100:.0f}%)."
         else:
@@ -451,6 +718,50 @@ class Rover:
                 pass
         return a
 
+    def _check_new_obstacles(self, t: float) -> None:
+        """Our own sweep just changed mapped ground (something new stands there). If it is on or right
+        next to our route, say what we saw and replan, even if the route is not blocked yet."""
+        if self.state not in DRIVING or t - self.last_rocks_t <= 8.0 or self.reroute is not None:
+            return
+        m = self.fleet.map
+        i, j = m.ij(self.x, self.y)
+        r = 18
+        j0, i0 = max(j - r, 0), max(i - r, 0)
+        win = m.changed_t[j0:j + r + 1, i0:i + r + 1] >= t - 3.0
+        if int(win.sum()) < 2:
+            return
+        jj, ii = np.nonzero(win)
+        cx = float(m.ox + (ii + i0).mean() * m.res)
+        cy = float(m.oy + (jj + j0).mean() * m.res)
+        if any(math.hypot(cx - ax, cy - ay) < 4.0 and t - at < 120.0 for ax, ay, at in self.rocks_seen):
+            return
+        dist = math.hypot(cx - self.x, cy - self.y)
+        ahead = dist < 9.0 and abs(wrap(math.atan2(cy - self.y, cx - self.x) - self.yaw)) < 0.8
+        pts = [(self.x, self.y)] + list(self.path[max(self.wp, 0):])
+        near = False
+        along = 0.0
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            L = math.hypot(bx - ax, by - ay)
+            if L > 1e-6:
+                q = max(0.0, min(1.0, ((cx - ax) * (bx - ax) + (cy - ay) * (by - ay)) / (L * L)))
+                if math.hypot(cx - (ax + q * (bx - ax)), cy - (ay + q * (by - ay))) < 3.0:
+                    near = True
+                    break
+            along += L
+            if along > 15.0:
+                break
+        if not (near or ahead):
+            return
+        old = path_length(pts) if len(pts) > 1 else 0.0
+        det = {"at": (cx, cy), "dist": round(dist, 1), "cells": int(win.sum())}
+        shape = m.change_shape(cx, cy, t - 20.0)
+        if shape is not None:
+            det.update(shape)
+        self.rocks_seen = [rs for rs in self.rocks_seen if t - rs[2] < 120.0] + [(cx, cy, t)]
+        self.reroute = ("long" if det.get("shape") == "long" else "rocks", cx, cy, dist, old, None)
+        self.on_anomaly(t, "new_obstacle", det, f"Slowing to {self.cfg.caution_v:.1f} m/s and replanning.")
+        self.plan_t = -1e9
+
     def _replan_now(self, t: float) -> None:
         self.searches.clear()
         self.pending_goal_key = None
@@ -462,7 +773,7 @@ class Rover:
         """Battery fraction to drive dist metres: learned motor cost per metre plus 25%, and the
         electronics drain at a cautious average speed (turns and slopes slow us down)."""
         cfg = self.cfg
-        return dist * (1.25 * self.e_per_m + cfg.battery_base_drain / (0.55 * cfg.v_max))
+        return dist * (1.25 * self.e_per_m + cfg.battery_base_drain / cfg.battery_capacity / (0.55 * cfg.v_max))
 
     def _battery(self, t: float, dt: float, energy_j: float) -> None:
         cfg = self.cfg
@@ -471,14 +782,15 @@ class Rover:
             power = self.sim.hazards.charge_factor() if self.sim.hazards is not None else 1.0
             self.battery = min(1.0, self.battery + power * dt / cfg.charge_time_s)
             return
-        motor = cfg.battery_motor_k * energy_j
-        self.battery = max(0.0, self.battery - cfg.battery_base_drain * dt - motor)
+        cap = cfg.battery_capacity
+        motor = cfg.battery_motor_k * energy_j / cap
+        self.battery = max(0.0, self.battery - cfg.battery_base_drain / cap * dt - motor)
         moved = math.hypot(self.x - self.last_xy[0], self.y - self.last_xy[1])
         self.e_acc_drain += motor
         self.e_acc_dist += moved
         if self.e_acc_dist > 6.0:
             rate = self.e_acc_drain / self.e_acc_dist
-            self.e_per_m = max(cfg.battery_motor_k * 12.0, 0.8 * self.e_per_m + 0.2 * rate)
+            self.e_per_m = max(cfg.battery_motor_k * 12.0 / cfg.battery_capacity, 0.8 * self.e_per_m + 0.2 * rate)
             self.e_acc_drain = self.e_acc_dist = 0.0
 
     def home_distance(self, t: float) -> float:
@@ -574,6 +886,8 @@ class Rover:
             self.plan_fails = {k: v for k, v in self.plan_fails.items() if t - v[0] < 3.0}
         self._read_drive_sensors(t)
         self._check_visibility(t)
+        if self.scan_changes > 0:
+            self._check_new_obstacles(t)
         self.hold_for_plan = False
         self.block_info = None
 
@@ -586,6 +900,13 @@ class Rover:
             return
         if self.state == "fault":
             self._reboot(t)
+        if self.obs is not None and self.state not in ("observing", "recovering"):
+            self.end_observing(t, "interrupted", quiet=True)     # held, faulted or sent elsewhere
+        elif self.state == "observing" and self.obs is None:
+            self.state = "exploring"
+        if self.state in DRIVING and self._check_immersion(t):
+            self._apply()
+            return
 
         if self.state == "idle":
             self._set_cmd(0.0, 0.0)
@@ -650,6 +971,10 @@ class Rover:
             if self._return(t):
                 self._apply()
                 return
+        elif self.state == "observing":
+            if self._observe(t):
+                self._apply()
+                return
         self._drive(t)
         self._apply()
 
@@ -695,12 +1020,15 @@ class Rover:
         elif reason == "regroup":
             self.fleet.log(t, "info", f"{self.id} can't reach any frontier from here. "
                                       f"Heading toward the lander to find a way round.", self.id, at=here)
+        elif reason == "cache":
+            self.next_goal_try = t + 1.0
 
     def _drop_target(self, t: float, reason: str | None = None, retry_s: float = 20.0) -> None:
         if self.target_idx is not None:
             self.fleet.release_target(t, self, self.target_idx, reason, retry_s)
             self.target_idx = None
             self.dwell_until = None
+            self.sampling = None
 
     def _check_charge_rate(self, t: float) -> None:
         """Watch the battery's own charge rate while docked. Slow charging (dust on the lander's
@@ -756,6 +1084,13 @@ class Rover:
             self._set_cmd(0.0, 0.0)
             self.path = []
             self.goal = None
+            self.fleet.cache_samples(t, self)
+            if self.return_reason == "cache" and self.battery >= 0.6 and not self.fleet.complete:
+                self.state = "exploring"
+                self.next_goal_try = t
+                self.fleet.log(t, "info", f"{self.id} heading back out with {self.capacity} free tubes "
+                                          f"(battery {self.battery * 100:.0f}%).", self.id, at=self.dock)
+                return True
             if self.fleet.complete and self.battery > 0.9:
                 self.state = "idle"
                 self.fleet.log(t, "info", f"{self.id} parked at the lander.", self.id, at=self.dock)
@@ -817,6 +1152,19 @@ class Rover:
         # an already found target that nobody is sampling?
         if t >= self.next_target_check:
             self.next_target_check = t + 3.0
+            if self.samples and len(self.samples) >= self.capacity and t - self.cache_note_t > 60.0:
+                k, d = f.valuable_target(t, self)
+                if k is not None:
+                    ts_ = f.targets[k]
+                    need = self.energy_for_distance(1.3 * (self.home_dist or math.hypot(self.x, self.y)))
+                    if self.battery > need + self.battery_margin + 0.1:
+                        self.cache_note_t = t
+                        f.log(t, "info", f"{self.id} tubes full ({len(self.samples)} of {self.capacity}) and "
+                                         f"{ts_.spec.id} looks valuable (spectrometer estimate "
+                                         f"{ts_.spec.est_value}/10, {d:.0f} m away). Returning to cache the samples "
+                                         f"first.", self.id, at=(ts_.spec.x, ts_.spec.y))
+                        self._go_home(t, "cache")
+                        return
             k, d = f.unclaimed_target(t, self)
             reach = 8.0 if self.degraded else 30.0     # no far investigations while unsure
             b = self.dir_bias
@@ -933,14 +1281,35 @@ class Rover:
         gx, gy = self.goal
         return any(abs(fx - gx) < 3.0 and abs(fy - gy) < 3.0 for (fx, fy, _s, _i) in self.fleet.frontiers)
 
+    def free_tubes(self) -> int:
+        return self.capacity - len(self.samples)
+
+    def tube_verdict(self, ts) -> str | None:
+        """Why this rover should not sample this target with its tubes, or None. With one tube left,
+        ordinary finds (spectrometer estimate under 6/10) are skipped to keep it for a better one."""
+        free = self.free_tubes()
+        if free <= 0:
+            return f"all {self.capacity} tubes full"
+        if free == 1 and self.capacity > 1 and ts.spec.est_value < 6:
+            return (f"estimated value {ts.spec.est_value}/10 and only 1 of {self.capacity} tubes left, keeping it "
+                    f"for a better find")
+        return None
+
     def can_investigate(self, t: float, ts) -> bool:
         if self.state != "exploring" or self.target_idx is not None:
+            return False
+        if self.tube_verdict(ts) is not None:
             return False
         d = math.hypot(ts.spec.x - self.x, ts.spec.y - self.y)
         if self.degraded and d > 8.0:
             return False
         need = self.energy_for_distance(1.3 * d + 1.3 * math.hypot(ts.spec.x, ts.spec.y)) + self.battery_margin + 0.05
         return self.battery > need
+
+    def instrument_time(self, inst: str) -> float:
+        cfg = self.cfg
+        return {"drill": cfg.drill_s, "scoop": cfg.scoop_s, "sniffer": cfg.sniffer_s,
+                "swab": cfg.swab_s}.get(inst, cfg.investigate_dwell_s)
 
     def start_investigation(self, t: float, tidx: int) -> None:
         ts = self.fleet.targets[tidx]
@@ -962,16 +1331,26 @@ class Rover:
         if self.dwell_until is not None:
             self._set_cmd(0.0, 0.0)
             if t >= self.dwell_until:
+                self.sampling = None
                 f.target_sampled(t, self, self.target_idx)
                 self.target_idx = None
                 self.dwell_until = None
                 self.state = "exploring"
                 self.goal, self.path = None, []
                 self.next_goal_try = t
+                self.next_target_check = t
             return True
         d = math.hypot(ts.spec.x - self.x, ts.spec.y - self.y)
         if d <= self.cfg.investigate_radius:
-            self.dwell_until = t + self.cfg.investigate_dwell_s
+            if self.free_tubes() <= 0:             # filled up on the way (operator, timing): leave it for later
+                self._drop_target(t, f"all {self.capacity} tubes full")
+                self.state = "exploring"
+                self.goal, self.path = None, []
+                return False
+            inst = ts.spec.instrument
+            dur = self.instrument_time(inst)
+            self.dwell_until = t + dur
+            self.sampling = {"tidx": self.target_idx, "instrument": inst, "t0": t, "dur": dur}
             self._set_cmd(0.0, 0.0)
             self.path = []
             return True
@@ -1103,6 +1482,205 @@ class Rover:
         self.hist.clear()
         self.fleet.log(t, "info", f"{self.id} rebooted. Back online.", self.id, at=(self.x, self.y))
 
+    # ================================================================== lifeforms: observe from a safe distance
+    def can_observe(self, t: float, tr) -> bool:
+        """Free, healthy, enough battery, close enough: may switch to observing this track."""
+        if self.state != "exploring" or self.held or self.op_goal is not None or self.degraded:
+            return False
+        if self.dir_bias is not None and t < self.dir_bias[2]:
+            return False
+        px, py = tr.predict(t)
+        d = math.hypot(px - self.x, py - self.y)
+        if d > 20.0:
+            return False
+        home = self.energy_for_distance(1.3 * math.hypot(px, py) + 1.3 * d)
+        return self.battery >= max(0.4, home + self.battery_margin + 0.15)
+
+    def start_observing(self, t: float, tr) -> None:
+        from .fleet import compass
+        px, py = tr.predict(t)
+        d = math.hypot(px - self.x, py - self.y)
+        self.prev_state = self.state
+        self.state = "observing"
+        self.sticky_goal = None
+        self.goal, self.path = None, []
+        self.searches.clear()
+        self.obs = {"track": tr.id, "t0": t, "x0": self.x, "y0": self.y, "mode": "look", "look_until": t + 1.5,
+                    "seen": {tr.id}, "speeds": [], "next_plan": t, "goal": None, "life": False, "decided": False,
+                    "most": 1, "start": (px, py), "far": 0.0}
+        tr.observer = self.id
+        self.fleet.log(t, "discovery", f"{self.id} sees something moving {d:.0f} m {compass(px - self.x, py - self.y)} "
+                                       f"(LiDAR track {tr.id}, {tr.speed:.1f} m/s, about {tr.size:.1f} m). Stopping to "
+                                       f"look.", self.id, at=(px, py))
+        if self.advisor is not None and self.advisor.on_sighting(self, tr, t):
+            self.obs["look_until"] = t + 12.0           # tier 2 decides (Gemma's look, maybe the operator)
+
+    def set_obs_mode(self, t: float, mode: str) -> None:
+        """mode: "follow" (approach to the standoff distance and follow), "here" (watch from where it
+        is, never closer) or "stop" (resume exploring)."""
+        if self.obs is None:
+            return
+        self.obs["decided"] = True
+        if mode == "stop":
+            self.end_observing(t, "operator")
+            return
+        self.obs["mode"] = mode
+        self.obs["next_plan"] = t
+
+    def _face(self, px: float, py: float) -> None:
+        e = wrap(math.atan2(py - self.y, px - self.x) - self.yaw)
+        self._set_cmd(0.0, 0.0 if abs(e) < 0.12 else max(-0.6, min(0.6, 1.5 * e)))
+
+    def _safe_cell(self, x: float, y: float) -> bool:
+        f = self.fleet
+        c = f._cost if f._cost is not None else f.cost(self.t_now)
+        i, j = f.map.ij(x, y)
+        return bool(f.map.known[j, i] and np.isfinite(c[j, i]))
+
+    def _standoff_goal(self, px: float, py: float, d: float):
+        """A safe spot about the standoff distance from the creature, on our side of it."""
+        sd = self.cfg.observe_standoff
+        base = math.atan2(self.y - py, self.x - px)
+        for off in (0.0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2):
+            gx, gy = px + sd * math.cos(base + off), py + sd * math.sin(base + off)
+            if math.hypot(gx - self.obs["x0"], gy - self.obs["y0"]) > self.cfg.observe_leash - 1.0:
+                continue
+            if self._safe_cell(gx, gy) and self.fleet.water_zone_at(gx, gy, margin=1.0) is None:
+                return gx, gy
+        return None
+
+    def _observe(self, t: float) -> bool:
+        """One cycle of observing. Returns True if it set the motor command itself."""
+        cfg, f, o = self.cfg, self.fleet, self.obs
+        tr = f.tracker.get(o["track"])
+        if tr is None or (tr.status == "lost" and t - tr.last_seen > 8.0):
+            self.end_observing(t, "lost")
+            return False
+        if tr.id != o["track"]:            # the tracker merged our track into an older one
+            o["track"] = tr.id
+            tr.observer = self.id
+        px, py = tr.predict(t)
+        d = math.hypot(px - self.x, py - self.y)
+        fresh = []
+        for o2 in f.tracker.near(px, py, 12.0, t):
+            o["seen"].add(o2.id)
+            if t - o2.last_seen < 1.0:
+                fresh.append(o2)
+                if o2.speed > 0.05:
+                    o["speeds"].append(o2.speed)
+        # individuals: the most separate tracks seen at the same time
+        o["most"] = max(o["most"], f.tracker.distinct(fresh, t))
+        o["far"] = max(o["far"], math.hypot(px - o["start"][0], py - o["start"][1]))
+        if tr.status == "lost":            # the cluster may have come back as a new track nearby
+            alt = [o2 for o2 in f.tracker.near(px, py, 3.0, t) if o2 is not tr and o2.observer is None]
+            if alt:
+                tr.observer = None
+                tr = alt[0]
+                tr.observer = self.id
+                o["track"] = tr.id
+                px, py = tr.predict(t)
+                d = math.hypot(px - self.x, py - self.y)
+        if t - o["t0"] >= cfg.observe_max_s:
+            self.end_observing(t, "time")
+            return False
+        if self._need_return(t):
+            self.end_observing(t, "battery")
+            self._go_home(t, "battery")
+            return False
+        if math.hypot(self.x - o["x0"], self.y - o["y0"]) > cfg.observe_leash:
+            self.end_observing(t, "leash")
+            return False
+        if o["mode"] == "look" and t >= o["look_until"]:
+            o["mode"] = "follow"           # rules alone (no tier 2 answer): follow carefully
+            if not o["decided"]:
+                f.log(t, "info", f"{self.id} keeps watching track {tr.id} with the rules alone. Approaching to "
+                                 f"{cfg.observe_standoff:.0f} m to observe.", self.id, at=(px, py))
+        # the closest tracked creature (any of the herd) decides when to back off
+        dn, near = d, (px, py)
+        for o2 in f.tracker.near(self.x, self.y, cfg.observe_min_dist + 1.0, t):
+            qx, qy = o2.predict(t)
+            dq = math.hypot(qx - self.x, qy - self.y)
+            if dq < dn:
+                dn, near = dq, (qx, qy)
+        if dn < cfg.observe_min_dist + 0.5:
+            bx, by = self.x - 1.2 * math.cos(self.yaw), self.y - 1.2 * math.sin(self.yaw)
+            self._face(*near)
+            if self._safe_cell(bx, by) and f.water_zone_at(bx, by, margin=0.5) is None:
+                self.cmd_v = -0.25
+            if t - self.last_backoff_t > 20.0:
+                self.last_backoff_t = t
+                f.log(t, "info", f"{self.id} a creature is {dn:.1f} m away. Backing off to keep at least "
+                                 f"{cfg.observe_min_dist:.0f} m (planetary protection).", self.id, at=near)
+            self.path = []
+            return True
+        if o["mode"] != "follow" or d <= cfg.observe_standoff + 1.0:
+            self.path = []
+            self.goal = None
+            self._face(px, py)
+            return True
+        # follow: approach to the standoff distance, replanning as it moves
+        moved = o["goal"] is None or math.hypot(px - o["goal"][2], py - o["goal"][3]) > 1.5
+        if t >= o["next_plan"] or moved or not self.path:
+            g = self._standoff_goal(px, py, d)
+            if g is None:
+                o["mode"] = "here"
+                f.log(t, "info", f"{self.id} can't get closer to track {tr.id}: no safe ground near it (steep, "
+                                 f"soft or water). Observing from here, {d:.0f} m away.", self.id, at=(px, py))
+                return False
+            path = f.plan(t, self, g)
+            if path is PENDING:
+                self._face(px, py)
+                return True
+            o["next_plan"] = t + 2.0
+            if path is None:
+                o["mode"] = "here"
+                f.log(t, "info", f"{self.id} no safe path closer to track {tr.id}. Observing from here, "
+                                 f"{d:.0f} m away.", self.id, at=(px, py))
+                return False
+            o["goal"] = (g[0], g[1], px, py)
+            self.goal = g
+            self._set_path(t, path)
+        return False
+
+    def end_observing(self, t: float, why: str, quiet: bool = False) -> None:
+        o, f = self.obs, self.fleet
+        if o is None:
+            return
+        self.obs = None
+        tr = f.tracker.get(o["track"])
+        px, py = tr.predict(t) if tr is not None else (self.x, self.y)
+        dur = t - o["t0"]
+        seen = [f.tracker.get(k) for k in o["seen"]]
+        seen = [s_ for s_ in seen if s_ is not None and s_.confirmed]
+        n = max(1, o["most"])
+        sp = o["speeds"]
+        avg = sum(sp) / len(sp) if sp else (tr.speed if tr is not None else 0.0)
+        # the rules confirm a lifeform on their own if it kept moving by itself while we watched
+        life = o.get("life") or (o["far"] > 1.5 and dur > 20.0 and avg > 0.1)
+        for s_ in seen:
+            s_.observer = None
+            s_.done_until = t + 300.0
+            if life:
+                s_.lifeform = True
+        if life:
+            f.confirm_herd(px, py, n, t)
+        f.observed_areas.append((px, py, t))
+        if self.state == "observing":
+            self.state = "exploring"
+        self.goal, self.path = None, []
+        self.next_goal_try = t
+        self.next_goal_eval = t
+        if quiet:
+            return
+        who = "the herd" if n > 1 else "the creature"
+        tail = {"time": "Resuming exploration.", "lost": "Lost sight of it. Resuming exploration.",
+                "leash": f"Not going more than {self.cfg.observe_leash:.0f} m from where it started. Resuming exploration.",
+                "battery": f"Battery {self.battery * 100:.0f}%, returning to the lander.",
+                "operator": "Resuming exploration (operator).",
+                "not_life": "Not a lifeform. Resuming exploration."}.get(why, "Resuming exploration.")
+        f.log(t, "discovery", f"{self.id} observed {who} for {dur:.0f} s: {n} individual{'s' if n > 1 else ''}, "
+                              f"average speed {avg:.1f} m/s. {tail}", self.id, at=(px, py))
+
     # ================================================================== recovery, stalls, flips
     def _track(self, t: float) -> None:
         intended_fwd = self.cmd_v > 0.2 and self.path
@@ -1216,6 +1794,8 @@ class Rover:
     def _recovering(self, t: float) -> None:
         if self.rec_phase == "sand":
             self._sand_escape(t)
+        elif self.rec_phase == "water":
+            self._water_escape(t)
         elif self.rec_phase == "reverse":
             self._set_cmd(-0.4, 0.0)
             if t >= self.rec_until:
@@ -1278,8 +1858,13 @@ class Rover:
                     self.reroute = ("rocks", x, y, dist, old, None)
                     i, j = f.map.ij(x, y)
                     cells = int((f.map.changed_t[max(j - 3, 0):j + 4, max(i - 3, 0):i + 4] >= t - 20.0).sum())
-                    self.on_anomaly(t, "new_obstacle", {"at": (x, y), "dist": round(dist, 1), "cells": cells},
-                                    f"Slowing to {self.cfg.caution_v:.1f} m/s and replanning.")
+                    det = {"at": (x, y), "dist": round(dist, 1), "cells": cells}
+                    shape = f.map.change_shape(x, y, t - 20.0)
+                    if shape is not None:
+                        det.update(shape)
+                        if shape.get("shape") == "long":
+                            self.reroute = ("long",) + self.reroute[1:]
+                    self.on_anomaly(t, "new_obstacle", det, f"Slowing to {self.cfg.caution_v:.1f} m/s and replanning.")
                 elif why == "soft":
                     z = f.soft_zone_at(x, y)
                     if z is not None and z[:2] not in self.soft_seen:
@@ -1298,17 +1883,17 @@ class Rover:
             return
         self.reroute = None
         why, x, y, dist, old_len, owner = ri
+        what = {"rocks": "the new rocks", "long": "the fallen obstacle"}.get(why, f"the soft ground {owner} reported")
         if path is None:
-            what = "the new rocks" if why == "rocks" else f"the soft ground {owner} reported"
             msg = f"{self.id} finds no way past {what}. Picking another goal."
         else:
             extra = path_length([(self.x, self.y)] + list(path)) - old_len
             tail = f" (+{extra:.0f} m)" if extra >= 1.0 else ""
-            if why == "rocks":
-                msg = f"{self.id} rerouting around the new rocks{tail}."
+            if why in ("rocks", "long"):
+                msg = f"{self.id} rerouting around {what}{tail}."
             else:
                 msg = f"{self.id} rerouting around soft ground reported by {owner}{tail}."
-        if why == "rocks":
+        if why in ("rocks", "long"):
             self.last_rocks_t = t
         self.fleet.log(t, "info", msg, self.id, at=(x, y))
 
@@ -1383,6 +1968,25 @@ class Rover:
             v, w = 0.0, 0.0                  # waiting (Gemma or the operator said wait)
         if self.hold_for_plan:
             v, w = 0.0, 0.0                  # something blocks the path just ahead; wait for the new plan
+        if self.state == "observing":
+            v = min(v, cfg.observe_v)
+        if v > 0.0 and self.fleet.tracker.tracks:
+            # planetary protection: never drive at a creature the LiDAR tracks
+            for tr in self.fleet.tracker.near(self.x, self.y, CREATURE_STOP_M, t):
+                px, py = tr.predict(t)
+                if abs(wrap(math.atan2(py - self.y, px - self.x) - self.yaw)) < 0.9:
+                    v = 0.0
+                    if t - self.last_backoff_t > 30.0:
+                        self.last_backoff_t = t
+                        self.fleet.log(t, "info", f"{self.id} stops: a moving creature {math.hypot(px - self.x, py - self.y):.1f} m "
+                                                  f"ahead (LiDAR track {tr.id}). Waiting for it to move off.", self.id,
+                                       at=(px, py))
+                    if self.yield_since is None:
+                        self.yield_since = t
+                    elif t - self.yield_since > 4.0:
+                        self.yield_since = None
+                        self.plan_t = -1e9   # replan round it (tracks cost extra in the planner)
+                    break
         intended_v = v
         # give way: lower id has priority, parked rovers are obstacles
         blocked_by = None
@@ -1478,7 +2082,7 @@ class Rover:
         if self.path and self.state not in ("charging", "idle", "fault"):
             rest = self.path[max(self.wp, 0):]
             pts = downsample([(self.x, self.y)] + rest, 30)
-        return {
+        msg = {
             "id": self.id,
             "x": round(self.x, 2), "y": round(self.y, 2), "z": round(self.z, 2),
             "yaw": round(self.yaw, 3),
@@ -1491,4 +2095,12 @@ class Rover:
             "sensors": self.sensors_msg(),
             "scan": self.scan_msg(),
             "brain": self.brain_msg(),
+            "track_id": None if self.obs is None else self.obs["track"],
+            "samples": [self.fleet.targets[k].spec.id for k in self.samples],
+            "capacity": self.capacity,
         }
+        if self.sampling is not None:
+            sm = self.sampling
+            msg["sampling"] = {"target": self.fleet.targets[sm["tidx"]].spec.id, "instrument": sm["instrument"],
+                               "progress": round(min(1.0, max(0.0, (self.t_now - sm["t0"]) / sm["dur"])), 2)}
+        return msg

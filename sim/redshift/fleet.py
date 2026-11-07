@@ -1,5 +1,6 @@
-"""Fleet level reasoning: shared map, frontier assignment, learned slope limit, targets, soft ground
-reports, rover status (faults) and the event log."""
+"""Fleet level reasoning: shared map, frontier assignment, learned slope limit, targets and samples,
+soft ground and water reports, the motion tracker and who observes a lifeform, rover status (faults)
+and the event log."""
 from __future__ import annotations
 
 import math
@@ -11,12 +12,16 @@ from .config import Config
 from .mapping import FleetMap
 from .planner import FAIL, PENDING, AStar, add_avoid, cost_grid, path_length, simplify
 from .terrain import KIND_LABEL, TargetSpec
+from .tracker import Tracker
 
 KIND_REASON = {
     "ice": "Ice often clusters, prioritising nearby frontiers.",
     "mineral": "Mineral veins tend to run in groups, prioritising nearby frontiers.",
     "vent": "Vents usually come in fields, prioritising nearby frontiers.",
+    "trace": "Traces mark where the creatures graze, prioritising nearby frontiers.",
 }
+W_VALUE = 4.0               # target choice: utility per point of (estimated) science value ...
+W_TDIST = 0.5               # ... minus this per metre away
 
 # goal utility weights
 W_SIZE = 0.5
@@ -47,12 +52,18 @@ class TargetState:
     investigator: str | None = None
     fails: int = 0
     retry_after: float = 0.0
+    value: int | None = None           # revealed by the on-board analysis
+    analysis: str | None = None
+    carried_by: str | None = None
+    cached: bool = False
 
     def to_msg(self) -> dict:
         return {
             "id": self.spec.id, "x": round(self.spec.x, 2), "y": round(self.spec.y, 2), "kind": self.spec.kind,
             "status": self.status, "found_by": self.found_by,
             "found_t": None if self.found_t is None else round(self.found_t, 1),
+            "instrument": self.spec.instrument, "value": self.value, "analysis": self.analysis,
+            "carried_by": self.carried_by, "cached": bool(self.cached),
         }
 
 
@@ -80,6 +91,7 @@ class Fleet:
         self._cost_t = -1e9
         self.reach = None                  # samples connected to the lander through passable ground
         self.reach_t = -1e9
+        self._reach_job = None             # a flood fill in progress (anytime, a slice per duty cycle)
         self.plan_calls = 0
         self.plan_expansions = 0
         self.plan_slices = 0
@@ -87,6 +99,16 @@ class Fleet:
         self.soft_zones: list = []         # [(x, y, radius, rover id, t)] soft ground found by wheel slip
         self.orphan = None                 # (x, y, rover id, t): area a faulted rover had to drop
         self.hazards = None                # set by the sim; only told about soft zones (for the UI)
+        self.water_zones: list = []        # [(x, y, radius, rover id, t)] liquid the fleet identified
+        self.dropoffs: list = []           # [(x, y, t)] LiDAR holes the camera said were not liquid
+        self.tracker = Tracker()           # moving LiDAR clusters (lifeforms)
+        self.observed_areas: list = []     # [(x, y, t)] where an observation ended (no repeat for a while)
+        self.lifeform_herds: list = []     # [(x, y, most individuals seen at once)] confirmed lifeforms
+        self.lifeforms_seen = 0
+        self.announced: list = []          # [(x, y, t)] sightings already logged without an observer
+        self.samples_cached = 0
+        self.science_score = 0
+        self.skip_logged: set = set()      # (rover id, target index) trade-offs already logged
 
     # ------------------------------------------------------------------ events
     def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None) -> None:
@@ -113,40 +135,61 @@ class Fleet:
 
     # ------------------------------------------------------------------ periodic
     def update(self, t: float) -> None:
-        if t - self.reach_t >= 2.0 or self.reach is None:
-            self._update_reach(t)
+        self.tracker.update(t)
+        if self.tracker.tracks:
+            self._assign_observers(t)
+        if self.reach is None:
+            self._update_reach(t, max_iters=None)     # first time: all at once
+        elif self._reach_job is not None or t - self.reach_t >= 2.0:
+            self._update_reach(t)                     # anytime: a slice per duty cycle
         if t - self.frontiers_t >= 1.0:
-            if self.reach_t < self.frontiers_t:      # limit changed since the last flood fill
-                self._update_reach(t)
             self.frontiers = self.map.frontier_clusters(self.slope_limit)
             self.frontiers_t = t
             for k in [k for k, exp in self.blacklist.items() if exp < t]:
                 del self.blacklist[k]
             self._check_complete(t)
 
-    def _update_reach(self, t: float) -> None:
+    def _update_reach(self, t: float, max_iters: int | None = 80) -> None:
         """Flood fill from the lander over every sample the planner may cross (known and gentle
-        enough, or unknown). Frontiers outside this region cannot be reached by the fleet."""
-        ok = np.isfinite(self.cost(t))
-        reach = np.zeros_like(ok)
-        for (x, y) in [(0.0, 0.0)] + [r.dock for r in self.rovers]:
-            i, j = self.map.ij(x, y)
-            reach[max(j - 2, 0):j + 3, max(i - 2, 0):i + 3] = True
-        reach &= ok
-        k = 0
+        enough, or unknown). Frontiers outside this region cannot be reached by the fleet. Anytime:
+        at most max_iters growth steps per call (a few ms on the 120 m map); the previous result is
+        used until the new one has converged."""
+        job = self._reach_job
+        if job is None:
+            ok = np.isfinite(self.cost(t))
+            reach = np.zeros_like(ok)
+            for (x, y) in [(0.0, 0.0)] + [r.dock for r in self.rovers]:
+                i, j = self.map.ij(x, y)
+                reach[max(j - 2, 0):j + 3, max(i - 2, 0):i + 3] = True
+            reach &= ok
+            job = self._reach_job = {"ok": ok, "reach": reach, "k": 0, "t": t}
+        ok, reach = job["ok"], job["reach"]
+        grown = np.empty_like(reach)
+        n = 0
         while True:
-            grown = reach.copy()
+            np.copyto(grown, reach)
             grown[1:, :] |= reach[:-1, :]
             grown[:-1, :] |= reach[1:, :]
             grown[:, 1:] |= reach[:, :-1]
             grown[:, :-1] |= reach[:, 1:]
             grown &= ok
-            k += 1
-            if k % 6 == 0 and (grown == reach).all():
+            job["k"] += 1
+            n += 1
+            if job["k"] % 6 == 0 and np.array_equal(grown, reach):
                 break
-            reach = grown
+            reach, grown = grown, reach
+            if max_iters is not None and n >= max_iters:
+                job["reach"] = reach
+                return                      # carry on next duty cycle
         self.reach = reach
-        self.reach_t = t
+        self.reach_t = job["t"]
+        self._reach_job = None
+
+    def refresh_reach(self) -> None:
+        """The passable map changed (water, soft ground, an avoid area, a new slope limit): start the
+        flood fill again on the next duty cycle."""
+        self.reach_t = -1e9
+        self._reach_job = None
 
     def in_reach(self, x: float, y: float, radius: int = 2) -> bool:
         """Is (x, y), or a sample within radius cells of it, connected to the lander?"""
@@ -177,7 +220,7 @@ class Fleet:
                 self.log(t, "info", "New frontier spotted. Resuming exploration.")
             return
         usable = self.usable_frontiers(t)
-        busy = any((r.state in ("exploring", "investigating") and r.goal is not None) or r.state == "fault"
+        busy = any((r.state in ("exploring", "investigating") and r.goal is not None) or r.state in ("fault", "observing")
                    for r in self.rovers)
         if usable or busy or t < 30.0:
             self.no_frontier_since = None
@@ -234,6 +277,7 @@ class Fleet:
             base = self.cost(t, lim, unk)
             others = [(o.x, o.y, 1.3 if (o.speed < 0.05 or o.state in ("idle", "charging", "fault")) else 0.9)
                       for o in self.rovers if o is not rover]
+            others += [(*tr.predict(t), 3.0) for tr in self.tracker.near(rover.x, rover.y, 25.0, t)]
             mult = add_avoid(base, self.map, others)
             srch = AStar(mult, self.map.ij(rover.x, rover.y), g, max_expansions=max_exp)
             srch.t0, srch.sx, srch.sy, srch.limit_version = t, rover.x, rover.y, self.limit_version
@@ -270,13 +314,13 @@ class Fleet:
         only the next waypoints are checked. Returns None or (x, y, metres ahead, reason) for the
         first sample that is now impassable. reason: "rocks" (ground that changed under a recent
         rockfall, seen by LiDAR), "soft" (soft ground a rover reported), "avoid" (an area the
-        operator put off limits) or "terrain" (steep ground that was unknown when the path was
-        planned)."""
+        operator put off limits), "water" (liquid the fleet identified) or "terrain" (steep ground
+        that was unknown when the path was planned)."""
         pts = rover.path
         if not pts:
             return None
         m = self.map
-        known, slope, blocked, soft, avoid = m.known, m.slope, m.blocked, m.soft, m.avoid
+        known, slope, blocked, soft, avoid, water = m.known, m.slope, m.blocked, m.soft, m.avoid, m.water
         start = pts[0]
         si, sj = m.ij(start[0], start[1])
         end = pts[-1]
@@ -289,6 +333,8 @@ class Fleet:
                 return "soft"
             if avoid[j, i]:
                 return "avoid"
+            if water[j, i]:
+                return "water"
             if blocked[j, i] or (known[j, i] and slope[j, i] > limit):
                 # new rocks: several samples near here changed lately (a boulder changes many)
                 return "rocks" if m.recently_changed(i, j, t - 20.0, r=3, min_count=2) else "terrain"
@@ -328,7 +374,7 @@ class Fleet:
         self.map.mark_soft(x, y, radius)
         self.invalidate_costs()
         self.frontiers_t = -1e9
-        self.reach_t = -1e9
+        self.refresh_reach()
         if self.hazards is not None:
             self.hazards.on_soft_zone(x, y, radius)
 
@@ -337,6 +383,89 @@ class Fleet:
             if math.hypot(x - z[0], y - z[1]) <= z[2] + margin:
                 return z
         return None
+
+    # ------------------------------------------------------------------ water (LiDAR holes + camera)
+    def add_water_zone(self, t: float, rover, x: float, y: float, radius: float, quiet: bool = True,
+                       source: str | None = None) -> None:
+        """Liquid identified around (x, y): impassable for every rover from now on."""
+        self.water_zones.append((float(x), float(y), float(radius), rover.id if rover is not None else None, float(t)))
+        self.map.mark_water(x, y, radius)
+        self.invalidate_costs()
+        self.frontiers_t = -1e9
+        self.refresh_reach()
+        for r in self.rovers:
+            r.plan_t = -1e9                 # everyone re-checks their route against the new water
+        if not quiet:
+            self.log(t, "info", f"{rover.id} marks water at ({x:.0f}, {y:.0f}), radius {radius:.1f} m.", rover.id,
+                     at=(x, y), source=source)
+
+    def water_zone_at(self, x: float, y: float, margin: float = 0.0):
+        for z in self.water_zones:
+            if math.hypot(x - z[0], y - z[1]) <= z[2] + margin:
+                return z
+        return None
+
+    def water_zone_gap(self, x: float, y: float) -> float:
+        """Distance from (x, y) to the edge of the nearest known water zone (inf if none)."""
+        return min((math.hypot(x - z[0], y - z[1]) - z[2] for z in self.water_zones), default=math.inf)
+
+    def dropoff_near(self, x: float, y: float, t: float, radius: float = 8.0, ttl: float = 120.0) -> bool:
+        self.dropoffs = [d for d in self.dropoffs if t - d[2] < ttl]
+        return any(math.hypot(x - d[0], y - d[1]) < radius for d in self.dropoffs)
+
+    # ------------------------------------------------------------------ lifeforms (motion tracks)
+    def _assign_observers(self, t: float) -> None:
+        """A new moving track: the nearest free rover with enough battery observes it (one at a time,
+        one per herd); the others keep exploring."""
+        tracker = self.tracker
+        fresh = tracker.new_confirmed
+        tracker.new_confirmed = []
+        self.observed_areas = [a for a in self.observed_areas if t - a[2] < 300.0]
+        observing = [r for r in self.rovers if r.state == "observing" and r.obs is not None]
+        max_obs = 2 if len(self.rovers) >= 3 else 1     # the others keep exploring
+        for tr in tracker.confirmed():
+            if tr.observer is not None or tr.ignored or tr.status == "lost" or t < tr.done_until:
+                continue
+            px, py = tr.predict(t)
+            if any(o2.observer is not None and math.hypot(o2.x - px, o2.y - py) < 12.0 for o2 in tracker.confirmed()):
+                continue                    # its herd is already being watched
+            if any(math.hypot(px - ax, py - ay) < 15.0 for ax, ay, _ in self.observed_areas):
+                continue                    # that herd was watched a moment ago
+            cands = [r for r in self.rovers if r.can_observe(t, tr)] if len(observing) < max_obs else []
+            if cands:
+                r = min(cands, key=lambda r_: math.hypot(r_.x - px, r_.y - py))
+                r.start_observing(t, tr)
+                observing.append(r)
+                continue
+            if tr in fresh and not any(math.hypot(px - ax, py - ay) < 15.0 and t - at < 120.0
+                                       for ax, ay, at in self.announced):
+                self.announced = [a for a in self.announced if t - a[2] < 120.0] + [(px, py, t)]
+                rid = sorted(tr.seen_by)[0]
+                rv = next((r for r in self.rovers if r.id == rid), None)
+                if rv is not None:
+                    d = math.hypot(px - rv.x, py - rv.y)
+                    self.log(t, "discovery", f"{rid} sees something moving {d:.0f} m {compass(px - rv.x, py - rv.y)} "
+                                             f"(LiDAR track {tr.id}, {tr.speed:.1f} m/s). No rover free to observe it now; "
+                                             f"logged.", rid, at=(px, py))
+
+    def confirm_lifeform(self, tr, t: float) -> None:
+        """Gemma (or the rules) confirmed this track is a lifeform: count it as one individual of the
+        herd around it (see confirm_herd)."""
+        tr.lifeform = True
+        px, py = tr.predict(t)
+        self.confirm_herd(px, py, 1, t)
+
+    def confirm_herd(self, x: float, y: float, n: int, t: float) -> None:
+        """At least n lifeforms seen at once around (x, y). Track ids churn when a creature is lost and
+        picked up again, so the fleet counts herds by place: a herd within 20 m of one already counted
+        is the same herd, and its count is the most individuals ever seen at the same time."""
+        for k, (hx, hy, cnt) in enumerate(self.lifeform_herds):
+            if math.hypot(x - hx, y - hy) < 20.0:
+                self.lifeform_herds[k] = (0.5 * (hx + x), 0.5 * (hy + y), max(cnt, n))
+                break
+        else:
+            self.lifeform_herds.append((x, y, n))
+        self.lifeforms_seen = sum(c for _, _, c in self.lifeform_herds)
 
     # ------------------------------------------------------------------ rover status
     def rover_faulted(self, t: float, rover) -> None:
@@ -458,14 +587,19 @@ class Fleet:
         label = KIND_LABEL[ts.spec.kind]
         dirn = compass(ts.spec.x - rover.x, ts.spec.y - rover.y)
         at = (ts.spec.x, ts.spec.y)
+        est = f"estimated value {ts.spec.est_value}/10"
         if rover.can_investigate(t, ts):
             ts.status = "investigating"
             ts.investigator = rover.id
             rover.start_investigation(t, tidx)
             self.log(t, "discovery", f"{rover.id} spectrometer flags a possible {label} ({ts.spec.id}) {dist:.0f} m "
-                                     f"{dirn}. Moving in to sample it.", rover.id, at=at)
+                                     f"{dirn}, {est}. Moving in to sample it.", rover.id, at=at)
         else:
-            if rover.state == "returning" or rover.battery < 0.35:
+            tube = rover.tube_verdict(ts)
+            if tube is not None:
+                why = tube
+                self.skip_logged.add((rover.id, tidx))
+            elif rover.state == "returning" or rover.battery < 0.35:
                 why = "battery too low"
             elif rover.degraded:
                 why = "LiDAR degraded, staying on mapped ground"
@@ -474,25 +608,74 @@ class Fleet:
             else:
                 why = "busy"
             self.log(t, "discovery", f"{rover.id} spectrometer flags a possible {label} ({ts.spec.id}) {dist:.0f} m "
-                                     f"{dirn}. Logged for later ({why}).", rover.id, at=at)
+                                     f"{dirn}, {est}. Logged for later ({why}).", rover.id, at=at)
 
     def unclaimed_target(self, t: float, rover):
-        best, bd = None, 1e9
+        """The found, unclaimed target with the best value for distance that this rover's tubes allow.
+        Returns (index, distance) or (None, inf). A low value find skipped because the tubes are nearly
+        full is logged once."""
+        best, bu, bd = None, -1e9, math.inf
         for k, ts in enumerate(self.targets):
             if ts.status == "found" and ts.investigator is None and t >= ts.retry_after:
+                d = math.hypot(ts.spec.x - rover.x, ts.spec.y - rover.y)
+                why = rover.tube_verdict(ts)
+                if why is not None:
+                    if rover.free_tubes() > 0 and (rover.id, k) not in self.skip_logged:
+                        self.skip_logged.add((rover.id, k))
+                        self.log(t, "info", f"{rover.id} skips {ts.spec.id} ({why}).", rover.id, at=(ts.spec.x, ts.spec.y))
+                    continue
+                u = W_VALUE * ts.spec.est_value - W_TDIST * d
+                if u > bu:
+                    best, bu, bd = k, u, d
+        return best, bd
+
+    def valuable_target(self, t: float, rover):
+        """A found, unclaimed target whose spectrometer estimate is high enough to fetch a free tube for."""
+        best, bd = None, math.inf
+        for k, ts in enumerate(self.targets):
+            if ts.status == "found" and ts.investigator is None and ts.spec.est_value >= self.cfg.high_value:
                 d = math.hypot(ts.spec.x - rover.x, ts.spec.y - rover.y)
                 if d < bd:
                     best, bd = k, d
         return best, bd
 
     def target_sampled(self, t: float, rover, tidx: int) -> None:
+        """The instrument finished: the sample goes into a tube and the on-board analysis reports."""
+        from .rover import VERB
         ts = self.targets[tidx]
         ts.status = "sampled"
         ts.investigator = None
+        ts.value = int(ts.spec.value)
+        ts.analysis = ts.spec.analysis
+        ts.carried_by = rover.id
+        if tidx not in rover.samples:
+            rover.samples.append(tidx)
         self.sampled_points.append((ts.spec.x, ts.spec.y))
-        label = KIND_LABEL[ts.spec.kind]
-        self.log(t, "discovery", f"{rover.id} sampled {label} {ts.spec.id}. {KIND_REASON[ts.spec.kind]}", rover.id,
-                 at=(ts.spec.x, ts.spec.y))
+        used = len(rover.samples)
+        verb = VERB.get(ts.spec.instrument, "sampled")
+        high = " High-value find!" if ts.value >= self.cfg.high_value else ""
+        self.log(t, "discovery", f"{rover.id} {verb} {ts.spec.id}: {ts.analysis[0].lower() + ts.analysis[1:]} "
+                                 f"(value {ts.value}/10). {used} of {rover.capacity} tubes used.{high} "
+                                 f"{KIND_REASON[ts.spec.kind]}", rover.id, at=(ts.spec.x, ts.spec.y))
+        if used >= rover.capacity:
+            self.log(t, "info", f"{rover.id} all {rover.capacity} tubes full. Caching them at the lander on the next "
+                                f"return.", rover.id, at=(rover.x, rover.y))
+
+    def cache_samples(self, t: float, rover) -> int:
+        """Docked at the lander: hand the tubes over to the sample cache. Returns how many."""
+        if not rover.samples:
+            return 0
+        n = len(rover.samples)
+        for k in rover.samples:
+            ts = self.targets[k]
+            ts.cached = True
+            ts.carried_by = None
+            self.samples_cached += 1
+            self.science_score += int(ts.value or 0)
+        rover.samples = []
+        self.log(t, "discovery", f"{rover.id} cached {n} sample{'s' if n != 1 else ''} at the lander (fleet total "
+                                 f"{self.samples_cached}, science score {self.science_score}).", rover.id, at=rover.dock)
+        return n
 
     def release_target(self, t: float, rover, tidx: int, reason: str | None = None, retry_s: float = 20.0) -> None:
         ts = self.targets[tidx]
@@ -520,6 +703,7 @@ class Fleet:
                 msg += f" Steepest successful climb so far: {math.floor(self.best_climb)} deg."
             self.log(t, "warn", msg, rover.id, at=(rover.x, rover.y))
             self.frontiers_t = -1e9   # recompute frontiers with the new limit
+            self.refresh_reach()
             return True
         self.log(t, "warn", f"{rover.id} stalled ({why}). Backing off and replanning.", rover.id,
                  at=(rover.x, rover.y))
@@ -543,6 +727,11 @@ class Fleet:
             "budget_ms": round(float(self.cfg.brain_budget_ms), 1),
             "cycle_ms": round(1000.0 / self.cfg.agent_hz, 1),
             "soft_zones": [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in self.soft_zones],
+            "water_zones": [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in self.water_zones],
+            "lifeforms_seen": int(self.lifeforms_seen),
+            "samples_cached": int(self.samples_cached),
+            "samples_carried": int(sum(len(r.samples) for r in self.rovers)),
+            "science_score": int(self.science_score),
         }
 
     def discovered_targets(self) -> list:

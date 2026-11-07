@@ -40,7 +40,40 @@ function TargetPips({ targets, total }) {
   ))
   const rest = Math.max(0, Math.min(24, (total ?? 0) - targets.length))
   for (let k = 0; k < rest; k++) pips.push(<i key={`rest${k}`} className="pip" data-status="unknown" />)
-  return <div className="pips">{pips}</div>
+  return <div className="pips" data-many={targets.length + rest > 9 || undefined}>{pips}</div>
+}
+
+export const LifeIcon = () => (
+  <svg className="life-icon" viewBox="0 0 16 16" aria-hidden="true">
+    <ellipse cx="6.6" cy="8.6" rx="3.6" ry="2.2" />
+    <circle cx="11.6" cy="7.6" r="1.6" />
+    <path d="M4.4 10.6 3.4 13.2M6.6 10.8v2.6M8.8 10.6l1 2.6M12.6 6.2l1-2M11.2 6.1l-.3-2.1" />
+  </svg>
+)
+
+// v4b: the fleet's science score and the samples in the lander's cache (one tube each).
+function Science({ fleet, targets }) {
+  const cached = targets.filter((t) => t.cached).sort((a, b) => (b.value ?? 0) - (a.value ?? 0))
+  const nCached = Number.isFinite(fleet.samples_cached) ? fleet.samples_cached : cached.length
+  const carried = Number.isFinite(fleet.samples_carried) ? fleet.samples_carried : 0
+  return (
+    <div className="stat stat-science">
+      <div className="stat-label">Science score</div>
+      <div className="stat-value">
+        {fixed(fleet.science_score, 0)}
+        <small> pts</small>
+      </div>
+      <div className="cache-row" aria-hidden="true">
+        {cached.slice(0, 14).map((t) => (
+          <i key={t.id} className="tube" data-full style={{ '--c': kindStyle(t.kind).color }} title={`${kindStyle(t.kind).label} ${t.id}${Number.isFinite(t.value) ? `, ${t.value}/10` : ''}`} />
+        ))}
+      </div>
+      <div className="stat-sub">
+        {nCached ? `${nCached} cached` : 'Cache empty'}
+        {carried ? `, ${carried} carried` : ''}
+      </div>
+    </div>
+  )
 }
 
 export function FleetStats() {
@@ -51,6 +84,8 @@ export function FleetStats() {
   const found = Number.isFinite(fleet.targets_found) ? fleet.targets_found : targets.length
   const total = Number.isFinite(fleet.targets_total) ? fleet.targets_total : null
   const sampled = targets.filter((x) => x.status === 'sampled').length
+  const science = Number.isFinite(fleet.science_score)
+  const life = Number.isFinite(fleet.lifeforms_seen) ? fleet.lifeforms_seen : null
   return (
     <section className="stats" aria-label="Fleet">
       <div className="stat">
@@ -63,11 +98,15 @@ export function FleetStats() {
           <i style={{ width: `${Math.max(0, Math.min(100, explored || 0))}%` }} />
         </div>
       </div>
-      <div className="stat">
-        <div className="stat-label">Sim time</div>
-        <div className="stat-value">{mmss(t)}</div>
-        <div className="stat-sub">{Number.isFinite(fleet.sim_speed) ? `${fixed(fleet.sim_speed, 1)}x speed` : 'Speed --'}</div>
-      </div>
+      {science ? (
+        <Science fleet={fleet} targets={targets} />
+      ) : (
+        <div className="stat">
+          <div className="stat-label">Sim time</div>
+          <div className="stat-value">{mmss(t)}</div>
+          <div className="stat-sub">{Number.isFinite(fleet.sim_speed) ? `${fixed(fleet.sim_speed, 1)}x speed` : 'Speed --'}</div>
+        </div>
+      )}
       <div className="stat">
         <div className="stat-label">Targets found</div>
         <div className="stat-value">
@@ -75,7 +114,15 @@ export function FleetStats() {
           <small> of {total ?? '--'}</small>
         </div>
         <TargetPips targets={targets} total={total} />
-        <div className="stat-sub">{sampled} sampled</div>
+        <div className="stat-sub">
+          {sampled} sampled
+          {life !== null && (
+            <span className="life-chip" data-some={life > 0 || undefined} title="Distinct lifeforms the fleet has confirmed">
+              <LifeIcon />
+              {life} {life === 1 ? 'lifeform' : 'lifeforms'}
+            </span>
+          )}
+        </div>
       </div>
       <SlopeLimit />
     </section>

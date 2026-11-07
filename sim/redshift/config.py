@@ -36,7 +36,7 @@ class Config:
     seed: int = 42
     num_rovers: int = 3
     sim_speed: float = 3.0
-    map_size: float = 80.0
+    map_size: float = 120.0
     gravity_g: float = 2.0
     viewer: bool = False
 
@@ -46,7 +46,11 @@ class Config:
     hfield_tile: int = 10          # heightfield tile size in cells (tiles make ray casts fast)
     lander_radius: float = 2.5
     lander_flat_radius: float = 4.0
-    num_rocks: int = 55
+    num_rocks: int = 55            # per 80 m x 80 m; terrain feature counts scale with the map area
+    water: bool = True             # lakes (and maybe a river), see terrain.py
+    spires: bool = True            # alien crystal spires
+    lifeforms: bool = True         # herds of grazers (lifeforms.py)
+    reserve_spires: int = 4        # hidden spare spire bodies for "drop a new spire here"
 
     # ---- physics ----
     timestep: float = 0.005
@@ -96,9 +100,22 @@ class Config:
     battery_heat_k: float = 0.02               # copper loss coefficient (W per (N m)^2)
     battery_margin: float = 0.15
     charge_time_s: float = 90.0     # empty to full
-    investigate_dwell_s: float = 3.0
+    investigate_dwell_s: float = 3.0   # fallback instrument time (s) for an unknown kind
     investigate_radius: float = 2.0
     target_bonus_radius: float = 15.0
+    sample_capacity: int = 3           # sample tubes per rover (protocol v4b)
+    drill_s: float = 10.0              # instrument run times (sim s): mineral drill core
+    scoop_s: float = 8.0               # ice scoop
+    sniffer_s: float = 6.0             # vent gas sniffer
+    swab_s: float = 6.0                # organic trace swab
+    high_value: int = 8                # an estimated value this high is worth a trip to free a tube
+
+    # ---- lifeforms: observing from a safe distance (planetary protection) ----
+    observe_standoff: float = 6.0      # follow at about this distance (m)
+    observe_min_dist: float = 4.0      # never closer than this to a tracked creature (m)
+    observe_max_s: float = 75.0        # an observation lasts at most this long (sim s)
+    observe_v: float = 0.35            # top speed while observing (m/s)
+    observe_leash: float = 25.0        # never further than this from where the observation started (m)
 
     # ---- edge compute budget (per rover per decision cycle, wall clock) ----
     brain_budget_ms: float = 40.0
@@ -108,7 +125,7 @@ class Config:
     exp_cost_us: float = 3.0        # measured cost of one A* expansion on the dev machine
 
     # ---- hazards (see hazards.py) ----
-    num_boulders: int = 12          # hidden boulder bodies allocated in the model for rockfalls
+    num_boulders: int = 24          # hidden boulder bodies allocated in the model for rockfalls (3 to 5 per rockfall)
     sand_radius: float = 2.5
     sand_friction: float = 0.3      # wheel friction inside a sand patch (normal: wheel_friction)
     sand_wheel_damping: float = 0.3  # extra wheel joint damping inside a patch (rolling resistance)
@@ -155,6 +172,12 @@ class Config:
         return (-half, -half)
 
     @property
+    def battery_capacity(self) -> float:
+        """Relative battery size: bigger maps get a bigger battery (1.0 at 80 m, 1.5 at 120 m), so a trip
+        to the far edge and back takes about the same share of a charge as on the 80 m map."""
+        return max(1.0, self.map_size / 80.0)
+
+    @property
     def gravity(self) -> float:
         return 9.81 * self.gravity_g
 
@@ -171,7 +194,7 @@ class Config:
             seed=_env_int("SEED", 42),
             num_rovers=max(1, min(8, _env_int("NUM_ROVERS", 3))),
             sim_speed=max(0.1, _env_float("SIM_SPEED", 3.0)),
-            map_size=max(30.0, _env_float("MAP_SIZE", 80.0)),
+            map_size=max(30.0, _env_float("MAP_SIZE", 120.0)),
             gravity_g=max(0.1, _env_float("GRAVITY_G", 2.0)),
             viewer=_env_bool("VIEWER", False),
             brain_budget_ms=max(1.0, _env_float("BRAIN_BUDGET_MS", 40.0)),

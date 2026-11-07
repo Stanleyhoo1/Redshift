@@ -15,6 +15,9 @@
   --ok: #62d6a8;
   --hazard: #ff3b5c;
   --sand: #e2bf7d;
+  --life: #c8f25a;
+  --water: #2f7fd0;
+  --spire: #b79cff;
   --side-w: 380px;
   --pad: 24px;
   --font: 'Archivo Variable', 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
@@ -625,7 +628,8 @@ code {
 }
 
 .log-list[hidden],
-.comms[hidden] {
+.comms[hidden],
+.samples[hidden] {
   display: none;
 }
 
@@ -2458,7 +2462,8 @@ code {
 }
 
 /* With the Comms tab open, the fleet stats fold into one row to give the thread room. */
-.side[data-tab='comms'] .stats {
+.side[data-tab='comms'] .stats,
+.side[data-tab='samples'] .stats {
   grid-template-columns: repeat(4, auto);
   justify-content: space-between;
   gap: 0 12px;
@@ -2466,21 +2471,25 @@ code {
   padding-bottom: 12px;
 }
 
-.side[data-tab='comms'] .stat-label {
+.side[data-tab='comms'] .stat-label,
+.side[data-tab='samples'] .stat-label {
   font-size: 12px;
   white-space: nowrap;
 }
 
-.side[data-tab='comms'] .stat-value {
+.side[data-tab='comms'] .stat-value,
+.side[data-tab='samples'] .stat-value {
   margin-top: 1px;
   font-size: 18px;
 }
 
-.side[data-tab='comms'] .stat-value small {
+.side[data-tab='comms'] .stat-value small,
+.side[data-tab='samples'] .stat-value small {
   font-size: 12.5px;
 }
 
-.side[data-tab='comms'] :is(.stat-sub, .meter, .gauge, .pips, .limit-delta) {
+.side[data-tab='comms'] :is(.stat-sub, .meter, .gauge, .pips, .limit-delta, .cache-row),
+.side[data-tab='samples'] :is(.stat-sub, .meter, .gauge, .pips, .limit-delta, .cache-row) {
   display: none;
 }
 
@@ -3610,4 +3619,794 @@ code {
   .limit-delta {
     animation: none !important;
   }
+}
+
+/* ---------------------------------------------------------------- v4: point-and-click hazards */
+
+.hud-hazards[data-v4] {
+  width: min(864px, 100%);
+}
+
+.hz-sep {
+  flex: none;
+  width: 1px;
+  margin: 3px 2px;
+  background: var(--line-2);
+}
+
+/* Placing: the button stays lit until the click lands (or Esc). */
+.hz-btn[data-placing] {
+  border-color: var(--hazard);
+  background: rgba(255, 59, 92, 0.2);
+  box-shadow: 0 0 0 1px var(--hazard), 0 0 18px rgba(255, 59, 92, 0.25);
+}
+
+.hz-btn[data-placing] svg {
+  stroke: #fff;
+}
+
+/* Lifeform: a find, not a hazard. */
+.hz-btn[data-discovery] svg {
+  stroke: var(--life);
+}
+
+.hz-btn[data-discovery]:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--life) 60%, transparent);
+  background: rgba(200, 242, 90, 0.1);
+}
+
+.hz-btn[data-discovery]:active:not(:disabled) {
+  background: rgba(200, 242, 90, 0.18);
+}
+
+.hz-btn[data-discovery][data-placing] {
+  border-color: var(--life);
+  background: rgba(200, 242, 90, 0.16);
+  box-shadow: 0 0 0 1px var(--life), 0 0 18px rgba(200, 242, 90, 0.22);
+}
+
+.hz-btn[data-discovery][data-placing] svg {
+  stroke: var(--life);
+}
+
+.hz-btn[data-discovery] .hz-cd {
+  background: var(--life);
+}
+
+/* A narrow bar (720p, laptops): two rows of three buttons, the title as an icon. The bar
+   is the view minus the sidebar and the control panel, so this is a viewport query. */
+@media (max-width: 1440px) {
+  .hud-hazards[data-v4] .hz-buttons {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 5px;
+  }
+  .hud-hazards[data-v4] .hz-sep {
+    display: none;
+  }
+  .hud-hazards[data-v4] .hz-title span {
+    display: none;
+  }
+  .hud-hazards[data-v4] .hz-btn {
+    padding: 6px 8px;
+  }
+}
+
+.banner-place {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  padding: 8px 16px 8px 12px;
+  border-color: color-mix(in srgb, var(--hazard) 60%, transparent);
+  background: rgba(30, 9, 14, 0.92);
+  color: #ffd6dd;
+  font-size: 14px;
+  font-weight: 560;
+  white-space: normal;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  animation: banner-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.banner-place[data-discovery] {
+  border-color: color-mix(in srgb, var(--life) 55%, transparent);
+  background: rgba(17, 24, 8, 0.92);
+  color: #e6f8c4;
+}
+
+.banner-place-icon svg {
+  display: block;
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: #ff8ea2;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.banner-place[data-discovery] .banner-place-icon svg {
+  stroke: var(--life);
+}
+
+kbd {
+  display: inline-block;
+  padding: 0 5px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 17px;
+}
+
+/* The tag over the ghost marker: what a click here does, or why the sim will refuse. */
+.ghost-tag {
+  /* Bottom centre on the anchor above the marker, so the marker itself stays visible. */
+  transform: translate(-50%, calc(-100% - 6px));
+  display: grid;
+  justify-items: center;
+  gap: 0;
+  padding: 4px 10px 5px;
+  border: 1px solid color-mix(in srgb, var(--c) 65%, transparent);
+  border-radius: 8px;
+  background: rgba(6, 9, 14, 0.88);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 12.5px;
+  line-height: 1.3;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ghost-tag b {
+  font-weight: 680;
+  color: var(--c);
+}
+
+.ghost-tag span {
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+
+.ghost-tag[data-bad] {
+  border-color: rgba(255, 90, 79, 0.75);
+}
+
+/* Over a rover (motor fault): above the rover's own name tag. */
+.ghost-tag[data-rover] {
+  transform: translate(-50%, calc(-100% - 22px));
+}
+
+.ghost-tag[data-bad] b {
+  color: #ff8a80;
+}
+
+/* ---------------------------------------------------------------- v4: lifeforms and tracks */
+
+.track-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 300px;
+  padding: 2px 8px 2px 3px;
+  border: 1px solid color-mix(in srgb, var(--life) 55%, transparent);
+  border-radius: 999px;
+  background: rgba(10, 14, 6, 0.85);
+  color: #ecf8d2;
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.3;
+  white-space: nowrap;
+  user-select: none;
+  transition: opacity 1.2s ease;
+}
+
+.track-tag-id {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--life);
+  color: #182006;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.track-tag-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.track-tag-eye {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: 0 0 0 2px rgba(10, 14, 6, 0.9), 0 0 0 3px var(--c);
+}
+
+.track-tag-more {
+  flex: none;
+  font-size: 11px;
+  font-weight: 650;
+  color: color-mix(in srgb, var(--life) 80%, white);
+}
+
+.track-tag-lost {
+  flex: none;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+.track-tag[data-lost] {
+  opacity: 0.5;
+  border-color: var(--line-2);
+}
+
+.track-tag[data-lost] .track-tag-id {
+  background: var(--ink-3);
+}
+
+.life-icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.life-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  color: var(--ink-3);
+}
+
+.life-chip[data-some] {
+  color: var(--life);
+}
+
+.ev[data-level='life'] {
+  --tint: rgba(200, 242, 90, 0.07);
+  --flash: rgba(200, 242, 90, 0.28);
+}
+
+.ev[data-level='life'] .ev-who {
+  color: var(--life);
+}
+
+.ev-icon-life {
+  display: block;
+  width: 14px;
+  height: 14px;
+  margin: 2px 0 0 -3px;
+  color: var(--life);
+}
+
+.ev-icon-life .life-icon {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+/* ---------------------------------------------------------------- v4: legend swatches */
+
+.sw-water {
+  border-radius: 3px;
+  background: linear-gradient(160deg, var(--c), var(--c2));
+  box-shadow: inset 0 3px 0 -2px rgba(232, 251, 255, 0.85);
+}
+
+.sw-spire {
+  width: 8px;
+  height: 14px;
+  margin: -1px 2px;
+  border-radius: 0;
+  background: linear-gradient(90deg, var(--c), var(--g));
+  clip-path: polygon(50% 0, 100% 34%, 88% 100%, 12% 100%, 0 34%);
+  filter: drop-shadow(0 0 3px var(--g));
+}
+
+.sw-life {
+  width: 13px;
+  height: 8px;
+  border-radius: 50%;
+  background: #a7a48f;
+  box-shadow: inset 0 0 0 2px #a7a48f, inset 0 0 0 4px var(--c);
+}
+
+.sw-track {
+  border-radius: 50%;
+  border: 2px dashed var(--c);
+}
+
+/* ---------------------------------------------------------------- v4b: samples */
+
+.tubes {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 3px;
+  flex: none;
+  margin-left: 10px;
+}
+
+.tube {
+  display: block;
+  width: 6px;
+  height: 13px;
+  border: 1.5px solid var(--line-2);
+  border-radius: 1px 1px 3px 3px;
+}
+
+.tube[data-full] {
+  border-color: var(--c);
+  background: linear-gradient(to top, var(--c) 72%, transparent 72%);
+}
+
+.tubes[data-full] .tube {
+  box-shadow: 0 0 6px color-mix(in srgb, var(--c, transparent) 45%, transparent);
+}
+
+.instr-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* "Drill [=====    ] 40%" in place of the goal line while an instrument runs. */
+.sampling {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--ink);
+}
+
+.sampling b {
+  font-weight: 620;
+}
+
+.sampling .instr-icon {
+  color: var(--signal);
+}
+
+.sampling-bar {
+  position: relative;
+  flex: 1;
+  min-width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line-2);
+  overflow: hidden;
+}
+
+.sampling-bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: var(--signal);
+  transition: width 220ms linear;
+}
+
+.sampling-pct {
+  flex: none;
+  min-width: 2.6em;
+  text-align: right;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.sp-instr {
+  display: grid;
+  gap: 3px;
+}
+
+.sp-instr-k {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink);
+}
+
+/* The instrument name (with its icon) is longer than "Slip" or "Load". */
+.sp-row .sp-instr-k:first-child {
+  width: auto;
+  min-width: 46px;
+}
+
+.sp-instr-k .instr-icon {
+  color: var(--c);
+}
+
+.sp-bar[data-level='instr'] i {
+  background: var(--c);
+}
+
+.sp-instr-sub {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.sp-head .tubes {
+  margin-left: 2px;
+}
+
+/* 3D: the instrument at work, and an analysed sample's value. */
+.sample-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--c) 60%, transparent);
+  border-radius: 999px;
+  background: rgba(6, 9, 14, 0.86);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.sample-chip .instr-icon {
+  color: var(--c);
+}
+
+.sample-chip b {
+  font-weight: 700;
+  color: var(--c);
+}
+
+.value-tag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+  padding: 4px 10px 4px 6px;
+  border: 1px solid color-mix(in srgb, var(--c) 60%, transparent);
+  border-radius: 8px;
+  background: rgba(6, 9, 14, 0.9);
+  color: var(--ink-2);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1.3;
+  user-select: none;
+}
+
+.value-tag-v {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--c) 18%, transparent);
+  color: var(--c);
+  font-size: 15px;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.value-tag-v small {
+  font-size: 11px;
+  font-weight: 560;
+  opacity: 0.8;
+}
+
+.value-tag-a {
+  width: max-content;
+  max-width: 200px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.lander-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.lander-cache {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink-3);
+}
+
+.lander-cache i {
+  width: 5px;
+  height: 10px;
+  border: 1.5px solid currentColor;
+  border-radius: 1px 1px 2.5px 2.5px;
+}
+
+.lander-cache[data-some] {
+  color: var(--signal);
+}
+
+.lander-cache[data-some] i {
+  background: currentColor;
+}
+
+/* Fleet stats: the science score and the cache, one tube per sample. */
+.cache-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 3px;
+  min-height: 13px;
+  margin-top: 8px;
+}
+
+.cache-empty {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.facts-dim {
+  font-weight: 450;
+  color: var(--ink-3);
+}
+
+/* The Samples tab. */
+.samples {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.smp-head {
+  flex: none;
+  display: flex;
+  gap: 16px;
+  padding: 0 24px 8px;
+  font-size: 13px;
+  color: var(--ink-3);
+}
+
+.smp-head b {
+  font-size: 15px;
+  font-weight: 680;
+  color: var(--ink);
+}
+
+.smp-list {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0 12px 16px;
+  list-style: none;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+
+.smp + .smp {
+  margin-top: 4px;
+}
+
+.smp-btn,
+.smp-live {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 12px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--ink);
+  font-size: 14px;
+  text-align: left;
+}
+
+.smp-btn {
+  cursor: pointer;
+}
+
+.smp-btn:hover {
+  border-color: var(--line-2);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.smp[data-picked] .smp-btn {
+  border-color: var(--ink-3);
+  background: var(--raise);
+}
+
+.smp-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.smp-top .sw-diamond {
+  flex: none;
+}
+
+.smp-kind {
+  font-weight: 640;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.smp-id {
+  font-weight: 450;
+  color: var(--ink-3);
+}
+
+.smp-ins {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.smp-v {
+  margin-left: auto;
+  flex: none;
+  font-size: 16px;
+  font-weight: 720;
+}
+
+.smp-v small {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-3);
+}
+
+.smp-v[data-none] {
+  color: var(--ink-3);
+}
+
+.smp-a {
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--ink-2);
+}
+
+.smp-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 3px;
+}
+
+.vbar {
+  position: relative;
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line-2);
+  overflow: hidden;
+}
+
+.vbar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #3aa6b3, var(--signal));
+}
+
+.smp-where {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.smp-where svg {
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: var(--signal);
+  stroke-width: 1.4;
+  stroke-linejoin: round;
+}
+
+.smp-where[data-cached] {
+  color: var(--signal);
+}
+
+.smp-live {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--c) 45%, transparent);
+}
+
+.smp-live .instr-icon {
+  color: var(--c);
+}
+
+.smp-live .smp-kind {
+  font-weight: 560;
+}
+
+.smp-pct {
+  margin-left: auto;
+  font-weight: 680;
+  color: var(--c);
+}
+
+.smp-prog i {
+  background: var(--c);
+}
+
+/* Compact rover cards: tubes sit between the state pill and the battery. */
+.rover-list[data-compact] .rover {
+  grid-template-areas:
+    'dot name pill tubes batt'
+    '. goal goal goal speed';
+}
+
+.rover-list[data-compact] .tubes {
+  grid-area: tubes;
+  justify-self: end;
+  margin-left: 4px;
+}
+
+/* 720p with sample science: four facts on one line (the gravity and time values speak for
+   themselves), and the cache tubes fold away so the three rover cards keep their room. */
+@media (max-height: 760px) {
+  .facts:has(.facts-time) {
+    gap: 2px 14px;
+  }
+  .facts:has(.facts-time) :is(.facts-g, .facts-time) dt {
+    display: none;
+  }
+  .stat-science .cache-row {
+    display: none;
+  }
+}
+
+.pips[data-many] {
+  gap: 6px 4px;
+}
+
+.pips[data-many] .pip {
+  width: 8.5px;
+  height: 8.5px;
+}
+
+
+/* The placement hint sits over the map: clicks go through it to the terrain. */
+.hud-top > .banner-place {
+  pointer-events: none;
+}
+
+/* Three tabs (Events, Comms, Samples) in the sidebar's width. */
+.tab,
+.tab-ask {
+  white-space: nowrap;
+}
+
+.lower:has(#tab-samples) .tabs {
+  gap: 2px;
+}
+
+.lower:has(#tab-samples) .tab {
+  gap: 6px;
+  padding-left: 9px;
+  padding-right: 9px;
+}
+
+.lower:has(#tab-samples) .tab-ask {
+  padding: 0 6px;
+  font-size: 11px;
 }

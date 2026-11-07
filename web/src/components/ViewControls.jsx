@@ -108,6 +108,7 @@ export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
   const truth = useApp((a) => a.truth)
   // An older sim sends no scans: say so instead of showing an empty layer.
   const noScan = useSim((s) => s.ticks > 3 && !Object.values(s.rovers).some((r) => r.scan))
+  const v4 = useSim((s) => s.v4)
   const ref = useHudRect('controls')
   const set = (key) => (value) => setView((v) => ({ ...v, [key]: value }))
   let realityHint = ''
@@ -124,6 +125,7 @@ export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
         <Toggle label="Paths" on={view.paths} onChange={set('paths')} keyHint="P" />
         <Toggle label="Slope colours" on={view.slope} onChange={set('slope')} keyHint="S" />
         <Toggle label="LiDAR" on={view.lidar} onChange={set('lidar')} hint={view.lidar && noScan ? 'No data' : ''} keyHint="L" />
+        {v4 && <Toggle label="Life" on={view.life} onChange={set('life')} keyHint="B" />}
       </div>
       <div className="hud-group">
         <div className="hud-label" id="follow-label">
