@@ -21,8 +21,10 @@
 
 - Visual pass: flood Start bug fixed, new water/terrain/models/effects, redesigned UI (see NOTES).
 
+- M9 done: utility + Gemma 4 comparison, seeds 1-3 x 6 scenarios: 15/18 with agent vs 14/18 utility only; 213 agent calls, 145 accepted, 60 rejected by the rule set, 0 errors, ~6 s median latency (`results/agent-3seeds.md`).
+
 ## Next
-- Utility + agent comparison (3 seeds x 6 scenarios, latency-faithful, sequential, ~4 min per run) is running in the background into `results/agent-runs.jsonl`; fill README "AGENT_TABLE" when done.
+- (optional) more seeds for the agent comparison; wildfire trapped-against-river cases.
 
 ## Blockers
 - (resolved) Pushing was blocked earlier; The repo `redshift` is not under `kayaclaridge-sys`; the only match is `Stanleyhoo1/Redshift` (you have WRITE access, found via `gh api user/repos`). Cloning and the local branch `naturaldisasterdemo` worked, but `git push -u origin naturaldisasterdemo` was refused by the Claude Code permission guard ("create public surface" on a repo owned by another account). All milestone commits are on the local `naturaldisasterdemo` branch in `~/redshift`. The owner pushed the branch; pushes to `naturaldisasterdemo` now go after each milestone.
