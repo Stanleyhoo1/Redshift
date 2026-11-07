@@ -90,7 +90,11 @@ export class Safety {
     if (rd.tempC > CFG.reflexTemp || close.length) {
       const h = this.escapeSearch(rd, b, 0.22);
       const near = close.length ? close.reduce((a, c) => (c.dist < a.dist ? c : a)) : null;
-      return { name: 'heat', cmd: escapeHeading(rd, h), text: `${rd.tempC > CFG.reflexTemp ? `Body temp ${rd.tempC.toFixed(0)}°C > ${CFG.reflexTemp}°C` : `Thermal ${near!.temp.toFixed(0)}°C at ${near!.dist.toFixed(1)} m ${compass(near!.bearing)}`} → ESCAPE ${compass(h)}` };
+      // don't charge down a bank into water: slow down if water is ahead or we're pointing steeply downhill
+      let waterAhead = false;
+      for (const d of [2, 4, 6, 8]) { const px = rd.x + d * Math.cos(h), py = rd.y + d * Math.sin(h); if (b.inside(px, py) && b.water[b.idx(px, py)] > 0.05) waterAhead = true; }
+      const spd = waterAhead || rd.pitch < -0.25 ? 1.2 : CFG.maxV;
+      return { name: 'heat', cmd: escapeHeading(rd, h, spd), text: `${rd.tempC > CFG.reflexTemp ? `Body temp ${rd.tempC.toFixed(0)}°C > ${CFG.reflexTemp}°C` : `Thermal ${near!.temp.toFixed(0)}°C at ${near!.dist.toFixed(1)} m ${compass(near!.bearing)}`} → ESCAPE ${compass(h)}` };
     }
     // 4. tornado wind
     if (rd.windSpeed > CFG.reflexWind) {

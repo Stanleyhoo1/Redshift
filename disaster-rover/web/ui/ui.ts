@@ -58,9 +58,9 @@ export class UI {
     return { lidar: ck('tLidar'), hazards: ck('tHaz'), fog: ck('tFog'), camera: ck('tCam'), path: ck('tPath') };
   }
   setRosStatus(text: string, cls: '' | 'ok' | 'warn' | 'bad') { const e = $('rosStatus'); e.textContent = text; e.className = 'status ' + cls; }
-  setAgentStatus(text: string, cls: '' | 'ok' | 'warn' | 'bad') { const e = $('agentStatus'); e.textContent = text; e.className = 'status ' + cls; }
+  setAgentStatus(text: string, cls: '' | 'ok' | 'warn' | 'bad') { this.agentState = text; const e = $('agentStatus'); e.textContent = text; e.className = 'status ' + cls; }
 
-  clearLogs() { this.logEl.innerHTML = ''; this.evEl.innerHTML = ''; this.agentEl.innerHTML = ''; this.lastEvents = 0; $('banner').className = 'hidden'; }
+  clearLogs() { this.lastAgent = ''; this.logEl.innerHTML = ''; this.evEl.innerHTML = ''; this.agentEl.innerHTML = ''; this.lastEvents = 0; $('banner').className = 'hidden'; }
   private append(el: HTMLElement, t: number, text: string, cls = '', max = 150) {
     const d = document.createElement('div');
     d.innerHTML = `<span class="t">[${t.toFixed(1)}]</span> <span class="${cls}"></span>`;
@@ -70,7 +70,13 @@ export class UI {
     el.scrollTop = el.scrollHeight;
   }
   log(t: number, text: string) { this.append(this.logEl, t, text); }
-  agentLog(t: number, text: string) { this.append(this.agentEl, t, text, /ACCEPTED/.test(text) ? 'acc' : /REJECTED|IGNORED|error|offline/i.test(text) ? 'rej' : '', 40); }
+  private lastAgent = ''; private agentState = '';
+  agentLog(t: number, text: string) {
+    // compact form for the 3D overlay: "tool(args) → VERDICT | latency"
+    const m = text.match(/→ (\w+\([^)]*\)) → .*→ (ACCEPTED|REJECTED \([a-z_]+)[^|]*\|\s*([\d.]+ s)/);
+    this.lastAgent = m ? `${m[1]} → ${m[2]}${m[2].startsWith('REJECTED') ? ')' : ''} · ${m[3]}` : text.slice(0, 90);
+    this.append(this.agentEl, t, text, /ACCEPTED/.test(text) ? 'acc' : /REJECTED|IGNORED|error|offline/i.test(text) ? 'rej' : '', 40);
+  }
 
   update(sim: Sim, info: BrainInfo | null) {
     const r = sim.rover;
@@ -94,7 +100,7 @@ export class UI {
     const ov = $('overlay');
     if (info?.behaviour) {
       const sc = info.scores ? Object.entries(info.scores).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<span>${k} ${v.toFixed(2)}</span>`).join('') : '';
-      ov.innerHTML = `<div class="beh">${info.behaviour.toUpperCase()}${info.confidence !== undefined ? ` <small>(${info.confidence.toFixed(2)})</small>` : ''}</div>${info.reflex ? `<div class="reflex">SAFETY REFLEX: ${info.reflex}</div>` : ''}<div class="scores">${sc}</div>${info.goal && info.goal !== 'none' ? `<div class="agent">GOAL: ${info.goal}</div>` : ''}`;
+      ov.innerHTML = `<div class="beh">${info.behaviour.toUpperCase()}${info.confidence !== undefined ? ` <small>(${info.confidence.toFixed(2)})</small>` : ''}</div>${info.reflex ? `<div class="reflex">SAFETY REFLEX: ${info.reflex}</div>` : ''}<div class="scores">${sc}</div>${info.goal && info.goal !== 'none' ? `<div class="agent">GOAL: ${info.goal}</div>` : ''}${/offline/i.test(this.agentState) ? `<div class="reflex">Agent offline, utility fallback</div>` : this.lastAgent && !/^Agent off/.test(this.agentState) ? `<div class="agent">GEMMA: ${this.lastAgent.replace(/</g, '&lt;')}</div>` : ''}`;
     } else ov.innerHTML = '';
     this.miniAcc++;
     if (this.miniAcc % 6 === 0) this.drawMini(sim, info);

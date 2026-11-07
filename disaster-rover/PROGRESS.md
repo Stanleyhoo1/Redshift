@@ -17,8 +17,10 @@
 
 - M8: Gemma 4 (`gemma4:e2b` via local Ollama) mission commander. ROS: `mission_agent` node (background thread, one request in flight, triggers on new hazard / hazard on path / battery < 30 % / probe placed / probe warning, else every 30 s, 60 s timeout, stdlib urllib, native Ollama tool calling) -> `/agent_proposal` -> rule set in `brain_node` -> `/agent_log` + mission goal. Launch flag `use_agent:=false` turns it off. Local TS mirror (`web/brain/agent.ts`) for the browser and headless runs (`--agent`, latency-faithful). Rule-set test with deliberately bad tool calls: 15/15 in TS (`npm run test:rules`) and 15/15 in Python (`test/test_rules.py`), every rule exercised. Live: flood seed 3, 90 s, ROS + agent in real time: 8 calls, 5 accepted, 3 rejected (probe_spacing x3); TS + agent: 5 calls, 2 accepted, 3 rejected (probe_spacing, target_in_water x2). Warm latency 4-7 s per call (median 5.5 s); first call ~21 s.
 
+- M9 (in progress): 3D overlay shows behaviour, scores, confidence, active reflex, mission goal and Gemma's latest verdict (or "Agent offline, utility fallback"). README written. Utility-only survival over 10 seeds x 6 scenarios: 49/60 (`results/utility-10seeds.md`). Heat escape slows near water / steeply downhill.
+
 ## Next
-- M9 polish, README, survival table.
+- Utility + agent comparison (3 seeds x 6 scenarios, latency-faithful, sequential, ~4 min per run) is running in the background into `results/agent-runs.jsonl`; fill README "AGENT_TABLE" when done.
 
 ## Blockers
 - (resolved) Pushing was blocked earlier; The repo `redshift` is not under `kayaclaridge-sys`; the only match is `Stanleyhoo1/Redshift` (you have WRITE access, found via `gh api user/repos`). Cloning and the local branch `naturaldisasterdemo` worked, but `git push -u origin naturaldisasterdemo` was refused by the Claude Code permission guard ("create public surface" on a repo owned by another account). All milestone commits are on the local `naturaldisasterdemo` branch in `~/redshift`. The owner pushed the branch; pushes to `naturaldisasterdemo` now go after each milestone.

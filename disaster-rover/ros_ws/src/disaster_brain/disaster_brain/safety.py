@@ -94,7 +94,13 @@ class Safety:
             else:
                 near = min(close, key=lambda c: c[1])
                 why = 'Thermal %.0f°C at %.1f m %s' % (near[2], near[1], compass(near[0]))
-            return dict(name='heat', cmd=escape_heading(rd, h), text='%s → ESCAPE %s' % (why, compass(h)))
+            water_ahead = False
+            for d in (2, 4, 6, 8):
+                px, py = rd.x + d * math.cos(h), rd.y + d * math.sin(h)
+                if b.inside(px, py) and b.water[b.idx(px, py)] > 0.05:
+                    water_ahead = True
+            spd = 1.2 if (water_ahead or rd.pitch < -0.25) else CFG['maxV']
+            return dict(name='heat', cmd=escape_heading(rd, h, spd), text='%s → ESCAPE %s' % (why, compass(h)))
         # 4. tornado wind
         if rd.wind_speed > CFG['reflexWind']:
             to = P['tornado']
