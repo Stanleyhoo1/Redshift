@@ -7,6 +7,11 @@ make every decision on their own; nothing is scripted. The world can also change
 (rockfalls, soft sand, dust storms, motor faults) and they have to notice and cope. The web UI
 (in `../web`) shows the world filling in. The message format is in `../PROTOCOL.md`.
 
+The brain has two tiers. Fast hand-written rules decide everything, 5 times a second, and keep the
+rovers safe. A small Gemma model running on your own machine gives advice beside them: which goal
+to pick, what an odd sensor reading means (with the camera picture), and what the operator's typed
+messages mean. The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`.
+
 ## What each module does
 
 | File | What it does |
@@ -20,10 +25,17 @@ make every decision on their own; nothing is scripted. The world can also change
 | `redshift/fleet.py` | Team decisions: who goes to which frontier, the shared slope limit, the target list, soft ground reports, who takes over from a broken rover, and the event log. |
 | `redshift/hazards.py` | Changes the world on request: rockfall, sand, dust storm, rover fault. Only the UI sees this list; the rovers must find out for themselves. |
 | `redshift/sim.py` | Runs it all: steps the physics, runs the rovers' decisions 5 times per sim second, and builds the messages for the UI. Also a command line runner that can script hazards. |
-| `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, and the camera images from `camera.py`. Runs the sim in the background at `SIM_SPEED` times real time. |
+| `redshift/camera.py` | Live pictures from each rover's mast camera (MuJoCo renders), for the UI and for Gemma. |
+| `redshift/gemma.py` | Talks to the local Gemma model (Ollama), or a fake model for demos and tests: prompts, answer checks, timeouts, a keyword parser for typed commands. |
+| `redshift/advisor.py` | Tier 2: asks Gemma at the right moments, applies its advice when it is safe, runs the operator chat and the questions to the operator. |
+| `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
 | `scripts/climb_test.py` | Drives a rover up ramps of known angle to check how steep it can climb. |
+| `scripts/gemma_bench.py` | Measures Gemma's speed and answers against a real Ollama. |
 | `tests/test_smoke.py` | Runs 400 sim seconds with no hazards and checks the results and every message. |
 | `tests/test_hazards.py` | Runs every hazard in turn and checks how the rovers react, plus the v2 message fields and `/api/hazard`. |
+| `tests/test_camera.py` | Camera renders and the camera endpoint. |
+| `tests/test_gemma.py` | `gemma.py` against a stub Ollama server. |
+| `tests/test_brain.py` | Tier 2 with the fake model: goal switches, anomaly checks, questions, every chat command, Gemma offline, v3 messages, speed and budget. |
 
 ## How to run
 
@@ -45,6 +57,15 @@ Server only (this is what Docker runs):
 
 ```bash
 uvicorn redshift.server:app --host 0.0.0.0 --port 8000
+GEMMA_FAKE=1 uvicorn redshift.server:app --port 8000      # fake Gemma: the whole pipeline without Ollama
+```
+
+Talk to the rovers (the UI's chat box does the same), and answer their questions:
+
+```bash
+curl -X POST localhost:8000/api/chat -d '{"text": "rover 2, check out the area north of the lander"}'
+curl -X POST localhost:8000/api/chat -d '{"text": "go to 10, -5", "rover": "r1"}'
+curl -X POST localhost:8000/api/answer -d '{"id": "q1", "option": "reroute"}'
 ```
 
 Change the world while it runs:
@@ -70,9 +91,15 @@ python -m redshift.sim --seconds 400 --hazard rockfall@60 --hazard sand@120:r1 \
 ```
 
 `--ticks` also builds the UI messages and reports their size. `--model-clock` makes runs repeat
-exactly (see "Edge compute budget").
+exactly (see "Edge compute budget"). `--gemma` attaches Gemma (from the `GEMMA_*` variables) and
+`--say` scripts operator messages; the chat is printed at the end:
 
-Tests (about 60 s):
+```bash
+GEMMA_FAKE=1 python -m redshift.sim --gemma --seconds 200 --hazard rockfall@60 \
+       --say "30:rover 2, go check out the area north of the lander" --say "45:r1 go to 10, -5"
+```
+
+Tests (about 2 minutes):
 
 ```bash
 python -m pytest -q tests/        # add -s to see the event log
@@ -92,6 +119,17 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer |
 | `BRAIN_BUDGET_MS` | 40 | compute budget per rover per decision cycle (ms) |
 | `AUTO_RESET_S` | 60 | once exploration is complete and every rover is parked, wait this many seconds, then start a new random planet (server only, 0 = off) |
+| `GEMMA_ENABLED` | 1 | 0 = rules only (no Gemma, no questions; typed commands still work through the keyword parser) |
+| `GEMMA_URL` | `http://host.docker.internal:11434` | Ollama; `http://localhost:11434` is tried next |
+| `GEMMA_MODEL` | `gemma4:e2b` | falls back to `gemma4:e4b`, then `gemma3:4b`, if not installed |
+| `GEMMA_FAKE` | 0 | 1 = fake model (fixed rules, 0.5 s delay): demos and tests without Ollama |
+| `GEMMA_BUDGET_MS` | 3000 | stated latency budget per Gemma call (answers after `GEMMA_TIMEOUT_S`, 4 s, are dropped) |
+| `GEMMA_ASK_EVERY_S` | 20 | a rover asks Gemma about its goal at most this often (sim s), or when it reaches a goal |
+| `OPERATOR_TIMEOUT_S` | 20 | wall seconds a question waits for the operator before the rover takes the safe default |
+| `OPERATOR_ASK_BELOW` | 0.75 | Gemma confidence below this makes the rover ask the operator |
+| `OPERATOR_ASK_FIRST` | 1 | the first anomaly after start or reset always asks the operator (reliable demo trigger) |
+
+More Gemma settings (timeouts, tokens, model loading) are in `GEMMA.md`.
 
 ## Sensors
 
@@ -135,13 +173,60 @@ re-planning, and logs what was seen. Other code can listen by adding a function 
 (`kind` is `new_obstacle`, `slip` or `low_visibility`; `type` uses the names `new_obstacle`,
 `wheel_slip`, `low_visibility`).
 
+## Two-tier brain (rules + Gemma)
+
+| | Tier 1: rules | Tier 2: Gemma (advice) |
+|---|---|---|
+| Runs | 5 times per sim second, every rover | one model call at a time, on its own thread |
+| Budget | 40 ms per rover per cycle | 3000 ms per call (timeout 4 s) |
+| Decides | everything: map, A*, slope limit, battery and return, soft ground, stalls, faults, every safety reaction | nothing on its own: it suggests, the rules check |
+
+Where Gemma helps:
+
+1. **Goal choice.** When a rover picks a new frontier (at most every 20 s, or when it reaches one),
+   it drives to the rules' pick straight away. Meanwhile the rules plan two other frontiers (A*
+   path length, steepest slope on the way, battery left after the trip home), maybe a found science
+   target and the trip home, and Gemma picks one with a short reason that quotes those numbers. If it
+   picks another option that is still valid, the rover switches and logs one event, for example
+   `r2 switching to frontier 14 m east (Gemma, 0.3 s): 'f2: slope max 9 deg, battery after return 51%'`.
+   If it agrees, that is logged at most once a minute per rover.
+2. **Anomalies.** New rocks, wheel slip, LiDAR range collapsing: the rules react at once (slow down,
+   back out, reroute). Then the rover's camera picture and sensor numbers go to Gemma, which says what
+   it is, how sure it is and what to do. Safe extras are applied (wait, go slowly, back off); unsafe
+   ones are refused, for example "proceed slowly" on soft ground (`Safety rule wins: ...`).
+3. **Questions to the operator.** If Gemma is unsure (confidence under 0.75, or it says
+   `ask_operator`), or it is the first anomaly since start or reset, the rover asks in the chat with
+   2 or 3 safe options and its camera picture, and creeps at 0.25 m/s along its safe route while it
+   waits. No answer in 20 s: it takes the safest option and says so.
+4. **Typed commands.** Gemma (or the keyword parser if Gemma is offline) turns the operator's text
+   into a command; the rules check it and run it or refuse with numbers ("r1: can't, battery 22%
+   would not get me there and back"). One reply per command. Commands: go to x, y; explore a
+   direction (for 3 minutes); sample a target; return home; hold; resume; avoid an area (a circle that
+   is off limits for the whole fleet); anything unclear gets a question back. After a command is done
+   the rover carries on on its own.
+
+**Hold** shows as state `idle` with goal `null` and a chat note ("r1: holding at (12, -4), say resume
+to continue"). A held rover still watches its battery: if it would not get home otherwise, it leaves
+the hold and says so.
+
+**Demo a question:** start the sim (with Ollama, or `GEMMA_FAKE=1`), wait until the rovers are
+driving, then trigger a rockfall (UI hazard button, or
+`curl -X POST localhost:8000/api/hazard -d '{"type": "rockfall"}'`). Within a few seconds the rover
+that sees the new rocks asks "New rocks block my path 3 m ahead ... Gemma thinks: rock (confidence
+0.80). What should I do?" with Go around / Approach slowly / Wait and its camera picture. Answer in
+the UI (or `POST /api/answer`), or wait 20 s for the safe default. Only the first anomaly after
+start or reset asks for sure; after a reset it asks again. `OPERATOR_ASK_BELOW=1.01` makes every
+anomaly ask (one question per rover per minute at most).
+
 ## Edge compute budget
 
 Each rover states a budget: 40 ms of compute per 200 ms decision cycle (`BRAIN_BUDGET_MS`). The
 "brain" is what a real rover computer would run: turning LiDAR hits into the map, frontier logic,
 path planning and the state machine. It does not include the simulated sensor hardware (the ray
 casts) or the physics. Work shared by the fleet (frontiers, reachability) is done by one rover
-per cycle, taking turns, and counts toward that rover's time.
+per cycle, taking turns, and counts toward that rover's time. The rules' share of tier 2 (planning
+Gemma's candidate goals and operator trips) counts too and also plans in slices. Gemma's own time
+does not: the model runs on another thread with its own budget (3000 ms per call).
 
 Planning is anytime: when a plan uses up the cycle's share of the budget, A* stops and carries on
 next cycle. Meanwhile the rover keeps its current route, or waits if something blocks it just
@@ -157,7 +242,8 @@ Measured on the dev machine (2 shared CPUs, 3 rovers, 400 sim s, wall clock):
 | all four hazards, seeds 42 / 7 / 123 | 1.1 to 1.3 | 2.2 to 3.6 | 8 to 30 | 0 |
 
 The whole sim still runs about 14 to 15 times faster than real time with 3 rovers, hazards and
-UI messages. A tick message is about 12 to 13 KB (most of it the LiDAR points).
+UI messages, and about 13 times with the fake Gemma attached. A tick message is about 12 to 13 KB
+(most of it the LiDAR points).
 
 The budget is wall clock time, so on a busy machine a plan may be split at a different moment and
 two runs can drift apart. `--model-clock` (or `plan_clock="model"` in `Config`) counts A*

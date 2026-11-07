@@ -29,6 +29,7 @@ NEAR_ROVER_PENALTY = 8.0
 DEGRADED_DIST_K = 2.5       # a rover that cannot see far weighs distance this much more
 DEGRADED_MAX_GOAL = 14.0    # and avoids frontiers farther than this (unless there is nothing closer)
 SEARCH_TTL = 3.0            # an unfinished plan older than this (sim s) is dropped and restarted
+DIR_BIAS = 30.0             # operator "explore <direction>": utility bonus for frontiers straight that way
 
 
 def compass(dx: float, dy: float) -> str:
@@ -88,11 +89,15 @@ class Fleet:
         self.hazards = None                # set by the sim; only told about soft zones (for the UI)
 
     # ------------------------------------------------------------------ events
-    def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None) -> None:
+    def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None) -> None:
+        """source: "gemma" or "operator" when the decision came from tier 2 or a typed command
+        (protocol v3); None means the rules (the field is then left out)."""
         self.event_seq += 1
         e = {"t": round(float(t), 1), "rover": rover, "level": level, "msg": msg, "_seq": self.event_seq}
         if at is not None:
             e["at"] = [round(float(at[0]), 1), round(float(at[1]), 1)]
+        if source is not None and source != "rules":
+            e["source"] = source
         self.events.append(e)
         if len(self.events) > 400:
             del self.events[:100]
@@ -102,6 +107,8 @@ class Fleet:
         out = {"t": e["t"], "rover": e["rover"], "level": e["level"], "msg": e["msg"]}
         if "at" in e:
             out["at"] = e["at"]
+        if "source" in e:
+            out["source"] = e["source"]
         return out
 
     # ------------------------------------------------------------------ periodic
@@ -262,13 +269,14 @@ class Fleet:
         """Walk the rover's remaining path. Within near_m metres every segment is sampled; further on
         only the next waypoints are checked. Returns None or (x, y, metres ahead, reason) for the
         first sample that is now impassable. reason: "rocks" (ground that changed under a recent
-        rockfall, seen by LiDAR), "soft" (soft ground a rover reported) or "terrain" (steep ground
-        that was unknown when the path was planned)."""
+        rockfall, seen by LiDAR), "soft" (soft ground a rover reported), "avoid" (an area the
+        operator put off limits) or "terrain" (steep ground that was unknown when the path was
+        planned)."""
         pts = rover.path
         if not pts:
             return None
         m = self.map
-        known, slope, blocked, soft = m.known, m.slope, m.blocked, m.soft
+        known, slope, blocked, soft, avoid = m.known, m.slope, m.blocked, m.soft, m.avoid
         start = pts[0]
         si, sj = m.ij(start[0], start[1])
         end = pts[-1]
@@ -279,6 +287,8 @@ class Fleet:
                 return None          # the planner's escape zone around the path start
             if soft[j, i]:
                 return "soft"
+            if avoid[j, i]:
+                return "avoid"
             if blocked[j, i] or (known[j, i] and slope[j, i] > limit):
                 # new rocks: several samples near here changed lately (a boulder changes many)
                 return "rocks" if m.recently_changed(i, j, t - 20.0, r=3, min_count=2) else "terrain"
@@ -375,6 +385,9 @@ class Fleet:
             return None
         cands = []
         w_dist = W_DIST * (DEGRADED_DIST_K if rover.degraded else 1.0)
+        bias = getattr(rover, "dir_bias", None)      # operator: "explore north" (unit vector, until t)
+        if bias is not None and t >= bias[2]:
+            bias = None
         reach = self.reach.ravel() if (self.reach is not None and self.in_reach(rover.x, rover.y)) else None
         skipped_battery = 0
         for (x, y, size, idx) in self.frontiers:
@@ -407,11 +420,14 @@ class Fleet:
                     u -= NEAR_ROVER_PENALTY
             if any(math.hypot(x - sx, y - sy) < self.cfg.target_bonus_radius for sx, sy in self.sampled_points):
                 u += SAMPLE_BONUS
+            if bias is not None:
+                u += DIR_BIAS * ((x - rover.x) * bias[0] + (y - rover.y) * bias[1]) / max(d, 1e-6)
             cands.append((u, x, y, size, key))
         if not cands and skipped_battery:
             rover.goal_fail_reason = "battery"
         cands.sort(key=lambda c: -c[0])
         cands = cands[:max_tries]
+        rover.goal_options = list(cands)        # ranked options: tier 2 (Gemma) may pick another one
         # a plan that ran out of time last cycle is finished first (anytime planning)
         pk = rover.pending_goal_key
         if pk is not None:

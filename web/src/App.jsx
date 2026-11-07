@@ -6,6 +6,7 @@ import { ViewControls } from './components/ViewControls.jsx'
 import { Legend } from './components/Legend.jsx'
 import { SensorPanel } from './components/SensorPanel.jsx'
 import { DustBanner, DustHaze, HazardPanel } from './components/HazardPanel.jsx'
+import { RequestCards } from './components/RequestCards.jsx'
 import { startConnection, wsUrl } from './net/connection.js'
 import { simStore, useApp, useSim } from './state/store.js'
 
@@ -125,6 +126,7 @@ export default function App() {
         <ViewControls view={view} setView={setView} follow={follow} onSelect={show} onOverview={goOverview} />
         <div className="hud-top">
           <HazardPanel />
+          <RequestCards onSelect={show} />
           <div className="banners">
             <ConnBanner />
             <DustBanner />

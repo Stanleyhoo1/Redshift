@@ -20,3 +20,16 @@ export function degrees(v) {
   if (!Number.isFinite(v)) return '--'
   return Math.abs(v - Math.round(v)) < 0.05 ? String(Math.round(v)) : v.toFixed(1)
 }
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// The sim writes messages like "r2 sampled ice deposit t7 (found by r3)". The row already shows
+// the rover's name, so drop the leading id and swap any other rover ids for their names.
+export function cleanMsg(msg, roverId, byId) {
+  let out = msg
+  if (roverId && out.startsWith(roverId + ' ')) out = out.slice(roverId.length + 1)
+  const ids = Object.keys(byId)
+  if (!ids.length) return out
+  const re = new RegExp(`\\b(${ids.sort((a, b) => b.length - a.length).map(escapeRe).join('|')})\\b`, 'g')
+  return out.replace(re, (id) => byId[id]?.name || id)
+}

@@ -10,7 +10,8 @@ Vite + React + three.js (@react-three/fiber, drei). Node 22.
 
 ```sh
 npm install
-npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS)
+npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
+                  #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, MOCK_GEMMA=offline, MOCK_PROTOCOL=2)
 npm run dev       # in a second terminal, then open http://localhost:5173
 ```
 
@@ -49,14 +50,41 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   rover blinks red and its card counts down.
 - Event log rows with a target icon fly the camera to where it happened. Hazards are red.
 - Keys: `R` `F` `P` `S` `L` toggle layers, `1` to `9` select a rover, `Esc` closes the
-  sensor panel (then returns to the overview), `0` for the overview.
+  sensor panel (then returns to the overview), `0` for the overview, `/` for the message box.
 - Reset sim asks for confirmation, then restarts the sim with a random seed.
 - The overview keeps the explored area in frame, in the space the panels leave free.
   Dragging or zooming takes over the camera until you press Off (or the sim resets).
-- Every version 2 field is optional: with an older sim the panel shows dashes, the camera
-  says it is unavailable and the hazard buttons say the sim does not support them.
+- Gemma (top of the sidebar): the local model's state and average latency ("Gemma 4 E2B,
+  Ready · 0.4 s"; amber while warming up, "rules only" when offline or off). Hover or click
+  it for calls, fallbacks, p95 and the budget. The sensor panel's compute section has a
+  second bar for it under the brain bar: average filled, p95 tick, budget line.
+- Events and Comms (tabs under the rover cards): the event log tags decisions Gemma made
+  ("Gemma") and ones the operator asked for ("Operator"). Comms is the chat with the fleet:
+  pick All or a rover, type and press Enter (or `/` from anywhere to jump there; Up recalls
+  what you sent), or click a suggestion. Rovers confirm (green), refuse with their reason
+  (amber) or ask (cyan), tagged Gemma or Rules. The sim's error text shows under the box.
+  With Comms open the fleet stats fold into one row. The tab counts unread replies and
+  lights up while a rover is waiting for an answer.
+- Clarification requests: when a rover cannot tell what it senses it asks, and a card opens
+  under the hazard bar with its camera (its LiDAR sweep if the sim cannot render), the
+  question, the options (the safe default marked) and a countdown. Answer there or in the
+  thread; the card confirms, or says which safe default it took when time ran out. More
+  questions queue as strips under the card. The asking rover's name tag shows a "?".
+- Every version 2 and 3 field is optional: with an older sim the panel shows dashes, the
+  camera says it is unavailable, the hazard buttons say the sim does not support them, the
+  Gemma pill and bar stay hidden and Comms says the sim has no operator chat.
 
 The mock implements all of version 2 (sensors from a ray-marched LiDAR over its heightmap,
 brain timings, `POST /api/hazard` with plausible reactions). Its camera endpoint answers
 503 on purpose. `node scripts/v2-shots.mjs` (mock and preview running) clicks through every
 hazard and saves screenshots; set `WIDTH` and `HEIGHT` for other sizes.
+
+It also implements version 3: Gemma warms up for about 10 s, then answers in 300 to 900 ms;
+Gemma-sourced events quote numbers; `POST /api/chat` understands return, hold, resume,
+explore a direction and go to x, y (refusing outside the map, on steep or soft ground, or
+when the battery would not cover the trip back) and asks back when it cannot parse; rovers
+ask after a rockfall or soft sand and once about 40 s in, with a 20 s countdown;
+`POST /api/answer` answers 404 and 409 like the real sim. `MOCK_PROTOCOL=2` makes it a
+version 2 sim. Test hooks, mock only: `POST /api/_mock/planner {"state": "offline"}`,
+`POST /api/_mock/ask {"rover": "r2"}`, `POST /api/_mock/battery {"rover": "r1", "battery": 0.3}`.
+`node scripts/v3-shots.mjs` drives all of it through the UI and saves screenshots.

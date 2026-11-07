@@ -133,6 +133,14 @@ class Config:
     # ---- telemetry ----
     scan_points: int = 200          # max LiDAR points per rover in a tick message (protocol: at most 300)
 
+    # ---- tier 2: Gemma advice, operator chat and questions (advisor.py) ----
+    gemma_ask_every_s: float = 20.0      # a rover asks Gemma about its goal at most this often (sim s), or on arrival
+    operator_timeout_s: float = 20.0     # WALL seconds a question waits for the operator before the safe default
+    operator_ask_below: float = 0.75     # Gemma confidence below this: ask the operator
+    operator_ask_first: bool = True      # always check the first anomaly after start or reset with the operator
+    question_cooldown_s: float = 60.0    # per rover, sim seconds between two questions
+    max_open_questions: int = 2          # fleet wide
+
     @property
     def nx(self) -> int:
         return int(round(self.map_size / self.res)) + 1
@@ -167,5 +175,9 @@ class Config:
             gravity_g=max(0.1, _env_float("GRAVITY_G", 2.0)),
             viewer=_env_bool("VIEWER", False),
             brain_budget_ms=max(1.0, _env_float("BRAIN_BUDGET_MS", 40.0)),
+            gemma_ask_every_s=max(2.0, _env_float("GEMMA_ASK_EVERY_S", 20.0)),
+            operator_timeout_s=max(1.0, _env_float("OPERATOR_TIMEOUT_S", 20.0)),
+            operator_ask_below=min(1.01, max(0.0, _env_float("OPERATOR_ASK_BELOW", 0.75))),
+            operator_ask_first=_env_bool("OPERATOR_ASK_FIRST", True),
         )
         return replace(base, **overrides) if overrides else base

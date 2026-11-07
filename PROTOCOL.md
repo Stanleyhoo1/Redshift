@@ -154,6 +154,54 @@ Full list of hazards in the current sim (small, sent every tick):
 Body: `{"type": "rockfall" | "sand" | "dust_storm" | "rover_fault", "rover": "r2"}` (`rover` optional: the sim picks a good one).
 Returns `{"ok": true, "hazard": {...}}` (same shape as in `hazards`), or HTTP 400 with `{"ok": false, "error": "..."}` (unknown type, no valid placement, every rover already faulted).
 
+## Version 3 additions (local Gemma planner, operator chat, clarification requests)
+
+All optional for clients (older sims omit them).
+
+### `planner` (in `init` and every `tick`)
+
+```json
+{"model": "gemma4:e2b", "state": "ready", "online": true, "calls": 42, "ok": 39, "fallbacks": 3,
+ "avg_ms": 410.0, "p95_ms": 980.0, "last_ms": 350.0, "budget_ms": 3000.0, "over_budget": 0}
+```
+
+`state`: `"ready" | "warming" | "offline" | "disabled"`. When not ready, the rovers run on rules alone.
+
+### Event addition
+
+Optional `"source": "rules" | "gemma" | "operator"` on events (missing means rules). Gemma-sourced messages quote the sensor readings Gemma cited.
+
+### `chat` (in `tick`: new messages since the last tick; in `init`: the last 50)
+
+```json
+[{"id": "c12", "t": 123.4, "from": "operator", "to": "r2", "text": "rover 2, check the crater east of the lander", "kind": "command", "source": null, "request_id": null},
+ {"id": "c13", "t": 124.1, "from": "r2", "to": "operator", "text": "Heading to (14, 2), 18 m. Max slope on the way 12 deg.", "kind": "ack", "source": "gemma", "request_id": null}]
+```
+
+- `from`: `"operator"`, a rover id, or `"fleet"`. `to`: a rover id, `"all"`, `"operator"` or null.
+- `kind`: `"command" | "ack" | "refuse" | "question" | "answer" | "info"`.
+- `source`: who interpreted or produced it (`"gemma"` or `"rules"`), null for operator text.
+- `request_id`: links questions and answers to a request below.
+
+### `requests` (in `init` and every `tick`: full list of OPEN clarification questions)
+
+```json
+[{"id": "q3", "rover": "r2", "t": 130.0, "question": "Something I can't identify blocks my path 4 m ahead (LiDAR: 0.8 m tall). What should I do?",
+  "options": [{"id": "reroute", "label": "Go around"}, {"id": "proceed_slowly", "label": "Approach slowly"}, {"id": "wait", "label": "Wait"}],
+  "default": "reroute", "expires_in": 14.2, "image": "/api/camera/r2.jpg?view=fpv"}]
+```
+
+- A rover asks when it (or Gemma) cannot interpret what it senses. It acts cautiously (slows or holds) while waiting.
+- `expires_in`: WALL-CLOCK seconds left (env `OPERATOR_TIMEOUT_S`, default 20). On expiry the rover takes `default` (always the safest option) and says so in the chat. No answer is ever required for the mission to continue.
+
+### `POST /api/chat`
+
+Body `{"text": "...", "rover": "r2"}` (`rover` optional). Returns `{"ok": true, "id": "c12"}` immediately; Gemma (or the rule-based fallback parser) interprets it asynchronously, the rules check it is safe, and the rover answers in `chat` with `ack`, `refuse` (with the reason and numbers) or `question` (when unclear). 400 for empty text.
+
+### `POST /api/answer`
+
+Body `{"id": "q3", "option": "reroute"}`. Returns `{"ok": true}`, 404 for an unknown request, 409 if it already expired or was answered.
+
 ### `GET /api/camera/{rover_id}.jpg`
 
 Live image rendered by MuJoCo from the rover's point of view, at the current sim state.
@@ -182,4 +230,9 @@ Nothing required. The server must ignore any text the client sends.
 | `GRAVITY_G` | 2.0 | gravity in Earth g |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer (only when running outside Docker) |
 | `BRAIN_BUDGET_MS` | 40 | stated compute budget per rover per decision cycle |
+| `GEMMA_ENABLED` | 1 | 0 = rules only |
+| `GEMMA_URL` | http://host.docker.internal:11434 | Ollama server (falls back to localhost:11434) |
+| `GEMMA_MODEL` | gemma4:e2b | preferred model; falls back to gemma4:e4b, then gemma3:4b if not installed |
+| `GEMMA_FAKE` | 0 | 1 = deterministic fake model (demo and tests without Ollama) |
+| `OPERATOR_TIMEOUT_S` | 20 | wall seconds a rover waits for an operator answer before taking the safe default |
 | `AUTO_RESET_S` | 60 | after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` (0 = off) |

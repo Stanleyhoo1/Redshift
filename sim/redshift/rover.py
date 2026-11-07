@@ -19,6 +19,11 @@ compute budget runs out, then resumes next cycle.
 Anything perception did not expect (new obstacles on the path, wheel slip, LiDAR returns collapsing)
 goes through Rover.on_anomaly(): it records the anomaly, slows the rover down at once (before any
 re-planning) and logs what was seen. Other layers can subscribe with Rover.anomaly_hooks.
+
+Tier 2 (advisor.py: Gemma advice and operator commands) can only nudge the rover through a few
+fields: held (operator hold: parked in state idle), op_goal (operator go_to), dir_bias (operator
+"explore north"), sticky_goal (a frontier Gemma picked), pause_until and crawl_until / crawl_v
+(wait or creep while a question is open). The safety rules below still run first every cycle.
 """
 from __future__ import annotations
 
@@ -186,6 +191,19 @@ class Rover:
         self.anomaly_hooks: list = []      # callables (rover, anomaly dict), e.g. a reasoning layer
         self.caution_until = -1e9
         self.caution_v = self.cfg.caution_v
+
+        # tier 2 nudges (advisor.py); the rules keep the final say
+        self.advisor = None                # set by the sim; rover_tick() runs after each decision cycle
+        self.held = False                  # operator "hold": parked in state idle until "resume"
+        self.op_goal = None                # operator go_to point (x, y)
+        self.op_fails = 0
+        self.dir_bias = None               # operator "explore <dir>": (unit x, unit y, until t)
+        self.sticky_goal = None            # frontier picked by Gemma: kept until reached or gone
+        self.goal_options: list = []       # ranked frontier options from the last choose_goal
+        self.pause_until = -1e9            # stand still (wait) until then
+        self.pause_dust = False            # the wait ends early when visibility comes back
+        self.crawl_until = -1e9            # creep at crawl_v until then (a question is open)
+        self.crawl_v = 0.25
 
         # charging telemetry (the lander's panels can be dusty)
         self.battery_margin = self.cfg.battery_margin
@@ -532,6 +550,8 @@ class Rover:
         self._c0 = time.perf_counter()
         try:
             self._tick(t, dt, energy_j, duty)
+            if self.advisor is not None:
+                self.advisor.rover_tick(self, t)    # tier 2 bookkeeping (no model calls in here)
         finally:
             ms = (time.perf_counter() - self._c0 - self._hw) * 1000.0
             self._c0 = None
@@ -569,7 +589,16 @@ class Rover:
 
         if self.state == "idle":
             self._set_cmd(0.0, 0.0)
-            if self.battery > 0.3 and not self.fleet.complete and t >= self.next_goal_try:
+            if self.held:
+                away = math.hypot(self.x - self.dock[0], self.y - self.dock[1]) > 1.6
+                if away and self.battery > 0.0 and self._need_return(t):
+                    # safety first: a long hold must not strand the rover
+                    self.held = False
+                    self._say(t, f"{self.id}: battery {self.battery * 100:.0f}%, leaving the hold to return "
+                                 f"to the lander.", "info")
+                    self.state = "exploring"
+                    self._go_home(t, "battery")
+            elif self.battery > 0.3 and not self.fleet.complete and t >= self.next_goal_try:
                 self.state = "exploring"
             self._apply()
             return
@@ -631,7 +660,20 @@ class Rover:
             self.next_home_check = t + (0.2 if self.home_pending else 3.0)
         return self.battery < self.need_home + self.battery_margin
 
+    def _say(self, t: float, text: str, kind: str = "info") -> None:
+        """A chat line from this rover to the operator (protocol v3 chat), if tier 2 is attached."""
+        if self.advisor is not None:
+            self.advisor.say(self.id, t, text, kind)
+
     def _go_home(self, t: float, reason: str) -> None:
+        if self.op_goal is not None and reason in ("battery", "range", "complete"):
+            gx, gy = self.op_goal
+            why = "exploration is complete" if reason == "complete" else f"battery {self.battery * 100:.0f}%"
+            self._say(t, f"{self.id}: {why}, giving up on ({gx:g}, {gy:g}) and returning to the lander.")
+        self.op_goal = None
+        self.sticky_goal = None
+        if reason in ("battery", "range"):
+            self.pause_until = min(self.pause_until, t)     # no waiting around when the battery says go home
         self._drop_target(t, "battery low" if reason in ("battery", "range") else None)
         self.state = "returning"
         self.return_reason = reason
@@ -689,7 +731,11 @@ class Rover:
         self._check_charge_rate(t)
         if self.battery >= 0.995:
             self.battery = 1.0
-            if self.fleet.complete:
+            if self.held:
+                self.state = "idle"
+                self.fleet.log(t, "info", f"{self.id} fully charged. Holding at the lander for the operator.",
+                               self.id, at=self.dock)
+            elif self.fleet.complete:
                 self.state = "idle"
                 self.fleet.log(t, "info", f"{self.id} fully charged and parked at the lander.", self.id, at=self.dock)
             else:
@@ -765,11 +811,19 @@ class Rover:
 
     def _explore(self, t: float) -> None:
         f = self.fleet
+        if self.op_goal is not None:
+            self._op_drive(t)
+            return
         # an already found target that nobody is sampling?
         if t >= self.next_target_check:
             self.next_target_check = t + 3.0
             k, d = f.unclaimed_target(t, self)
             reach = 8.0 if self.degraded else 30.0     # no far investigations while unsure
+            b = self.dir_bias
+            if k is not None and b is not None and t < b[2]:    # operator: "explore north"
+                ts_ = f.targets[k].spec
+                if ((ts_.x - self.x) * b[0] + (ts_.y - self.y) * b[1]) < 0.3 * max(d, 1e-6):
+                    k = None
             if k is not None and d < reach and self.can_investigate(t, f.targets[k]):
                 ts = f.targets[k]
                 ts.status = "investigating"
@@ -779,9 +833,13 @@ class Rover:
                                  f"found by {ts.found_by}), {d:.0f} m away.", self.id, at=(ts.spec.x, ts.spec.y))
                 return
         need = self.goal is None
+        reached = False
         if not need:
             dgoal = math.hypot(self.goal[0] - self.x, self.goal[1] - self.y)
-            if dgoal < 1.5 or not self._goal_still_frontier() or t >= self.next_goal_eval:
+            reached = dgoal < 1.5
+            # a frontier Gemma picked (sticky) is kept until reached or no longer a frontier
+            periodic = t >= self.next_goal_eval and self.goal != self.sticky_goal
+            if reached or not self._goal_still_frontier() or periodic:
                 need = True
         replan = self.goal is not None and self._need_replan(t)
         if need and t >= self.next_goal_try:
@@ -810,9 +868,12 @@ class Rover:
             self._after_replan(t, path)
             old = self.goal
             self.goal, self.goal_size, self.goal_t = goal, size, t
+            self.sticky_goal = None
             self.next_goal_eval = t + 15.0
             self._set_path(t, path)
             f.takeover_note(t, self, goal)
+            if self.advisor is not None:          # tier 2 may suggest another option; we drive this one now
+                self.advisor.on_goal_chosen(self, t, goal, path, size, reached)
             big_change = old is None or math.hypot(goal[0] - old[0], goal[1] - old[1]) > 15.0
             if t - self.last_goal_event_t > 75.0 and big_change:
                 self.last_goal_event_t = t
@@ -833,6 +894,40 @@ class Rover:
                 self.next_goal_try = t
             else:
                 self._set_path(t, path)
+
+    def _op_drive(self, t: float) -> None:
+        """Drive to the operator's go_to point (state stays "exploring"). The usual safety checks
+        (battery, blocked path, stalls) still apply; autonomy resumes on arrival."""
+        gx, gy = self.op_goal
+        if math.hypot(gx - self.x, gy - self.y) < 1.5:
+            self.op_goal = None
+            self.goal, self.path = None, []
+            self.next_goal_try = t
+            self._say(t, f"{self.id}: arrived at ({gx:g}, {gy:g}). Back to exploring.")
+            self.fleet.log(t, "info", f"{self.id} reached the operator's point ({gx:.0f}, {gy:.0f}). "
+                                      f"Back to exploring.", self.id, at=(gx, gy), source="operator")
+            return
+        self.goal = self.op_goal
+        if not self._need_replan(t):
+            return
+        path = self.fleet.plan(t, self, self.goal, max_exp=30000)
+        self._after_replan(t, path)
+        if path is PENDING:
+            self._hold_if_blocked()
+        elif path is None:
+            self.op_fails += 1
+            if self.block_info is not None:
+                self.path = []                 # never keep driving into what blocked us
+            self.plan_t = t
+            if self.op_fails >= 3:
+                self.op_goal = None
+                self.goal, self.path = None, []
+                self.next_goal_try = t
+                self._say(t, f"{self.id}: no safe path to ({gx:g}, {gy:g}) any more "
+                             f"(slope limit {self.fleet.slope_limit:.0f} deg). Back to exploring.")
+        else:
+            self.op_fails = 0
+            self._set_path(t, path)
 
     def _goal_still_frontier(self) -> bool:
         gx, gy = self.goal
@@ -1023,6 +1118,10 @@ class Rover:
 
     def _detect_stall(self, t: float) -> bool:
         if t < self.stall_cooldown:
+            return False
+        if t < self.pause_until:               # standing still on purpose (waiting)
+            self.stuck_ref = None
+            self.hist.clear()
             return False
         h = self.hist
         if len(h) == h.maxlen and all(e[5] for e in h):
@@ -1278,6 +1377,10 @@ class Rover:
             v *= 0.8
         if t < self.caution_until:
             v = min(v, self.caution_v)       # just saw something unexpected: go slow while re-planning
+        if t < self.crawl_until and not (self.state == "returning" and self.return_reason in ("battery", "range")):
+            v = min(v, self.crawl_v)         # a question to the operator is open: creep along the safe route
+        if t < self.pause_until:
+            v, w = 0.0, 0.0                  # waiting (Gemma or the operator said wait)
         if self.hold_for_plan:
             v, w = 0.0, 0.0                  # something blocks the path just ahead; wait for the new plan
         intended_v = v
