@@ -20,7 +20,20 @@ export const STATE_STYLE = {
   charging: { label: 'Charging', color: '#f2c14c' },
   recovering: { label: 'Recovering', color: '#f46a5b' },
   idle: { label: 'Idle', color: '#8d99aa' },
+  fault: { label: 'Fault', color: '#ff3b5c' },
 }
+
+// Environment changes injected into the sim (PROTOCOL.md version 2). Crimson, so a
+// hazard never reads as a rover warning (amber) or a discovery (cyan).
+export const HAZARD = '#ff3b5c'
+export const SAND = '#e2bf7d'
+export const DUST = '#b98a5c'
+export const HAZARD_TYPES = [
+  { type: 'rockfall', label: 'Rockfall', hint: 'Boulders land on a rover route. LiDAR sees them, the planner steers around.' },
+  { type: 'sand', label: 'Soft sand', hint: 'Hidden soft ground on a route. Only wheel slip gives it away.' },
+  { type: 'dust_storm', label: 'Dust storm', hint: 'LiDAR range collapses to a few metres for a while. Rovers slow down.' },
+  { type: 'rover_fault', label: 'Motor fault', hint: 'One rover loses its motors and reboots. The fleet routes around it.' },
+]
 
 export const KIND_STYLE = {
   mineral: { label: 'Mineral', long: 'mineral deposit', color: '#b48cff' },

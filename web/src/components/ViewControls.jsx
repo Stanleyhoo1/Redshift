@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { appStore, nowSeconds, simStore, useApp, useSim } from '../state/store.js'
 import { resetSim } from '../net/connection.js'
 import { shortName } from '../lib/format.js'
+import { useHudRect } from '../lib/useHudRect.js'
 
 function useStale() {
   const [stale, setStale] = useState(false)
@@ -101,10 +102,13 @@ function ResetControl() {
   )
 }
 
-export function ViewControls({ view, setView, follow, setFollow, onOverview }) {
+export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
   const meta = useSim((s) => s.roverMeta)
   const gen = useSim((s) => s.gen)
   const truth = useApp((a) => a.truth)
+  // An older sim sends no scans: say so instead of showing an empty layer.
+  const noScan = useSim((s) => s.ticks > 3 && !Object.values(s.rovers).some((r) => r.scan))
+  const ref = useHudRect('controls')
   const set = (key) => (value) => setView((v) => ({ ...v, [key]: value }))
   let realityHint = ''
   if (view.reality) {
@@ -112,13 +116,14 @@ export function ViewControls({ view, setView, follow, setFollow, onOverview }) {
     else if (truth.error) realityHint = 'Unavailable'
   }
   return (
-    <div className="hud hud-controls">
+    <div className="hud hud-controls" ref={ref}>
       <ConnStatus />
       <div className="hud-group">
         <Toggle label="Reality" on={view.reality} onChange={set('reality')} hint={realityHint} keyHint="R" />
         <Toggle label="Frontiers" on={view.frontiers} onChange={set('frontiers')} keyHint="F" />
         <Toggle label="Paths" on={view.paths} onChange={set('paths')} keyHint="P" />
         <Toggle label="Slope colours" on={view.slope} onChange={set('slope')} keyHint="S" />
+        <Toggle label="LiDAR" on={view.lidar} onChange={set('lidar')} hint={view.lidar && noScan ? 'No data' : ''} keyHint="L" />
       </div>
       <div className="hud-group">
         <div className="hud-label" id="follow-label">
@@ -129,7 +134,7 @@ export function ViewControls({ view, setView, follow, setFollow, onOverview }) {
             Off
           </button>
           {meta.map((m, i) => (
-            <button key={m.id} type="button" aria-pressed={follow === m.id} onClick={() => setFollow(m.id)} title={`${m.name} (${i + 1})`}>
+            <button key={m.id} type="button" aria-pressed={follow === m.id} onClick={() => onSelect(m.id)} title={`Follow ${m.name} and show its sensors (${i + 1})`}>
               <span className="dot" style={{ background: m.color }} />
               {shortName(m.name, m.id)}
             </button>

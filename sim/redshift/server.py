@@ -2,7 +2,8 @@
 
 The Simulation runs in a background thread paced to SIM_SPEED x real time. An asyncio task sends a
 `tick` to every connected WebSocket client about 5 times per wall second; new clients get an `init`
-first. Everything that touches the simulation holds one lock.
+first. Everything that touches the simulation holds one lock. POST /api/hazard changes the world
+(rockfall, sand, dust storm, rover fault); GET /api/camera/{rover_id}.jpg comes from camera.py.
 
     uvicorn redshift.server:app --port 8000           (what Docker runs)
     python -m redshift.server [--viewer] [--port 8000] (native run, optional MuJoCo viewer)
@@ -26,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from .config import Config
+from .hazards import TYPES as HAZARD_TYPES
+from .hazards import HazardError
 from .sim import Simulation
 
 TICK_HZ = 5.0
@@ -249,7 +252,7 @@ async def auto_reset_loop() -> None:
                 continue
             if runner is not watched:          # a manual reset restarts the countdown
                 watched, done_since = runner, None
-            with runner.locked() as sim:
+            with runner.locked() as sim:     # a faulted rover is not parked: no reset while one is down
                 done = sim.fleet.complete and all(r.state in ("idle", "charging") for r in sim.rovers)
             if not done:
                 done_since = None
@@ -296,9 +299,17 @@ app = FastAPI(title="Redshift sim", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+try:   # onboard camera renders (camera.py); the server runs without them if they cannot load
+    from .camera import router as camera_router
+    app.include_router(camera_router)
+except Exception as _e:  # noqa: BLE001
+    _log(f"camera endpoint unavailable: {_e}")
+
+
 @app.get("/")
 async def root():
-    return PlainTextResponse("Redshift sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset.\n")
+    return PlainTextResponse("Redshift sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, "
+                             "/api/hazard, /api/camera/{rover_id}.jpg.\n")
 
 
 @app.get("/api/health")
@@ -331,6 +342,40 @@ async def reset(request: Request):
                 return JSONResponse({"ok": False, "error": "seed must be an integer"}, status_code=400)
     await restart_sim(seed)
     return {"ok": True, "seed": seed}
+
+
+@app.post("/api/hazard")
+async def hazard(request: Request):
+    """Change the world now: {"type": "rockfall" | "sand" | "dust_storm" | "rover_fault", "rover": "r2"}
+    (rover optional). The rovers are not told; they have to notice through their sensors."""
+    runner = state.runner
+    if runner is None:
+        return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    body = (await request.body()).strip()
+    try:
+        data = json.loads(body) if body else {}
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return JSONResponse({"ok": False, "error": 'Body must be JSON like {"type": "rockfall", "rover": "r2"}'},
+                            status_code=400)
+    kind, rover = data.get("type"), data.get("rover")
+    if kind not in HAZARD_TYPES:
+        return JSONResponse({"ok": False, "error": f"unknown hazard type {kind!r} (use one of "
+                                                   f"{', '.join(HAZARD_TYPES)})"}, status_code=400)
+    if rover is not None and not isinstance(rover, str):
+        return JSONResponse({"ok": False, "error": "rover must be a rover id like \"r2\""}, status_code=400)
+
+    def trigger():
+        with runner.locked() as sim:
+            return sim.hazards.trigger(kind, rover)
+
+    try:
+        h = await asyncio.to_thread(trigger)
+    except HazardError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    _log(f"hazard {h['id']}: {h['type']}" + (f" on {h['rover']}" if h.get("rover") else ""))
+    return {"ok": True, "hazard": h}
 
 
 @app.websocket("/ws")

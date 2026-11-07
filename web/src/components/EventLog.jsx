@@ -15,20 +15,51 @@ function cleanMsg(msg, roverId, byId) {
   return out.replace(re, (id) => byId[id]?.name || id)
 }
 
-const EventRow = memo(function EventRow({ e, rover, live, byId }) {
+const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
+  const hazard = e.level === 'hazard'
+  const content = (
+    <>
+      <span className="ev-time">{mmss(e.t)}</span>
+      {hazard ? (
+        <svg className="ev-icon" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="M6 1.2 11 10.4H1z" />
+          <path d="M6 4.6v2.6M6 8.6v.1" />
+        </svg>
+      ) : (
+        <span className="ev-dot" style={rover ? { background: rover.color } : undefined} data-fleet={!rover || undefined} aria-hidden="true" />
+      )}
+      <span className="ev-text">
+        <span className="ev-who">{hazard ? 'Hazard' : rover ? rover.name : e.rover || 'Fleet'}</span>{' '}
+        <span className="ev-msg">{cleanMsg(e.msg, e.rover, byId)}</span>
+        {e.at && (
+          <span className="ev-goto" aria-hidden="true">
+            <svg viewBox="0 0 12 12">
+              <circle cx="6" cy="6" r="3.6" />
+              <path d="M6 .8v2M6 9.2v2M.8 6h2M9.2 6h2" />
+            </svg>
+          </span>
+        )}
+      </span>
+    </>
+  )
+  // Events with a location fly the camera there.
+  if (e.at && onFocus) {
+    return (
+      <li className="ev ev-link" data-level={e.level} data-live={live || undefined}>
+        <button type="button" className="ev-btn" onClick={() => onFocus(e)} title={`Show where this happened (${e.at[0].toFixed(0)}, ${e.at[1].toFixed(0)})`}>
+          {content}
+        </button>
+      </li>
+    )
+  }
   return (
     <li className="ev" data-level={e.level} data-live={live || undefined}>
-      <span className="ev-time">{mmss(e.t)}</span>
-      <span className="ev-dot" style={rover ? { background: rover.color } : undefined} data-fleet={!rover || undefined} aria-hidden="true" />
-      <span className="ev-text">
-        <span className="ev-who">{rover ? rover.name : e.rover || 'Fleet'}</span>{' '}
-        <span className="ev-msg">{cleanMsg(e.msg, e.rover, byId)}</span>
-      </span>
+      {content}
     </li>
   )
 })
 
-export function EventLog() {
+export function EventLog({ onFocusEvent }) {
   const events = useSim((s) => s.events)
   const meta = useSim((s) => s.roverMeta)
   const initSeq = useSim((s) => s.initSeq)
@@ -62,7 +93,7 @@ export function EventLog() {
         }}
       >
         {events.map((e) => (
-          <EventRow key={e.key} e={e} rover={e.rover ? byId[e.rover] : null} live={e.key > initSeq} byId={byId} />
+          <EventRow key={e.key} e={e} rover={e.rover ? byId[e.rover] : null} live={e.key > initSeq} byId={byId} onFocus={onFocusEvent} />
         ))}
         {!events.length && <li className="empty-note">Rover decisions and discoveries will appear here.</li>}
       </ol>

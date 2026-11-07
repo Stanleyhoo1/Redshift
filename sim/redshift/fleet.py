@@ -1,4 +1,5 @@
-"""Fleet level reasoning: shared map, frontier assignment, learned slope limit, targets, event log."""
+"""Fleet level reasoning: shared map, frontier assignment, learned slope limit, targets, soft ground
+reports, rover status (faults) and the event log."""
 from __future__ import annotations
 
 import math
@@ -8,7 +9,7 @@ import numpy as np
 
 from .config import Config
 from .mapping import FleetMap
-from .planner import astar, add_avoid, cost_grid, path_length, simplify
+from .planner import FAIL, PENDING, AStar, add_avoid, cost_grid, path_length, simplify
 from .terrain import KIND_LABEL, TargetSpec
 
 KIND_REASON = {
@@ -25,6 +26,9 @@ OVERLAP_RADIUS = 8.0
 OVERLAP_PENALTY = 22.0
 SAMPLE_BONUS = 14.0
 NEAR_ROVER_PENALTY = 8.0
+DEGRADED_DIST_K = 2.5       # a rover that cannot see far weighs distance this much more
+DEGRADED_MAX_GOAL = 14.0    # and avoids frontiers farther than this (unless there is nothing closer)
+SEARCH_TTL = 3.0            # an unfinished plan older than this (sim s) is dropped and restarted
 
 
 def compass(dx: float, dy: float) -> str:
@@ -77,17 +81,28 @@ class Fleet:
         self.reach_t = -1e9
         self.plan_calls = 0
         self.plan_expansions = 0
+        self.plan_slices = 0
+        self._costs: dict = {}             # (limit, limit_version, unknown_cost) -> (grid, t)
+        self.soft_zones: list = []         # [(x, y, radius, rover id, t)] soft ground found by wheel slip
+        self.orphan = None                 # (x, y, rover id, t): area a faulted rover had to drop
+        self.hazards = None                # set by the sim; only told about soft zones (for the UI)
 
     # ------------------------------------------------------------------ events
-    def log(self, t: float, level: str, msg: str, rover: str | None = None) -> None:
+    def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None) -> None:
         self.event_seq += 1
-        self.events.append({"t": round(float(t), 1), "rover": rover, "level": level, "msg": msg, "_seq": self.event_seq})
+        e = {"t": round(float(t), 1), "rover": rover, "level": level, "msg": msg, "_seq": self.event_seq}
+        if at is not None:
+            e["at"] = [round(float(at[0]), 1), round(float(at[1]), 1)]
+        self.events.append(e)
         if len(self.events) > 400:
             del self.events[:100]
 
     @staticmethod
     def public_event(e: dict) -> dict:
-        return {"t": e["t"], "rover": e["rover"], "level": e["level"], "msg": e["msg"]}
+        out = {"t": e["t"], "rover": e["rover"], "level": e["level"], "msg": e["msg"]}
+        if "at" in e:
+            out["at"] = e["at"]
+        return out
 
     # ------------------------------------------------------------------ periodic
     def update(self, t: float) -> None:
@@ -155,7 +170,8 @@ class Fleet:
                 self.log(t, "info", "New frontier spotted. Resuming exploration.")
             return
         usable = self.usable_frontiers(t)
-        busy = any(r.state in ("exploring", "investigating") and r.goal is not None for r in self.rovers)
+        busy = any((r.state in ("exploring", "investigating") and r.goal is not None) or r.state == "fault"
+                   for r in self.rovers)
         if usable or busy or t < 30.0:
             self.no_frontier_since = None
             return
@@ -172,30 +188,63 @@ class Fleet:
     def _bucket(self, x: float, y: float) -> tuple:
         return (int(math.floor(x / 4.0)), int(math.floor(y / 4.0)))
 
-    def cost(self, t: float, limit: float | None = None) -> np.ndarray:
+    def cost(self, t: float, limit: float | None = None, unknown_cost: float = 1.0) -> np.ndarray:
+        """Cost grid for planning, cached for 0.6 s. The default grid (current limit, normal
+        unknown cost) is also kept as self._cost for quick path checks."""
         lim = self.slope_limit if limit is None else limit
-        key = (lim, self.limit_version)
-        if self._cost is None or key != self._cost_key or t - self._cost_t > 0.6:
-            self._cost = cost_grid(self.map, lim)
-            self._cost_key = key
-            self._cost_t = t
-        return self._cost
+        key = (lim, self.limit_version, unknown_cost)
+        hit = self._costs.get(key)
+        if hit is None or t - hit[1] > 0.6 or t < hit[1]:
+            grid = cost_grid(self.map, lim, unknown_cost=unknown_cost)
+            if len(self._costs) > 6:
+                self._costs.clear()
+            self._costs[key] = (grid, t)
+            if key == (self.slope_limit, self.limit_version, 1.0):
+                self._cost, self._cost_key, self._cost_t = grid, key, t
+            return grid
+        return hit[0]
+
+    def invalidate_costs(self) -> None:
+        self._cost = None
+        self._costs.clear()
 
     def plan(self, t: float, rover, goal: tuple, relax: float = 0.0, max_exp: int = 14000):
-        """Plan from the rover to goal (x, y). Returns list of (x, y) waypoints (dense) or None."""
-        lim = self.slope_limit + relax
-        base = self.cost(t, lim) if relax == 0.0 else cost_grid(self.map, lim, unknown_cost=0.6)
-        others = [(o.x, o.y, 1.3 if (o.speed < 0.05 or o.state in ("idle", "charging")) else 0.9)
-                  for o in self.rovers if o is not rover]
-        mult = add_avoid(base, self.map, others)
-        s = self.map.ij(rover.x, rover.y)
+        """Plan from the rover to goal (x, y). Returns a list of (x, y) waypoints, None if there is
+        no path, or PENDING if the rover's compute budget for this cycle ran out first (the search
+        resumes on the next call with the same goal)."""
         g = self.map.ij(goal[0], goal[1])
-        self.plan_calls += 1
-        cells, exp = astar(mult, s, g, max_expansions=max_exp)
-        self.plan_expansions += exp
-        if cells is None:
+        key = (g, round(relax, 1))
+        fail = rover.plan_fails.get(key)
+        if fail is not None and t - fail[0] < 2.0 and math.hypot(rover.x - fail[1], rover.y - fail[2]) < 1.0:
+            return None                     # same question, same answer a moment ago
+        srch = rover.searches.get(key)
+        if srch is not None and (srch.limit_version != self.limit_version or t - srch.t0 > SEARCH_TTL
+                                 or math.hypot(rover.x - srch.sx, rover.y - srch.sy) > 1.0):
+            srch = None
+        if srch is None:
+            lim = self.slope_limit + relax
+            unk = self.cfg.degraded_unknown_cost if rover.degraded else (0.6 if relax > 0 else 1.0)
+            base = self.cost(t, lim, unk)
+            others = [(o.x, o.y, 1.3 if (o.speed < 0.05 or o.state in ("idle", "charging", "fault")) else 0.9)
+                      for o in self.rovers if o is not rover]
+            mult = add_avoid(base, self.map, others)
+            srch = AStar(mult, self.map.ij(rover.x, rover.y), g, max_expansions=max_exp)
+            srch.t0, srch.sx, srch.sy, srch.limit_version = t, rover.x, rover.y, self.limit_version
+            self.plan_calls += 1
+        deadline, cap = rover.plan_limits()
+        exp0 = srch.exp
+        status = srch.run(deadline, max_exp=cap)
+        rover.exp_used += srch.exp - exp0
+        self.plan_slices += 1
+        if status is PENDING:
+            rover.searches[key] = srch
+            return PENDING
+        rover.searches.pop(key, None)
+        self.plan_expansions += srch.exp
+        if status == FAIL:
+            rover.plan_fails[key] = (t, rover.x, rover.y)
             return None
-        pts = [self.map.xy(i, j) for (i, j) in cells]
+        pts = [self.map.xy(i, j) for (i, j) in srch.cells()]
         pts[-1] = (float(goal[0]), float(goal[1]))
         return simplify(pts) if len(pts) > 2 else pts
 
@@ -208,6 +257,101 @@ class Fleet:
             if c[j, i] == math.inf:
                 return True
         return False
+
+    def blocked_ahead(self, t: float, rover, limit: float, near_m: float = 12.0, horizon: int = 8):
+        """Walk the rover's remaining path. Within near_m metres every segment is sampled; further on
+        only the next waypoints are checked. Returns None or (x, y, metres ahead, reason) for the
+        first sample that is now impassable. reason: "rocks" (ground that changed under a recent
+        rockfall, seen by LiDAR), "soft" (soft ground a rover reported) or "terrain" (steep ground
+        that was unknown when the path was planned)."""
+        pts = rover.path
+        if not pts:
+            return None
+        m = self.map
+        known, slope, blocked, soft = m.known, m.slope, m.blocked, m.soft
+        start = pts[0]
+        si, sj = m.ij(start[0], start[1])
+        end = pts[-1]
+
+        def bad(x, y):
+            i, j = m.ij(x, y)
+            if abs(i - si) <= 2 and abs(j - sj) <= 2:
+                return None          # the planner's escape zone around the path start
+            if soft[j, i]:
+                return "soft"
+            if blocked[j, i] or (known[j, i] and slope[j, i] > limit):
+                # new rocks: several samples near here changed lately (a boulder changes many)
+                return "rocks" if m.recently_changed(i, j, t - 20.0, r=3, min_count=2) else "terrain"
+            return None
+
+        px, py = rover.x, rover.y
+        along = 0.0
+        step = 0.3
+        for k in range(max(rover.wp, 1), len(pts)):
+            bx, by = pts[k]
+            L = math.hypot(bx - px, by - py)
+            n = max(1, int(L / step))
+            for q in range(1, n + 1):
+                f = q / n
+                x, y = px + f * (bx - px), py + f * (by - py)
+                d = along + f * L
+                if d < 1.0 or math.hypot(x - end[0], y - end[1]) < 0.6:
+                    continue
+                why = bad(x, y)
+                if why is not None:
+                    return (x, y, d, why)
+            along += L
+            px, py = bx, by
+            if along > near_m:
+                for (x, y) in pts[k + 1:k + 1 + horizon]:
+                    if math.hypot(x - end[0], y - end[1]) < 0.6:
+                        continue
+                    why = bad(x, y)
+                    if why is not None:
+                        return (x, y, along, why)
+                break
+        return None
+
+    # ------------------------------------------------------------------ soft ground (from wheel slip)
+    def add_soft_zone(self, t: float, rover, x: float, y: float, radius: float) -> None:
+        self.soft_zones.append((float(x), float(y), float(radius), rover.id, float(t)))
+        self.map.mark_soft(x, y, radius)
+        self.invalidate_costs()
+        self.frontiers_t = -1e9
+        self.reach_t = -1e9
+        if self.hazards is not None:
+            self.hazards.on_soft_zone(x, y, radius)
+
+    def soft_zone_at(self, x: float, y: float, margin: float = 0.5):
+        for z in self.soft_zones:
+            if math.hypot(x - z[0], y - z[1]) <= z[2] + margin:
+                return z
+        return None
+
+    # ------------------------------------------------------------------ rover status
+    def rover_faulted(self, t: float, rover) -> None:
+        """A rover reported that its motors are offline: free everything it had claimed so the
+        others can re-plan and take over."""
+        area = rover.goal if (rover.goal is not None and rover.state in ("exploring", "investigating")) \
+            else (rover.x, rover.y)
+        self.orphan = (float(area[0]), float(area[1]), rover.id, t)
+        for o in self.rovers:
+            if o is not rover:
+                o.next_goal_eval = t        # everyone reconsiders their goal now
+                o.next_target_check = t
+                o.plan_t = -1e9
+
+    def takeover_note(self, t: float, rover, goal: tuple) -> None:
+        if self.orphan is None:
+            return
+        ox, oy, rid, t0 = self.orphan
+        if t - t0 > 40.0:
+            self.orphan = None
+            return
+        if rid != rover.id and math.hypot(goal[0] - ox, goal[1] - oy) < 12.0:
+            self.orphan = None
+            self.log(t, "info", f"{rover.id} takes over {rid}'s area {math.hypot(goal[0] - rover.x, goal[1] - rover.y):.0f} m "
+                                f"{compass(goal[0] - rover.x, goal[1] - rover.y)}.", rover.id, at=goal)
 
     def segment_blocked(self, a: tuple, b: tuple) -> bool:
         """True if the straight segment a->b crosses an impassable sample (current cost grid)."""
@@ -230,6 +374,7 @@ class Fleet:
         if self.complete or not self.frontiers:
             return None
         cands = []
+        w_dist = W_DIST * (DEGRADED_DIST_K if rover.degraded else 1.0)
         reach = self.reach.ravel() if (self.reach is not None and self.in_reach(rover.x, rover.y)) else None
         skipped_battery = 0
         for (x, y, size, idx) in self.frontiers:
@@ -243,10 +388,12 @@ class Fleet:
                 continue
             # battery feasibility: get there and then home with margin
             need = rover.energy_for_distance(d * 1.3 + math.hypot(x, y) * 1.3)
-            if need + self.cfg.battery_margin > rover.battery:
+            if need + rover.battery_margin > rover.battery:
                 skipped_battery += 1
                 continue
-            u = W_SIZE * min(size, 40) - W_DIST * d
+            u = W_SIZE * min(size, 40) - w_dist * d
+            if rover.degraded and d > DEGRADED_MAX_GOAL:
+                u -= 200.0                  # only if nothing nearer can be reached
             ang = abs(math.atan2(math.sin(math.atan2(y - rover.y, x - rover.x) - rover.yaw),
                                  math.cos(math.atan2(y - rover.y, x - rover.x) - rover.yaw)))
             u -= W_TURN * ang
@@ -264,8 +411,18 @@ class Fleet:
         if not cands and skipped_battery:
             rover.goal_fail_reason = "battery"
         cands.sort(key=lambda c: -c[0])
-        for (u, x, y, size, key) in cands[:max_tries]:
+        cands = cands[:max_tries]
+        # a plan that ran out of time last cycle is finished first (anytime planning)
+        pk = rover.pending_goal_key
+        if pk is not None:
+            first = [c for c in cands if c[4] == pk]
+            cands = first + [c for c in cands if c[4] != pk]
+        rover.pending_goal_key = None
+        for (u, x, y, size, key) in cands:
             path = self.plan(t, rover, (x, y))
+            if path is PENDING:
+                rover.pending_goal_key = key
+                return PENDING
             if path is not None:
                 return (x, y), path, size
             rover.blacklist[key] = t + 40.0     # unreachable from here; other rovers may still get there
@@ -284,16 +441,24 @@ class Fleet:
         ts.found_t = t
         label = KIND_LABEL[ts.spec.kind]
         dirn = compass(ts.spec.x - rover.x, ts.spec.y - rover.y)
+        at = (ts.spec.x, ts.spec.y)
         if rover.can_investigate(t, ts):
             ts.status = "investigating"
             ts.investigator = rover.id
             rover.start_investigation(t, tidx)
-            self.log(t, "discovery", f"{rover.id} spotted a possible {label} ({ts.spec.id}) {dist:.0f} m {dirn}. "
-                                     f"Moving in to sample it.", rover.id)
+            self.log(t, "discovery", f"{rover.id} spectrometer flags a possible {label} ({ts.spec.id}) {dist:.0f} m "
+                                     f"{dirn}. Moving in to sample it.", rover.id, at=at)
         else:
-            why = "battery too low" if rover.state == "returning" or rover.battery < 0.35 else "busy"
-            self.log(t, "discovery", f"{rover.id} spotted a possible {label} ({ts.spec.id}) {dist:.0f} m {dirn}. "
-                                     f"Logged for later ({why}).", rover.id)
+            if rover.state == "returning" or rover.battery < 0.35:
+                why = "battery too low"
+            elif rover.degraded:
+                why = "LiDAR degraded, staying on mapped ground"
+            elif rover.state == "fault":
+                why = "motors offline"
+            else:
+                why = "busy"
+            self.log(t, "discovery", f"{rover.id} spectrometer flags a possible {label} ({ts.spec.id}) {dist:.0f} m "
+                                     f"{dirn}. Logged for later ({why}).", rover.id, at=at)
 
     def unclaimed_target(self, t: float, rover):
         best, bd = None, 1e9
@@ -310,34 +475,38 @@ class Fleet:
         ts.investigator = None
         self.sampled_points.append((ts.spec.x, ts.spec.y))
         label = KIND_LABEL[ts.spec.kind]
-        self.log(t, "discovery", f"{rover.id} sampled {label} {ts.spec.id}. {KIND_REASON[ts.spec.kind]}", rover.id)
+        self.log(t, "discovery", f"{rover.id} sampled {label} {ts.spec.id}. {KIND_REASON[ts.spec.kind]}", rover.id,
+                 at=(ts.spec.x, ts.spec.y))
 
-    def release_target(self, t: float, rover, tidx: int, reason: str | None = None) -> None:
+    def release_target(self, t: float, rover, tidx: int, reason: str | None = None, retry_s: float = 20.0) -> None:
         ts = self.targets[tidx]
         if ts.status == "investigating" and ts.investigator == rover.id:
             ts.status = "found"
             ts.investigator = None
-            ts.retry_after = t + 20.0
+            ts.retry_after = t + retry_s
             if reason:
-                self.log(t, "info", f"{rover.id} left {ts.spec.id} for later: {reason}.", rover.id)
+                self.log(t, "info", f"{rover.id} left {ts.spec.id} for later: {reason}.", rover.id,
+                         at=(ts.spec.x, ts.spec.y))
 
     # ------------------------------------------------------------------ learning
-    def report_slope_stall(self, t: float, rover, slope_deg: float) -> bool:
+    def report_slope_stall(self, t: float, rover, slope_deg: float, load: float | None = None) -> bool:
         """A rover could not climb a slope. Returns True if the fleet limit was lowered."""
         measured = int(round(slope_deg))
         floor = max(self.cfg.slope_limit_floor_deg, math.floor(self.best_climb))
         new = max(floor, measured - 2)
+        why = f"slope {measured} deg" + (f" with motors at {load * 100:.0f}%" if load is not None else "")
         if new < self.slope_limit - 0.01:
             self.slope_limit = float(new)
             self.limit_version += 1
-            self._cost = None
-            msg = f"{rover.id} stalled on a {measured} deg slope. Lowering fleet slope limit to {new:.0f} deg."
+            self.invalidate_costs()
+            msg = f"{rover.id} stalled ({why}). Lowering fleet slope limit to {new:.0f} deg."
             if self.best_climb >= 1.0:
                 msg += f" Steepest successful climb so far: {math.floor(self.best_climb)} deg."
-            self.log(t, "warn", msg, rover.id)
+            self.log(t, "warn", msg, rover.id, at=(rover.x, rover.y))
             self.frontiers_t = -1e9   # recompute frontiers with the new limit
             return True
-        self.log(t, "warn", f"{rover.id} stalled on a {measured} deg slope. Backing off and replanning.", rover.id)
+        self.log(t, "warn", f"{rover.id} stalled ({why}). Backing off and replanning.", rover.id,
+                 at=(rover.x, rover.y))
         return False
 
     def record_climb(self, t: float, rover, pitch_deg: float) -> None:
@@ -355,6 +524,9 @@ class Fleet:
             "targets_found": found,
             "targets_total": len(self.targets),
             "sim_speed": float(self.cfg.sim_speed),
+            "budget_ms": round(float(self.cfg.brain_budget_ms), 1),
+            "cycle_ms": round(1000.0 / self.cfg.agent_hz, 1),
+            "soft_zones": [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in self.soft_zones],
         }
 
     def discovered_targets(self) -> list:

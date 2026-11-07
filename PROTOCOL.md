@@ -83,6 +83,83 @@ Sent about 5 times per wall-clock second.
 - `targets`: full list of targets discovered so far (never undiscovered ones). `status`: `"found" | "investigating" | "sampled"`. `kind`: `"mineral" | "ice" | "vent"`.
 - `events`: only new events since the last tick. `level`: `"info" | "warn" | "discovery"`. `rover` may be `null` for fleet-wide events.
 
+## Version 2 additions (hazards, sensors, edge budget)
+
+All fields below are additions. Clients must tolerate them being missing (older sims).
+
+### Rover additions (in every `tick.rovers[]` entry)
+
+```json
+{
+  "state": "fault",
+  "sensors": {
+    "lidar_range": 8.0, "lidar_hits": 812,
+    "pitch": 3.1, "roll": -1.2,
+    "wheel_speed": 0.62, "ground_speed": 0.58, "slip": 0.06,
+    "motor_load": 0.41,
+    "spectro": {"id": "t3", "dist": 6.2}
+  },
+  "scan": [1.2, 3.4, 0.1, 1.3, 3.6, 0.2],
+  "brain": {"last_ms": 4.2, "avg_ms": 5.1, "peak_ms": 17.8, "over": 0}
+}
+```
+
+- New state `"fault"`: motors disabled by a hazard; the rover is a parked obstacle until it reboots.
+- `sensors` (what the rover's own sensors read this cycle):
+  - `lidar_range`: current effective LiDAR range in m (drops in a dust storm). `lidar_hits`: returns in the last sweep.
+  - `pitch`, `roll`: degrees, from the simulated IMU (nose up = positive pitch, right side down = positive roll).
+  - `wheel_speed`: average wheel surface speed from the wheel encoders, m/s. `ground_speed`: actual body speed over ground, m/s.
+  - `slip`: 0 to 1, how much the wheels spin without moving the rover (0 = full grip).
+  - `motor_load`: 0 to 1, average absolute motor torque as a fraction of the torque cap.
+  - `spectro`: nearest target the spectrometer currently sees, or `null`.
+- `scan`: points from the rover's most recent LiDAR sweep, flat `[x, y, z, x, y, z, ...]` in world metres, 1 decimal, at most 300 points (downsampled).
+- `brain`: compute used by this rover's decision making (perception processing, mapping, planning, decisions; NOT the simulated sensor hardware), in ms: `last_ms` last cycle, `avg_ms` and `peak_ms` over the last 10 sim seconds, `over` = cycles over budget in that window.
+
+### Fleet additions (`fleet` in `init` and `tick`)
+
+```json
+{"budget_ms": 40.0, "cycle_ms": 200.0, "soft_zones": [[12.0, -4.5, 2.5]]}
+```
+
+- `budget_ms`: stated per-rover compute budget per decision cycle. `cycle_ms`: decision cycle length (sim time).
+- `soft_zones`: soft ground the fleet has detected through wheel slip, `[x, y, radius]` (what the fleet believes, not ground truth).
+
+### Hazards (`hazards` in `init` and `tick`)
+
+Full list of hazards in the current sim (small, sent every tick):
+
+```json
+[
+  {"id": "h1", "type": "rockfall", "t": 120.0, "x": 5.0, "y": 8.0, "radius": 3.0, "rover": "r2",
+   "rocks": [[4.2, 7.5, 0.6, 0.5], [5.6, 8.4, 0.7, 0.6]], "active": true},
+  {"id": "h2", "type": "sand", "t": 150.0, "x": -6.0, "y": 3.0, "radius": 2.5, "rover": "r1", "known": false, "active": true},
+  {"id": "h3", "type": "dust_storm", "t": 200.0, "remaining": 45.0, "active": true},
+  {"id": "h4", "type": "rover_fault", "t": 260.0, "rover": "r3", "remaining": 60.0, "active": true}
+]
+```
+
+- `type`: `"rockfall" | "sand" | "dust_storm" | "rover_fault"`. `t`: sim time it started. `rover`: the rover it was aimed at, or null.
+- `rockfall.rocks`: true boulder positions `[x, y, z_centre, radius]`. Boulders drop in over about 1 s from `t`.
+- `sand`: hidden soft ground (LiDAR cannot see it). `known`: true once any rover has detected it by wheel slip.
+- `dust_storm` and `rover_fault` have `remaining` sim seconds and become `"active": false` when over (they may then be dropped from the list).
+- Rovers never read this list. They only learn about hazards through their sensors (LiDAR sees boulders, wheel slip reveals sand, LiDAR returns shrink in dust, a faulted rover's status is shared with the fleet).
+
+### Event additions
+
+- New level `"hazard"`: an environment change (always `rover: null`), e.g. "Rockfall on Rover 2's route."
+- Optional `"at": [x, y]`: where the event happened, so the UI can fly the camera there.
+
+### `POST /api/hazard`
+
+Body: `{"type": "rockfall" | "sand" | "dust_storm" | "rover_fault", "rover": "r2"}` (`rover` optional: the sim picks a good one).
+Returns `{"ok": true, "hazard": {...}}` (same shape as in `hazards`), or HTTP 400 with `{"ok": false, "error": "..."}` (unknown type, no valid placement, every rover already faulted).
+
+### `GET /api/camera/{rover_id}.jpg`
+
+Live image rendered by MuJoCo from the rover's point of view, at the current sim state.
+Query: `view=fpv` (onboard camera on the mast, looking forward, default) or `view=chase` (behind and above the rover, showing the rover itself), `w` and `h` (pixels, default 320 x 240, max 640 x 480).
+Returns `image/jpeg`. 404 for an unknown rover, 503 with a JSON error if rendering is unavailable on this machine. The UI polls it a few times a second for the selected rover only.
+
 ## HTTP
 
 - `GET /api/health` -> `{"ok": true}`
@@ -104,4 +181,5 @@ Nothing required. The server must ignore any text the client sends.
 | `MAP_SIZE` | 80 | map width in metres |
 | `GRAVITY_G` | 2.0 | gravity in Earth g |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer (only when running outside Docker) |
+| `BRAIN_BUDGET_MS` | 40 | stated compute budget per rover per decision cycle |
 | `AUTO_RESET_S` | 60 | after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` (0 = off) |

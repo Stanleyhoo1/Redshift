@@ -10,7 +10,7 @@ Vite + React + three.js (@react-three/fiber, drei). Node 22.
 
 ```sh
 npm install
-npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G)
+npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS)
 npm run dev       # in a second terminal, then open http://localhost:5173
 ```
 
@@ -32,9 +32,31 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
 
 ## Using it
 
-- Toggles: Reality (ground truth overlay), Frontiers, Paths, Slope colours.
-- Follow a rover with the buttons or by clicking its card; Off returns to the overview.
-- Keys: `R` `F` `P` `S` toggle layers, `1` to `9` follow a rover, `0` or `Esc` for the overview.
+- Toggles: Reality (ground truth overlay), Frontiers, Paths, Slope colours, LiDAR (each
+  rover's latest sweep as points in its colour).
+- Select a rover (its card, its 3D model or name tag, a Follow button, or `1` to `9`): the
+  camera follows it and its live sensor panel opens over the lower left of the view:
+  camera (FPV or Chase, about 4 frames a second), a LiDAR scope (rover at the centre facing
+  up, returns coloured by height, the dashed ring is the current range), IMU attitude,
+  wheel speed against ground speed with slip and motor load (slip holds its peak for a few
+  seconds), spectrometer, battery, and brain time against the stated budget. `Esc` or the
+  close button hides the panel; clicking the selected card again returns to the overview.
+- Hazards (top right): Rockfall, Soft sand, Dust storm, Motor fault, aimed at a rover or
+  Auto. The sim's own error text shows inline if it refuses. Rovers are never told: they
+  find out through LiDAR (boulders, dust), wheel slip (sand) or fleet status (faults).
+  On screen: boulders drop in, the fleet's soft zones are hatched (the true patch is a
+  dashed outline with Reality on), a dust storm hazes the view with a banner, a faulted
+  rover blinks red and its card counts down.
+- Event log rows with a target icon fly the camera to where it happened. Hazards are red.
+- Keys: `R` `F` `P` `S` `L` toggle layers, `1` to `9` select a rover, `Esc` closes the
+  sensor panel (then returns to the overview), `0` for the overview.
 - Reset sim asks for confirmation, then restarts the sim with a random seed.
-- The overview keeps the explored area in frame. Dragging or zooming takes over the
-  camera until you press Off (or the sim resets).
+- The overview keeps the explored area in frame, in the space the panels leave free.
+  Dragging or zooming takes over the camera until you press Off (or the sim resets).
+- Every version 2 field is optional: with an older sim the panel shows dashes, the camera
+  says it is unavailable and the hazard buttons say the sim does not support them.
+
+The mock implements all of version 2 (sensors from a ray-marched LiDAR over its heightmap,
+brain timings, `POST /api/hazard` with plausible reactions). Its camera endpoint answers
+503 on purpose. `node scripts/v2-shots.mjs` (mock and preview running) clicks through every
+hazard and saves screenshots; set `WIDTH` and `HEIGHT` for other sizes.

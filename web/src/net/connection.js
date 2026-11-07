@@ -109,6 +109,49 @@ export async function loadTruth(gen) {
   }
 }
 
+// POST /api/hazard (PROTOCOL.md, version 2). Resolves with the server's hazard, or
+// throws an Error carrying the server's own error text (HTTP 400) when it refuses.
+export async function postHazard(type, rover) {
+  const body = rover ? { type, rover } : { type }
+  let res
+  try {
+    res = await fetch('/api/hazard', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch {
+    throw new Error('Could not reach the sim')
+  }
+  const j = parseMessage(await res.text().catch(() => '')) || {}
+  if (!res.ok || j.ok === false) {
+    if (res.status === 404 || res.status === 405) throw new Error('This sim does not support hazards yet')
+    // FastAPI validation errors carry a list in `detail`.
+    const detail = Array.isArray(j.detail) ? j.detail[0]?.msg : j.detail
+    throw new Error(j.error || (typeof detail === 'string' ? detail : '') || `Hazard refused (HTTP ${res.status})`)
+  }
+  return j.hazard || null
+}
+
+// One frame from GET /api/camera/{id}.jpg. Resolves with a Blob, or throws an Error
+// whose `status` is the HTTP status (0 for a network failure).
+export async function fetchCameraFrame(id, view, w, h, signal) {
+  const url = `/api/camera/${encodeURIComponent(id)}.jpg?view=${view}&w=${w}&h=${h}&_=${Date.now()}`
+  let res
+  try {
+    res = await fetch(url, { cache: 'no-store', signal })
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err
+    throw Object.assign(new Error('No connection to the sim'), { status: 0 })
+  }
+  const type = res.headers.get('content-type') || ''
+  if (!res.ok || !type.startsWith('image/')) {
+    const j = parseMessage(await res.text().catch(() => '')) || {}
+    throw Object.assign(new Error(j.error || j.detail || `HTTP ${res.status}`), { status: res.status })
+  }
+  return res.blob()
+}
+
 export async function resetSim(seed) {
   const res = await fetch('/api/reset', {
     method: 'POST',

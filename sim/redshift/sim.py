@@ -1,10 +1,12 @@
 """Simulation: owns the terrain, the MuJoCo world, the shared map, the fleet and the rovers.
 
-One call to step() advances physics by one agent period (1 / agent_hz sim seconds), then runs the
-fleet planner and every rover's decision tick. The server calls it from a background thread; the
-CLI below runs it flat out:
+One call to step() advances physics by one agent period (1 / agent_hz sim seconds), then runs every
+rover's decision tick. One rover per cycle (rotating) is on "fleet duty" and also refreshes the
+shared frontiers and reachability, so that shared work counts toward a rover's compute budget.
+The server calls step() from a background thread; the CLI below runs it flat out and can script
+hazards:
 
-    python -m redshift.sim --seconds 300 [--seed N]
+    python -m redshift.sim --seconds 300 [--seed N] [--hazard rockfall@60] [--hazard sand@120:r1]
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ import numpy as np
 
 from .config import ROVER_COLORS, Config
 from .fleet import Fleet
+from .hazards import HazardError, HazardManager
 from .mapping import FleetMap
 from .rover import Rover
 from .terrain import Terrain
@@ -53,9 +56,12 @@ class Simulation:
 
         self.map = FleetMap(cfg)
         self.fleet = Fleet(cfg, self.map, self.terrain.targets)
+        self.hazards = None
         self.rovers = [Rover(self, k, rid, f"Rover {k + 1}", color, docks[k])
                        for k, (rid, _x, _y, _yaw, color) in enumerate(spawns)]
         self.fleet.rovers = self.rovers
+        self.hazards = HazardManager(self)
+        self.fleet.hazards = self.hazards
 
         # per rover motor energy bookkeeping (actuator ids and wheel dof ids, shape n x 4)
         self._act = np.array([r.acts for r in self.rovers], dtype=np.int64).reshape(n, 4)
@@ -72,6 +78,7 @@ class Simulation:
         self._half = (cfg.nx - 1) * cfg.res / 2.0
         self._event_cursor = 0          # _seq of the last event handed out in a tick message
         self._truth_json = None
+        self._truth_version = -1
         self.flips = 0
 
         # rovers start on the pad: one tick so the map has the lander area in it from the start
@@ -93,8 +100,12 @@ class Simulation:
         act, dof, energy = self._act, self._dof, self.energy
         t_start = float(d.time)
         self._snap_qpos[:] = d.qpos
+        hz = self.hazards
         c0 = time.perf_counter()
+        hz.update_physics(t_start)
         for _ in range(self.steps_per_tick):
+            if hz.drops:
+                hz.animate(float(d.time))
             mujoco.mj_step(m, d)
             f = d.actuator_force[act]
             energy += (np.abs(f * d.qvel[dof]) + k_heat * f * f).sum(axis=1) * dt
@@ -102,12 +113,15 @@ class Simulation:
         if d.time < t_start + 0.5 * self.agent_dt or not np.isfinite(d.qpos).all() or not np.isfinite(d.qvel).all():
             self._recover_physics(t_start)
         self._check_rovers_in_world()
-        c1 = time.perf_counter()
         t = float(d.time)
-        self.fleet.update(t)
-        for k, r in enumerate(self.rovers):
-            r.tick(t, self.agent_dt, float(energy[k]))
-            energy[k] = 0.0
+        hz.step(t)
+        c1 = time.perf_counter()
+        n = len(self.rovers)
+        s0 = self.ticks % n
+        for k in range(n):
+            r = self.rovers[(s0 + k) % n]
+            r.tick(t, self.agent_dt, float(energy[r.idx]), duty=(k == 0))
+            energy[r.idx] = 0.0
         self.ticks += 1
         c2 = time.perf_counter()
         self.prof["physics"] += c1 - c0
@@ -206,6 +220,7 @@ class Simulation:
             "targets": self.fleet.discovered_targets(),
             "events": evs,
             "fleet": self.fleet.stats(),
+            "hazards": self.hazards.to_msgs(self.t),
         }
 
     def tick_message(self) -> dict:
@@ -221,20 +236,26 @@ class Simulation:
             "targets": self.fleet.discovered_targets(),
             "events": self._new_events(),
             "fleet": self.fleet.stats(),
+            "hazards": self.hazards.to_msgs(self.t),
         }
+
+    def truth_heights(self) -> np.ndarray:
+        """True heights: terrain, rocks and any rockfall boulders."""
+        return self.hazards.truth_heights(self.terrain.truth_heights)
 
     def truth_payload(self) -> dict:
         cfg = self.cfg
         return {
             "nx": cfg.nx, "ny": cfg.ny, "res": cfg.res,
             "origin": [float(cfg.origin[0]), float(cfg.origin[1])],
-            "heights": np.round(self.terrain.truth_heights.astype(np.float64), 2).ravel().tolist(),
+            "heights": np.round(self.truth_heights().astype(np.float64), 2).ravel().tolist(),
             "targets": [{"id": t.id, "x": round(t.x, 2), "y": round(t.y, 2), "kind": t.kind}
                         for t in self.terrain.targets],
         }
 
     def truth_json(self) -> str:
-        if self._truth_json is None:
+        if self._truth_json is None or self._truth_version != self.hazards.version:
+            self._truth_version = self.hazards.version
             self._truth_json = json.dumps(self.truth_payload(), separators=(",", ":"))
         return self._truth_json
 
@@ -256,6 +277,22 @@ class Simulation:
                         "odometer_m": round(r.odometer, 1)} for r in self.rovers],
         }
 
+    def brain_stats(self) -> dict:
+        """Per rover brain time over the whole run (ms): avg, p95, max, cycles over budget."""
+        out = {}
+        for r in self.rovers:
+            a = np.array(r.brain_all) if r.brain_all else np.zeros(1)
+            out[r.id] = {"avg": float(a.mean()), "p95": float(np.percentile(a, 95)), "max": float(a.max()),
+                         "over": int((a > self.cfg.brain_budget_ms).sum()), "cycles": len(r.brain_all)}
+        return out
+
+
+def parse_hazard(spec: str):
+    """'rockfall@60', 'sand@120:r1' -> (type, sim time, rover id or None)."""
+    kind, _, rest = spec.partition("@")
+    when, _, rover = rest.partition(":")
+    return kind.strip(), float(when or 0.0), (rover.strip() or None)
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Run the Redshift simulation headless, as fast as possible.")
@@ -264,13 +301,29 @@ def main(argv=None) -> int:
     ap.add_argument("--rovers", type=int, default=None, help="number of rovers (default: NUM_ROVERS or 3)")
     ap.add_argument("--report-every", type=float, default=60.0, help="progress line every N sim seconds (0 = off)")
     ap.add_argument("--quiet", action="store_true", help="do not print the event log")
+    ap.add_argument("--hazard", action="append", default=[], metavar="TYPE@T[:ROVER]",
+                    help="trigger a hazard at sim time T, e.g. rockfall@60, sand@120:r1, dust_storm@200, "
+                         "rover_fault@260:r3 (repeatable; retried for up to 60 s if it cannot be placed)")
+    ap.add_argument("--ticks", action="store_true", help="build a tick message every 0.6 sim s and report its size")
+    ap.add_argument("--model-clock", action="store_true",
+                    help="cap planning by counted A* expansions instead of the wall clock (repeatable runs)")
+    ap.add_argument("--budget-ms", type=float, default=None, help="brain budget per rover per cycle (default: "
+                                                                  "BRAIN_BUDGET_MS or 40)")
     args = ap.parse_args(argv)
+    try:
+        plan = sorted((parse_hazard(h) for h in args.hazard), key=lambda h: h[1])
+    except ValueError:
+        ap.error("--hazard must look like TYPE@SECONDS or TYPE@SECONDS:ROVER")
 
     overrides = {}
     if args.seed is not None:
         overrides["seed"] = args.seed
     if args.rovers is not None:
         overrides["num_rovers"] = max(1, min(8, args.rovers))
+    if args.model_clock:
+        overrides["plan_clock"] = "model"
+    if args.budget_ms is not None:
+        overrides["brain_budget_ms"] = max(1.0, args.budget_ms)
     cfg = Config.from_env(**overrides)
 
     w0 = time.perf_counter()
@@ -280,9 +333,28 @@ def main(argv=None) -> int:
           f"{len(sim.terrain.targets)} targets (built in {build_s:.2f} s)")
     w1 = time.perf_counter()
     next_report = args.report_every if args.report_every > 0 else float("inf")
+    pending = [[k, when, rover, when] for (k, when, rover) in plan]    # last field: next try
+    sizes = []
+    next_msg = 0.6
     try:
         while sim.t < args.seconds - 1e-9:
             sim.step()
+            for hp in list(pending):
+                if sim.t >= hp[3]:
+                    try:
+                        h = sim.hazards.trigger(hp[0], hp[2])
+                        print(f"  t={sim.t:6.1f}s hazard {h['id']} {h['type']}"
+                              f"{' on ' + h['rover'] if h.get('rover') else ''}", flush=True)
+                        pending.remove(hp)
+                    except HazardError as e:
+                        if sim.t - hp[1] > 60.0:
+                            print(f"  t={sim.t:6.1f}s hazard {hp[0]} gave up: {e}", flush=True)
+                            pending.remove(hp)
+                        else:
+                            hp[3] = sim.t + 2.0
+            if args.ticks and sim.t >= next_msg:
+                next_msg += 0.6
+                sizes.append(len(json.dumps(sim.tick_message(), separators=(",", ":"))))
             if sim.t >= next_report - 1e-9:
                 s = sim.summary()
                 wall = time.perf_counter() - w1
@@ -312,13 +384,24 @@ def main(argv=None) -> int:
     p = sim.prof
     print(f"  speed               {sim.t / max(wall, 1e-9):.1f} sim s per wall s "
           f"(physics {p['physics']:.1f} s, agents {p['agents']:.1f} s, wall {wall:.1f} s)")
-    print(f"  planner             {sim.fleet.plan_calls} A* calls, {sim.fleet.plan_expansions} expansions")
+    print(f"  planner             {sim.fleet.plan_calls} A* searches, {sim.fleet.plan_slices} slices, "
+          f"{sim.fleet.plan_expansions} expansions")
+    print(f"  map changes         {sim.map.changes} samples overwritten by change detection")
+    print(f"  brain budget        {cfg.brain_budget_ms:.0f} ms per rover per {1000.0 / cfg.agent_hz:.0f} ms cycle")
+    for rid, b in sim.brain_stats().items():
+        print(f"  brain {rid}            avg {b['avg']:.2f} ms, p95 {b['p95']:.2f} ms, max {b['max']:.1f} ms, "
+              f"over budget {b['over']} of {b['cycles']} cycles")
+    if sizes:
+        a = np.array(sizes)
+        print(f"  tick size           median {np.median(a) / 1024:.1f} KB, p95 {np.percentile(a, 95) / 1024:.1f} KB, "
+              f"max {a.max() / 1024:.1f} KB ({len(a)} ticks)")
     if not args.quiet:
         print("")
         print("Event log")
         for e in sim.fleet.events:
             who = e["rover"] or "fleet"
-            print(f"  [{e['t']:7.1f}] {e['level']:9s} {who:5s} {e['msg']}")
+            at = f"  @({e['at'][0]:.0f}, {e['at'][1]:.0f})" if "at" in e else ""
+            print(f"  [{e['t']:7.1f}] {e['level']:9s} {who:5s} {e['msg']}{at}")
     return 0
 
 

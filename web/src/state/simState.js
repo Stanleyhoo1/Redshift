@@ -23,6 +23,7 @@ export function emptyState() {
     frontiers: [],
     events: [], // newest first, each with a client-side `key`
     fleet: {},
+    hazards: [], // v2: full list from the latest tick (may stay empty with older sims)
     limit: { current: null, initial: null, prev: null, changedAt: null },
     t: 0,
     terrain: null,
@@ -210,6 +211,8 @@ function roverMetaFrom(list) {
     }))
 }
 
+const EVENT_LEVELS = new Set(['info', 'warn', 'discovery', 'hazard'])
+
 function keyEvents(list, seq) {
   const out = []
   for (const e of Array.isArray(list) ? list : []) {
@@ -219,8 +222,9 @@ function keyEvents(list, seq) {
       key: seq,
       t: num(e.t, 0),
       rover: e.rover == null ? null : String(e.rover),
-      level: e.level === 'warn' || e.level === 'discovery' ? e.level : 'info',
+      level: EVENT_LEVELS.has(e.level) ? e.level : 'info',
       msg: e.msg == null ? '' : String(e.msg),
+      at: isXY(e.at) ? [e.at[0], e.at[1]] : null,
     })
   }
   return { events: out, seq }
@@ -239,8 +243,40 @@ function limitFromFleet(fleet, prevLimit, now, detectChange) {
   }
 }
 
-const isXY = (p) => Array.isArray(p) && p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1])
+function isXY(p) {
+  return Array.isArray(p) && p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1])
+}
 const validTarget = (t) => t && typeof t === 'object' && t.id != null && Number.isFinite(t.x) && Number.isFinite(t.y)
+const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v)
+
+// v2 scan: flat [x, y, z, ...] in world metres. Kept as is (no copy) when it is usable.
+function sanitizeScan(scan) {
+  if (!Array.isArray(scan) || scan.length < 3) return null
+  return scan
+}
+
+// v2 hazards: keep the shape from PROTOCOL.md, drop anything unusable.
+export function sanitizeHazards(list) {
+  if (!Array.isArray(list)) return []
+  const out = []
+  for (const h of list) {
+    if (!isObj(h) || typeof h.type !== 'string') continue
+    out.push({
+      id: h.id == null ? `${h.type}:${h.t}` : String(h.id),
+      type: h.type,
+      t: num(h.t, 0),
+      x: num(h.x, null),
+      y: num(h.y, null),
+      radius: num(h.radius, null),
+      rover: h.rover == null ? null : String(h.rover),
+      rocks: Array.isArray(h.rocks) ? h.rocks.filter((r) => isXY(r)) : [],
+      known: !!h.known,
+      remaining: num(h.remaining, null),
+      active: h.active !== false,
+    })
+  }
+  return out
+}
 
 function sanitizeRover(r, prev) {
   return {
@@ -255,7 +291,17 @@ function sanitizeRover(r, prev) {
     goal: isXY(r.goal) ? [r.goal[0], r.goal[1]] : null,
     path: Array.isArray(r.path) ? r.path.filter(isXY) : [],
     target_id: r.target_id == null ? null : String(r.target_id),
+    // v2 (null when the sim does not send them)
+    sensors: isObj(r.sensors) ? r.sensors : null,
+    scan: sanitizeScan(r.scan),
+    brain: isObj(r.brain) ? r.brain : null,
   }
+}
+
+// Sim time right now, estimated between ticks (ticks carry `t` about 5 times a second).
+export function simTimeNow(s, now) {
+  const speed = Number.isFinite(s.fleet?.sim_speed) && s.fleet.sim_speed > 0 ? s.fleet.sim_speed : 1
+  return s.t + Math.max(0, Math.min(0.5, now - s.lastMsgAt)) * speed
 }
 
 export function applyInit(prev, msg, now) {
@@ -283,6 +329,7 @@ export function applyInit(prev, msg, now) {
   s.initSeq = keyed.seq
   s.fleet = msg.fleet && typeof msg.fleet === 'object' ? { ...msg.fleet } : {}
   s.limit = limitFromFleet(s.fleet, s.limit, now, false)
+  s.hazards = sanitizeHazards(msg.hazards)
   s.t = num(msg.t, s.events[0]?.t ?? 0)
   return s
 }
@@ -333,6 +380,11 @@ export function applyTick(prev, msg, now) {
   if (msg.fleet && typeof msg.fleet === 'object') {
     s.fleet = { ...prev.fleet, ...msg.fleet }
     s.limit = limitFromFleet(s.fleet, prev.limit, now, true)
+  }
+  if (Array.isArray(msg.hazards)) {
+    // Sent every tick; keep the old array when nothing changed so selectors stay quiet.
+    const next = sanitizeHazards(msg.hazards)
+    s.hazards = JSON.stringify(next) === JSON.stringify(prev.hazards) ? prev.hazards : next
   }
   return s
 }
