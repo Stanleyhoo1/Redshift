@@ -22,7 +22,9 @@ You need Docker with Compose (Docker Desktop with WSL integration, or Docker Eng
 docker compose up --build
 ```
 
-Open http://localhost:8080. The sim API is also exposed on http://localhost:8000.
+Open http://localhost:8080. The web container talks to the sim over Docker's private network, so only port 8080 is used on your machine.
+
+If the page stays on "Waiting for the simulation", check the sim container with `docker compose ps -a` and `docker compose logs --tail=60 sim`.
 
 Change the planet or speed:
 
