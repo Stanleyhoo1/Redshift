@@ -1,0 +1,83 @@
+import { useSim } from '../state/store.js'
+import { degrees, fixed, mmss } from '../lib/format.js'
+import { kindStyle } from '../lib/theme.js'
+
+const GAUGE_MAX = 45 // degrees shown on the slope limit gauge
+
+function SlopeLimit() {
+  const limit = useSim((s) => s.limit)
+  const { current, initial, prev, changedAt } = limit
+  const changed = changedAt !== null && prev !== null
+  const delta = changed ? current - prev : 0
+  const pct = (v) => `${Math.max(0, Math.min(100, (v / GAUGE_MAX) * 100))}%`
+  return (
+    <div className="stat stat-limit">
+      <div className="stat-label">Slope limit</div>
+      <div className="stat-value limit-value" key={changedAt ?? 'base'} data-flash={changed || undefined}>
+        {degrees(current)}
+        <small> deg</small>
+        {changed && (
+          <span className="limit-delta" key={changedAt}>
+            {delta > 0 ? '+' : '-'}
+            {degrees(Math.abs(delta))}
+          </span>
+        )}
+      </div>
+      <div className="stat-sub">(started at {degrees(initial)})</div>
+      {Number.isFinite(current) && (
+        <div className="gauge" aria-hidden="true">
+          <i className="gauge-fill" style={{ width: pct(current) }} />
+          {Number.isFinite(initial) && <i className="gauge-mark" style={{ left: pct(initial) }} />}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function TargetPips({ targets, total }) {
+  const pips = targets.map((t) => (
+    <i key={t.id} className="pip" data-status={t.status} style={{ '--kind': kindStyle(t.kind).color }} title={`${kindStyle(t.kind).label}, ${t.status}`} />
+  ))
+  const rest = Math.max(0, Math.min(24, (total ?? 0) - targets.length))
+  for (let k = 0; k < rest; k++) pips.push(<i key={`rest${k}`} className="pip" data-status="unknown" />)
+  return <div className="pips">{pips}</div>
+}
+
+export function FleetStats() {
+  const fleet = useSim((s) => s.fleet)
+  const t = useSim((s) => s.t)
+  const targets = useSim((s) => s.targets)
+  const explored = fleet.explored_pct
+  const found = Number.isFinite(fleet.targets_found) ? fleet.targets_found : targets.length
+  const total = Number.isFinite(fleet.targets_total) ? fleet.targets_total : null
+  const sampled = targets.filter((x) => x.status === 'sampled').length
+  return (
+    <section className="stats" aria-label="Fleet">
+      <div className="stat">
+        <div className="stat-label">Explored</div>
+        <div className="stat-value">
+          {fixed(explored, 1)}
+          <small>%</small>
+        </div>
+        <div className="meter" aria-hidden="true">
+          <i style={{ width: `${Math.max(0, Math.min(100, explored || 0))}%` }} />
+        </div>
+      </div>
+      <div className="stat">
+        <div className="stat-label">Sim time</div>
+        <div className="stat-value">{mmss(t)}</div>
+        <div className="stat-sub">{Number.isFinite(fleet.sim_speed) ? `${fixed(fleet.sim_speed, 1)}x speed` : 'Speed --'}</div>
+      </div>
+      <div className="stat">
+        <div className="stat-label">Targets found</div>
+        <div className="stat-value">
+          {found}
+          <small> of {total ?? '--'}</small>
+        </div>
+        <TargetPips targets={targets} total={total} />
+        <div className="stat-sub">{sampled} sampled</div>
+      </div>
+      <SlopeLimit />
+    </section>
+  )
+}
