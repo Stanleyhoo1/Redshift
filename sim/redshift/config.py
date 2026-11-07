@@ -1,0 +1,137 @@
+"""Configuration: environment variables from PROTOCOL.md plus tunables."""
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import dataclass, replace
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+ROVER_COLORS = ["#ff7a45", "#36cfc9", "#9254de", "#fadb14", "#73d13d", "#f759ab", "#40a9ff", "#ffc069"]
+
+
+@dataclass(frozen=True)
+class Config:
+    # ---- protocol env vars ----
+    seed: int = 42
+    num_rovers: int = 3
+    sim_speed: float = 3.0
+    map_size: float = 80.0
+    gravity_g: float = 2.0
+    viewer: bool = False
+
+    # ---- world ----
+    world_name: str = "Redshift-b"
+    res: float = 0.5               # map grid spacing (m), same grid for hfield and protocol
+    hfield_tile: int = 10          # heightfield tile size in cells (tiles make ray casts fast)
+    lander_radius: float = 2.5
+    lander_flat_radius: float = 4.0
+    num_rocks: int = 55
+
+    # ---- physics ----
+    timestep: float = 0.005
+    cone: str = "pyramidal"
+    impratio: float = 1.0
+    agent_hz: float = 5.0          # decision rate (sim time)
+    lidar_hz: float = 5.0          # scan rate per rover (sim time)
+
+    # ---- rover body (tuned so the climb limit at 2 g is about 20 deg) ----
+    # scripts/climb_test.py: climbs 20 deg at full speed, stalls at 21, slides back at 22. The limit is
+    # set by motor torque (so it depends on gravity), not by grip: at 1 g the same rover climbs ~26 deg.
+    chassis_half: tuple = (0.4, 0.25, 0.1)
+    chassis_mass: float = 18.0
+    wheel_radius: float = 0.18
+    wheel_mass: float = 1.0
+    wheel_x: float = 0.22
+    wheel_y: float = 0.40          # wide track, short wheelbase: easy skid steer turns
+    wheel_z: float = -0.02
+    wheel_friction: float = 0.8
+    terrain_friction: float = 0.5
+    motor_torque: float = 7.2      # torque cap per wheel (N m)
+    motor_kv: float = 25.0         # velocity servo gain (N m s / rad)
+    max_wheel_speed: float = 8.0   # rad/s
+    lidar_height: float = 0.75     # sensor site above chassis centre (on a mast)
+
+    # ---- driving ----
+    v_max: float = 0.8             # m/s
+    w_max: float = 1.2             # rad/s
+    track_eff: float = 0.55        # effective half track for skid steer kinematics (m)
+    lookahead: float = 1.3
+
+    # ---- perception ----
+    lidar_range: float = 8.0
+    lidar_az: int = 72
+    lidar_el_deg: tuple = (-40.0, -31.0, -24.0, -19.0, -15.0, -12.0, -9.5, -7.5, -6.0, -4.7, -3.6, -2.5, -1.0, 2.0)
+    spectro_range: float = 8.0
+
+    # ---- decisions ----
+    slope_limit_initial_deg: float = 30.0
+    slope_limit_floor_deg: float = 12.0
+    stall_window_s: float = 3.0
+    stall_progress_m: float = 0.15
+    flip_tilt_deg: float = 70.0
+    flip_time_s: float = 2.0
+    battery_base_drain: float = 1.0 / 1500.0   # per second, electronics and heaters
+    battery_motor_k: float = 1.0 / 70000.0     # per joule of motor work (incl. copper losses)
+    battery_heat_k: float = 0.02               # copper loss coefficient (W per (N m)^2)
+    battery_margin: float = 0.15
+    charge_time_s: float = 90.0     # empty to full
+    investigate_dwell_s: float = 3.0
+    investigate_radius: float = 2.0
+    target_bonus_radius: float = 15.0
+
+    @property
+    def nx(self) -> int:
+        return int(round(self.map_size / self.res)) + 1
+
+    @property
+    def ny(self) -> int:
+        return self.nx
+
+    @property
+    def origin(self) -> tuple:
+        half = (self.nx - 1) * self.res / 2.0
+        return (-half, -half)
+
+    @property
+    def gravity(self) -> float:
+        return 9.81 * self.gravity_g
+
+    @property
+    def lidar_el(self) -> tuple:
+        return tuple(math.radians(e) for e in self.lidar_el_deg)
+
+    def with_seed(self, seed: int) -> "Config":
+        return replace(self, seed=int(seed))
+
+    @classmethod
+    def from_env(cls, **overrides) -> "Config":
+        base = cls(
+            seed=_env_int("SEED", 42),
+            num_rovers=max(1, min(8, _env_int("NUM_ROVERS", 3))),
+            sim_speed=max(0.1, _env_float("SIM_SPEED", 3.0)),
+            map_size=max(30.0, _env_float("MAP_SIZE", 80.0)),
+            gravity_g=max(0.1, _env_float("GRAVITY_G", 2.0)),
+            viewer=_env_bool("VIEWER", False),
+        )
+        return replace(base, **overrides) if overrides else base

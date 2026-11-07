@@ -1,0 +1,464 @@
+"""FastAPI server for the Redshift simulation (see PROTOCOL.md).
+
+The Simulation runs in a background thread paced to SIM_SPEED x real time. An asyncio task sends a
+`tick` to every connected WebSocket client about 5 times per wall second; new clients get an `init`
+first. Everything that touches the simulation holds one lock.
+
+    uvicorn redshift.server:app --port 8000           (what Docker runs)
+    python -m redshift.server [--viewer] [--port 8000] (native run, optional MuJoCo viewer)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+import os
+import random
+import sys
+import threading
+import time
+import traceback
+from contextlib import asynccontextmanager, contextmanager
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+
+from .config import Config
+from .sim import Simulation
+
+TICK_HZ = 5.0
+
+
+def _auto_reset_s() -> float:
+    """Seconds to wait after exploration ends (all rovers parked) before starting a new planet. 0 = off."""
+    try:
+        return max(0.0, float(os.environ.get("AUTO_RESET_S", "60") or 0))
+    except ValueError:
+        return 60.0
+
+
+AUTO_RESET_S = _auto_reset_s()
+CLIENT_QUEUE_MAX = 40          # about 8 s of ticks; a client further behind than that gets a fresh init
+MAX_DEBT_S = 2.0               # if the sim falls this far behind real time, stop trying to catch up
+
+
+def _log(msg: str) -> None:
+    print(f"[redshift] {msg}", file=sys.stderr, flush=True)
+
+
+def _clean(obj):
+    """Replace non-finite floats with None (only used if a NaN ever slips through)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    return obj
+
+
+def dumps(obj) -> str:
+    try:
+        return json.dumps(obj, separators=(",", ":"), allow_nan=False)
+    except ValueError:
+        return json.dumps(_clean(obj), separators=(",", ":"), allow_nan=False)
+
+
+# ====================================================================== simulation thread
+class SimRunner:
+    """Owns one Simulation and the thread that steps it in real time (times sim_speed)."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.sim = Simulation(cfg)
+        self.lock = threading.Lock()
+        self._wait_lock = threading.Lock()
+        self._waiting = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.speed = 0.0               # measured sim seconds per wall second
+        self.errors = 0
+
+    @contextmanager
+    def locked(self):
+        """Hold the simulation lock. The sim thread steps aside quickly when someone is waiting."""
+        with self._wait_lock:
+            self._waiting += 1
+        try:
+            self.lock.acquire()
+        finally:
+            with self._wait_lock:
+                self._waiting -= 1
+        try:
+            yield self.sim
+        finally:
+            self.lock.release()
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="redshift-sim", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+            self._thread = None
+
+    def _run(self) -> None:
+        sim, speed = self.sim, max(self.cfg.sim_speed, 0.01)
+        wall0, sim0 = time.perf_counter(), sim.t
+        win_wall, win_sim = wall0, sim0
+        next_status = wall0 + 60.0
+        consecutive_errors = 0
+        while not self._stop.is_set():
+            now = time.perf_counter()
+            ahead = sim.t - (sim0 + (now - wall0) * speed)
+            if ahead > 0.0:
+                self._stop.wait(min(ahead / speed, 0.05))
+                continue
+            if -ahead > MAX_DEBT_S:            # machine too slow: run flat out but forget the backlog
+                wall0, sim0 = now, sim.t
+            with self.lock:
+                try:
+                    sim.step()
+                    consecutive_errors = 0
+                except Exception:
+                    self.errors += 1
+                    consecutive_errors += 1
+                    _log("simulation step failed:\n" + traceback.format_exc())
+                    if consecutive_errors >= 20:
+                        _log("too many errors in a row, the simulation is paused")
+                        self._stop.wait(1.0)
+            if self._waiting:
+                time.sleep(0.001)              # let the broadcaster or the viewer take the lock
+            if now - win_wall >= 2.0:
+                self.speed = (sim.t - win_sim) / (now - win_wall)
+                win_wall, win_sim = now, sim.t
+            if now >= next_status:
+                next_status = now + 60.0
+                st = sim.fleet.stats()
+                _log(f"t={sim.t:.0f} s, {self.speed:.2f}x real time, explored {st['explored_pct']:.0f}%, "
+                     f"slope limit {st['slope_limit_deg']:.0f} deg, targets {st['targets_found']}/{st['targets_total']}")
+
+
+# ====================================================================== clients
+class Client:
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+    def send_later(self, text: str) -> bool:
+        """Queue a message. Returns False if the client is too far behind (caller resyncs it)."""
+        if self.queue.qsize() >= CLIENT_QUEUE_MAX:
+            return False
+        self.queue.put_nowait(text)
+        return True
+
+    def restart_with(self, text: str) -> None:
+        """Drop everything still queued and start again from this message (an init)."""
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.queue.put_nowait(text)
+
+    async def pump(self) -> None:
+        try:
+            while True:
+                text = await self.queue.get()
+                await self.ws.send_text(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass   # the receive loop notices the disconnect and cleans up
+
+
+class AppState:
+    def __init__(self):
+        self.runner: SimRunner | None = None
+        self.clients: set = set()
+        self.reset_lock: asyncio.Lock | None = None
+        self.broadcaster: asyncio.Task | None = None
+
+
+state = AppState()
+
+
+def build_init_text() -> str:
+    with state.runner.locked() as sim:
+        msg = sim.init_message()
+    return dumps(msg)
+
+
+async def broadcast_loop() -> None:
+    loop = asyncio.get_running_loop()
+    period = 1.0 / TICK_HZ
+    next_t = loop.time()
+    while True:
+        next_t += period
+        delay = next_t - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        elif delay < -1.0:
+            next_t = loop.time()
+        try:
+            runner = state.runner
+            if runner is None:
+                continue
+            # Build the tick and hand it to the current clients with no await in between, so a
+            # client that connects now gets its init strictly before any later tick.
+            with runner.locked() as sim:
+                msg = sim.tick_message()
+            text = dumps(msg)
+            lagging = [c for c in list(state.clients) if not c.send_later(text)]
+            if lagging:
+                init = build_init_text()
+                for c in lagging:
+                    c.restart_with(init)
+        except Exception:
+            _log("broadcast failed:\n" + traceback.format_exc())
+
+
+async def restart_sim(seed: int) -> None:
+    """Stop the current sim, start a fresh one with this seed and re-init every client."""
+    async with state.reset_lock:
+        old = state.runner
+        cfg = (old.cfg if old is not None else Config.from_env()).with_seed(seed)
+        if old is not None:
+            await asyncio.to_thread(old.stop)
+        new = await asyncio.to_thread(SimRunner, cfg)
+        # swap and re-init every client in one go (no await), so nobody sees the new sim's ticks first
+        state.runner = new
+        new.start()
+        init = build_init_text()
+        for c in list(state.clients):
+            c.restart_with(init)
+    _log(f"reset: seed {seed}")
+
+
+async def auto_reset_loop() -> None:
+    """Keeps a demo running unattended: once the fleet has finished exploring and every rover is
+    parked or charging, wait AUTO_RESET_S seconds and land on a new planet."""
+    watched, done_since = None, None
+    while True:
+        await asyncio.sleep(2.0)
+        try:
+            runner = state.runner
+            if runner is None:
+                continue
+            if runner is not watched:          # a manual reset restarts the countdown
+                watched, done_since = runner, None
+            with runner.locked() as sim:
+                done = sim.fleet.complete and all(r.state in ("idle", "charging") for r in sim.rovers)
+            if not done:
+                done_since = None
+                continue
+            now = time.monotonic()
+            if done_since is None:
+                done_since = now
+            elif now - done_since >= AUTO_RESET_S:
+                seed = random.randint(1, 99999)
+                _log(f"exploration finished, landing on a new planet (seed {seed})")
+                await restart_sim(seed)
+        except Exception:
+            _log("auto reset failed:\n" + traceback.format_exc())
+
+
+# ====================================================================== app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cfg = Config.from_env()
+    state.reset_lock = asyncio.Lock()
+    state.runner = await asyncio.to_thread(SimRunner, cfg)
+    state.runner.start()
+    _log(f"simulation running: seed {cfg.seed}, {cfg.num_rovers} rovers, {cfg.gravity_g:g} g, "
+         f"map {cfg.map_size:g} m, {cfg.sim_speed:g}x real time")
+    state.broadcaster = asyncio.create_task(broadcast_loop())
+    auto = asyncio.create_task(auto_reset_loop()) if AUTO_RESET_S > 0 else None
+    try:
+        yield
+    finally:
+        for task in (state.broadcaster, auto):
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+        runner, state.runner = state.runner, None
+        if runner is not None:
+            await asyncio.to_thread(runner.stop)
+
+
+app = FastAPI(title="Redshift sim", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.get("/")
+async def root():
+    return PlainTextResponse("Redshift sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset.\n")
+
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True}
+
+
+@app.get("/api/truth")
+async def truth():
+    runner = state.runner
+    if runner is None:
+        return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    text = await asyncio.to_thread(runner.sim.truth_json)   # static per terrain, cached after the first call
+    return Response(content=text, media_type="application/json", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/reset")
+async def reset(request: Request):
+    body = (await request.body()).strip()
+    seed = state.runner.cfg.seed if state.runner is not None else Config.from_env().seed
+    if body:
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return JSONResponse({"ok": False, "error": 'Body must be JSON like {"seed": 7}'}, status_code=400)
+        if isinstance(data, dict) and data.get("seed") is not None:
+            try:
+                seed = int(data["seed"])
+            except (TypeError, ValueError):
+                return JSONResponse({"ok": False, "error": "seed must be an integer"}, status_code=400)
+    await restart_sim(seed)
+    return {"ok": True, "seed": seed}
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    client = Client(ws)
+    try:
+        client.restart_with(build_init_text())
+    except Exception:
+        _log("could not build init:\n" + traceback.format_exc())
+        await ws.close()
+        return
+    state.clients.add(client)
+    pump = asyncio.create_task(client.pump())
+    try:
+        while True:
+            msg = await ws.receive()          # anything the client sends is ignored
+            if msg.get("type") == "websocket.disconnect":
+                break
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        state.clients.discard(client)
+        pump.cancel()
+
+
+# ====================================================================== native run with viewer
+def _probe_display() -> str | None:
+    """Check that a window with an OpenGL context can be opened. MuJoCo's viewer exits the whole
+    process if it cannot, so test first with a hidden window. Returns None if OK, else the reason."""
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return "no display found"
+    if sys.platform == "darwin":
+        return None   # GLFW must be started by mjpython itself on macOS; launch_passive explains if not
+    try:
+        import warnings
+
+        import glfw
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if not glfw.init():
+                return "could not start GLFW (no usable display)"
+            try:
+                glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
+                win = glfw.create_window(16, 16, "probe", None, None)
+                if not win:
+                    return "could not create an OpenGL window"
+                glfw.destroy_window(win)
+            finally:
+                glfw.terminate()
+    except Exception as e:
+        return f"display check failed ({e})"
+    return None
+
+
+def _run_viewer(server) -> bool:
+    """Open the MuJoCo viewer in this (main) thread and keep it synced with the sim.
+    Returns False if no viewer could be opened."""
+    reason = _probe_display()
+    if reason:
+        _log(f"{reason}, so no viewer: running headless")
+        return False
+    try:
+        import mujoco.viewer  # imported lazily: needs OpenGL, which the Docker image does not have
+    except Exception as e:
+        _log(f"MuJoCo viewer unavailable ({e}): running headless")
+        return False
+    while state.runner is None and not server.should_exit:
+        time.sleep(0.1)
+    while not server.should_exit:
+        runner = state.runner
+        if runner is None:
+            time.sleep(0.1)
+            continue
+        try:
+            handle = mujoco.viewer.launch_passive(runner.sim.model, runner.sim.data,
+                                                  show_left_ui=False, show_right_ui=False)
+        except Exception as e:
+            hint = " (on macOS start it with mjpython)" if sys.platform == "darwin" else ""
+            _log(f"could not open the MuJoCo viewer{hint}: {e}. Running headless")
+            return False
+        with handle:
+            with runner.locked():
+                handle.cam.lookat[:] = (0.0, 0.0, 0.0)
+                handle.cam.distance = 0.75 * runner.cfg.map_size
+                handle.cam.elevation = -35.0
+                handle.cam.azimuth = 135.0
+            while handle.is_running() and not server.should_exit and state.runner is runner:
+                with runner.locked():
+                    handle.sync()
+                time.sleep(1.0 / 30.0)
+            closed_by_user = not handle.is_running()
+        if closed_by_user and state.runner is runner:
+            _log("viewer closed; the server keeps running (Ctrl+C to stop)")
+            return True
+        # otherwise a reset swapped in a new world: reopen the viewer on it
+    return True
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Run the Redshift simulation server.")
+    ap.add_argument("--viewer", action="store_true", help="open the native MuJoCo viewer (or set VIEWER=1)")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    args = ap.parse_args(argv)
+
+    import uvicorn
+
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="info"))
+    if not (args.viewer or Config.from_env().viewer):
+        server.run()
+        return 0
+    thread = threading.Thread(target=server.run, name="uvicorn", daemon=True)
+    thread.start()
+    import signal
+
+    signal.signal(signal.SIGTERM, lambda *_: setattr(server, "should_exit", True))
+    try:
+        _run_viewer(server)
+        while thread.is_alive():
+            thread.join(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.should_exit = True
+        thread.join(10.0)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
