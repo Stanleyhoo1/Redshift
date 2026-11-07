@@ -8,8 +8,11 @@ services:
       MAP_SIZE: ${MAP_SIZE:-80}
       GRAVITY_G: ${GRAVITY_G:-2.0}
       AUTO_RESET_S: ${AUTO_RESET_S:-60}
-    ports:
-      - "8000:8000"
+    # No host port on purpose: the web container reaches the sim over the compose network, so
+    # nothing clashes with other apps on port 8000. To call the sim API directly from your
+    # machine, uncomment these two lines (pick any free host port).
+    # ports:
+    #   - "8765:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=2)"]
       interval: 5s
