@@ -41,7 +41,7 @@ Stop with Ctrl+C, then `docker compose down`.
 | `SIM_SPEED` | 3.0 | sim seconds per real second |
 | `MAP_SIZE` | 80 | map width in metres |
 | `GRAVITY_G` | 2.0 | gravity in Earth g |
-| `AUTO_RESET_S` | 60 | once exploration is complete and the rovers have parked, wait this many seconds and land on a new random planet (0 = off) |
+| `AUTO_RESET_S` | 0 | off: the planet only changes when you press Reset sim. Set it (e.g. 60) to land on a new random planet that many seconds after exploration finishes |
 | `GEMMA_ENABLED` | 1 | 0 = rules only |
 | `GEMMA_MODEL` | gemma4:e2b | falls back to gemma4:e4b, then gemma3:4b if not installed |
 | `GEMMA_URL` | http://host.docker.internal:11434 | where Ollama runs |
