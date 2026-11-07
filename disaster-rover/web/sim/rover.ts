@@ -2,7 +2,7 @@ import { World, Occ } from './world';
 import type { Twist } from '../brain/msgs';
 
 export const ROVER = {
-  radius: 0.9,
+  radius: 0.8,
   maxV: 3.0,
   maxW: 1.6,
   accel: 3.0,
@@ -77,7 +77,8 @@ export class Rover {
     const ny = this.y + (effV * Math.sin(nyaw) + this.pushY + jy) * dt;
     this.yaw = Math.atan2(Math.sin(nyaw), Math.cos(nyaw));
 
-    if (this.collides(world, nx, ny)) {
+    // (if already overlapping something, e.g. rubble fell on us, allow moving out)
+    if (this.collides(world, nx, ny, Math.atan2(ny - this.y, nx - this.x))) {
       const speed = Math.hypot(effV + this.pushX, this.pushY);
       if (speed > 4) this.damage((speed - 4) * 8, 'smashed into an obstacle');
       this.v = 0; this.pushX *= -0.3; this.pushY *= -0.3;
@@ -109,9 +110,12 @@ export class Rover {
     this.battery = Math.max(0, this.battery - dt * (0.10 + 0.22 * Math.abs(this.v) / ROVER.maxV + (d2 > 0.05 ? 0.1 : 0)));
   }
 
-  collides(world: World, x: number, y: number): boolean {
-    for (let a = 0; a < 8; a++) {
-      const px = x + ROVER.radius * Math.cos(a * Math.PI / 4), py = y + ROVER.radius * Math.sin(a * Math.PI / 4);
+  /** contact test on the leading edge only (points facing the direction of travel), so side contact can slide */
+  collides(world: World, x: number, y: number, dir: number): boolean {
+    for (let a = 0; a < 12; a++) {
+      const ang = a * Math.PI / 6;
+      if (Math.cos(ang - dir) < 0.25) continue;
+      const px = x + ROVER.radius * Math.cos(ang), py = y + ROVER.radius * Math.sin(ang);
       const o = world.occAt(px, py);
       if (o !== Occ.Free && o !== Occ.Rubble) return true;
     }

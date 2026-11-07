@@ -71,7 +71,7 @@ export class Sensors {
 
     // ---- thermal camera: 36 sectors, max apparent temperature and its distance (IR sees through smoke) ----
     const ns = SENSOR.thermalSectors;
-    const tMax = new Array(ns).fill(22), tDist = new Array(ns).fill(-1);
+    const tMax = new Array(ns).fill(22), tDist = new Array(ns).fill(-1), hotNear = new Array(ns).fill(-1);
     const [rcx, rcy] = World.cellOf(r.x, r.y);
     const R = Math.ceil(SENSOR.thermalRange / CELL);
     for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
@@ -83,9 +83,10 @@ export class Sensors {
       const T = dis.cellTemp(i, t) * (1 - 0.25 * d / SENSOR.thermalRange);
       let s = Math.floor(((Math.atan2(py - r.y, px - r.x) + Math.PI) / (2 * Math.PI)) * ns) % ns; if (s < 0) s += ns;
       if (T > tMax[s]) { tMax[s] = T; tDist[s] = d; }
+      if (T > 100 && (hotNear[s] < 0 || d < hotNear[s])) hotNear[s] = d;
     }
     const thermal: number[] = [];
-    for (let s = 0; s < ns; s++) thermal.push(tMax[s] + rng.gauss(2), tDist[s] < 0 ? -1 : tDist[s] + rng.gauss(0.5));
+    for (let s = 0; s < ns; s++) thermal.push(tMax[s] + rng.gauss(2), tDist[s] < 0 ? -1 : tDist[s] + rng.gauss(0.5), hotNear[s] < 0 ? -1 : hotNear[s] + rng.gauss(0.4));
 
     // ---- camera: water detector per sector, range cut by smoke ----
     const water: number[] = [];
@@ -122,7 +123,8 @@ export class Sensors {
 
     // ---- depth camera elevation patch (DSM, includes structures) ----
     const n = 2 * Math.round(SENSOR.elevRadius / SENSOR.elevRes) + 1;
-    const ox = Math.round(r.x / SENSOR.elevRes) * SENSOR.elevRes - SENSOR.elevRadius, oy = Math.round(r.y / SENSOR.elevRes) * SENSOR.elevRes - SENSOR.elevRadius;
+    // samples on 2 m cell centres (odd coordinates) so each one lands squarely in a map cell
+    const ox = Math.round((r.x - 1) / SENSOR.elevRes) * SENSOR.elevRes + 1 - SENSOR.elevRadius, oy = Math.round((r.y - 1) / SENSOR.elevRes) * SENSOR.elevRes + 1 - SENSOR.elevRadius;
     const elev: number[] = [ox, oy, SENSOR.elevRes, n];
     const elevVis = SENSOR.elevRadius * Math.max(0.4, 1 - 1.2 * localSmoke);
     for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
@@ -168,7 +170,7 @@ export class Sensors {
         angular_velocity: { x: sh() * 0.05, y: sh() * 0.05, z: r.w + rng.gauss(0.005) }, angular_velocity_covariance: new Array(9).fill(0),
         linear_acceleration: { x: r.ax + sh() + rng.gauss(0.05), y: r.ay + sh() + rng.gauss(0.05), z: r.az + sh() * 0.5 + rng.gauss(0.05) }, linear_acceleration_covariance: new Array(9).fill(0),
       },
-      thermal: fma([['sector', ns], ['field', 2]], thermal),
+      thermal: fma([['sector', ns], ['field', 3]], thermal),
       water_depth: { data: Math.max(0, w.waterAt(r.x, r.y) + rng.gauss(0.01)) },
       wind: { header: { ...hdr, frame_id: 'map' }, vector: { x: wx + rng.gauss(0.3), y: wy + rng.gauss(0.3), z: 0 } },
       pressure: { header: hdr, fluid_pressure: dis.pressureAt(r.x, r.y) + rng.gauss(8), variance: 64 },

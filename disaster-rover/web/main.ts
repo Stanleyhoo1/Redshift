@@ -1,7 +1,7 @@
 import { Sim } from './sim/sim';
 import { SceneView } from './render/scene';
 import { UI } from './ui/ui';
-import { WanderBrain } from './brain/types';
+import { LocalBrain } from './brain/brain';
 import type { BrainOutput, SensorFrame } from './brain/msgs';
 import { zeroTwist } from './brain/msgs';
 
@@ -22,13 +22,13 @@ const view = new SceneView(document.getElementById('c') as HTMLCanvasElement);
 let sim = new Sim({ seed: ui.seed(), duration: ui.duration(), disasters: ui.disasterConfig() });
 view.load(sim);
 let running = false, acc = 0, last = performance.now();
-const wander = new WanderBrain();
+let local = new LocalBrain();
 
 ui.onStart = () => { if (sim.done || sim.t > 0) reset(); running = true; };
 ui.onPause = () => { running = !running; };
 ui.onReset = () => reset();
 ui.onTrigger = k => sim.trigger(k);
-function reset() { sim = new Sim({ seed: ui.seed(), duration: ui.duration(), disasters: ui.disasterConfig() }); view.load(sim); running = false; ui.clearLogs(); }
+function reset() { sim = new Sim({ seed: ui.seed(), duration: ui.duration(), disasters: ui.disasterConfig() }); local = new LocalBrain(); view.load(sim); running = false; ui.clearLogs(); }
 
 function loop(now: number) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now;
@@ -37,7 +37,7 @@ function loop(now: number) {
     while (acc >= Sim.DT && !sim.done) {
       if (sim.steps % Sim.BRAIN_EVERY === 0) {
         const f = sim.frame();
-        const out = ui.brainMode() === 'manual' ? manual(f) : wander.tick(f);
+        const out = ui.brainMode() === 'manual' ? manual(f) : local.tick(f);
         sim.apply(out);
         if (out.decision_log) ui.log(sim.t, out.decision_log);
       }
@@ -45,8 +45,9 @@ function loop(now: number) {
     }
   }
   view.toggles = ui.toggles();
-  view.render(null, null, null);
-  ui.update(sim, null);
+  const info = ui.brainMode() === 'local' ? local.info() : null;
+  view.render(info?.view ?? null, info?.path ?? null, info?.goalPt ?? null);
+  ui.update(sim, info);
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);

@@ -57,7 +57,7 @@ export interface SensorFrame {
   scan: LaserScan;
   odom: Odometry;
   imu: Imu;
-  /** 36 sectors x [maxTempC, distance m]; dims "sector","field" */
+  /** 36 sectors x [maxTempC, distance of max (m), distance of nearest >100°C pixel (m, -1 none)]; dims "sector","field" */
   thermal: Float32MultiArray;
   water_depth: Float32;
   wind: Vector3Stamped;

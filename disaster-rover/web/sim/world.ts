@@ -173,10 +173,11 @@ export class World {
       const halfW = 4 + 1.5 * noise.value(x / 20, 3);
       let isRiver = false;
       if (dr < halfW) { h = -1.4 * (1 - dr / halfW) - 0.3; isRiver = true; }
-      else if (dr < halfW + 6) h = Math.min(h, 0.25 + (dr - halfW) * 0.18);
+      // banks ramp up gently (max ~19°): no cliffs where hills meet the floodplain
+      else h = Math.min(h, 0.25 + (dr - halfW) * 0.34);
       const dl = Math.hypot(x - lake.x, y - lake.y) / lake.r;
       if (dl < 1) { h = -2 * (1 - dl) - 0.3; isRiver = true; }
-      else if (dl < 1.5) h = Math.min(h, 0.3 + (dl - 1) * 2);
+      else h = Math.min(h, 0.3 + (dl - 1) * lake.r * 0.34);
       const i = World.idx(cx, cy);
       this.height[i] = h;
       this.river[i] = isRiver ? 1 : 0;
@@ -238,6 +239,7 @@ export class World {
       if (this.river[i] || this.land[i] === Land.Forest || this.land[i] === Land.Town || this.land[i] === Land.Rock) continue;
       const [gx, gy] = this.gradAt(x, y); const dr = Math.abs(y - riverY(x));
       if (this.trees.some(t => (t.x - x) ** 2 + (t.y - y) ** 2 < 25)) continue;
+      if (this.buildings.some(b => Math.abs(b.x - x) < b.w / 2 + 6 && Math.abs(b.y - y) < b.d / 2 + 6)) continue;
       const s = -Math.hypot(gx, gy) * 10 - Math.abs(dr - 28) * 0.1 - Math.hypot(x, y) * 0.03 - Math.max(0, 25 - Math.hypot(x - best.x, y - best.y));
       if (s > sb.s) sb = { x, y, s };
     }
