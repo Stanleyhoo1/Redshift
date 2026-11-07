@@ -96,7 +96,13 @@ export const useStore = create<State>()((set, get) => ({
 
   beginDeploy: (cfg) => {
     get().resetMission()
-    set({ lastConfig: cfg, screen: 'boot' })
+    const st = get().status
+    set({
+      lastConfig: cfg,
+      screen: 'boot',
+      // optimistic until the server's first status frame arrives
+      status: { type: 'status', status: 'launching', backend: cfg.sim_backend, detail: null, checklist: st?.status === 'launching' ? st.checklist : {}, config: cfg },
+    })
   },
 
   resetMission: () =>
