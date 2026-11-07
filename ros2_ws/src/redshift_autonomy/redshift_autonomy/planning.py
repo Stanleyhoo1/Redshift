@@ -1,0 +1,258 @@
+"""Gravity-aware grid planning: cost maps, 8-connected A*, frontier extraction and pure pursuit.
+
+Cost model (per metre): time proxy `d · cell_cost` plus climb energy `w_energy · g · max(0, Δh)`.
+`cell_cost = 1 + 2·(slope/θ_max)²` on known ground, ×3 in caution bands, `unknown_cost` on
+unexplored cells (optimistic exploration), and lethal where slope > θ_max(g), step/rock obstacles or
+permanent hazards — dilated by the robot radius.
+"""
+from __future__ import annotations
+
+import heapq
+import math
+import time
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+RING = 1.0e6          # inflated-but-not-core lethal (escapable when starting inside it)
+SQ2 = math.sqrt(2.0)
+_NBRS = [(-1, -1, SQ2), (-1, 0, 1.0), (-1, 1, SQ2), (0, -1, 1.0),
+         (0, 1, 1.0), (1, -1, SQ2), (1, 0, 1.0), (1, 1, SQ2)]
+
+
+@dataclass
+class CostMap:
+    cost: np.ndarray        # float32; RING for inflation ring, inf for core lethal
+    elev: np.ndarray        # float32, NaN where unknown
+    known: np.ndarray
+    lethal: np.ndarray      # inflated lethal mask (core | ring)
+    res: float
+    origin: tuple
+    g: float
+    w_energy: float
+
+
+def disk_kernel(radius_cells: int) -> np.ndarray:
+    d = 2 * radius_cells + 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+
+
+def build_costmap(known, lethal, caution, slope_deg, elev, limits, res, origin, inflation_m=0.6,
+                  caution_mode=False, unknown_cost=2.5, w_energy=4.0) -> CostMap:
+    theta = limits.max_slope_deg
+    s = np.nan_to_num(np.asarray(slope_deg, dtype=np.float32), nan=0.0)
+    cost = (1.0 + 2.0 * (s / theta) ** 2).astype(np.float32)
+    cost[caution] *= 3.0
+    cost[~known] = unknown_cost * (2.0 if caution_mode else 1.0)
+    core = (lethal | (known & (s > theta))).astype(np.uint8)
+    infl = inflation_m + (0.4 if caution_mode else 0.0)
+    r = int(math.ceil(infl / res)) if infl > 0 else 0
+    inflated = cv2.dilate(core, disk_kernel(r)).astype(bool) if r > 0 else core.astype(bool)
+    cost[inflated] = RING
+    cost[core.astype(bool)] = np.inf
+    return CostMap(cost=cost, elev=np.asarray(elev, dtype=np.float32), known=np.asarray(known, bool),
+                   lethal=inflated, res=float(res), origin=tuple(origin), g=float(limits.g),
+                   w_energy=float(w_energy))
+
+
+def astar(cm: CostMap, start, goal, max_expansions: int = 250_000):
+    """8-connected A*. Returns (path [(r, c)...] or None, stats)."""
+    t0 = time.perf_counter()
+    H, W = cm.cost.shape
+    stats = {'expansions': 0, 'ms': 0.0, 'cost': math.inf, 'capped': False, 'length_m': 0.0}
+    sr, sc = start
+    gr, gc = goal
+    if not (0 <= sr < H and 0 <= sc < W and 0 <= gr < H and 0 <= gc < W):
+        return None, stats
+    cost_l = cm.cost.ravel().tolist()
+    goal_i = gr * W + gc
+    if cost_l[goal_i] >= RING:
+        stats['ms'] = (time.perf_counter() - t0) * 1000
+        return None, stats
+    escape = cost_l[sr * W + sc] >= RING
+    elev_l = np.nan_to_num(cm.elev, nan=0.0).ravel().tolist()
+    known_l = cm.known.ravel().tolist()
+    res = cm.res
+    climb_w = cm.w_energy * cm.g
+    N = H * W
+    gbest = [math.inf] * N
+    came = [-1] * N
+    closed = bytearray(N)
+    start_i = sr * W + sc
+    gbest[start_i] = 0.0
+
+    def h(r, c):
+        dr, dc = abs(r - gr), abs(c - gc)
+        return res * ((dr + dc) + (SQ2 - 2.0) * min(dr, dc))
+
+    heap = [(h(sr, sc), 0.0, start_i)]
+    found = False
+    exp = 0
+    while heap:
+        _, gcur, i = heapq.heappop(heap)
+        if closed[i]:
+            continue
+        closed[i] = 1
+        exp += 1
+        if i == goal_i:
+            found = True
+            break
+        if exp > max_expansions:
+            stats['capped'] = True
+            break
+        r, c = divmod(i, W)
+        ci = cost_l[i]
+        if ci >= RING:
+            ci = 30.0
+        for dr, dc, dd in _NBRS:
+            rr, cc = r + dr, c + dc
+            if rr < 0 or rr >= H or cc < 0 or cc >= W:
+                continue
+            j = rr * W + cc
+            if closed[j]:
+                continue
+            cj = cost_l[j]
+            if cj >= RING:
+                if escape and cj < math.inf:
+                    cj = 30.0
+                else:
+                    continue
+            if dr and dc and (cost_l[r * W + cc] == math.inf or cost_l[rr * W + c] == math.inf):
+                continue  # no diagonal squeeze between core obstacles
+            step = res * dd * 0.5 * (ci + cj)
+            if known_l[i] and known_l[j]:
+                dz = elev_l[j] - elev_l[i]
+                if dz > 0:
+                    step += climb_w * dz
+            ng = gcur + step
+            if ng < gbest[j]:
+                gbest[j] = ng
+                came[j] = i
+                heapq.heappush(heap, (ng + h(rr, cc), ng, j))
+    stats['expansions'] = exp
+    stats['ms'] = (time.perf_counter() - t0) * 1000
+    if not found:
+        return None, stats
+    path = []
+    i = goal_i
+    while i != -1:
+        path.append(divmod(i, W))
+        i = came[i]
+    path.reverse()
+    stats['cost'] = gbest[goal_i]
+    stats['length_m'] = path_length_m(path, res)
+    return path, stats
+
+
+def path_length_m(path, res) -> float:
+    return sum(res * math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(path, path[1:]))
+
+
+def cell_to_world(rc, res, origin):
+    r, c = rc
+    return (origin[0] + (c + 0.5) * res, origin[1] + (r + 0.5) * res)
+
+
+def world_to_cell(x, y, res, origin, shape):
+    c = int(math.floor((x - origin[0]) / res))
+    r = int(math.floor((y - origin[1]) / res))
+    return min(max(r, 0), shape[0] - 1), min(max(c, 0), shape[1] - 1)
+
+
+def cells_to_world(path, res, origin) -> np.ndarray:
+    if not path:
+        return np.zeros((0, 2))
+    p = np.asarray(path, dtype=np.float64)
+    return np.stack([origin[0] + (p[:, 1] + 0.5) * res, origin[1] + (p[:, 0] + 0.5) * res], axis=1)
+
+
+def path_blocked(path, lethal, start_idx: int = 0) -> int:
+    for k in range(max(0, start_idx), len(path)):
+        r, c = path[k]
+        if lethal[r, c]:
+            return k
+    return -1
+
+
+@dataclass
+class Frontier:
+    target: tuple          # (r, c) frontier cell nearest the cluster centroid
+    centroid: tuple        # (r, c) float
+    size: int
+
+    def target_xy(self, res, origin):
+        return cell_to_world(self.target, res, origin)
+
+
+def find_frontiers(known, free, min_size: int = 4, tile_m: float = 8.0, res: float = 0.5):
+    """Known-free cells with an unknown 4-neighbour, clustered (8-conn) and split into ~tile_m tiles."""
+    unknown = ~known
+    unk_n = np.zeros_like(known)
+    unk_n[1:, :] |= unknown[:-1, :]
+    unk_n[:-1, :] |= unknown[1:, :]
+    unk_n[:, 1:] |= unknown[:, :-1]
+    unk_n[:, :-1] |= unknown[:, 1:]
+    fmask = known & free & unk_n
+    if not fmask.any():
+        return []
+    n, labels = cv2.connectedComponents(fmask.astype(np.uint8), connectivity=8)
+    rows, cols = np.nonzero(fmask)
+    T = max(1, int(round(tile_m / res)))
+    tiles_per_row = labels.shape[1] // T + 1
+    key = labels[rows, cols].astype(np.int64) * 1_000_000 + (rows // T) * tiles_per_row + (cols // T)
+    order = np.argsort(key, kind='stable')
+    key, rows, cols = key[order], rows[order], cols[order]
+    bounds = np.flatnonzero(np.diff(key)) + 1
+    out = []
+    for rs, cs in zip(np.split(rows, bounds), np.split(cols, bounds)):
+        if len(rs) < min_size:
+            continue
+        cr, cc = rs.mean(), cs.mean()
+        k = int(np.argmin((rs - cr) ** 2 + (cs - cc) ** 2))
+        out.append(Frontier(target=(int(rs[k]), int(cs[k])), centroid=(float(cr), float(cc)), size=int(len(rs))))
+    return out
+
+
+def score_frontiers(frontiers, robot_xy, res, origin, claims=(), claim_radius=8.0, heading=None,
+                    w_size=0.35, w_dist=1.0, min_dist=1.5):
+    scored = []
+    for f in frontiers:
+        x, y = f.target_xy(res, origin)
+        d = math.hypot(x - robot_xy[0], y - robot_xy[1])
+        if d < min_dist:
+            continue
+        s = w_size * f.size * res - w_dist * d
+        if any(math.hypot(x - cx, y - cy) < claim_radius for cx, cy in claims):
+            s -= 40.0
+        if heading is not None:
+            s += 3.0 * math.cos(math.atan2(y - robot_xy[1], x - robot_xy[0]) - heading)
+        scored.append((s, f))
+    scored.sort(key=lambda t: -t[0])
+    return [f for _, f in scored]
+
+
+def wrap(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def pure_pursuit(pose, path_xy, lookahead=1.5, v_max=0.8, w_max=1.0, goal_tol=0.6):
+    """Returns (v, w, closest_idx, done)."""
+    x, y, yaw = pose
+    if path_xy is None or len(path_xy) == 0:
+        return 0.0, 0.0, 0, True
+    p = np.asarray(path_xy, dtype=np.float64)
+    d = np.hypot(p[:, 0] - x, p[:, 1] - y)
+    idx = int(np.argmin(d))
+    d_goal = float(d[-1])
+    if d_goal < goal_tol:
+        return 0.0, 0.0, len(p) - 1, True
+    ahead = np.flatnonzero(d[idx:] >= lookahead)
+    tx, ty = p[idx + ahead[0]] if len(ahead) else p[-1]
+    alpha = wrap(math.atan2(ty - y, tx - x) - yaw)
+    if abs(alpha) > 1.0:
+        return 0.0, math.copysign(0.8 * w_max, alpha), idx, False
+    v = v_max * (1.0 - 0.5 * abs(alpha)) * min(1.0, d_goal / 1.5)
+    ld = max(math.hypot(tx - x, ty - y), 1e-3)
+    w = float(np.clip(v * 2.0 * math.sin(alpha) / ld, -w_max, w_max))
+    return float(v), w, idx, False
