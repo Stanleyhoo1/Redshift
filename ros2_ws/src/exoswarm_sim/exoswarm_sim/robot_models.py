@@ -9,8 +9,10 @@ from __future__ import annotations
 import math
 
 ROVER_SPEC = {
-    'mass_kg': 60.0, 'wheel_radius_m': 0.20, 'track_m': 0.85, 'wheelbase_m': 0.70, 'cg_height_m': 0.35,
+    'mass_kg': 60.0, 'wheel_radius_m': 0.20, 'track_m': 0.85, 'wheelbase_m': 0.60, 'cg_height_m': 0.35,
     'wheels': 4, 'tau_max_nm': 20.8, 'base_height_m': 0.28, 'radius_m': 0.6,
+    # longitudinal grip vs. lateral scrub (fdir1 = wheel axle): skid-steer turning stays within the torque limit
+    'wheel_mu': 0.9, 'wheel_mu_lateral': 0.2,
     'lidar_xyz': [0.25, 0.0, 0.62], 'lidar_rings': 16, 'lidar_samples': 360,
     'lidar_vfov': [-0.2618, 0.1745], 'lidar_range': [0.3, 25.0],
     'camera_xyz': [0.45, 0.0, 0.50], 'camera_pitch_rad': 0.2094, 'camera_hfov': 1.396,
@@ -104,7 +106,7 @@ def rover_sdf(name: str, pose, spec: dict = ROVER_SPEC) -> str:
       {_inertial(wheel_m, wheel_ixx, wheel_iyy, wheel_ixx)}
       <collision name="collision">
         <geometry><sphere><radius>{r}</radius></sphere></geometry>
-        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+        <surface><friction><ode><mu>{s['wheel_mu_lateral']}</mu><mu2>{s['wheel_mu']}</mu2><fdir1>0 1 0</fdir1></ode></friction></surface>
       </collision>
       <visual name="tire">
         <pose>0 0 0 1.5708 0 0</pose>

@@ -61,6 +61,7 @@ class EdgeBudget:
     STEP = 0.25
     MAX_LEVEL = 3
     DWELL_S = 2.0
+    RESTORE_DWELL_S = 6.0
     EMA = 0.35
 
     def __init__(self, profile_id: str):
@@ -80,13 +81,19 @@ class EdgeBudget:
         load = sum(ms * p.perf_scale * hz.get(k, 0.0) for k, ms in host_ms.items()) / 1000.0
         self._ema = load if self._ema is None else self.EMA * load + (1 - self.EMA) * self._ema
         changed, reason = False, ''
-        if now - self._last_change >= self.DWELL_S:
+        since = now - self._last_change
+        if since >= self.DWELL_S:
+            # restoring is predictive: only step up if the projected load at the higher rate stays under HIGH
+            hz_now = self.perception_hz
+            hz_up = p.perception_hz_max * (1.0 - self.STEP * max(0, self.level - 1))
+            projected = self._ema * hz_up / max(hz_now, 1e-6)
             if self._ema > self.HIGH and self.level < self.MAX_LEVEL:
                 self.level += 1
                 changed = True
                 reason = (f'Edge load {self._ema * 100:.0f}% > {self.HIGH * 100:.0f}% on {p.label}: '
                           f'perception throttled to {self.perception_hz:.1f} Hz')
-            elif self._ema < self.LOW and self.level > 0:
+            elif (self._ema < self.LOW and self.level > 0 and since >= self.RESTORE_DWELL_S
+                  and projected < 0.85 * self.HIGH):
                 self.level -= 1
                 changed = True
                 reason = (f'Edge load {self._ema * 100:.0f}% < {self.LOW * 100:.0f}%: '

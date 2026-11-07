@@ -129,3 +129,22 @@ def test_layers_rgb_and_occupancy_encoding():
     assert img[0, 0, 1] == 0 and img[0, 0, 0] == 0  # unknown corner
     occ = m.to_occupancy()
     assert occ[0, 0] == -1 and occ[i, j] == 0
+
+
+def test_far_range_pose_error_between_scans_is_not_an_obstacle():
+    # two scans of the same flat ground 18-22 m away whose heights disagree by 0.32 m (≈1° pitch error)
+    m = GlobalMap(60.0, 0.5)
+    far = patch(18, 22, -2, 2, lambda x, y: np.zeros_like(x))
+    m.integrate(far, t=0.0, sensor_xyz=(0.0, 0.0, 0.9))
+    m.integrate(far + np.array([0.0, 0.0, 0.32]), t=0.1, sensor_xyz=(0.0, 0.0, 0.9))
+    m.integrate(far + np.array([0.0, 0.0, 0.32]), t=0.2, sensor_xyz=(0.0, 0.0, 0.9))
+    m.recompute(lim(2.2))
+    assert not (m.cls == OBSTACLE).any()
+    # ...while the same step seen at close range is an obstacle
+    near = patch(3, 4, -0.5, 0.5, lambda x, y: np.zeros_like(x))
+    m.integrate(near, t=0.3, sensor_xyz=(0.0, 0.0, 0.9))
+    m.integrate(near + np.array([0.0, 0.0, 0.5]), t=0.4, sensor_xyz=(0.0, 0.0, 0.9))
+    m.integrate(near + np.array([0.0, 0.0, 0.5]), t=0.5, sensor_xyz=(0.0, 0.0, 0.9))
+    m.recompute(lim(2.2))
+    i, j = m.cell_of(3.5, 0.0)
+    assert m.cls[i, j] == OBSTACLE

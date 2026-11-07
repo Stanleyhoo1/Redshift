@@ -79,7 +79,8 @@ def camera_points_body(depth, cam: CameraModel, pitch: float, cam_h: float, stri
     yo = (v - cam.cy) / cam.fy * d
     xf, yl, zu = d, -xo, -yo
     c, s = math.cos(pitch), math.sin(pitch)
-    pts = np.stack([xf * c + zu * s, yl, -xf * s + zu * c + cam_h], axis=-1)
+    with np.errstate(invalid='ignore'):
+        pts = np.stack([xf * c + zu * s, yl, -xf * s + zu * c + cam_h], axis=-1)
     pts[~np.isfinite(d) | (d <= 0)] = np.nan
     return pts if keep_shape else pts.reshape(-1, 3)
 
@@ -104,6 +105,8 @@ def fit_ground_plane(pts: np.ndarray, x_max: float = 10.0, iters: int = 3, inlie
 
 
 def _components(mask: np.ndarray, min_area: int):
+    if mask.size == 0 or not mask.any():     # OpenCV segfaults on empty inputs
+        return
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
     for k in range(1, n):
         if stats[k, cv2.CC_STAT_AREA] >= min_area:
@@ -112,7 +115,8 @@ def _components(mask: np.ndarray, min_area: int):
 
 def detect_objects(rgb, depth, cam: CameraModel, cam_pitch: float, cam_h: float, pose=None,
                    cam_conf: float = 1.0, max_range: float = 15.0, slope_limit_deg: float = 20.0,
-                   use_camera: bool = True):
+                   use_camera: bool = True, classes=('ROCK', 'CRATER', 'SCIENCE', 'SLOPE'), rock_h: float = 0.25,
+                   tophat_px: int = 0, min_rock_px: int | None = None, rock_gray_min: float = 0.0):
     """Returns a list of Detection sorted by confidence (bbox in rgb pixel coordinates)."""
     dh, dw = depth.shape
     if rgb.shape[:2] != (dh, dw):
@@ -127,11 +131,18 @@ def detect_objects(rgb, depth, cam: CameraModel, cam_pitch: float, cam_h: float,
     valid = np.isfinite(P).all(axis=-1) & (rng_h < max_range)
     a, b, c = fit_ground_plane(P.reshape(-1, 3))
     resid = np.where(valid, P[..., 2] - (a * P[..., 0] + b * P[..., 1] + c), 0.0)
+    if tophat_px > 0:
+        # nadir views span tens of metres of undulating terrain: height above the grey opening (top-hat)
+        # keeps ramps at zero and isolates bumps narrower than the kernel (boulders)
+        z = np.where(valid, P[..., 2], np.nan)
+        z = np.where(valid, z, np.nanmedian(z) if valid.any() else 0.0).astype(np.float32)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(tophat_px) + 1,) * 2)
+        resid = np.where(valid, cv2.morphologyEx(z, cv2.MORPH_TOPHAT, k), 0.0)
     hsv = cv2.cvtColor(rgb_s, cv2.COLOR_RGB2HSV)
     H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     k3 = np.ones((3, 3), np.uint8)
 
-    pos = valid & (resid > 0.25)
+    pos = valid & (resid > rock_h)
     grayish = (S < 75) & (V > 35) & (V < 215)
     rock_mask = pos | (grayish & valid & (resid > 0.12)) if use_camera else pos
     rock_mask = cv2.morphologyEx(rock_mask.astype(np.uint8), cv2.MORPH_OPEN, k3).astype(bool)
@@ -162,10 +173,18 @@ def detect_objects(rgb, depth, cam: CameraModel, cam_pitch: float, cam_h: float,
                 st[cv2.CC_STAT_WIDTH] * bx_scale, st[cv2.CC_STAT_HEIGHT] * by_scale)
         dets.append(Detection(cls, float(min(0.99, conf)), bbox, r, bearing, wxy, sources, slope))
 
-    for m, st in _components(rock_mask, int(25 * area_scale)):
+    if 'ROCK' not in classes:
+        rock_mask = np.zeros_like(rock_mask)
+    if 'CRATER' not in classes:
+        neg = np.zeros_like(neg)
+    if 'SCIENCE' not in classes:
+        sci = np.zeros_like(sci)
+    for m, st in _components(rock_mask, int(25 * area_scale) if min_rock_px is None else min_rock_px):
         area = st[cv2.CC_STAT_AREA] / area_scale
         frac_gray = float(grayish[m].mean())
         mres = float(resid[m].mean())
+        if frac_gray < rock_gray_min and mres < 0.6:
+            continue        # low bump with regolith colour: terrain texture, not a boulder
         conf = 0.55 + 0.2 * min(1.0, area / 150) + 0.15 * frac_gray + 0.1 * min(1.0, mres / 0.6)
         conf *= 0.6 + 0.4 * (cam_conf if use_camera else 0.5)
         make('ROCK', m, st, conf, ['DEPTH', 'CAM'] if use_camera and frac_gray > 0.3 else ['DEPTH'])
@@ -180,7 +199,7 @@ def detect_objects(rgb, depth, cam: CameraModel, cam_pitch: float, cam_h: float,
 
     # steep surface patches: local plane fits on blocks, merged
     blk = max(8, dw // 10)
-    nby, nbx = dh // blk, dw // blk
+    nby, nbx = (dh // blk, dw // blk) if 'SLOPE' in classes else (0, 0)
     steep = np.zeros((nby, nbx), bool)
     slopes = np.zeros((nby, nbx))
     obstacle_px = rock_mask | neg
@@ -301,20 +320,41 @@ def fuse_uncertainty(camera_conf: float, lidar_conf: float, imu_vib: float, mode
     return float(np.clip(1.0 - conf, 0.0, 1.0))
 
 
-def lidar_corridor(points_base, half_width: float = 1.0, x_max: float = 10.0, obstacle_h: float = 0.3) -> dict:
-    """Points in a levelled base frame (ground ≈ z 0) → nearest obstacle in the forward corridor."""
+CORRIDOR_CELL_M = 0.25
+
+
+def lidar_corridor(points_base, half_width: float = 1.0, x_max: float = 10.0, obstacle_h: float = 0.3,
+                   prev_cells=None, x_min: float = 1.0) -> dict:
+    """Points in a levelled base frame (ground ≈ z 0) → nearest obstacle in the forward corridor.
+
+    Obstacle cells (0.25 m columns) need >= 3 returns (solid surfaces are dense, dust backscatter is sparse) and,
+    when `prev_cells` from the previous scan is given, must also have been dense there (±1 cell for ego-motion):
+    dust is re-drawn every scan, boulders are not. `out['cells']` feeds the next call."""
     p = np.asarray(points_base, dtype=np.float64).reshape(-1, 3)
     p = p[np.isfinite(p).all(axis=1)]
-    out = {'obstacle_dist_m': math.inf, 'slope_ahead_deg': 0.0, 'conf': 0.0, 'points': 0}
+    out = {'obstacle_dist_m': math.inf, 'slope_ahead_deg': 0.0, 'conf': 0.0, 'points': 0, 'cells': set()}
     if len(p) < 20:
         return out
     near = p[np.hypot(p[:, 0], p[:, 1]) < 12.0]
     a, b, c = fit_ground_plane(near, x_max=12.0, inlier_m=0.2)
     res = p[:, 2] - (a * p[:, 0] + b * p[:, 1] + c)
-    cor = (p[:, 0] > 0.5) & (p[:, 0] < x_max) & (np.abs(p[:, 1]) < half_width)
+    # x_min: returns inside the rover's own stopping envelope are dominated by dust backscatter; anything solid
+    # that close was already seen (and mapped) on approach
+    cor = (p[:, 0] > x_min) & (p[:, 0] < x_max) & (np.abs(p[:, 1]) < half_width)
     obs = cor & (res > obstacle_h) & (res < 3.0)
     if obs.sum() >= 3:
-        out['obstacle_dist_m'] = float(np.sort(p[obs, 0])[2])
+        q = p[obs]
+        cell = np.floor(q[:, :2] / CORRIDOR_CELL_M).astype(np.int64)
+        key = cell[:, 0] * 100_000 + cell[:, 1]
+        uk, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+        dense_keys = set(uk[cnt >= 3].tolist())
+        out['cells'] = dense_keys
+        if prev_cells is not None:
+            near = {k + dx * 100_000 + dy for k in prev_cells for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+            dense_keys &= near
+        dense = np.isin(key, list(dense_keys)) if dense_keys else np.zeros(len(q), bool)
+        if dense.any():
+            out['obstacle_dist_m'] = float(q[dense, 0].min())
     gnd = cor & (np.abs(res) < 0.15) & (p[:, 0] > 1.0) & (p[:, 0] < 8.0)
     if gnd.sum() >= 10:
         A = np.c_[p[gnd, 0], np.ones(int(gnd.sum()))]

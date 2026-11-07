@@ -181,6 +181,29 @@ def test_lidar_corridor_finds_obstacle_and_slope():
     assert math.isinf(lidar_corridor(clear)['obstacle_dist_m'])
 
 
+def test_lidar_corridor_ignores_sparse_dust_backscatter():
+    rng = np.random.default_rng(3)
+    scan = organized_scan(noise=0.07, dropout=0.2).reshape(-1, 3)
+    scan = scan[np.isfinite(scan).all(axis=1)] + np.array([0, 0, 1.0])
+    # ~2 % of a 16x360 scan as backscatter: random returns 0.3-3 m from the sensor at sensor height ±0.5 m
+    def dust(n=115):
+        r, a = rng.uniform(0.4, 2.0, n), rng.uniform(-math.pi, math.pi, n)
+        return np.c_[r * np.cos(a), r * np.sin(a), 1.0 + rng.uniform(-0.5, 0.2, n)]
+
+    prev = None
+    for _ in range(10):      # consecutive scans, independently re-drawn dust each time
+        cor = lidar_corridor(np.vstack([scan, dust()]), prev_cells=prev)
+        if prev is not None:
+            assert math.isinf(cor['obstacle_dist_m'])
+        prev = cor['cells']
+    # a real boulder persists across scans and is still found through the dust
+    rock = organized_scan(obstacle_x=2.0).reshape(-1, 3)
+    rock = rock[np.isfinite(rock).all(axis=1)] + np.array([0, 0, 1.0])
+    c1 = lidar_corridor(np.vstack([rock, dust()]))
+    c2 = lidar_corridor(np.vstack([rock, dust()]), prev_cells=c1['cells'])
+    assert c2['obstacle_dist_m'] == pytest.approx(2.0, abs=0.4)
+
+
 def test_annotate_shape_and_modes():
     rgb, depth = render(rock=(5.0, 0.4, 0.8))
     dets = detect_objects(rgb, depth, CAM, PITCH, CAM_H)
@@ -189,3 +212,16 @@ def test_annotate_shape_and_modes():
     assert out.shape == rgb.shape and out.dtype == np.uint8
     out2 = annotate(rgb, dets, dict(info, mode='LIDAR_ONLY'))
     assert not np.array_equal(out, out2)
+
+
+def test_detect_objects_class_subset_and_highpass_nadir():
+    # nadir view of gently undulating ground with one boulder: only ROCK/SCIENCE requested
+    cam = CameraModel.from_hfov(80, 60, math.pi / 2)
+    yy, xx = np.mgrid[0:60, 0:80]
+    depth = (12.0 + 0.6 * np.sin(xx / 9.0) + 0.4 * np.cos(yy / 7.0)).astype(np.float32)
+    depth[25:33, 35:44] -= 0.9                       # boulder top 0.9 m above the ground
+    rgb = np.full((60, 80, 3), (150, 80, 50), np.uint8)
+    dets = detect_objects(rgb, depth, cam, math.pi / 2, 12.0, classes=('ROCK', 'SCIENCE'), rock_h=0.35,
+                          tophat_px=6, max_range=40.0)
+    assert {d.cls for d in dets} == {'ROCK'}
+    assert detect_objects(rgb, depth, cam, math.pi / 2, 12.0, classes=()) == []

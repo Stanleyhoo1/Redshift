@@ -16,8 +16,22 @@ import numpy as np
 
 UNKNOWN, FREE, CAUTION, HAZARD, PERMANENT, SCIENCE, OBSTACLE = range(7)
 STEP_M = 0.30
+RANGE_MARGIN = 0.02     # m of step margin per m of range beyond 5 m
 HIGH_HITS = 2
 REVEAL_S = 6.0
+
+
+def slope_from_elevation(elev: np.ndarray, res: float) -> np.ndarray:
+    """Slope (deg) of an elevation grid with NaN = unknown (normalized-convolution gap fill, 3x3 Sobel)."""
+    valid = np.isfinite(elev)
+    gz = np.where(valid, elev, 0.0).astype(np.float32)
+    w = valid.astype(np.float32)
+    num = cv2.blur(gz, (3, 3))
+    den = cv2.blur(w, (3, 3))
+    filled = np.where(valid, elev, np.where(den > 0, num / np.maximum(den, 1e-6), 0.0)).astype(np.float32)
+    gx = cv2.Sobel(filled, cv2.CV_32F, 1, 0, ksize=3) / (8.0 * res)
+    gy = cv2.Sobel(filled, cv2.CV_32F, 0, 1, ksize=3) / (8.0 * res)
+    return np.where(valid, np.degrees(np.arctan(np.hypot(gx, gy))), 0.0).astype(np.float32)
 
 
 class GlobalMap:
@@ -63,18 +77,27 @@ class GlobalMap:
         """Fuse world-frame points (N, 3). Returns number of points used."""
         pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
         pts = pts[np.isfinite(pts).all(axis=1)]
+        rng = None
         if sensor_xyz is not None and len(pts):
             rng = np.linalg.norm(pts - np.asarray(sensor_xyz, dtype=np.float64), axis=1)
-            pts = pts[(rng >= min_range) & (rng <= max_range)]
+            keep = (rng >= min_range) & (rng <= max_range)
+            pts, rng = pts[keep], rng[keep]
         if not len(pts):
             return 0
         flat, ok = self._flat_idx(pts)
+        if not ok.any():
+            return 0
         flat, z = flat[ok], pts[ok, 2].astype(np.float32)
         zmin, zmax = self.zmin.ravel(), self.zmax.ravel()
+        # obstacle evidence: a vertical step inside this scan, or a step above the cell's previously mapped
+        # ground with a margin growing with range (1 deg of pose/pitch error at 20 m is 0.35 m of height)
+        scan_min = np.full(self.n * self.n, np.inf, np.float32)
+        np.minimum.at(scan_min, flat, z)
+        margin = STEP_M if rng is None else STEP_M + RANGE_MARGIN * np.maximum(0.0, rng[ok] - 5.0)
+        high = (z > scan_min[flat] + STEP_M) | (z > zmin[flat] + margin)
         np.minimum.at(zmin, flat, z)
         np.maximum.at(zmax, flat, z)
         np.add.at(self.hits.ravel(), flat, 1)
-        high = z > zmin[flat] + STEP_M
         if high.any():
             np.add.at(self.high.ravel(), flat[high], 1)
         self._mark_known(flat, t)
@@ -102,7 +125,8 @@ class GlobalMap:
             return used
         steps = np.maximum(2, np.ceil(dxy / (0.5 * self.res)).astype(int))
         reps = np.repeat(np.arange(len(a)), steps)
-        frac = np.concatenate([np.linspace(0, 1, s, endpoint=False) for s in steps])
+        starts = np.cumsum(steps) - steps
+        frac = (np.arange(int(steps.sum())) - np.repeat(starts, steps)) / np.repeat(steps, steps)
         fill = a[reps] + (b[reps] - a[reps]) * frac[:, None]
         flat, inside = self._flat_idx(fill)
         flat, z = flat[inside], fill[inside, 2].astype(np.float32)
@@ -147,15 +171,7 @@ class GlobalMap:
     def recompute(self, limits) -> None:
         g = self.ground()
         valid = np.isfinite(g)
-        # normalized-convolution fill so gradients at the known/unknown boundary stay sane
-        gz = np.where(valid, g, 0.0).astype(np.float32)
-        w = valid.astype(np.float32)
-        num = cv2.blur(gz, (3, 3))
-        den = cv2.blur(w, (3, 3))
-        filled = np.where(valid, g, np.where(den > 0, num / np.maximum(den, 1e-6), 0.0)).astype(np.float32)
-        gx = cv2.Sobel(filled, cv2.CV_32F, 1, 0, ksize=3) / (8.0 * self.res)
-        gy = cv2.Sobel(filled, cv2.CV_32F, 0, 1, ksize=3) / (8.0 * self.res)
-        self.slope = np.where(valid, np.degrees(np.arctan(np.hypot(gx, gy))), 0.0).astype(np.float32)
+        self.slope = slope_from_elevation(g, self.res)
         theta = limits.max_slope_deg
         obstacle = valid & (self.high >= HIGH_HITS)
         slope_bad = valid & (self.slope > theta)
