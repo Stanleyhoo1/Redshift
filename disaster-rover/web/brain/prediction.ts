@@ -118,7 +118,7 @@ export class Predictor {
       if (y + 1 < G && !isNaN(b.elev[i + G]) && !b.struct[i + G]) m = Math.max(m, Math.abs(b.elev[i + G] - e0));
       if (y > 0 && !isNaN(b.elev[i - G]) && !b.struct[i - G]) m = Math.max(m, Math.abs(b.elev[i - G] - e0));
       const deg = Math.atan(m / CFG.RES) * 180 / Math.PI;
-      tmp[i] = clamp01((deg - 12) / 14);
+      tmp[i] = clamp01((deg - 15) / 15);
     }
     // conservative: a cell is as steep as its steepest neighbour (2 m cells hide sub-cell relief)
     for (let i = 0; i < n; i++) {

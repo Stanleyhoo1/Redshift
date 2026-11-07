@@ -43,7 +43,7 @@ class Readings:
     """Everything derived from ONE sensor frame. No ground truth anywhere in here."""
     __slots__ = ('t', 'dt', 'x', 'y', 'yaw', 'v', 'w', 'roll', 'pitch', 'tilt_deg', 'status', 'depth', 'temp_c',
                  'wind_x', 'wind_y', 'wind_speed', 'pressure', 'pressure_drop', 'shake', 'lidar_front', 'return_frac',
-                 'smoke', 'thermal_max', 'hot_sectors', 'streaks', 'flashes', 'funnel', 'water_near', 'stage_obs')
+                 'smoke', 'scan_r', 'scan_a0', 'scan_inc', 'scan_max', 'thermal_max', 'hot_sectors', 'streaks', 'flashes', 'funnel', 'water_near', 'stage_obs')
 
 
 def _mark_hot(b, px, py, T, t):
@@ -307,6 +307,8 @@ def perceive(b, f, ps):
     rd.status, rd.depth, rd.temp_c = status, depth, temp_c
     rd.wind_x, rd.wind_y, rd.wind_speed, rd.pressure, rd.pressure_drop = wx, wy, ws, pr, ps.pressure_base - pr
     rd.shake, rd.lidar_front, rd.return_frac, rd.smoke = shake, front, return_frac, smoke
+    rd.scan_r = [rmax + 1 if r is None else r for r in sc['ranges']]
+    rd.scan_a0, rd.scan_inc, rd.scan_max = yaw + sc['angle_min'], sc['angle_increment'], rmax
     rd.thermal_max, rd.hot_sectors = thermal_max, hot_sectors
     rd.streaks, rd.flashes, rd.funnel, rd.water_near, rd.stage_obs = streaks, flashes, funnel, water_near, stage_obs
     return rd

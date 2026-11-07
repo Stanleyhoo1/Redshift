@@ -35,7 +35,8 @@ export function cellCost(b: Belief, i: number, startI: number, relaxed = false):
   if (i === startI) return 1;
   if (b.blocked(i)) return Infinity;
   const r = b.planRisk(i), sl = b.channels[CH.slope][i], w = b.channels[CH.water][i];
-  if ((r > 0.85 && !relaxed) || sl >= 0.6 || w > 0.7) return Infinity;
+  // relaxed (escape) mode also accepts steeper ground, still well under the 34° rollover
+  if ((r > 0.85 && !relaxed) || sl >= (relaxed ? 0.85 : 0.6) || w > 0.7) return Infinity;
   let c = 1 + 9 * r * r + 6 * sl + (b.lastSeen[i] < 0 ? 0.6 : 0);
   // keep a margin from obstacles (the 2 m grid is coarse vs the 0.9 m rover radius)
   const G = CFG.G, x = i % G, y = (i / G) | 0;
@@ -49,7 +50,7 @@ export interface PathResult { path: { x: number; y: number }[]; cost: number; ce
 export function astar(b: Belief, sx: number, sy: number, gx: number, gy: number, relaxed = false, maxExpand = 12000): PathResult | null {
   const G = CFG.G, s = b.idx(sx, sy), g = b.idx(gx, gy);
   if (cellCost(b, g, s, relaxed) === Infinity && g !== s) return null;
-  const gs = new Float32Array(G * G).fill(Infinity), from = new Int32Array(G * G).fill(-1), closed = new Uint8Array(G * G);
+  const gs = new Float64Array(G * G).fill(Infinity), from = new Int32Array(G * G).fill(-1), closed = new Uint8Array(G * G);
   const h = (i: number) => Math.hypot((i % G) - (g % G), ((i / G) | 0) - ((g / G) | 0));
   const open = new Heap(); gs[s] = 0; open.push(h(s), s);
   let exp = 0;
@@ -79,11 +80,15 @@ export function astar(b: Belief, sx: number, sy: number, gx: number, gy: number,
 /** Dijkstra from the rover out to maxDist metres: travel cost (m-equivalent) per reachable cell. */
 export function reachMap(b: Belief, sx: number, sy: number, maxDist: number, relaxed = false): Float32Array {
   const G = CFG.G, s = b.idx(sx, sy);
-  const gs = new Float32Array(G * G).fill(Infinity);
+  // float64 + closed set: with float32 the stored cost rounds up, `ng < gs[j]` keeps succeeding and
+  // stale heap entries re-expand in a cascade (seconds per call)
+  const gs = new Float64Array(G * G).fill(Infinity), closed = new Uint8Array(G * G);
   const open = new Heap(); gs[s] = 0; open.push(0, s);
-  const lim = maxDist / CFG.RES * 3;
+  // effectively geometric: risky cells cost more but must not hide a safe spot behind them
+  const lim = maxDist / CFG.RES * 12;
   while (open.size) {
-    const i = open.pop(); const gi = gs[i]; if (gi > lim) continue;
+    const i = open.pop(); if (closed[i]) continue; closed[i] = 1;
+    const gi = gs[i]; if (gi > lim) continue;
     const x = i % G, y = (i / G) | 0;
     for (const [dx, dy, dl] of NB) {
       const nx = x + dx, ny = y + dy; if (nx < 0 || ny < 0 || nx >= G || ny >= G) continue;
@@ -95,8 +100,9 @@ export function reachMap(b: Belief, sx: number, sy: number, maxDist: number, rel
       if (ng < gs[j]) { gs[j] = ng; open.push(ng, j); }
     }
   }
-  for (let i = 0; i < gs.length; i++) if (gs[i] !== Infinity) gs[i] *= CFG.RES;
-  return gs;
+  const out = new Float32Array(G * G);
+  for (let i = 0; i < gs.length; i++) out[i] = gs[i] === Infinity ? Infinity : gs[i] * CFG.RES;
+  return out;
 }
 
 /** max planning risk along the first `metres` of a path */

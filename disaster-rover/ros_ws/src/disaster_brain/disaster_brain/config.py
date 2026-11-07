@@ -9,7 +9,7 @@ N = G * G
 CFG = dict(
     confTau=40.0, horizon=30.0, mapPeriod=0.5,
     maxV=3.0, maxW=1.6, ambient=22.0, lidarMax=30.0, thermalRange=45.0, cameraRange=28.0,
-    reflexWater=0.2, reflexTemp=52.0, reflexTilt=22.0, reflexWind=26.0, reflexFront=1.3,
+    reflexWater=0.2, reflexTemp=52.0, reflexTilt=26.0, reflexWind=26.0, reflexFront=1.3,
     lowConfReturnFrac=0.12, staleFrame=0.6,
     hotTemp=120.0, shakeThresh=1.8, tornadoWind=13.0, tornadoPressure=35.0,
     hysteresis=0.08, minDwell=2.0,

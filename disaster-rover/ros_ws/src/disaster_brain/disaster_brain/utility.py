@@ -40,6 +40,15 @@ def build_ctx(b, rd, P, reach, probes, home, goal):
     reach_ok = np.isfinite(reach)
     pr = b.predicted
     pred_stage = flood['predStage']
+    away = []
+    if P['fire']['active'] and P['fire']['nearest'] < 50:
+        away.append(P['fire']['bearing'])
+    to = P['tornado']
+    if to['active'] and to['dist'] < 50:
+        away.append(math.atan2(to['y'] - rd.y, to['x'] - rd.x))
+    me = P['meteor']
+    if me['active'] and math.hypot(me['cx'] - rd.x, me['cy'] - rd.y) < 50:
+        away.append(math.atan2(me['cy'] - rd.y, me['cx'] - rd.x))
     # ---- safest spot ----
     safe = None
     m = reach_ok & (pr < 0.3) & (b.pred_water < 0.15)
@@ -47,7 +56,11 @@ def build_ctx(b, rd, P, reach, probes, home, goal):
         bonus = np.zeros(N)
         if flood['active']:
             bonus = np.where(~np.isnan(b.elev), np.minimum(4.0, np.nan_to_num(b.elev) - pred_stage) * 2, 0.0)
-        v = np.minimum(b.haz_dist, 45) - 0.2 * np.where(reach_ok, reach, 0) - 40 * pr + bonus
+        toward = np.zeros(N)
+        ang = np.arctan2(b.ys - rd.y, b.xs - rd.x)
+        for a in away:
+            toward = np.maximum(toward, np.cos(ang - a))
+        v = np.minimum(b.haz_dist, 45) - 0.2 * np.where(reach_ok, reach, 0) - 40 * pr - 15 * np.maximum(0, toward) + bonus
         v = np.where(m, v, -np.inf)
         i = int(np.argmax(v))
         safe = _spot(i, v[i], reach[i], '%.0f m from hazards' % min(b.haz_dist[i], 99))
@@ -142,8 +155,10 @@ def score(ctx, P, rd, goal, placed):
     fi, to, me = P['fire'], P['tornado'], P['meteor']
     if fi['active'] and fi['eta'] < 45:
         f = max(f, 0.35 + 0.55 * (1 - fi['eta'] / 45))
-    if fi['active'] and fi['nearest'] < 14:
-        f = max(f, 0.9)
+    if fi['active'] and fi['nearest'] < 35:
+        f = max(f, 0.8 + 0.15 * (1 - fi['nearest'] / 35))
+    if fi['active'] and fi['eta'] < 30:
+        f = max(f, 0.7)
     if to['active'] and to['cpa'] < 32 and to['tcpa'] < 35:
         f = max(f, 0.5 + 0.45 * (1 - to['cpa'] / 32))
     if to['active'] and to['dist'] < 35:

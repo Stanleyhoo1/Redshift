@@ -37,3 +37,14 @@
 - Bug found by the ROS test: a Float32MultiArray with a 0-size dimension produced stride 0/0 = NaN -> JSON null -> rosbridge rejected the message.
 - Browser uses roslib; headless uses a 40-line rosbridge client over Node 22's built-in WebSocket (no extra deps).
 - A `/cmd_vel` older than 1 s is not trusted (rover stops); if the socket drops mid-run the app switches to the local brain.
+
+## Flood + wildfire (M5)
+- Session crashed mid-M5 while a long benchmark ran; the in-flight edits had all applied (checked marker by marker). Benchmarks are now short (5-8 seeds, `timeout 170`).
+- Real cause of the slowdown: TS Dijkstra stored costs in a Float32Array; rounded-up float32 values let `ng < gs[j]` keep succeeding and stale heap entries re-expanded in a cascade (6 s per call). Float64 + closed set: 5 ms. Python was unaffected (float64, stale-entry skip).
+- Local steering (`steerClear`): every forward command is checked against the live LiDAR scan; if blocked within 2.6 m it re-aims at the nearest clear heading. The 2 m map lags behind reality in smoke.
+- Smoke "stop & re-scan" is suppressed when a fire is within 30 m and has a 10 s cooldown. Standing still in smoke next to a fire was the main cause of early deaths.
+- Fire + water: one combined escape search scores heat repulsion, water depth, slope and banks together. With fire close, shallow water up to 0.36 m (hard limit 0.5) is acceptable refuge.
+- Refuges in the direction of a sensed fire/tornado/meteor zone are penalised; otherwise the flee target flipped along the fire front.
+- Slope risk relaxed to (deg-15)/15 (blocks at 24°) and the tilt reflex to 26°. The old 20° block made the generated 19° river banks a wall and boxed the rover in for a minute at a time.
+- Flee with no reachable refuge now drives the escape heading instead of spinning in place.
+- Fire is "close" (flee >= 0.8) within 35 m.

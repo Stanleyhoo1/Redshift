@@ -1,7 +1,7 @@
 """SAFETY REFLEXES: hard limits that override every behaviour instantly. Mirror of web/brain/safety.ts."""
 import math
 
-from .config import CFG, compass, wrap
+from .config import CFG, HEAT, SLOPE, compass, wrap
 
 
 def tw(v, w):
@@ -19,9 +19,45 @@ def escape_heading(rd, heading, speed=None):
     return tw(v, max(-mw, min(mw, 2.5 * err)))
 
 
+def clearance(rd, heading, half_width=0.3):
+    m = float('inf')
+    for k, r in enumerate(rd.scan_r):
+        a = rd.scan_a0 + k * rd.scan_inc
+        if abs(wrap(a - heading)) > half_width:
+            continue
+        r = rd.scan_max if r > rd.scan_max else r
+        if r < m:
+            m = r
+    return m
+
+
+def steer_clear(rd, cmd, need=2.6):
+    """Local steering: re-aim a forward command at the nearest LiDAR-clear heading."""
+    if cmd['linear']['x'] <= 0.05:
+        return cmd
+    want = rd.yaw + cmd['angular']['z'] * 0.6
+    if clearance(rd, want) >= need:
+        return cmd
+    best, best_cost = None, float('inf')
+    for k in range(-12, 13):
+        h = want + k * math.pi / 18
+        c = clearance(rd, h)
+        if c < need:
+            continue
+        cost = abs(k) - min(c, 10) * 0.05
+        if cost < best_cost:
+            best_cost, best = cost, h
+    if best is None:
+        return tw(0, 1.2 if cmd['angular']['z'] >= 0 else -1.2)
+    err = wrap(best - rd.yaw)
+    v = 0.0 if abs(err) > 1.0 else min(cmd['linear']['x'], CFG['maxV'] * math.cos(err))
+    return tw(v, max(-CFG['maxW'], min(CFG['maxW'], 2.5 * err)))
+
+
 class Safety:
     def __init__(self):
         self.low_conf_since = -1.0
+        self.last_rescan = -1e9
 
     def check(self, rd, b, P):
         # 1. incoming meteor
@@ -36,20 +72,15 @@ class Safety:
             return dict(name='meteor_dodge', cmd=escape_heading(rd, away),
                         text='Camera: meteor streak, impact %.1f m %s in %.1f s → DODGE %s' % (d, compass(math.atan2(wy - rd.y, wx - rd.x)), ttl, compass(away)))
         # 2. water
-        if rd.depth > CFG['reflexWater']:
-            h = self._best_dry_heading(rd, b)
+        heat_near = rd.temp_c > 40 or any(s[1] < 14 for s in rd.hot_sectors)
+        if rd.depth > (0.36 if heat_near else CFG['reflexWater']):
+            h = self.escape_search(rd, b, 0.3) if heat_near else self._best_dry_heading(rd, b)
             return dict(name='water', cmd=escape_heading(rd, h, 2.2),
                         text='Water depth %.2f m > %s m limit → climb out %s' % (rd.depth, CFG['reflexWater'], compass(h)))
         # 3. heat
         close = [s for s in rd.hot_sectors if s[1] < 9]
         if rd.temp_c > CFG['reflexTemp'] or close:
-            rx = ry = 0.0
-            for (a, dist, T) in rd.hot_sectors:
-                w = T / max(1.0, dist * dist)
-                rx -= w * math.cos(a)
-                ry -= w * math.sin(a)
-            h = math.atan2(ry, rx) if (rx or ry) else rd.yaw + math.pi
-            h = self._avoid_water(rd, b, h)
+            h = self.escape_search(rd, b, 0.38)
             if rd.temp_c > CFG['reflexTemp']:
                 why = 'Body temp %.0f°C > %.0f°C' % (rd.temp_c, CFG['reflexTemp'])
             else:
@@ -79,16 +110,49 @@ class Safety:
         # 6. stale data
         if rd.dt > CFG['staleFrame']:
             return dict(name='stale', cmd=tw(0, 0), text='Sensor frame %.2f s old → STOP' % rd.dt)
-        # 7. low perception confidence
-        if rd.return_frac < CFG['lowConfReturnFrac'] and rd.smoke > 0.25:
+        # 7. low perception confidence (not while a known fire is close)
+        fire_close = P['fire']['active'] and P['fire']['nearest'] < 30
+        if rd.return_frac < CFG['lowConfReturnFrac'] and rd.smoke > 0.25 and not fire_close and rd.t - self.last_rescan > 10:
             if self.low_conf_since < 0:
                 self.low_conf_since = rd.t
-            if rd.t - self.low_conf_since < 2.5:
+            if rd.t - self.low_conf_since >= 2.5:
+                self.last_rescan = rd.t
+                self.low_conf_since = -1.0
+            else:
                 return dict(name='rescan', cmd=tw(0, 0.6),
                             text='LiDAR returns %.0f%%, smoke %.2f → low confidence: STOP & RE-SCAN' % (rd.return_frac * 100, rd.smoke))
         else:
             self.low_conf_since = -1.0
         return None
+
+    def escape_search(self, rd, b, max_depth):
+        best, best_s = rd.yaw + math.pi, -1e18
+        heat = b.channels[HEAT]
+        for k in range(24):
+            a = k * math.pi / 12
+            s = 0.0
+            for (hb, hd, ht) in rd.hot_sectors:
+                s -= (ht / max(4.0, hd * hd)) * max(0.0, math.cos(a - hb)) * 3
+            for d in (3, 6, 10):
+                px, py = rd.x + d * math.cos(a), rd.y + d * math.sin(a)
+                if not b.inside(px, py):
+                    s -= 30
+                    continue
+                i = b.idx(px, py)
+                if b.blocked(i):
+                    s -= 8
+                wd = b.water[i]
+                if wd > max_depth:
+                    s -= 25 * (wd - max_depth + 0.1)
+                s -= 6 * heat[i]
+                if b.channels[SLOPE][i] >= 0.6:
+                    s -= 10
+                if b.water_dist[i] < 4 and b.channels[SLOPE][i] > 0.3:
+                    s -= 8
+            s += 0.5 * clearance(rd, a) / 30
+            if s > best_s:
+                best_s, best = s, a
+        return best
 
     def _best_dry_heading(self, rd, b):
         best, best_s = rd.yaw + math.pi, -1e18

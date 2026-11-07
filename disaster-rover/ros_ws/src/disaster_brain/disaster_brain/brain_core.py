@@ -13,7 +13,7 @@ from .perception import perceive, PerceptionState
 from .prediction import Predictor
 from .planner import astar, reach_map, path_risk, cost_grid
 from .utility import build_ctx, score, select
-from .safety import Safety, tw
+from .safety import Safety, tw, steer_clear, clearance, escape_heading
 from .rules import validate_tool_call
 
 
@@ -78,6 +78,13 @@ class BrainCore:
             reach[self.bad_until > t] = np.inf
             self.reach = reach
             self.ctx = build_ctx(b, rd, P, reach, self._probes(rd), self.home, self.goal)
+            ctx0 = self.ctx
+            if (not ctx0['safe'] or not ctx0['high']) and (ctx0['dynNear'] > 0.25 or P['flood']['active'] or P['fire']['active']):
+                rel = build_ctx(b, rd, P, reach_map(b, rd.x, rd.y, 75, True), self._probes(rd), self.home, self.goal)
+                if not ctx0['safe']:
+                    ctx0['safe'] = rel['safe']
+                if not ctx0['high']:
+                    ctx0['high'] = rel['high']
             if not self._batt_event and rd.status['battery'] < CFG['batteryAgentEvent']:
                 self._batt_event = True
                 self.events.append(dict(kind='battery', text='battery %.0f%%' % rd.status['battery']))
@@ -129,7 +136,9 @@ class BrainCore:
                 self.path = None
             elif self.path:
                 cmd = self._follow(rd, self.path)
-        elif self.behaviour in ('explore', 'flee'):
+        elif self.behaviour == 'flee':
+            cmd = escape_heading(rd, self.safety.escape_search(rd, b, 0.3), 2.4)
+        elif self.behaviour == 'explore':
             cmd = tw(0, 0.5)
 
         # stuck recovery
@@ -163,7 +172,8 @@ class BrainCore:
                 reflex['text'] += ' [stalled: wiggle]'
             elif started or moved >= 0.4:
                 self._reflex_pos = (rd.x, rd.y, t)
-        if cmd['linear']['x'] > 0 and rd.lidar_front < CFG['reflexFront']:
+        cmd = steer_clear(rd, cmd)
+        if cmd['linear']['x'] > 0 and rd.lidar_front < CFG['reflexFront'] and clearance(rd, rd.yaw, 0.25) < CFG['reflexFront']:
             cmd = tw(0, cmd['angular']['z'] or 0.9)
 
         log = None

@@ -16,7 +16,7 @@ export const CFG = {
   // ---- safety reflex limits (rover hard limits: water 0.5 m, air 160 °C, tilt 34°, wind 46 m/s) ----
   reflexWater: 0.2,
   reflexTemp: 52,
-  reflexTilt: 22,
+  reflexTilt: 26,
   reflexWind: 26,
   reflexFront: 1.3,
   lowConfReturnFrac: 0.12,

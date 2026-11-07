@@ -39,6 +39,11 @@ export function buildCtx(b: Belief, rd: Readings, P: Predictions, reach: Float32
   const e = b.elev[ri];
   const aboveWater = P.flood.active && !isNaN(e) && !isNaN(P.flood.stage) ? e - P.flood.stage : 99;
 
+  // bearings of nearby dynamic hazards: a refuge on the far side of us from them beats one beside them
+  const away: number[] = [];
+  if (P.fire.active && P.fire.nearest < 50) away.push(P.fire.bearing);
+  if (P.tornado.active && P.tornado.dist < 50) away.push(Math.atan2(P.tornado.y - rd.y, P.tornado.x - rd.x));
+  if (P.meteor.active && Math.hypot(P.meteor.cx - rd.x, P.meteor.cy - rd.y) < 50) away.push(Math.atan2(P.meteor.cy - rd.y, P.meteor.cx - rd.x));
   // ---- candidate spots from one Dijkstra (reach) ----
   let safe: Spot | null = null, high: Spot | null = null, probe: Spot | null = null, frontier: Spot | null = null;
   const placed = probes.length;
@@ -47,7 +52,9 @@ export function buildCtx(b: Belief, rd: Readings, P: Predictions, reach: Float32
     const x = b.cx(i), y = b.cy(i), pr = b.predicted[i];
     // safest spot: far from dynamic hazards and predicted water, cheap to reach
     if (pr < 0.3 && b.predWater[i] < 0.15) {
-      const v = Math.min(b.hazDist[i], 45) - 0.2 * c - 40 * pr + (P.flood.active && !isNaN(b.elev[i]) ? Math.min(4, b.elev[i] - P.flood.predStage) * 2 : 0);
+      let toward = 0;
+      for (const a of away) toward = Math.max(toward, Math.cos(Math.atan2(y - rd.y, x - rd.x) - a));
+      const v = Math.min(b.hazDist[i], 45) - 0.2 * c - 40 * pr - 15 * Math.max(0, toward) + (P.flood.active && !isNaN(b.elev[i]) ? Math.min(4, b.elev[i] - P.flood.predStage) * 2 : 0);
       if (!safe || v > safe.value) safe = { x, y, value: v, cost: c, why: `${Math.min(b.hazDist[i], 99).toFixed(0)} m from hazards` };
     }
     // high ground: elevation above the predicted flood stage
@@ -132,7 +139,8 @@ export function score(ctx: Ctx, P: Predictions, rd: Readings, goal: Goal | null,
   // flee: dynamic hazards nearby / predicted to arrive soon
   let f = ctx.dynNear;
   if (P.fire.active && P.fire.eta < 45) f = Math.max(f, 0.35 + 0.55 * (1 - P.fire.eta / 45));
-  if (P.fire.active && P.fire.nearest < 14) f = Math.max(f, 0.9);
+  if (P.fire.active && P.fire.nearest < 35) f = Math.max(f, 0.8 + 0.15 * (1 - P.fire.nearest / 35));
+  if (P.fire.active && P.fire.eta < 30) f = Math.max(f, 0.7);
   if (P.tornado.active && P.tornado.cpa < 32 && P.tornado.tcpa < 35) f = Math.max(f, 0.5 + 0.45 * (1 - P.tornado.cpa / 32));
   if (P.tornado.active && P.tornado.dist < 35) f = Math.max(f, 0.6 + 0.35 * (1 - P.tornado.dist / 35));
   if (P.meteor.active) { const d = Math.hypot(P.meteor.cx - rd.x, P.meteor.cy - rd.y); if (d < P.meteor.spread * 1.6) f = Math.max(f, 0.55 + 0.4 * (1 - d / (P.meteor.spread * 1.6))); }

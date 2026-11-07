@@ -4,7 +4,7 @@ import { perceive, PerceptionState, Readings } from './perception';
 import { Predictor } from './prediction';
 import { astar, reachMap, pathRisk, PathResult } from './planner';
 import { buildCtx, score, select, Ctx, Scores, Goal, ToolCall, Spot } from './utility';
-import { Safety, Reflex } from './safety';
+import { Safety, Reflex, steerClear, clearance, escapeHeading } from './safety';
 import { validateToolCall, RuleResult } from './rules';
 import type { Brain } from './types';
 import type { SensorFrame, BrainOutput, Twist } from './msgs';
@@ -57,6 +57,12 @@ export class LocalBrain implements Brain {
       const reach = this.reach;
       for (let i = 0; i < reach.length; i++) if (this.badUntil[i] > t) reach[i] = Infinity;
       this.ctx = buildCtx(b, rd, P, reach, this.probesPlaced(rd), this.home, this.goal);
+      // boxed in by risk: look for a way out across risky ground
+      if ((!this.ctx.safe || !this.ctx.high) && (this.ctx.dynNear > 0.25 || P.flood.active || P.fire.active)) {
+        const relaxed = buildCtx(b, rd, P, reachMap(b, rd.x, rd.y, 75, true), this.probesPlaced(rd), this.home, this.goal);
+        if (!this.ctx.safe) this.ctx.safe = relaxed.safe;
+        if (!this.ctx.high) this.ctx.high = relaxed.high;
+      }
       if (!this.battEvent && rd.status.battery < CFG.batteryAgentEvent) { this.battEvent = true; this.events.push({ kind: 'battery', text: `battery ${rd.status.battery.toFixed(0)}%` }); }
     }
     const ctx = this.ctx!;
@@ -98,7 +104,10 @@ export class LocalBrain implements Brain {
         if (this.behaviour === 'explore' && this.goal && (this.goal.call.name === 'go_to_region') && Math.hypot(this.goal.x - rd.x, this.goal.y - rd.y) < 5) this.goal = null;
         this.target = null; this.path = null;
       } else if (this.path) cmd = this.follow(rd, this.path);
-    } else if (this.behaviour === 'explore' || this.behaviour === 'flee') {
+    } else if (this.behaviour === 'flee') {
+      // no planned way out: move along the best local escape heading (away from heat, not into deep water)
+      cmd = escapeHeading(rd, this.safety.escapeSearch(rd, b, 0.3), 2.4);
+    } else if (this.behaviour === 'explore') {
       cmd = tw(0, 0.5); // nothing reachable: turn in place to sense more
     }
 
@@ -127,8 +136,9 @@ export class LocalBrain implements Brain {
         reflex.text += ' [stalled: wiggle]';
       } else if (reflexStarted || Math.hypot(rd.x - this.reflexPos.x, rd.y - this.reflexPos.y) >= 0.4) this.reflexPos = { x: rd.x, y: rd.y, t };
     }
-    // never drive forward into something LiDAR sees right in front
-    if (cmd.linear.x > 0 && rd.lidarFront < CFG.reflexFront) { cmd = tw(0, cmd.angular.z || 0.9); }
+    // local steering around what LiDAR sees right now (the 2 m map can lag, e.g. in smoke)
+    cmd = steerClear(rd, cmd);
+    if (cmd.linear.x > 0 && rd.lidarFront < CFG.reflexFront && clearance(rd, rd.yaw, 0.25) < CFG.reflexFront) cmd = tw(0, cmd.angular.z || 0.9);
 
     // ---- decision log ----
     let log: string | null = null;

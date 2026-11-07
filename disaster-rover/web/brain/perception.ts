@@ -15,6 +15,8 @@ export interface Readings {
   windX: number; windY: number; windSpeed: number; pressure: number; pressureDrop: number;
   shake: number;
   lidarFront: number; returnFrac: number; smoke: number;
+  /** raw scan for local steering: ranges + world angle of beam 0 + increment */
+  scanR: number[]; scanA0: number; scanInc: number; scanMax: number;
   /** hottest thermal sector */
   thermalMax: { temp: number; dist: number; bearing: number };
   /** sectors with a >100 °C pixel: bearing (world), distance to it, sector max temp */
@@ -211,7 +213,7 @@ export function perceive(b: Belief, f: SensorFrame, ps: PerceptionState): Readin
     t, dt, x, y, yaw, v: f.odom.twist.twist.linear.x, w: f.odom.twist.twist.angular.z, roll, pitch,
     tiltDeg: Math.max(Math.abs(roll), Math.abs(pitch)) * 180 / Math.PI,
     status, depth, tempC, windX: wx, windY: wy, windSpeed: ws, pressure: pr, pressureDrop: ps.pressureBase - pr, shake,
-    lidarFront: front, returnFrac, smoke, thermalMax, hotSectors, streaks, flashes, funnel, waterNear, stageObs,
+    lidarFront: front, returnFrac, smoke, scanR: sc.ranges, scanA0: yaw + sc.angle_min, scanInc: sc.angle_increment, scanMax: sc.range_max, thermalMax, hotSectors, streaks, flashes, funnel, waterNear, stageObs,
   };
 }
 export { clamp01 };

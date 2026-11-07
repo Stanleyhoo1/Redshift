@@ -23,7 +23,7 @@ def cost_grid(b, relaxed=False):
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         near |= shift2(b2, dx, dy, False)
     c = c + np.where(near.reshape(-1), 2.5, 0.0)
-    imp = blocked | (sl >= 0.6) | (w > 0.7)
+    imp = blocked | (sl >= (0.85 if relaxed else 0.6)) | (w > 0.7)
     if not relaxed:
         imp |= r > 0.85
     c = np.where(imp, INF, c)
@@ -96,7 +96,7 @@ def reach_map(b, sx, sy, max_dist, relaxed=False, grid=None):
     gs = [INF] * N
     gs[s] = 0.0
     op = [(0.0, s)]
-    lim = max_dist / RES * 3
+    lim = max_dist / RES * 12  # effectively geometric
     sxc, syc = s % G, s // G
     rc = max_dist / RES
     while op:

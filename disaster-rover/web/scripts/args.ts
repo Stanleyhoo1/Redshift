@@ -17,6 +17,7 @@ export function disasterConfig(list: string | undefined, intensity: number, rand
   const cfg = defaultDisasterConfig();
   cfg.random = random;
   for (const raw of (list ?? '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)) {
+    if (raw === 'none') continue;
     if (raw === 'all') { for (const k of DISASTER_KINDS) cfg[k] = { enabled: true, intensity }; continue; }
     const k = ALIASES[raw];
     if (!k) throw new Error(`unknown disaster "${raw}" (use ${Object.keys(ALIASES).join(', ')}, all)`);

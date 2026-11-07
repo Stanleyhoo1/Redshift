@@ -118,7 +118,7 @@ class Predictor:
             diff = np.where(ok2 & okn, np.abs(np.nan_to_num(en) - np.nan_to_num(e2)), 0.0)
             np.maximum(m, diff, out=m)
         deg = np.degrees(np.arctan(m / RES))
-        tmp = np.where(ok2, np.clip((deg - 12) / 14, 0, 1), 0.0)
+        tmp = np.where(ok2, np.clip((deg - 15) / 15, 0, 1), 0.0)
         cs2 = tmp.copy()
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
