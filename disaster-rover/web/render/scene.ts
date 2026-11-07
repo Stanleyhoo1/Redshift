@@ -172,7 +172,8 @@ export class SceneView {
       if (this.toggles.fog && !sim.revealed[i]) { r *= 0.22; g *= 0.24; b *= 0.3; }
       col[i * 3] = r; col[i * 3 + 1] = g; col[i * 3 + 2] = b;
       pos[i * 3 + 1] = w.height[i];
-      wp[i * 3 + 1] = w.water[i] > 0.02 ? w.height[i] + w.water[i] : w.height[i] - 0.6;
+      const hidden = this.toggles.fog && !sim.revealed[i];
+      wp[i * 3 + 1] = w.water[i] > 0.02 && !hidden ? w.height[i] + w.water[i] : w.height[i] - 0.6;
     }
     this.terrainColors.needsUpdate = true; this.terrainPos.needsUpdate = true; this.waterPos.needsUpdate = true;
     if (w.craters.length !== this.nCraters) this.terrain.geometry.computeVertexNormals();
