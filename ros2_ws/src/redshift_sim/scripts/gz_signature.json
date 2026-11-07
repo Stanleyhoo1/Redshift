@@ -1,0 +1,244 @@
+{
+ "/rover_0/odom": {
+  "type": "nav_msgs/Odometry",
+  "hz": 27.6,
+  "count": 163,
+  "frame_id": "world",
+  "child_frame_id": "rover_0/base_link",
+  "~z": 2.9
+ },
+ "/rover_0/imu_raw": {
+  "type": "sensor_msgs/Imu",
+  "hz": 99.3,
+  "count": 589,
+  "frame_id": "rover_0/base_link/imu",
+  "~accel_g": 2.2,
+  "~roll_pitch_deg": [
+   -0.0,
+   -0.0
+  ],
+  "orientation_ref": "offset -45 deg"
+ },
+ "/rover_0/camera/image_raw": {
+  "type": "sensor_msgs/Image",
+  "hz": 10.0,
+  "count": 58,
+  "frame_id": "rover_0/base_link/camera",
+  "encoding": "rgb8",
+  "width": 320,
+  "height": 240,
+  "step": 960,
+  "is_bigendian": 0,
+  "~mean_rgb": [
+   152.4,
+   96.3,
+   68.3
+  ]
+ },
+ "/rover_0/camera/depth_raw": {
+  "type": "sensor_msgs/Image",
+  "hz": 9.4,
+  "count": 55,
+  "frame_id": "rover_0/base_link/camera",
+  "encoding": "32FC1",
+  "width": 320,
+  "height": 240,
+  "step": 1280,
+  "is_bigendian": 0,
+  "~depth": {
+   "finite_frac": 0.695,
+   "posinf_frac": 0.305,
+   "neginf_frac": 0.0,
+   "nan_frac": 0.0
+  },
+  "~depth_range": [
+   0.95,
+   38.01
+  ],
+  "no_return": "+inf"
+ },
+ "/rover_0/camera/camera_info": {
+  "type": "sensor_msgs/CameraInfo",
+  "hz": 9.9,
+  "count": 59,
+  "frame_id": "rover_0/base_link/camera",
+  "width": 320,
+  "height": 240,
+  "k": [
+   190.7,
+   0.0,
+   160.0,
+   0.0,
+   190.7,
+   120.0,
+   0.0,
+   0.0,
+   1.0
+  ],
+  "p": [
+   190.7,
+   0.0,
+   160.0,
+   0.0,
+   0.0,
+   190.7,
+   120.0,
+   0.0,
+   0.0,
+   0.0,
+   1.0,
+   0.0
+  ],
+  "distortion_model": "plumb_bob"
+ },
+ "/rover_0/wheel_odom": {
+  "type": "nav_msgs/Odometry",
+  "hz": 19.1,
+  "count": 114,
+  "frame_id": "rover_0/odom",
+  "child_frame_id": "rover_0/base_link",
+  "~z": 0.0
+ },
+ "/rover_0/lidar/points_raw": {
+  "type": "sensor_msgs/PointCloud2",
+  "hz": 10.0,
+  "count": 59,
+  "frame_id": "rover_0/base_link/lidar",
+  "width": 360,
+  "height": 16,
+  "point_step": 32,
+  "is_dense": false,
+  "fields": [
+   [
+    "x",
+    0,
+    7,
+    1
+   ],
+   [
+    "y",
+    4,
+    7,
+    1
+   ],
+   [
+    "z",
+    8,
+    7,
+    1
+   ],
+   [
+    "intensity",
+    16,
+    7,
+    1
+   ],
+   [
+    "ring",
+    24,
+    4,
+    1
+   ]
+  ],
+  "~points": {
+   "finite_frac": 0.499,
+   "posinf_frac": 0.231,
+   "neginf_frac": 0.27,
+   "nan_frac": 0.0
+  },
+  "no_return": "+inf-inf",
+  "ring0_elev_deg": -15.0,
+  "ring_order": "ascending",
+  "col_order": "ccw",
+  "col0_az_deg": -180.0
+ },
+ "/scout_0/odom": {
+  "type": "nav_msgs/Odometry",
+  "hz": 27.6,
+  "count": 163,
+  "frame_id": "world",
+  "child_frame_id": "scout_0/base_link",
+  "~z": 2.67
+ },
+ "/scout_0/imu_raw": {
+  "type": "sensor_msgs/Imu",
+  "hz": 99.3,
+  "count": 589,
+  "frame_id": "scout_0/base_link/imu",
+  "~accel_g": 2.2,
+  "~roll_pitch_deg": [
+   0.0,
+   -0.0
+  ],
+  "orientation_ref": "world"
+ },
+ "/scout_0/camera/image_raw": {
+  "type": "sensor_msgs/Image",
+  "hz": 5.0,
+  "count": 29,
+  "frame_id": "scout_0/base_link/camera",
+  "encoding": "rgb8",
+  "width": 160,
+  "height": 120,
+  "step": 480,
+  "is_bigendian": 0,
+  "~mean_rgb": [
+   218.0,
+   177.0,
+   149.0
+  ]
+ },
+ "/scout_0/camera/depth_raw": {
+  "type": "sensor_msgs/Image",
+  "hz": 5.0,
+  "count": 29,
+  "frame_id": "scout_0/base_link/camera",
+  "encoding": "32FC1",
+  "width": 160,
+  "height": 120,
+  "step": 640,
+  "is_bigendian": 0,
+  "~depth": {
+   "finite_frac": 0.0,
+   "posinf_frac": 1.0,
+   "neginf_frac": 0.0,
+   "nan_frac": 0.0
+  },
+  "~depth_range": null,
+  "no_return": "+inf"
+ },
+ "/scout_0/camera/camera_info": {
+  "type": "sensor_msgs/CameraInfo",
+  "hz": 5.0,
+  "count": 29,
+  "frame_id": "scout_0/base_link/camera",
+  "width": 160,
+  "height": 120,
+  "k": [
+   80.0,
+   0.0,
+   80.0,
+   0.0,
+   80.0,
+   60.0,
+   0.0,
+   0.0,
+   1.0
+  ],
+  "p": [
+   80.0,
+   0.0,
+   80.0,
+   0.0,
+   0.0,
+   80.0,
+   60.0,
+   0.0,
+   0.0,
+   0.0,
+   1.0,
+   0.0
+  ],
+  "distortion_model": "plumb_bob"
+ }
+}
