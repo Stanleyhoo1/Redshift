@@ -5,8 +5,9 @@ import * as THREE from 'three'
 import { simStore, useSim, roverPoses } from '../state/store.js'
 import { forEachTrailPoint, sampleGround, sampleGroundNear, TRAIL_POINTS } from '../state/simState.js'
 import { FatPolyline } from './fatLine.js'
-import { glowTexture } from './textures.js'
+import { glowTexture, warningTexture } from './textures.js'
 import { reducedMotion } from './sceneConstants.js'
+import { HAZARD } from '../lib/theme.js'
 
 const MODEL_SCALE = 1.5 // a little larger than life so rovers read on a projector
 
@@ -20,6 +21,14 @@ const geo = {
   halo: new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
   goalRing: new THREE.RingGeometry(0.72, 0.92, 48).rotateX(-Math.PI / 2),
   goalDot: new THREE.CircleGeometry(0.2, 20).rotateX(-Math.PI / 2),
+  selRing: new THREE.RingGeometry(1.85, 1.98, 64).rotateX(-Math.PI / 2),
+  faultRing: new THREE.RingGeometry(1.45, 1.9, 48).rotateX(-Math.PI / 2),
+}
+const selMat = new THREE.MeshBasicMaterial({ color: '#e8eef5', transparent: true, opacity: 0.8, depthWrite: false })
+const faultMats = {
+  ring: new THREE.MeshBasicMaterial({ color: HAZARD, transparent: true, depthWrite: false }),
+  glow: new THREE.MeshBasicMaterial({ color: HAZARD, map: glowTexture(), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }),
+  sign: new THREE.SpriteMaterial({ map: warningTexture(), transparent: true, depthWrite: false, depthTest: false }),
 }
 const shared = {
   wheel: new THREE.MeshStandardMaterial({ color: '#1a1e26', roughness: 0.9, metalness: 0.1 }),
@@ -72,10 +81,15 @@ function groundNormal(T, x, y, out) {
 
 const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a))
 
-function Rover({ meta }) {
+function Rover({ meta, selected, onSelect }) {
   const outer = useRef()
   const inner = useRef()
   const pose = useRef(null)
+  const fault = useRef()
+  const sign = useRef()
+  const sel = useRef()
+  const state = useSim((s) => s.rovers[meta.id]?.state)
+  const faulted = state === 'fault'
   // drei <Html> picks its DOM container once R3F has connected its events; mounting it
   // earlier makes it unmount and remount its own React root (a React error in dev).
   const labelsReady = useThree((s) => !!s.events.connected)
@@ -85,8 +99,16 @@ function Rover({ meta }) {
   )
   useEffect(() => () => haloMat.dispose(), [haloMat])
   useEffect(() => () => roverPoses.delete(meta.id), [meta.id])
+  useEffect(() => () => (document.body.style.cursor = ''), [])
 
-  useFrame((_, dt) => {
+  // Click (not drag) on the rover or its label selects it: sensor panel and follow.
+  const select = (e) => {
+    e.stopPropagation()
+    if (e.delta > 6) return
+    onSelect?.(meta.id)
+  }
+
+  useFrame(({ clock, camera, size }, dt) => {
     const s = simStore.get()
     const r = s.rovers[meta.id]
     const o = outer.current
@@ -119,20 +141,65 @@ function Rover({ meta }) {
     _q.setFromRotationMatrix(_basis)
     if (inner.current) inner.current.quaternion.slerp(_q, Math.min(1, a * 1.2))
     roverPoses.set(meta.id, o.position)
+
+    // Motor fault: a blinking crimson ring and a warning sign over the parked rover.
+    const isFault = r.state === 'fault'
+    const t = clock.elapsedTime
+    const blink = reducedMotion ? 1 : 0.5 + 0.5 * Math.sign(Math.sin(t * 6.5))
+    if (fault.current) {
+      fault.current.visible = isFault
+      if (isFault) {
+        faultMats.ring.opacity = 0.25 + 0.75 * blink
+        faultMats.glow.opacity = 0.2 + 0.6 * blink
+        const k = reducedMotion ? 1 : 1 + 0.12 * Math.sin(t * 3)
+        fault.current.scale.set(k, 1, k)
+      }
+    }
+    if (sign.current) {
+      sign.current.visible = isFault
+      if (isFault) {
+        faultMats.sign.opacity = 0.35 + 0.65 * blink
+        // Keep the sign about 26 px tall and just above the (DOM) name label at any zoom.
+        const mPerPx = (2 * camera.position.distanceTo(o.position) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))) / Math.max(1, size.height)
+        const k = Math.max(1.1, Math.min(4, 26 * mPerPx))
+        sign.current.scale.setScalar(k)
+        sign.current.position.y = 2.5 + 14 * mPerPx + k / 2 + 3 * mPerPx
+      }
+    }
+    if (sel.current && sel.current.visible && !reducedMotion) {
+      const k = 1 + 0.05 * Math.sin(t * 2.4)
+      sel.current.scale.set(k, 1, k)
+    }
   })
 
   return (
-    <group ref={outer} visible={false}>
+    <group
+      ref={outer}
+      visible={false}
+      onClick={select}
+      onPointerOver={(e) => {
+        e.stopPropagation()
+        document.body.style.cursor = 'pointer'
+      }}
+      onPointerOut={() => (document.body.style.cursor = '')}
+    >
       <group ref={inner}>
         <RoverModel color={meta.color} />
         <mesh geometry={geo.halo} material={haloMat} scale={4.2} position={[0, 0.06, 0]} renderOrder={3} />
       </group>
+      <mesh ref={sel} geometry={geo.selRing} material={selMat} position={[0, 0.1, 0]} visible={!!selected} renderOrder={3} />
+      <group ref={fault} visible={false}>
+        <mesh geometry={geo.faultRing} material={faultMats.ring} position={[0, 0.12, 0]} renderOrder={4} />
+        <mesh geometry={geo.halo} material={faultMats.glow} scale={6} position={[0, 0.08, 0]} renderOrder={4} />
+      </group>
+      <sprite ref={sign} material={faultMats.sign} position={[0, 3.55, 0]} scale={1.15} visible={false} renderOrder={10} />
       {labelsReady && (
         <Html position={[0, 2.5, 0]} center zIndexRange={[12, 0]} style={{ pointerEvents: 'none' }}>
-          <div className="rover-tag">
+          <button type="button" className="rover-tag" data-selected={selected || undefined} data-fault={faulted || undefined} onClick={() => onSelect?.(meta.id)} title={`Show ${meta.name}'s sensors`}>
             <span className="dot" style={{ background: meta.color }} />
             {meta.name}
-          </div>
+            {faulted && <span className="rover-tag-fault">Fault</span>}
+          </button>
         </Html>
       )}
     </group>
@@ -264,7 +331,7 @@ function RoverPath({ meta }) {
   )
 }
 
-export function Rovers({ showPaths }) {
+export function Rovers({ showPaths, selected, onSelect }) {
   const meta = useSim((s) => s.roverMeta)
   const gen = useSim((s) => s.gen)
   return (
@@ -273,7 +340,7 @@ export function Rovers({ showPaths }) {
         <group key={`${gen}:${m.id}`}>
           <RoverTrail meta={m} />
           {showPaths && <RoverPath meta={m} />}
-          <Rover meta={m} />
+          <Rover meta={m} selected={selected === m.id} onSelect={onSelect} />
         </group>
       ))}
     </group>

@@ -4,8 +4,13 @@
 // autonomy, it only produces realistic-looking data:
 //   procedural terrain, rovers driving to frontiers along A* paths, sensing within
 //   a 10 m radius, target discoveries, battery drain and charging, slope-limit learning.
+// Version 2 additions: per-rover sensors (a ray-marched 360 degree LiDAR over the
+// heightmap, IMU, wheel slip, motor load, spectrometer), brain timings against a
+// compute budget, and injectable hazards (POST /api/hazard): rockfall, soft sand,
+// dust storm and motor fault. Rovers only react to what their sensors pick up.
 //
-// Run: node mock/mock-server.mjs   (env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G)
+// Run: node mock/mock-server.mjs
+// Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS
 
 import http from 'node:http'
 import { WebSocketServer } from 'ws'
@@ -24,6 +29,21 @@ const MIN_SLOPE_LIMIT = 18
 const LANDER = { x: 0, y: 0, radius: 2.5 }
 const ROVER_COLORS = ['#ff7a45', '#ffd23f', '#ff5fa2', '#7cf29a', '#b39dff', '#4dd0e1', '#f4f4f4', '#ffa8a8']
 const KIND_LABEL = { mineral: 'mineral deposit', ice: 'ice patch', vent: 'thermal vent' }
+
+// Version 2: sensors, edge budget and hazards.
+const LIDAR_RANGE = 8
+const DUST_LIDAR_RANGE = 3
+const LIDAR_AZ = 72
+const LIDAR_EL = [-40, -31, -24, -19, -15, -12, -9.5, -7.5, -6, -4.7, -3.6, -2.5, -1, 2].map((d) => (d * Math.PI) / 180)
+const MAST_H = 0.75
+const SCAN_MAX = 300
+const SPECTRO_RANGE = 8
+const BUDGET_MS = Number(process.env.BRAIN_BUDGET_MS || 40)
+const CYCLE_MS = 200
+const BRAIN_WINDOW_S = 10
+const DUST_S = 90
+const FAULT_S = 90
+const HAZARD_TYPES = ['rockfall', 'sand', 'dust_storm', 'rover_fault']
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -230,6 +250,7 @@ function newSim(seed) {
     t: 0,
     known: new Uint8Array(n * n),
     measured: new Float32Array(n * n),
+    mslope: new Float32Array(n * n), // measured slope (boulders raise it)
     knownCount: 0,
     pendingCells: [],
     rovers: [],
@@ -241,6 +262,10 @@ function newSim(seed) {
     nextStallT: 40 + rand() * 20,
     nextSlipT: 70 + rand() * 40,
     milestones: [10, 25, 50, 75, 90],
+    hazards: [],
+    nextHazard: 1,
+    rocks: [], // { x, y, z, r, landT, seen, hazard }
+    softZones: [], // what the fleet believes: [x, y, r]
   }
   for (let r = 0; r < NUM_ROVERS; r++) {
     const a = (r / NUM_ROVERS) * Math.PI * 2 + Math.PI / 6
@@ -263,15 +288,27 @@ function newSim(seed) {
       timer: 1 + r * 0.8,
       replanT: 0,
       lastGoalEventT: -999,
+      // v2
+      replannedAt: -999,
+      reactedAt: -999,
+      sandT: 0,
+      slipBoost: null,
+      scan: [],
+      hits: 0,
+      sensors: null,
+      cycles: [], // [t, ms] over the last BRAIN_WINDOW_S
+      faultHazard: null,
     })
   }
   addEvent(null, 'info', `Survey started. ${NUM_ROVERS} rover${NUM_ROVERS === 1 ? '' : 's'} deployed from the lander.`)
   for (const r of sim.rovers) sense(r)
+  updateSensors(CYCLE_MS / 1000)
   computeFrontiers()
 }
 
-function addEvent(roverId, level, msg) {
+function addEvent(roverId, level, msg, at = null) {
   const e = { t: r1(sim.t), rover: roverId, level, msg }
+  if (at) e.at = [r1(at[0]), r1(at[1])]
   sim.pendingEvents.push(e)
   sim.events.push(e)
   if (sim.events.length > 50) sim.events.splice(0, sim.events.length - 50)
@@ -293,13 +330,30 @@ function slopeAt(x, y) {
   return world.slopes[idx(i, j)]
 }
 
+// Bilinear height of the true terrain (for the LiDAR rays and the IMU).
+function groundSmooth(x, y) {
+  const fx = clamp((x - world.ox) / RES, 0, world.n - 1.001)
+  const fy = clamp((y - world.oy) / RES, 0, world.n - 1.001)
+  const i = Math.floor(fx)
+  const j = Math.floor(fy)
+  const tx = fx - i
+  const ty = fy - j
+  const h = world.heights
+  const k = j * world.n + i
+  return lerp(lerp(h[k], h[k + 1], tx), lerp(h[k + world.n], h[k + world.n + 1], tx), ty)
+}
+
 function gaussian(rand) {
   const u = Math.max(1e-9, rand())
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rand())
 }
 
+const dustActive = () => sim.hazards.some((h) => h.type === 'dust_storm' && h.active)
+const lidarRange = () => (dustActive() ? DUST_LIDAR_RANGE : LIDAR_RANGE)
+
 function sense(rover) {
-  const R = Math.round(SENSOR_RADIUS / RES)
+  // Mapping follows the LiDAR: a dust storm shrinks what each rover can add to the map.
+  const R = Math.round((dustActive() ? DUST_LIDAR_RANGE + 0.5 : SENSOR_RADIUS) / RES)
   const ci = toI(rover.x)
   const cj = toJ(rover.y)
   for (let dj = -R; dj <= R; dj++) {
@@ -314,12 +368,13 @@ function sense(rover) {
       sim.knownCount++
       const h = r2(world.heights[k] + gaussian(sim.rand) * 0.015)
       sim.measured[k] = h
+      sim.mslope[k] = world.slopes[k]
       sim.pendingCells.push([i, j, h, r1(world.slopes[k])])
     }
   }
   for (const t of world.targets) {
     if (sim.discovered.has(t.id)) continue
-    if (Math.hypot(t.x - rover.x, t.y - rover.y) > SENSOR_RADIUS - 1) continue
+    if (Math.hypot(t.x - rover.x, t.y - rover.y) > (dustActive() ? DUST_LIDAR_RANGE + 2 : SENSOR_RADIUS - 1)) continue
     sim.discovered.set(t.id, { ...t, status: 'found', found_by: rover.id, found_t: r1(sim.t), assigned: null })
     const label = KIND_LABEL[t.kind]
     addEvent(rover.id, 'discovery', `Found ${/^[aeiou]/.test(label) ? 'an' : 'a'} ${label} at (${t.x.toFixed(1)}, ${t.y.toFixed(1)}).`)
@@ -360,7 +415,29 @@ function computeFrontiers() {
 // ---------------------------------------------------------------------------
 // Path planning: A* on a 1 m grid over what the fleet knows (unknown is optimistic).
 
-function planPath(sx, sy, gx, gy) {
+// What the fleet knows it must keep clear of: boulders its LiDAR has seen, soft ground
+// found through wheel slip, and rovers parked with a fault. Never the hidden truth.
+function knownObstacles(self) {
+  const out = []
+  for (const rk of sim.rocks) if (rk.seen) out.push([rk.x, rk.y, rk.r + 0.8])
+  for (const z of sim.softZones) out.push([z[0], z[1], z[2] + 0.6])
+  for (const r of sim.rovers) if (r !== self && r.state === 'fault') out.push([r.x, r.y, 1.7])
+  return out
+}
+
+function planPath(sx, sy, gx, gy, self = null) {
+  // Discs that contain the start are only expensive (so a rover can drive out of one).
+  const obstacles = []
+  const soft = []
+  for (const o of knownObstacles(self)) (Math.hypot(sx - o[0], sy - o[1]) < o[2] ? soft : obstacles).push(o)
+  const inDisc = (list, x, y) => {
+    for (const o of list) {
+      const dx = x - o[0]
+      const dy = y - o[1]
+      if (dx * dx + dy * dy < o[2] * o[2]) return true
+    }
+    return false
+  }
   const step = 2
   const m = Math.floor((world.n - 1) / step) + 1
   const toNode = (x, y) => [clamp(Math.round(toI(x) / step), 0, m - 1), clamp(Math.round(toJ(y) / step), 0, m - 1)]
@@ -428,10 +505,14 @@ function planPath(sx, sy, gx, gy) {
         if (closed[nb]) continue
         const k = idx(ni * step, nj * step)
         let cost = Math.hypot(di, dj)
+        const wx = world.ox + ni * step * RES
+        const wy = world.oy + nj * step * RES
+        if (obstacles.length && nb !== goal && inDisc(obstacles, wx, wy)) continue
+        if (soft.length && inDisc(soft, wx, wy)) cost *= 3
         if (sim.known[k]) {
-          const s = world.slopes[k]
+          const s = sim.mslope[k]
           if (s >= limit && nb !== goal) continue
-          cost *= 1 + (s / limit) ** 2 * 2.5
+          cost *= 1 + (Math.min(s, limit) / limit) ** 2 * 2.5
         } else {
           cost *= 1.25
         }
@@ -462,12 +543,13 @@ function planPath(sx, sy, gx, gy) {
 // Rover behaviour
 
 function setGoal(rover, gx, gy, state, why) {
-  const path = planPath(rover.x, rover.y, gx, gy)
+  const path = planPath(rover.x, rover.y, gx, gy, rover)
   if (!path) return false
   rover.state = state
   rover.goal = [r1(gx), r1(gy)]
   rover.path = path
   rover.replanT = sim.t + 6
+  rover.replannedAt = sim.t
   if (why && sim.t - rover.lastGoalEventT > 25) {
     addEvent(rover.id, 'info', why)
     rover.lastGoalEventT = sim.t
@@ -489,11 +571,13 @@ function chooseExplorationGoal(rover) {
     }
   }
   const others = sim.rovers.filter((r) => r !== rover && r.goal)
+  const avoid = knownObstacles(rover)
   let best = null
   let bestScore = -Infinity
   for (const f of sim.frontiers) {
     const d = Math.hypot(f[0] - rover.x, f[1] - rover.y)
     if (d < 4) continue
+    if (avoid.some((o) => Math.hypot(f[0] - o[0], f[1] - o[1]) < o[2] + 0.5)) continue
     let score = Math.pow(f[2], 0.6) / (d + 6)
     for (const o of others) {
       const od = Math.hypot(o.goal[0] - f[0], o.goal[1] - f[1])
@@ -540,7 +624,13 @@ function startReturn(rover) {
   rover.lastGoalEventT = sim.t
 }
 
+function trueSandAt(x, y) {
+  return sim.hazards.find((h) => h.type === 'sand' && Math.hypot(x - h.x, y - h.y) < h.radius) || null
+}
+
 function drive(rover, dt, maxSpeed) {
+  if (dustActive()) maxSpeed *= 0.5 // unsure what is ahead: slow down
+  if (trueSandAt(rover.x, rover.y)) maxSpeed = Math.min(maxSpeed, 0.12) // bogged down
   if (!rover.path.length) {
     rover.speed = Math.max(0, rover.speed - dt * 1.5)
     return true
@@ -563,11 +653,18 @@ function drive(rover, dt, maxSpeed) {
   const slope = slopeAt(rover.x, rover.y)
   const target = maxSpeed * (1 - 0.45 * clamp(slope / sim.slopeLimit, 0, 1)) * (Math.abs(diff) > 0.9 ? 0.25 : 1)
   rover.speed += clamp(target - rover.speed, -dt * 1.2, dt * 0.6)
-  rover.x += Math.cos(rover.yaw) * rover.speed * dt
-  rover.y += Math.sin(rover.yaw) * rover.speed * dt
+  const nx = rover.x + Math.cos(rover.yaw) * rover.speed * dt
+  const ny = rover.y + Math.sin(rover.yaw) * rover.speed * dt
+  // Bumper: a boulder the LiDAR has not reported yet still stops the rover.
+  const rock = sim.rocks.find((rk) => sim.t >= rk.landT && Math.hypot(nx - rk.x, ny - rk.y) < rk.r + 0.45)
+  if (rock) {
+    rover.speed = 0
+    if (!rock.seen) markRocksSeen(rover, [rock])
+    return false
+  }
   const lim = MAP_SIZE / 2 - 1
-  rover.x = clamp(rover.x, -lim, lim)
-  rover.y = clamp(rover.y, -lim, lim)
+  rover.x = clamp(nx, -lim, lim)
+  rover.y = clamp(ny, -lim, lim)
   return false
 }
 
@@ -575,7 +672,33 @@ function stepRover(rover, dt) {
   const moving = rover.speed > 0.05
   rover.battery = clamp(rover.battery - dt * (moving ? 0.0032 : 0.0008), 0, 1)
 
+  // Wheel slip is the only way to feel soft sand: the LiDAR sees flat ground. The
+  // wheels dig in over a couple of seconds (slip climbs), then the rover reacts.
+  const driving = rover.state === 'exploring' || rover.state === 'investigating' || rover.state === 'returning'
+  const inSand = !!trueSandAt(rover.x, rover.y)
+  rover.sinkT = inSand && rover.state !== 'fault' && rover.state !== 'charging' ? (rover.sinkT || 0) + dt : 0
+  if (driving && inSand) {
+    rover.sandT += dt
+    if (rover.sandT > 2.4) detectSoftGround(rover)
+  } else if (rover.state !== 'recovering') {
+    rover.sandT = 0
+  }
+
   switch (rover.state) {
+    case 'fault': {
+      rover.speed = 0
+      rover.path = []
+      rover.goal = null
+      const h = rover.faultHazard
+      if (!h || h.remaining <= 0) {
+        rover.faultHazard = null
+        rover.state = 'idle'
+        rover.timer = 1
+        addEvent(rover.id, 'info', 'Reboot complete. Motors back online, resuming exploration.', [rover.x, rover.y])
+        rover.lastGoalEventT = sim.t
+      }
+      break
+    }
     case 'idle': {
       rover.speed = 0
       rover.timer -= dt
@@ -674,11 +797,133 @@ function stepRover(rover, dt) {
         rover.speed = 0
         rover.state = 'idle'
         rover.timer = 0.5
-        addEvent(rover.id, 'info', `Backed off the slope. Replanning with the ${sim.slopeLimit} deg limit.`)
+        if (rover.recoverWhy === 'sand') addEvent(rover.id, 'info', 'Out of the soft ground. Replanning around the soft zone.')
+        else addEvent(rover.id, 'info', `Backed off the slope. Replanning with the ${sim.slopeLimit} deg limit.`)
+        rover.recoverWhy = null
+        rover.sandT = 0
       }
       break
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Hazard reactions (driven only by what the rovers sense)
+
+function pathNear(rover, x, y, r) {
+  let px = rover.x
+  let py = rover.y
+  for (const [qx, qy] of rover.path) {
+    const dx = qx - px
+    const dy = qy - py
+    const len2 = dx * dx + dy * dy || 1e-9
+    const t = clamp(((x - px) * dx + (y - py) * dy) / len2, 0, 1)
+    if (Math.hypot(px + dx * t - x, py + dy * t - y) < r) return true
+    px = qx
+    py = qy
+  }
+  return false
+}
+
+// Replan every rover whose route crosses (x, y, r). Returns the rovers that changed course.
+function replanAround(x, y, r, except = null) {
+  const changed = []
+  for (const rover of sim.rovers) {
+    if (rover === except || !rover.goal || !rover.path.length) continue
+    if (rover.state === 'fault' || rover.state === 'charging' || rover.state === 'recovering') continue
+    if (!pathNear(rover, x, y, r)) continue
+    if (setGoal(rover, rover.goal[0], rover.goal[1], rover.state)) changed.push(rover)
+    else {
+      releaseTarget(rover)
+      rover.goal = null
+      rover.path = []
+      rover.state = 'idle'
+      rover.timer = 0.5
+      changed.push(rover)
+    }
+  }
+  return changed
+}
+
+// The LiDAR (or the bumper) found boulders: write them into the shared map as steep
+// ground and steer around them.
+function markRocksSeen(rover, rocks) {
+  const fresh = rocks.filter((rk) => !rk.seen)
+  if (!fresh.length) return
+  for (const rk of fresh) {
+    rk.seen = true
+    const R = Math.ceil((rk.r + 0.3) / RES)
+    const ci = toI(rk.x)
+    const cj = toJ(rk.y)
+    for (let dj = -R; dj <= R; dj++) {
+      for (let di = -R; di <= R; di++) {
+        const i = ci + di
+        const j = cj + dj
+        if (!inMap(i, j)) continue
+        const d = Math.hypot(world.ox + i * RES - rk.x, world.oy + j * RES - rk.y)
+        if (d > rk.r + 0.25) continue
+        const k = idx(i, j)
+        const top = rk.z + Math.sqrt(Math.max(0, rk.r * rk.r - Math.min(d, rk.r) ** 2))
+        const h = r2(Math.max(world.heights[k], top))
+        if (!sim.known[k]) {
+          sim.known[k] = 1
+          sim.knownCount++
+        }
+        sim.measured[k] = h
+        sim.mslope[k] = Math.max(sim.mslope[k], 38 + d * 10)
+        sim.pendingCells.push([i, j, h, r1(sim.mslope[k])])
+      }
+    }
+  }
+  const byHazard = new Map()
+  for (const rk of fresh) byHazard.set(rk.hazard, [...(byHazard.get(rk.hazard) || []), rk])
+  for (const [hz, list] of byHazard) {
+    const cx = list.reduce((s, rk) => s + rk.x, 0) / list.length
+    const cy = list.reduce((s, rk) => s + rk.y, 0) / list.length
+    const dist = Math.round(Math.hypot(cx - rover.x, cy - rover.y))
+    const blocking = rover.path.length && list.some((rk) => pathNear(rover, rk.x, rk.y, rk.r + 0.8))
+    const changed = replanAround(cx, cy, (hz?.radius ?? 3) + 1)
+    rover.reactedAt = sim.t
+    if (!hz.reported) {
+      hz.reported = true
+      const n = hz.rocks.length
+      addEvent(
+        rover.id,
+        'warn',
+        blocking || changed.includes(rover)
+          ? `LiDAR: ${n} boulders ${dist} m ahead, blocking the route. Marked them impassable and replanned around them.`
+          : `LiDAR: ${n} new boulders ${dist} m away. Marked them impassable on the shared map.`,
+        [cx, cy],
+      )
+      const others = changed.filter((r) => r !== rover)
+      if (others.length) addEvent(null, 'info', `${others.map((r) => r.id).join(' and ')} replanned around the boulders using the shared map.`, [cx, cy])
+    }
+  }
+}
+
+function detectSoftGround(rover) {
+  const slip = Math.round((rover.sensors?.slip ?? 0.7) * 100)
+  const ex = rover.x + Math.cos(rover.yaw) * 1.0
+  const ey = rover.y + Math.sin(rover.yaw) * 1.0
+  const near = sim.softZones.find((z) => Math.hypot(z[0] - ex, z[1] - ey) < z[2] + 1.5)
+  if (near) {
+    near[2] = r1(Math.min(4.5, Math.max(near[2], Math.hypot(near[0] - ex, near[1] - ey) + 1.2)))
+  } else {
+    sim.softZones.push([r1(ex), r1(ey), 2.2])
+  }
+  const truth = trueSandAt(rover.x, rover.y)
+  if (truth) truth.known = true
+  releaseTarget(rover)
+  rover.state = 'recovering'
+  rover.recoverWhy = 'sand'
+  rover.timer = 3.5
+  rover.path = []
+  rover.goal = null
+  rover.sandT = -999 // one detection per visit
+  rover.reactedAt = sim.t
+  addEvent(rover.id, 'warn', `Wheel slip ${slip}%, wheels turning but barely moving: soft ground. Backing out and marking a soft zone.`, [ex, ey])
+  const changed = replanAround(ex, ey, 3.2, rover)
+  addEvent(null, 'info', changed.length ? `Soft zone shared with the fleet. ${changed.map((r) => r.id).join(' and ')} replanned to avoid it.` : 'Soft zone shared with the fleet. Every route now avoids it.')
 }
 
 function fleetEvents() {
@@ -704,7 +949,8 @@ function fleetEvents() {
     const movers = sim.rovers.filter((r) => r.speed > 0.1)
     if (movers.length) {
       const rover = movers[Math.floor(sim.rand() * movers.length)]
-      addEvent(rover.id, 'warn', 'Wheel slip on loose ground. Slowing down.')
+      rover.slipBoost = { until: sim.t + 2.5, value: 0.34 + sim.rand() * 0.1 }
+      addEvent(rover.id, 'warn', `Wheel slip ${Math.round(rover.slipBoost.value * 100)}% on loose ground. Slowing down.`, [rover.x, rover.y])
       rover.speed *= 0.3
     }
     sim.nextSlipT = sim.t + 60 + sim.rand() * 60
@@ -713,6 +959,341 @@ function fleetEvents() {
   while (sim.milestones.length && pct >= sim.milestones[0]) {
     addEvent(null, 'info', `${sim.milestones.shift()}% of the map explored.`)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Sensors (v2)
+
+// 360 degree LiDAR: LIDAR_AZ x LIDAR_EL rays from the mast, marched over the true
+// heightmap and the landed boulders. Hills and boulders cast shadows. Returns the hit
+// count and up to SCAN_MAX points; boulders it hits are reported to the fleet map.
+function lidarScan(rover, range) {
+  const gz = groundSmooth(rover.x, rover.y)
+  const oz = gz + MAST_H
+  const near = sim.rocks.filter((rk) => sim.t >= rk.landT && Math.hypot(rk.x - rover.x, rk.y - rover.y) < range + rk.r)
+  const seen = new Set()
+  const pts = []
+  const step = 0.2
+  const top = world.maxH + 1
+  for (let a = 0; a < LIDAR_AZ; a++) {
+    const az = rover.yaw + (a / LIDAR_AZ) * Math.PI * 2
+    const ca = Math.cos(az)
+    const sa = Math.sin(az)
+    for (const el of LIDAR_EL) {
+      const ce = Math.cos(el)
+      const se = Math.sin(el)
+      for (let d = step; d <= range; d += step) {
+        const x = rover.x + ca * ce * d
+        const y = rover.y + sa * ce * d
+        const z = oz + se * d
+        if (z > top) break
+        let rock = null
+        for (const rk of near) {
+          const dx = x - rk.x
+          const dy = y - rk.y
+          const dz = z - rk.z
+          if (dx * dx + dy * dy + dz * dz < rk.r * rk.r) {
+            rock = rk
+            break
+          }
+        }
+        if (rock) {
+          seen.add(rock)
+          pts.push(x, y, z)
+          break
+        }
+        const g = groundSmooth(x, y)
+        if (z <= g) {
+          pts.push(x, y, g)
+          break
+        }
+      }
+    }
+  }
+  const hits = pts.length / 3
+  const stride = Math.max(1, Math.ceil(hits / SCAN_MAX))
+  const scan = []
+  for (let p = 0; p < hits; p += stride) scan.push(r1(pts[p * 3]), r1(pts[p * 3 + 1]), r1(pts[p * 3 + 2]))
+  return { hits, scan, seen: [...seen] }
+}
+
+function readSensors(rover, range, hits) {
+  // IMU from the terrain gradient along and across the heading.
+  const d = 0.6
+  const hx = (groundSmooth(rover.x + d, rover.y) - groundSmooth(rover.x - d, rover.y)) / (2 * d)
+  const hy = (groundSmooth(rover.x, rover.y + d) - groundSmooth(rover.x, rover.y - d)) / (2 * d)
+  const c = Math.cos(rover.yaw)
+  const s = Math.sin(rover.yaw)
+  const deg = (v) => (Math.atan(v) * 180) / Math.PI
+  const shake = rover.speed > 0.05 ? 0.5 : 0.08
+  const pitch = deg(hx * c + hy * s) + gaussian(sim.rand) * shake
+  const roll = deg(-(hx * s - hy * c)) + gaussian(sim.rand) * shake
+
+  // Wheels: ground speed is what the rover really does; slip is the difference.
+  const slope = slopeAt(rover.x, rover.y)
+  let slip = 0.03 + 0.12 * clamp(slope / sim.slopeLimit, 0, 1) + Math.abs(gaussian(sim.rand)) * 0.015
+  const inSand = trueSandAt(rover.x, rover.y)
+  const powered = rover.state !== 'fault' && rover.state !== 'charging' && rover.state !== 'idle'
+  if (inSand && powered) slip = 0.3 + 0.46 * clamp((rover.sinkT || 0) / 1.8, 0, 1) + sim.rand() * 0.05
+  if (rover.slipBoost && sim.t < rover.slipBoost.until) slip = Math.max(slip, rover.slipBoost.value + gaussian(sim.rand) * 0.03)
+  slip = clamp(slip, 0, 0.95)
+  const ground = Math.abs(rover.speed)
+  let wheel = powered ? ground / Math.max(0.05, 1 - slip) : 0
+  if (inSand && powered) wheel = Math.max(wheel, 0.42 + sim.rand() * 0.06)
+  if (!powered) slip = 0
+  const load = powered
+    ? clamp(0.16 + 0.55 * clamp(slope / 40, 0, 1) + 0.5 * slip + 0.25 * ground + gaussian(sim.rand) * 0.02, 0.03, 1)
+    : 0
+
+  let spectro = null
+  for (const t of sim.discovered.values()) {
+    const dist = Math.hypot(t.x - rover.x, t.y - rover.y)
+    if (dist <= SPECTRO_RANGE && (!spectro || dist < spectro.dist)) spectro = { id: t.id, dist: r1(dist) }
+  }
+  return {
+    lidar_range: range,
+    lidar_hits: hits,
+    pitch: r1(pitch),
+    roll: r1(roll),
+    wheel_speed: r2(wheel),
+    ground_speed: r2(ground),
+    slip: r2(slip),
+    motor_load: r2(load),
+    spectro,
+  }
+}
+
+// Decision-making compute per 200 ms cycle: steady perception and mapping work, with
+// spikes when A* replans or a hazard forces a reaction.
+function brainCycles(rover, dtTotal) {
+  const n = Math.max(1, Math.round((dtTotal * 1000) / CYCLE_MS))
+  for (let c = 0; c < n; c++) {
+    const t = sim.t - ((n - 1 - c) * CYCLE_MS) / 1000
+    let ms = 2.6 + sim.rand() * 1.3 + rover.hits * 0.0016
+    if (rover.state === 'fault') ms = 1.2 + sim.rand() * 0.5
+    if (c === n - 1 && sim.t - rover.replannedAt < dtTotal) ms += 7 + sim.rand() * 8
+    if (c === n - 1 && sim.t - rover.reactedAt < dtTotal) ms += 9 + sim.rand() * 6
+    rover.cycles.push([t, ms])
+  }
+  while (rover.cycles.length && rover.cycles[0][0] < sim.t - BRAIN_WINDOW_S) rover.cycles.shift()
+}
+
+function brainSummary(rover) {
+  const list = rover.cycles
+  if (!list.length) return null
+  let sum = 0
+  let peak = 0
+  let over = 0
+  for (const [, ms] of list) {
+    sum += ms
+    peak = Math.max(peak, ms)
+    if (ms > BUDGET_MS) over++
+  }
+  return { last_ms: r1(list[list.length - 1][1]), avg_ms: r1(sum / list.length), peak_ms: r1(peak), over }
+}
+
+function updateSensors(dtTotal) {
+  const range = lidarRange()
+  for (const rover of sim.rovers) {
+    const { hits, scan, seen } = lidarScan(rover, range)
+    rover.hits = hits
+    rover.scan = scan
+    if (seen.some((rk) => !rk.seen)) markRocksSeen(rover, seen)
+    rover.sensors = readSensors(rover, range, hits)
+    brainCycles(rover, dtTotal)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hazards (v2): POST /api/hazard
+
+function publicHazard(h) {
+  const out = { id: h.id, type: h.type, t: r1(h.t), rover: h.rover, active: h.active }
+  if (h.type === 'rockfall') Object.assign(out, { x: r1(h.x), y: r1(h.y), radius: h.radius, rocks: h.rocks.map((rk) => [r1(rk.x), r1(rk.y), r2(rk.z), r2(rk.r)]) })
+  if (h.type === 'sand') Object.assign(out, { x: r1(h.x), y: r1(h.y), radius: h.radius, known: !!h.known })
+  if (h.type === 'dust_storm' || h.type === 'rover_fault') out.remaining = r1(Math.max(0, h.remaining))
+  if (h.type === 'rover_fault') {
+    const r = sim.rovers.find((q) => q.id === h.rover)
+    if (r) Object.assign(out, { x: r1(r.x), y: r1(r.y) })
+  }
+  return out
+}
+
+class HazardError extends Error {}
+
+function remainingPath(rover) {
+  let len = 0
+  let px = rover.x
+  let py = rover.y
+  for (const [x, y] of rover.path) {
+    len += Math.hypot(x - px, y - py)
+    px = x
+    py = y
+  }
+  return len
+}
+
+// The point `dist` metres along the rover's route (or straight ahead without one).
+function pointAhead(rover, dist) {
+  let px = rover.x
+  let py = rover.y
+  let left = dist
+  for (const [x, y] of rover.path) {
+    const seg = Math.hypot(x - px, y - py)
+    if (seg >= left) return [px + ((x - px) * left) / seg, py + ((y - py) * left) / seg]
+    left -= seg
+    px = x
+    py = y
+  }
+  if (rover.path.length && dist - left > 2.5) return [px, py]
+  return [rover.x + Math.cos(rover.yaw) * dist, rover.y + Math.sin(rover.yaw) * dist]
+}
+
+function validSpot(x, y, r) {
+  const lim = MAP_SIZE / 2 - r - 1
+  if (Math.abs(x) > lim || Math.abs(y) > lim) return false
+  if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + r + 0.8) return false
+  return !sim.hazards.some((h) => (h.type === 'rockfall' || h.type === 'sand') && Math.hypot(h.x - x, h.y - y) < h.radius + r)
+}
+
+function pickRover(requested) {
+  const r = sim.rovers.find((q) => q.id === String(requested))
+  if (!r) throw new HazardError(`No rover called ${requested}.`)
+  return r
+}
+
+// Rovers to try for a hazard on a route, best first: long routes ahead, then the rest.
+function routeCandidates(needRoute) {
+  const ok = sim.rovers.filter((r) => r.state !== 'fault' && r.state !== 'charging')
+  const drivers = ok.filter((r) => r.path.length && remainingPath(r) > (needRoute ? 4.4 : 6)).sort((a, b) => remainingPath(b) - remainingPath(a))
+  if (drivers.length > 1 && sim.rand() < 0.4) [drivers[0], drivers[1]] = [drivers[1], drivers[0]]
+  if (needRoute) return drivers
+  return [...drivers, ...ok.filter((r) => !drivers.includes(r))]
+}
+
+function createHazard(type, requested) {
+  if (!HAZARD_TYPES.includes(type)) throw new HazardError(`Unknown hazard type "${type}". Use rockfall, sand, dust_storm or rover_fault.`)
+  const base = { id: `h${sim.nextHazard}`, type, t: sim.t, rover: null, active: true }
+
+  if (type === 'dust_storm') {
+    const live = sim.hazards.find((h) => h.type === 'dust_storm' && h.active)
+    if (live) throw new HazardError(`A dust storm is already blowing (${Math.ceil(live.remaining)} s left).`)
+    const h = { ...base, remaining: DUST_S }
+    sim.hazards.push(h)
+    sim.nextHazard++
+    addEvent(null, 'hazard', 'Dust storm rolling in. Visibility dropping fast.')
+    for (const r of sim.rovers) r.reactedAt = sim.t
+    addEvent(null, 'warn', `LiDAR returns collapsing on every rover: range down to ${DUST_LIDAR_RANGE} m. Halving speed and mapping only what is close.`)
+    return h
+  }
+
+  if (type === 'rover_fault') {
+    const rover = requested != null ? pickRover(requested) : null
+    if (rover && rover.state === 'fault') throw new HazardError(`${rover.name} already has a motor fault (${Math.ceil(rover.faultHazard?.remaining ?? 0)} s left).`)
+    const pool = sim.rovers.filter((r) => r.state !== 'fault')
+    if (!pool.length) throw new HazardError('Every rover already has a motor fault.')
+    const moving = pool.filter((r) => r.speed > 0.1 && r.state !== 'charging')
+    const victim = rover || (moving.length ? moving : pool)[Math.floor(sim.rand() * (moving.length || pool.length))]
+    const h = { ...base, rover: victim.id, remaining: FAULT_S }
+    sim.hazards.push(h)
+    sim.nextHazard++
+    const hadTarget = victim.targetId ? sim.discovered.get(victim.targetId) : null
+    releaseTarget(victim)
+    victim.state = 'fault'
+    victim.faultHazard = h
+    victim.speed = 0
+    victim.path = []
+    victim.goal = null
+    addEvent(null, 'hazard', `Motor fault on ${victim.id}.`, [victim.x, victim.y])
+    addEvent(victim.id, 'warn', `Motors not responding. Parked, rebooting (${FAULT_S} s). Fleet told to treat it as an obstacle.`, [victim.x, victim.y])
+    const changed = replanAround(victim.x, victim.y, 2.2, victim)
+    if (changed.length) addEvent(null, 'info', `${changed.map((r) => r.id).join(' and ')} replanned around the parked ${victim.id}.`, [victim.x, victim.y])
+    if (hadTarget && hadTarget.status !== 'sampled') {
+      const helper = sim.rovers
+        .filter((r) => r !== victim && r.state !== 'fault' && r.state !== 'charging' && r.battery > 0.4 && !r.targetId)
+        .sort((a, b) => Math.hypot(a.x - hadTarget.x, a.y - hadTarget.y) - Math.hypot(b.x - hadTarget.x, b.y - hadTarget.y))[0]
+      if (helper && setGoal(helper, hadTarget.x, hadTarget.y, 'investigating')) {
+        hadTarget.assigned = helper.id
+        helper.targetId = hadTarget.id
+        helper.reactedAt = sim.t
+        addEvent(helper.id, 'info', `Taking over the ${KIND_LABEL[hadTarget.kind]} that ${victim.id} was heading to.`, [hadTarget.x, hadTarget.y])
+      }
+    }
+    return h
+  }
+
+  // rockfall and sand go on a rover's route
+  let candidates
+  if (requested != null) {
+    const r = pickRover(requested)
+    if (r.state === 'fault') throw new HazardError(`${r.name} is parked with a motor fault. Pick another rover.`)
+    if (type === 'sand' && (!r.path.length || remainingPath(r) < 4)) throw new HazardError(`${r.name} is not driving a route right now, so soft sand would never be found. Try another rover.`)
+    candidates = [r]
+  } else {
+    candidates = routeCandidates(type === 'sand')
+    if (!candidates.length) throw new HazardError(type === 'sand' ? 'No rover is driving a long enough route right now. Try again in a few seconds.' : 'Every rover has a motor fault.')
+  }
+  const radius = type === 'rockfall' ? 2.6 : r1(2.0 + sim.rand() * 0.5)
+  const dists = type === 'rockfall' ? [6.5, 7.5, 5.5, 8.5, 9.5, 4.8] : [4.2, 5, 3.6, 6, 7, 3]
+  let spot = null
+  let rover = candidates[0]
+  for (const cand of candidates) {
+    for (const d of dists) {
+      if (type === 'sand' && d > remainingPath(cand) - 0.8) continue
+      const [x, y] = pointAhead(cand, d)
+      if (validSpot(x, y, radius) && sim.rovers.every((r) => Math.hypot(r.x - x, r.y - y) > radius + 1.2)) {
+        spot = [x, y]
+        break
+      }
+    }
+    if (spot) {
+      rover = cand
+      break
+    }
+  }
+  if (!spot) {
+    const who = candidates.length === 1 ? `${rover.name}'s route` : 'any rover route'
+    throw new HazardError(`No valid spot on ${who} (too close to the lander, the map edge or another hazard). Try again in a few seconds.`)
+  }
+  const h = { ...base, rover: rover.id, x: spot[0], y: spot[1], radius }
+  if (type === 'rockfall') {
+    h.rocks = []
+    const count = 5 + Math.floor(sim.rand() * 3)
+    for (let k = 0; k < count && h.rocks.length < count; k++) {
+      for (let tries = 0; tries < 20; tries++) {
+        const a = sim.rand() * Math.PI * 2
+        const d = k === 0 ? sim.rand() * 0.4 : 0.6 + sim.rand() * (radius - 0.9)
+        const r = 0.36 + sim.rand() * 0.42 + (k === 0 ? 0.2 : 0)
+        const x = spot[0] + Math.cos(a) * d
+        const y = spot[1] + Math.sin(a) * d
+        if (h.rocks.some((q) => Math.hypot(q.x - x, q.y - y) < q.r + r - 0.1)) continue
+        h.rocks.push({ x, y, z: groundSmooth(x, y) + r * 0.55, r, landT: sim.t + 0.6 + sim.rand() * 0.4, seen: false, hazard: h })
+        break
+      }
+    }
+    sim.rocks.push(...h.rocks)
+    addEvent(null, 'hazard', `Rockfall on ${rover.id}'s route.`, spot)
+  } else {
+    h.known = false
+    addEvent(null, 'hazard', `Soft sand on ${rover.id}'s route. Its LiDAR cannot see it.`, spot)
+  }
+  sim.hazards.push(h)
+  sim.nextHazard++
+  return h
+}
+
+function stepHazards(dt) {
+  for (const h of sim.hazards) {
+    if (!h.active || h.remaining == null) continue
+    h.remaining -= dt
+    if (h.remaining > 0) continue
+    h.remaining = 0
+    h.active = false
+    h.endedAt = sim.t
+    if (h.type === 'dust_storm') addEvent(null, 'info', `Dust storm over. LiDAR back to ${LIDAR_RANGE} m, full speed again.`)
+  }
+  // Finished storms and faults stay listed (inactive) for a little while, then go.
+  sim.hazards = sim.hazards.filter((h) => h.active || sim.t - h.endedAt < 10)
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +1307,9 @@ function fleetSummary() {
     targets_found: sim.discovered.size,
     targets_total: world.targets.length,
     sim_speed: SIM_SPEED,
+    budget_ms: BUDGET_MS,
+    cycle_ms: CYCLE_MS,
+    soft_zones: sim.softZones.map((z) => [r1(z[0]), r1(z[1]), r1(z[2])]),
   }
 }
 
@@ -754,6 +1338,9 @@ function roverStates() {
     goal: r.goal,
     path: r.path.length ? [[r2(r.x), r2(r.y)], ...r.path.slice(0, 29).map(([x, y]) => [r2(x), r2(y)])] : [],
     target_id: r.targetId,
+    sensors: r.sensors,
+    scan: r.scan,
+    brain: brainSummary(r),
   }))
 }
 
@@ -761,7 +1348,7 @@ function initMessage() {
   const cells = []
   const n = world.n
   for (let k = 0; k < sim.known.length; k++) {
-    if (sim.known[k]) cells.push([k % n, (k / n) | 0, sim.measured[k], r1(world.slopes[k])])
+    if (sim.known[k]) cells.push([k % n, (k / n) | 0, sim.measured[k], r1(sim.mslope[k])])
   }
   return {
     type: 'init',
@@ -773,6 +1360,8 @@ function initMessage() {
     targets: targetList(),
     events: sim.events.slice(-50),
     fleet: fleetSummary(),
+    hazards: sim.hazards.map(publicHazard),
+    t: r1(sim.t),
   }
 }
 
@@ -797,9 +1386,11 @@ function tick() {
   for (let s = 0; s < sub; s++) {
     const dt = dtTotal / sub
     sim.t += dt
+    stepHazards(dt)
     for (const r of sim.rovers) stepRover(r, dt)
   }
   for (const r of sim.rovers) sense(r)
+  updateSensors(dtTotal)
   computeFrontiers()
   fleetEvents()
   const msg = {
@@ -811,6 +1402,7 @@ function tick() {
     targets: targetList(),
     events: sim.pendingEvents,
     fleet: fleetSummary(),
+    hazards: sim.hazards.map(publicHazard),
   }
   sim.pendingCells = []
   sim.pendingEvents = []
@@ -873,9 +1465,40 @@ const server = http.createServer((req, res) => {
     })
     return
   }
+  if (req.method === 'POST' && url.pathname === '/api/hazard') {
+    let body = ''
+    req.on('data', (chunk) => {
+      body += chunk
+      if (body.length > 1e5) req.destroy()
+    })
+    req.on('end', () => {
+      let parsed
+      try {
+        parsed = body ? JSON.parse(body) : {}
+      } catch {
+        return sendJson(res, 400, { ok: false, error: 'Body must be JSON like {"type": "rockfall", "rover": "r2"}' })
+      }
+      try {
+        const h = createHazard(String(parsed?.type ?? ''), parsed?.rover == null || parsed.rover === '' ? null : parsed.rover)
+        console.log(`[mock] hazard ${h.id} ${h.type}${h.rover ? ` on ${h.rover}` : ''}`)
+        sendJson(res, 200, { ok: true, hazard: publicHazard(h) })
+      } catch (err) {
+        if (!(err instanceof HazardError)) console.error(err)
+        sendJson(res, 400, { ok: false, error: err instanceof HazardError ? err.message : 'Could not create the hazard.' })
+      }
+    })
+    return
+  }
+  const cam = /^\/api\/camera\/([^/]+)\.jpg$/.exec(url.pathname)
+  if (req.method === 'GET' && cam) {
+    const id = decodeURIComponent(cam[1])
+    if (!sim.rovers.some((r) => r.id === id)) return sendJson(res, 404, { ok: false, error: `Unknown rover ${id}` })
+    // No renderer in the mock: the UI must show its "Camera unavailable" state.
+    return sendJson(res, 503, { ok: false, error: 'Camera rendering is not available in the mock sim' })
+  }
   if (req.method === 'GET' && url.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' })
-    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset.\n')
+    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, /api/hazard, /api/camera/{id}.jpg.\n')
   }
   sendJson(res, 404, { ok: false, error: 'Not found' })
 })

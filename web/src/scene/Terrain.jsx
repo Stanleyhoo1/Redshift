@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from 'react'
-import { useFrame } from '@react-three/fiber'
+import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import { simStore, useSim, nowSeconds, roverPoses } from '../state/store.js'
 import { SIGNAL, SLOPE, GROUND_RAMP } from '../lib/theme.js'
@@ -53,6 +53,9 @@ uniform vec3 uBad;
 uniform vec3 uRamp[5];
 uniform vec2 uRovers[8];
 uniform int uRoverCount;
+uniform vec3 uFogColor;
+uniform float uFogNear;
+uniform float uFogFar;
 varying float vSlope;
 varying float vKnown;
 varying float vFlash;
@@ -110,6 +113,10 @@ void main() {
   float rim = 1.0 - smoothstep(0.5, 0.85, vKnown);
   col = mix(col, uSignal, rim * 0.9);
 
+  // Dust storm haze (scene.fog, see DustStorm.jsx): linear with distance from the camera.
+  float fogF = clamp((length(vPos - cameraPosition) - uFogNear) / max(uFogFar - uFogNear, 1e-3), 0.0, 1.0);
+  col = mix(col, uFogColor, fogF);
+
   gl_FragColor = vec4(col, 1.0);
 }
 `
@@ -148,6 +155,9 @@ function createMaterial() {
       uRamp: { value: GROUND_RAMP.map(display3) },
       uRovers: { value: Array.from({ length: 8 }, () => new THREE.Vector2(1e5, 1e5)) },
       uRoverCount: { value: 0 },
+      uFogColor: { value: new THREE.Color() },
+      uFogNear: { value: 1e5 },
+      uFogFar: { value: 1e6 },
     },
   })
 }
@@ -320,6 +330,7 @@ export function Terrain({ slopeColors }) {
   const roverMeta = useSim((s) => s.roverMeta)
   const material = useMemo(createMaterial, [])
   const mesh = useMemo(() => (terrain ? new TerrainMesh(terrain) : null), [terrain])
+  const scene = useThree((s) => s.scene)
 
   useEffect(() => () => mesh?.dispose(), [mesh])
   useEffect(() => () => material.dispose(), [material])
@@ -348,6 +359,15 @@ export function Terrain({ slopeColors }) {
       c++
     }
     u.uRoverCount.value = c
+    const fog = scene.fog
+    if (fog && fog.isFog) {
+      u.uFogColor.value.copy(fog.color)
+      u.uFogNear.value = fog.near
+      u.uFogFar.value = fog.far
+    } else {
+      u.uFogNear.value = 1e5
+      u.uFogFar.value = 1e6
+    }
   })
 
   if (!mesh) return null

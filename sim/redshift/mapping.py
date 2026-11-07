@@ -5,6 +5,16 @@ ones, so estimates converge as rovers pass by). Slopes come from a least squares
 3x3 neighbourhood using the true hit positions; a step term (largest deviation of a neighbour from
 that plane) makes rocks and ledges show up as steep. Small holes between scan lines are filled from
 their neighbours. Changed samples are tracked so each tick only sends deltas.
+
+The world can change (a rockfall drops boulders on mapped ground). If the highest hit near a sample
+centre stands more than CHANGE_DZ above the stored surface, that is evidence of a new obstacle; once
+CHANGE_SCANS separate scans agree, the sample is overwritten. A single noisy ray never changes the
+map; the first sample in an area needs CHANGE_SEED_DZ. Only smooth samples are watched (on rough ground hits a few centimetres
+apart legitimately differ), plus, for a short while, the neighbours of a sample that just changed.
+Overwritten samples remember when, so a rover can tell "new rocks" from ground it simply had not
+seen before.
+
+A separate soft layer holds soft ground the fleet found through wheel slip (LiDAR cannot see it).
 """
 from __future__ import annotations
 
@@ -16,6 +26,16 @@ from .config import Config
 
 FILL_OFFSET = 0.40   # pseudo offset for hole-filled samples: any real hit in the footprint replaces them
 EDGE_MARGIN_M = 1.5  # no paths or frontiers this close to the map edge
+CHANGE_DZ = 0.2      # height disagreement (m) that counts as evidence the ground changed ...
+CHANGE_SEED_DZ = 0.4  # ... for the first sample in an area (smaller ones happen at rock edges)
+CHANGE_OFF = 0.25    # only hits this close to the sample centre (m) can change a sample
+CHANGE_SCANS = 3     # separate scans that must agree before a sample is overwritten
+CHANGE_AGREE = 0.6   # those scans' heights must roughly agree (a falling boulder does not)
+CHANGE_GAP = 30      # evidence older than this many scans (about 2 s for 3 rovers) is forgotten
+CHANGE_MAX_SLOPE = 18.0  # only smooth samples can change: on rough ground, hits a few cm apart differ
+CHANGE_NEAR_S = 60.0     # ... or samples next to one that changed lately (lets a whole boulder fill in)
+CHANGE_CONFIRMED = 3     # a first change needs the old surface to have been confirmed this many times
+CHANGE_COOLDOWN_S = 30.0  # a sample changes at most once in this long (no flicker at boulder edges)
 _NBR = [(dj, di) for dj in (-1, 0, 1) for di in (-1, 0, 1)]
 
 
@@ -33,6 +53,17 @@ class FleetMap:
         self.hdx = np.zeros(shape, np.float32)        # stored hit offset from sample centre
         self.hdy = np.zeros(shape, np.float32)
         self.hoff = np.full(shape, np.inf, np.float32)
+        self.gx = np.zeros(shape, np.float32)         # local plane gradient (for change detection)
+        self.gy = np.zeros(shape, np.float32)
+        self.chg_n = np.zeros(shape, np.int16)        # consecutive scans disagreeing with the map
+        self.chg_z = np.zeros(shape, np.float32)      # height those scans saw
+        self.chg_seq = np.zeros(shape, np.int64)      # scan number of the last disagreement
+        self.chg_conf = np.zeros(shape, np.int16)     # sweeps that confirmed the stored surface
+        self.changed_t = np.full(shape, -1e9, np.float32)   # when a sample was last overwritten
+        self.near_chg_t = np.full(shape, -1e9, np.float32)  # when a sample's neighbour last changed
+        self.soft = np.zeros(shape, bool)             # soft ground reported by the fleet
+        self.scan_seq = 0
+        self.changes = 0                              # samples overwritten so far
         self.sent_h = np.full(shape, np.nan, np.float32)
         self.sent_s = np.full(shape, np.nan, np.float32)
         self.dirty = np.zeros(shape, bool)
@@ -60,17 +91,19 @@ class FleetMap:
         return 100.0 * self.known_count / float(self.nx * self.ny)
 
     # ------------------------------------------------------------------ integration
-    def integrate(self, pts: np.ndarray) -> None:
-        """pts: (N, 3) world hit points on terrain or rocks."""
+    def integrate(self, pts: np.ndarray, t: float = 0.0) -> int:
+        """pts: (N, 3) world hit points on terrain or rocks (one LiDAR sweep).
+        Returns the number of samples overwritten because the ground changed."""
+        self.scan_seq += 1
         if len(pts) == 0:
-            return
+            return 0
         fi = (pts[:, 0] - self.ox) / self.res
         fj = (pts[:, 1] - self.oy) / self.res
         i = np.rint(fi).astype(np.int64)
         j = np.rint(fj).astype(np.int64)
         ok = (i >= 0) & (i < self.nx) & (j >= 0) & (j < self.ny)
         if not ok.any():
-            return
+            return 0
         i, j, fi, fj, z = i[ok], j[ok], fi[ok], fj[ok], pts[ok, 2]
         dx = ((fi - i) * self.res).astype(np.float32)
         dy = ((fj - j) * self.res).astype(np.float32)
@@ -83,18 +116,102 @@ class FleetMap:
         sel = order[first]
         f = flat[sel]
         better = off[sel] < self.hoff.ravel()[f]
-        if not better.any():
-            return
-        sel, f = sel[better], f[better]
+        known_f = self.known.ravel()[f]
+        if known_f.any():
+            # a closer hit normally just refines a sample, but on known ground it can also reveal a change:
+            # far above the stored surface means something new is there (or, absurdly high, a boulder still
+            # falling: ignore that hit)
+            jump = z[sel] - self.h.ravel()[f]
+            better &= ~(known_f & (jump > 1.5))
+            big = better & known_f & (jump > CHANGE_SEED_DZ) & (self.chg_conf.ravel()[f] >= CHANGE_CONFIRMED) \
+                & (self.changed_t.ravel()[f] < t - CHANGE_COOLDOWN_S)
+            if big.any():
+                self._stamp_changes(f[big], t)
+        upd = sel[better]
+        top = self._changed(flat, z, dx, dy, off, f[better], t)
+        n_changed = 0 if top is None else len(top)
+        if n_changed:
+            upd = np.concatenate([upd, top])
+        if len(upd) == 0:
+            return 0
+        f = flat[upd]
         newly = ~self.known.ravel()[f]
-        self.hz.ravel()[f] = z[sel]
-        self.hdx.ravel()[f] = dx[sel]
-        self.hdy.ravel()[f] = dy[sel]
-        self.hoff.ravel()[f] = off[sel]
+        self.hz.ravel()[f] = z[upd]
+        self.hdx.ravel()[f] = dx[upd]
+        self.hdy.ravel()[f] = dy[upd]
+        self.hoff.ravel()[f] = off[upd]
         self.known.ravel()[f] = True
         self.known_count += int(newly.sum())
-        jj, ii = j[sel], i[sel]
+        jj, ii = j[upd], i[upd]
         self._refit(int(jj.min()) - 2, int(jj.max()) + 2, int(ii.min()) - 2, int(ii.max()) + 2)
+        return n_changed
+
+    def _changed(self, flat, z, dx, dy, off, updated, t: float):
+        """Change detection (new obstacles) for known samples this sweep did not update anyway.
+        Per sample it looks at the highest hit near the centre in this sweep; if that stands well
+        above the stored surface in CHANGE_SCANS separate sweeps (and nothing in between says the
+        surface is unchanged), the sample is overwritten with that hit. Returns hit indices to
+        write, one per changed sample, or None."""
+        inner = np.flatnonzero(off < CHANGE_OFF)
+        if len(inner) == 0:
+            return None
+        fl = flat[inner]
+        order = np.lexsort((-z[inner], fl))
+        fs = fl[order]
+        first = np.ones(len(fs), bool)
+        first[1:] = fs[1:] != fs[:-1]
+        top = inner[order[first]]                  # highest hit near the centre, per sample
+        ft = flat[top]
+        cand = (self.known.ravel()[ft] & (self.hoff.ravel()[ft] < FILL_OFFSET)
+                & (self.changed_t.ravel()[ft] < t - CHANGE_COOLDOWN_S)
+                & ((self.slope.ravel()[ft] <= CHANGE_MAX_SLOPE) | (self.near_chg_t.ravel()[ft] >= t - CHANGE_NEAR_S)))
+        if len(updated):
+            cand &= ~np.isin(ft, updated)
+        if not cand.any():
+            return None
+        top, ft = top[cand], ft[cand]
+        # expected height at the hit's spot from the stored surface (plane through the sample)
+        corr = np.clip(self.gx.ravel()[ft] * dx[top] + self.gy.ravel()[ft] * dy[top], -0.15, 0.15)
+        d = z[top] - (self.h.ravel()[ft] + corr)
+        near = self.near_chg_t.ravel()[ft] >= t - CHANGE_NEAR_S
+        n = self.chg_n.ravel()
+        conf = self.chg_conf.ravel()
+        agree = np.abs(d) <= CHANGE_DZ
+        if agree.any():
+            fa_ = ft[agree]
+            n[fa_] = 0                             # this sweep confirms the map here
+            conf[fa_] = np.minimum(conf[fa_] + 1, 1000)
+        # higher than the map (a new obstacle), but not absurdly so (a boulder still in the air). A first
+        # change in an area also needs a well established old surface: a sample seen once from afar
+        # that turns out higher is a correction, not a change.
+        up = (d > np.where(near, CHANGE_DZ, CHANGE_SEED_DZ)) & (d < 2.0) & (near | (conf[ft] >= CHANGE_CONFIRMED))
+        if not up.any():
+            return None
+        fd, td = ft[up], top[up]
+        zd = z[td]
+        seq = self.scan_seq
+        same = ((np.abs(self.chg_z.ravel()[fd] - zd) < CHANGE_AGREE)
+                & (seq - self.chg_seq.ravel()[fd] <= CHANGE_GAP) & (self.chg_seq.ravel()[fd] < seq))
+        cnt = np.where(same, n[fd] + 1, 1).astype(np.int16)
+        n[fd] = cnt
+        self.chg_z.ravel()[fd] = zd
+        self.chg_seq.ravel()[fd] = seq
+        acc = cnt >= CHANGE_SCANS
+        if not acc.any():
+            return None
+        fa = fd[acc]
+        n[fa] = 0
+        self._stamp_changes(fa, t)
+        return td[acc]
+
+    def _stamp_changes(self, fa, t: float) -> None:
+        """Remember that these samples changed (and open the neighbourhood for fill-in)."""
+        self.chg_conf.ravel()[fa] = 0
+        self.changed_t.ravel()[fa] = t
+        for f1 in np.asarray(fa).tolist():
+            jj, ii = divmod(int(f1), self.nx)
+            self.near_chg_t[max(jj - 2, 0):jj + 3, max(ii - 2, 0):ii + 3] = t
+        self.changes += int(len(fa))
 
     def _refit(self, j0: int, j1: int, i0: int, i1: int) -> None:
         """Recompute plane fits, heights and slopes for samples in [j0..j1] x [i0..i1]."""
@@ -197,6 +314,8 @@ class FleetMap:
         kn = self.known[win]
         self.h[win] = np.where(kn, hc[inner], 0.0)
         self.slope[win] = np.where(kn, slope[inner], 0.0)
+        self.gx[win] = np.where(kn, gx[inner], 0.0)
+        self.gy[win] = np.where(kn, gy[inner], 0.0)
         self.dirty[win] |= kn
         self.version += 1
 
@@ -213,8 +332,27 @@ class FleetMap:
         self.version += 1
         return int(self.blocked[j0:j1 + 1, i0:i1 + 1].sum()) - before
 
+    def mark_soft(self, x: float, y: float, radius: float) -> int:
+        """Soft ground (found by wheel slip): impassable for every rover. Returns new samples marked."""
+        i, j = self.ij(x, y)
+        k = int(math.ceil(radius / self.res))
+        j0, j1 = max(0, j - k), min(self.ny - 1, j + k)
+        i0, i1 = max(0, i - k), min(self.nx - 1, i + k)
+        yy, xx = np.mgrid[j0:j1 + 1, i0:i1 + 1]
+        m = (xx - i) ** 2 + (yy - j) ** 2 <= (radius / self.res) ** 2 + 1e-6
+        before = int(self.soft[j0:j1 + 1, i0:i1 + 1].sum())
+        self.soft[j0:j1 + 1, i0:i1 + 1] |= m
+        self.version += 1
+        return int(self.soft[j0:j1 + 1, i0:i1 + 1].sum()) - before
+
+    def recently_changed(self, i: int, j: int, since: float, r: int = 1, min_count: int = 1) -> bool:
+        """Were at least min_count samples within r cells of (i, j) overwritten by change detection
+        after `since`?"""
+        win = self.changed_t[max(j - r, 0):j + r + 1, max(i - r, 0):i + r + 1]
+        return int((win >= since).sum()) >= min_count
+
     def traversable(self, limit_deg: float) -> np.ndarray:
-        return self.known & (self.slope <= limit_deg) & ~self.blocked
+        return self.known & (self.slope <= limit_deg) & ~self.blocked & ~self.soft
 
     # ------------------------------------------------------------------ deltas for the protocol
     def take_changed_cells(self) -> list:

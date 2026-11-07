@@ -49,7 +49,7 @@ function WorldFacts() {
   )
 }
 
-export function Sidebar({ follow, onFollow }) {
+export function Sidebar({ follow, selected, onSelect, onFocusEvent }) {
   return (
     <aside className="side">
       <header className="side-head">
@@ -58,8 +58,8 @@ export function Sidebar({ follow, onFollow }) {
         <WorldFacts />
       </header>
       <FleetStats />
-      <RoverList follow={follow} onFollow={onFollow} />
-      <EventLog />
+      <RoverList follow={follow} selected={selected} onSelect={onSelect} />
+      <EventLog onFocusEvent={onFocusEvent} />
     </aside>
   )
 }

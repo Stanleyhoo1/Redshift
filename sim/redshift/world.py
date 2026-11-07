@@ -2,10 +2,13 @@
 
 Geom groups:
   0 terrain heightfield tiles
-  1 rocks and lander pad (seen by LiDAR)
+  1 rocks, rockfall boulders and lander pad (seen by LiDAR)
   2 science target markers (no collision, seen by the spectrometer rays)
   3 rovers (excluded from every LiDAR scan)
   5 invisible walls just outside the map edge (keep rovers on the map, not seen by LiDAR)
+
+Rockfall boulders are mocap bodies parked far below the map until hazards.py drops them in.
+Each rover carries a simulated IMU (framequat + gyro on a site at the chassis centre).
 """
 from __future__ import annotations
 
@@ -23,11 +26,13 @@ GROUP_TARGET = 2
 GROUP_ROVER = 3
 GROUP_WALL = 5
 
-TARGET_RGBA = {
-    "mineral": "0.95 0.55 0.15 1",
-    "ice": "0.55 0.85 1.0 1",
-    "vent": "1.0 0.25 0.35 1",
+TARGET_RGBA = {          # same colours as the dashboard: mineral #b48cff, ice #a8d4ff, vent #ff8a3d
+    "mineral": "0.706 0.549 1.0 1",
+    "ice": "0.659 0.831 1.0 1",
+    "vent": "1.0 0.541 0.239 1",
 }
+
+BOULDER_PARK_Z = -60.0     # hidden boulders wait this far below the lowest terrain
 
 WHEEL_LAYOUT = [  # (sx, sy): front-left, rear-left, front-right, rear-right
     (1, 1), (-1, 1), (1, -1), (-1, -1),
@@ -63,13 +68,15 @@ def rover_body_xml(cfg: Config, rid: str, x: float, y: float, z: float, yaw: flo
         f'  <geom name="{rid}_head" type="box" size="0.06 0.06 0.035" pos="0.18 0 {cfg.lidar_height:.3f}" '
         f'rgba="{rgba}" group="{GROUP_ROVER}" contype="0" conaffinity="0" mass="0"/>',
         f'  <site name="{rid}_lidar" pos="0.18 0 {cfg.lidar_height + 0.05:.3f}" size="0.03" group="{GROUP_ROVER}"/>',
+        f'  <site name="{rid}_imu" pos="0 0 0" size="0.02" group="{GROUP_ROVER}"/>',
     ]
     def wheel(k: int, pos: str, indent: str) -> list:
         return [
             f'{indent}<body name="{rid}_wb{k}" pos="{pos}">',
             f'{indent}  <joint name="{rid}_w{k}" type="hinge" axis="0 1 0" damping="0.05" armature="0.02"/>',
             f'{indent}  <geom name="{rid}_wheel{k}" type="sphere" size="{r}" mass="{cfg.wheel_mass}" '
-            f'friction="{wf} 0.005 0.0001" rgba="0.12 0.12 0.12 1" group="{GROUP_ROVER}" contype="2" conaffinity="1"/>',
+            f'friction="{wf} 0.005 0.0001" priority="1" rgba="0.12 0.12 0.12 1" group="{GROUP_ROVER}" '
+            f'contype="2" conaffinity="1"/>',
             f'{indent}</body>',
         ]
 
@@ -100,6 +107,22 @@ def rover_actuator_xml(cfg: Config, rid: str) -> str:
         f'forcerange="{-t} {t}" ctrlrange="{-w} {w}"/>'
         for k in range(4)
     )
+
+
+def rover_sensor_xml(rid: str) -> str:
+    """Simulated IMU: attitude (framequat, what an AHRS chip reports) and body rates (gyro)."""
+    return (f'<framequat name="{rid}_imu_quat" objtype="site" objname="{rid}_imu"/>'
+            f'<gyro name="{rid}_imu_gyro" site="{rid}_imu"/>')
+
+
+def boulder_sizes(cfg: Config) -> list:
+    """Semi-axes (sx, sy, sz) of the hidden rockfall boulders. Deterministic, a mix of sizes."""
+    base = (0.55, 0.62, 0.5, 0.58, 0.66, 0.52, 0.6, 0.56, 0.64, 0.5, 0.6, 0.54)
+    out = []
+    for k in range(cfg.num_boulders):
+        r = base[k % len(base)]
+        out.append((r, round(0.9 * r, 3), round(0.78 * r, 3)))
+    return out
 
 
 def rover_spawn_height(cfg: Config) -> float:
@@ -133,6 +156,7 @@ class World:
     rover_ids: list
     target_geom_ids: dict      # geom id -> target index
     rover_geom_range: dict     # rover id -> (first geom id, last geom id)
+    boulders: list             # [(mocap id, geom id, (sx, sy, sz))] hidden rockfall boulders
 
 
 def _tile_spans(n: int, tile: int) -> list:
@@ -211,13 +235,25 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
             f'rgba="{TARGET_RGBA[t.kind]}" group="{GROUP_TARGET}" contype="0" conaffinity="0"/>'
         )
 
-    bodies, actuators, rover_ids = [], [], []
+    bodies, actuators, sensors, rover_ids = [], [], [], []
     z0 = rover_spawn_height(cfg)
     for (rid, x, y, yaw, color) in rover_spawns:
         gz = float(terrain.height_at(x, y))
         bodies.append(rover_body_xml(cfg, rid, x, y, gz + z0 + 0.03, yaw, color))
         actuators.append(rover_actuator_xml(cfg, rid))
+        sensors.append(rover_sensor_xml(rid))
         rover_ids.append(rid)
+
+    # rockfall boulders: kinematic (mocap) bodies parked far below the map, seen by LiDAR (group 1)
+    # and solid for rovers once hazards.py moves them into place
+    park_z = terrain.min_h + BOULDER_PARK_Z
+    bsizes = boulder_sizes(cfg)
+    for k, (sx, sy, sz) in enumerate(bsizes):
+        bodies.append(
+            f'<body name="boulder_{k}" mocap="true" pos="{-20.0 + 3.0 * k:.2f} 0 {park_z:.2f}">'
+            f'<geom name="boulder_{k}" type="ellipsoid" size="{sx:.3f} {sy:.3f} {sz:.3f}" material="rock" '
+            f'group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/></body>'
+        )
 
     span = cfg.map_size
     xml = f"""
@@ -247,6 +283,9 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
   <actuator>
     {''.join(actuators)}
   </actuator>
+  <sensor>
+    {''.join(sensors)}
+  </sensor>
 </mujoco>
 """
     model = mujoco.MjModel.from_xml_string(xml)
@@ -275,4 +314,10 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
         gids = [g for g in range(model.ngeom) if model.body_rootid[model.geom_bodyid[g]] == bid]
         rover_geom_range[rid] = (min(gids), max(gids))
 
-    return World(model, data, tiles, rover_ids, target_geom_ids, rover_geom_range)
+    boulders = []
+    for k, size in enumerate(bsizes):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"boulder_{k}")
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"boulder_{k}")
+        boulders.append((int(model.body_mocapid[bid]), int(gid), size))
+
+    return World(model, data, tiles, rover_ids, target_geom_ids, rover_geom_range, boulders)

@@ -1,19 +1,32 @@
-import { useEffect, useRef } from 'react'
+import { useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
-import { simStore, useSim, roverPoses } from '../state/store.js'
+import { simStore, useSim, roverPoses, hudLayout } from '../state/store.js'
+import { sampleGroundNear } from '../state/simState.js'
 
 const _d = new THREE.Vector3()
 const _o = new THREE.Vector3()
 const _p = new THREE.Vector3()
 const FOLLOW_DISTANCE = 28
+const FLY_DISTANCE = 30
 const ELEVATION = 0.98 // overview camera angle above the horizon, radians
 
-// The control panel covers the left edge of the 3D view, so the picture is shifted
-// right by about half its width: the scene is then centred in the free space.
-function hudShift(width) {
-  return width > 640 ? Math.min(124, width * 0.12) : 0
+// The part of the view the HUD panels leave free, in px: { x0, x1, y0, y1 }.
+// The control panel covers the left edge and the hazard bar the top, so the picture is
+// shifted to be centred in what is left. With the sensor panel open (a rover selected)
+// the free space is the band above it, where the followed rover then sits.
+function freeRect(size) {
+  const { width: W, height: H } = size
+  if (W <= 640) return { x0: 0, x1: W, y0: H * 0.06, y1: H * 0.94 }
+  const c = hudLayout.controls
+  const hz = hudLayout.hazards
+  const sp = hudLayout.sensors
+  // Without a measurement (first frames) fall back to the old fixed left shift.
+  const x0 = c ? Math.min(W * 0.4, c.right) : 2 * Math.min(124, W * 0.12)
+  const top = Math.max(H * 0.06, hz ? hz.bottom + 10 : 0)
+  if (sp && sp.top > top + 80) return { x0: x0 + 8, x1: W - 8, y0: top, y1: sp.top - 8 }
+  return { x0, x1: W, y0: top, y1: H * 0.94 }
 }
 
 // The area the overview keeps in frame: what the fleet knows so far plus a margin,
@@ -46,15 +59,16 @@ function overviewBox(map, T) {
   return { x0, x1, y0, y1, h: (map.minH + map.maxH) / 2 }
 }
 
-// Camera pose that fits a box into the free part of the view.
-function overviewPose(box, size, fov) {
+// Camera pose that fits a box into the free part of the view. The view offset already
+// centres the free rect on screen, so the fit only needs its half extents in NDC.
+function overviewPose(box, size, fov, free) {
   const cam = new THREE.PerspectiveCamera(fov, size.width / Math.max(1, size.height), 0.1, 10000)
   const dir = new THREE.Vector3(0, Math.sin(ELEVATION), Math.cos(ELEVATION))
   const target = new THREE.Vector3((box.x0 + box.x1) / 2, box.h, -(box.y0 + box.y1) / 2)
   const corners = []
   for (const x of [box.x0, box.x1]) for (const y of [box.y0, box.y1]) corners.push(new THREE.Vector3(x, box.h, -y))
-  const xMax = ((size.width - 2 * hudShift(size.width)) / Math.max(1, size.width)) * 0.97
-  const yMax = 0.88
+  const xMax = ((free.x1 - free.x0) / Math.max(1, size.width)) * 0.97
+  const yMax = (free.y1 - free.y0) / Math.max(1, size.height)
   const span = Math.max(box.x1 - box.x0, box.y1 - box.y0, 1)
   const place = (d) => {
     cam.position.copy(target).addScaledVector(dir, d)
@@ -92,28 +106,46 @@ function overviewPose(box, size, fov) {
   return { target, position: target.clone().addScaledVector(dir, d) }
 }
 
-// Orbit camera with three modes:
+// Keeps the free part of the view centred on screen with a view offset, easing when a
+// panel opens or closes so the picture glides instead of jumping.
+function applyShift(s, camera, size, free, dt) {
+  const W = size.width
+  const H = size.height
+  const wx = (free.x0 + free.x1) / 2 - W / 2
+  const wy = (free.y0 + free.y1) / 2 - H / 2
+  const resized = !s.shift || s.shift.W !== W || s.shift.H !== H
+  if (resized) s.shift = { x: wx, y: wy, W, H }
+  else {
+    const k = 1 - Math.exp(-Math.min(dt, 0.1) * 5)
+    const nx = s.shift.x + (wx - s.shift.x) * k
+    const ny = s.shift.y + (wy - s.shift.y) * k
+    if (Math.abs(nx - s.shift.x) < 0.05 && Math.abs(ny - s.shift.y) < 0.05) return
+    s.shift.x = Math.abs(wx - nx) < 0.3 ? wx : nx
+    s.shift.y = Math.abs(wy - ny) < 0.3 ? wy : ny
+  }
+  if (Math.abs(s.shift.x) < 0.5 && Math.abs(s.shift.y) < 0.5) camera.clearViewOffset()
+  else camera.setViewOffset(W, H, -s.shift.x, -s.shift.y, W, H)
+}
+
+// Orbit camera with four modes:
 //   auto   - overview that keeps the explored area in frame, easing out as it grows
 //   user   - someone moved the camera: hands off until "Off" (0 / Esc) or a sim reset
 //   follow - glides along with one rover; you can still orbit around it
-export function CameraRig({ follow, overview = 0 }) {
+//   fly    - glides to a spot (an event with a location), then hands over as "user"
+export function CameraRig({ follow, overview = 0, focus = null }) {
   const map = useSim((s) => s.map)
   const gen = useSim((s) => s.gen)
   const camera = useThree((s) => s.camera)
   const size = useThree((s) => s.size)
   const controls = useRef()
-  const st = useRef({ mode: 'auto', snapped: false, key: '', checkedAt: 0, goal: null, followId: null, zooming: false, overview, gen })
-
-  useEffect(() => {
-    const shift = hudShift(size.width)
-    if (shift) camera.setViewOffset(size.width, size.height, -shift, 0, size.width, size.height)
-    else camera.clearViewOffset()
-  }, [camera, size])
+  const st = useRef({ mode: 'auto', snapped: false, key: '', checkedAt: 0, goal: null, followId: null, zooming: false, overview, gen, focusKey: focus?.key ?? null, fly: null, shift: null })
 
   useFrame((_, dt) => {
     const c = controls.current
     if (!c || !map) return
     const s = st.current
+    const free = freeRect(size)
+    applyShift(s, camera, size, free, dt)
     const wantOverview = overview !== s.overview
     const newRun = gen !== s.gen
     s.overview = overview
@@ -125,14 +157,43 @@ export function CameraRig({ follow, overview = 0 }) {
     }
     if (!follow && (wantOverview || newRun)) s.mode = 'auto'
 
+    // A clicked event with a location: fly there, keeping the current viewing angle.
+    if (focus && focus.key !== s.focusKey) {
+      s.focusKey = focus.key
+      if (!newRun && !follow) {
+        const h = sampleGroundNear(simStore.get().terrain, focus.x, focus.y, 8) ?? (map.minH + map.maxH) / 2
+        const target = new THREE.Vector3(focus.x, h, -focus.y)
+        _o.copy(camera.position).sub(c.target)
+        if (_o.lengthSq() < 1e-6) _o.set(0, Math.sin(ELEVATION), Math.cos(ELEVATION))
+        // Never flatter than about 35 degrees, so the spot is not hidden behind a hill.
+        _o.normalize()
+        if (_o.y < 0.57) {
+          const flat = Math.hypot(_o.x, _o.z) || 1
+          _o.set((_o.x / flat) * 0.82, 0.57, (_o.z / flat) * 0.82)
+        }
+        s.fly = { target, position: target.clone().addScaledVector(_o, FLY_DISTANCE) }
+        s.mode = 'fly'
+      }
+    }
+
+    if (s.mode === 'fly') {
+      const a = 1 - Math.exp(-Math.min(dt, 0.1) * 2.6)
+      c.target.lerp(s.fly.target, a)
+      camera.position.lerp(s.fly.position, a)
+      camera.lookAt(c.target)
+      if (camera.position.distanceTo(s.fly.position) < 0.2 && c.target.distanceTo(s.fly.target) < 0.05) s.mode = 'user'
+      return
+    }
+
     if (s.mode === 'auto') {
       const T = simStore.get().terrain
-      const key = `${gen}:${size.width}x${size.height}:${T ? `${T.bi0},${T.bi1},${T.bj0},${T.bj1}` : ''}`
+      const fr = `${Math.round(free.x0)},${Math.round(free.x1)},${Math.round(free.y0)},${Math.round(free.y1)}`
+      const key = `${gen}:${size.width}x${size.height}:${fr}:${T ? `${T.bi0},${T.bi1},${T.bj0},${T.bj1}` : ''}`
       const now = performance.now()
       if (key !== s.key && (!s.goal || newRun || now - s.checkedAt > 250)) {
         s.key = key
         s.checkedAt = now
-        s.goal = overviewPose(overviewBox(map, T), size, camera.fov)
+        s.goal = overviewPose(overviewBox(map, T), size, camera.fov, free)
       }
       if (!s.snapped) {
         s.snapped = true
@@ -177,9 +238,9 @@ export function CameraRig({ follow, overview = 0 }) {
       maxDistance={Math.max(240, span * 3)}
       zoomSpeed={0.8}
       onStart={() => {
-        // Someone grabbed the camera: stop auto framing (or the follow zoom).
+        // Someone grabbed the camera: stop auto framing, a fly-to (or the follow zoom).
         const s = st.current
-        if (s.mode === 'auto') s.mode = 'user'
+        if (s.mode === 'auto' || s.mode === 'fly') s.mode = 'user'
         s.zooming = false
       }}
     />

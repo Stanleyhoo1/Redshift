@@ -100,6 +100,39 @@ class Config:
     investigate_radius: float = 2.0
     target_bonus_radius: float = 15.0
 
+    # ---- edge compute budget (per rover per decision cycle, wall clock) ----
+    brain_budget_ms: float = 40.0
+    plan_share: float = 0.75        # share of the budget the planner may use in one cycle
+    plan_clock: str = "wall"        # "wall": stop planning on the wall clock (real budget, not repeatable);
+                                    # "model": count A* expansions at exp_cost_us each (repeatable runs)
+    exp_cost_us: float = 3.0        # measured cost of one A* expansion on the dev machine
+
+    # ---- hazards (see hazards.py) ----
+    num_boulders: int = 12          # hidden boulder bodies allocated in the model for rockfalls
+    sand_radius: float = 2.5
+    sand_friction: float = 0.3      # wheel friction inside a sand patch (normal: wheel_friction)
+    sand_wheel_damping: float = 0.3  # extra wheel joint damping inside a patch (rolling resistance)
+    sand_drag_fwd: float = 5.0      # sinkage drag on the rover body, x weight, per m/s, when pushing in
+    sand_drag_rev: float = 0.5      # same when backing out along its own compacted ruts
+    dust_storm_s: float = 90.0
+    dust_lidar_range: float = 3.0
+    dust_charge_factor: float = 0.3  # lander solar charging power left during a dust storm
+    fault_s: float = 90.0
+
+    # ---- reactions ----
+    slip_threshold: float = 0.6
+    slip_time_s: float = 1.5
+    slip_min_wheel_speed: float = 0.2
+    soft_zone_radius: float = 3.2   # how big the fleet assumes a soft patch is (true ones: sand_radius)
+    sand_free_s: float = 30.0       # failsafe: a rover still stuck after this long digs itself out
+    degraded_v_max: float = 0.4     # top speed while the LiDAR is degraded
+    degraded_unknown_cost: float = 8.0
+    slow_charge_margin: float = 0.25  # return margin while the lander charges slowly
+    caution_v: float = 0.3           # speed right after perception flags something unexpected
+
+    # ---- telemetry ----
+    scan_points: int = 200          # max LiDAR points per rover in a tick message (protocol: at most 300)
+
     @property
     def nx(self) -> int:
         return int(round(self.map_size / self.res)) + 1
@@ -133,5 +166,6 @@ class Config:
             map_size=max(30.0, _env_float("MAP_SIZE", 80.0)),
             gravity_g=max(0.1, _env_float("GRAVITY_G", 2.0)),
             viewer=_env_bool("VIEWER", False),
+            brain_budget_ms=max(1.0, _env_float("BRAIN_BUDGET_MS", 40.0)),
         )
         return replace(base, **overrides) if overrides else base

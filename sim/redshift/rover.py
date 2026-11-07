@@ -1,22 +1,47 @@
-"""Per-rover embodied agent: LiDAR + spectrometer, skid-steer controller, battery, state machine.
+"""Per-rover embodied agent: sensors, skid-steer controller, battery, state machine.
 
-States (protocol enum): exploring, investigating, returning, charging, recovering, idle.
+Sensors (all the rover knows about the world):
+  LiDAR          spinning, on a mast; hits go into the shared map (mj_multiRay)
+  spectrometer   LiDAR hits on science targets within range
+  IMU            MuJoCo framequat + gyro on the chassis: pitch, roll, tilt, heading, yaw rate
+  wheel encoders wheel joint speeds -> wheel surface speed
+  motor feedback actuator torques -> motor load; controller status (a fault shows up here)
+  wheel load     normal force on each wheel (strain gauges; read only while slip is suspected)
+  bumper         three short rays at the nose (mj_ray)
+  position       ground truth, treated as GPS-like localisation (no SLAM)
+
+States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault.
+
+Each decision cycle is timed (the "brain": map integration, frontier logic, planning, state machine;
+not the simulated sensor hardware or physics) and planning stops when the cycle's share of the
+compute budget runs out, then resumes next cycle.
+
+Anything perception did not expect (new obstacles on the path, wheel slip, LiDAR returns collapsing)
+goes through Rover.on_anomaly(): it records the anomaly, slows the rover down at once (before any
+re-planning) and logs what was seen. Other layers can subscribe with Rover.anomaly_hooks.
 """
 from __future__ import annotations
 
 import math
+import time
 from collections import deque
 
 import mujoco
 import numpy as np
 
 from .config import Config
-from .planner import downsample, path_length
+from .planner import PENDING, downsample, path_length
 from .terrain import KIND_LABEL
 from .world import GROUP_ROCK
 
 LIDAR_GROUPS = np.array([1, 1, 1, 0, 0, 0], np.uint8)   # terrain, rocks, targets; never rovers (group 3)
 BUMPER_GROUPS = np.array([0, 1, 0, 0, 0, 0], np.uint8)  # rocks only
+DRIVING = ("exploring", "investigating", "returning")
+PARKED = ("idle", "charging", "fault")
+ANOMALY_KINDS = ("new_obstacle", "slip", "low_visibility")
+ANOMALY_TYPE = {"new_obstacle": "new_obstacle", "slip": "wheel_slip", "low_visibility": "low_visibility"}
+CAUTION_S = {"new_obstacle": 3.0, "slip": 1.0, "low_visibility": 3.0}   # how long the cautious slowdown lasts
+BRAKE_KV = 400.0       # wheel brake stiffness while the motor controller is down (normal servo: motor_kv)
 
 
 def wrap(a: float) -> float:
@@ -39,13 +64,18 @@ class Rover:
         self.nq = sum(7 if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE else 1 for j in jnts)
         self.nv = sum(6 if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE else 1 for j in jnts)
         self.site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, f"{rid}_lidar")
+        self.imu_q = int(m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, f"{rid}_imu_quat")])
+        self.imu_g = int(m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, f"{rid}_imu_gyro")])
         # own spec sheet: wheel torque needed per unit sin(slope) to hold the whole rover against gravity
         self.mass = float(m.body_subtreemass[self.body])
         self.grav_torque = self.mass * self.cfg.gravity * self.cfg.wheel_radius
         self.acts = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{rid}_m{k}") for k in range(4)]
         self.wdofs = [int(m.jnt_dofadr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, f"{rid}_w{k}")])
                       for k in range(4)]
+        self.wheel_gidx = {mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"{rid}_wheel{k}"): k for k in range(4)}
+        self._f6 = np.zeros(6)
         self.rng = np.random.default_rng(self.cfg.seed * 101 + idx)
+        self.imu_rng = np.random.default_rng(self.cfg.seed * 131 + idx)
 
         # lidar buffers
         self.el = np.array(self.cfg.lidar_el)
@@ -53,8 +83,6 @@ class Rover:
         self.nray = self.n_az * len(self.el)
         self.ray_gid = np.zeros(self.nray, np.int32)
         self.ray_dist = np.zeros(self.nray, np.float64)
-        self.bump_gid = np.zeros(3, np.int32)
-        self.bump_dist = np.zeros(3, np.float64)
 
         # state
         self.state = "exploring"
@@ -67,12 +95,15 @@ class Rover:
         self.wp = 0
         self.plan_t = -1e9
         self.plan_limit_version = -1
+        self.plan_relax = 0.0
+        self._last_relax = 0.0
         self.next_goal_try = 0.0
         self.next_goal_eval = 0.0
         self.last_goal_event_t = -1e9
         self.target_idx = None
         self.dwell_until = None
         self.inv_fails = 0
+        self.next_inv_plan = 0.0
         self.next_target_check = 0.0
         self.rec_phase = None
         self.rec_until = 0.0
@@ -95,6 +126,7 @@ class Rover:
         self.home_dist = None
         self.home_dist_t = -1e9
         self.home_dist_xy = (0.0, 0.0)
+        self.home_pending = False
         self.need_home = 0.0
         self.next_home_check = 0.0
         self.no_goal_since = None
@@ -102,34 +134,188 @@ class Rover:
         self.dock_near_since = None
         self.goal_fail_reason = None
         self.blacklist: dict = {}          # frontier bucket -> time until which this rover skips it
+
+        # planning (anytime) and re-routing
+        self.searches: dict = {}           # unfinished A* searches, resumed next cycle
+        self.plan_fails: dict = {}         # (goal cell, relax) -> (t, x, y) of a recent failed search
+        self.pending_goal_key = None
+        self.block_info = None             # (x, y, metres ahead, reason) if the path is blocked
+        self.hold_for_plan = False
+        self.reroute = None                # pending "new obstacle" announcement
+        self.last_rocks_t = -1e9
+        self.rocks_seen: list = []         # (x, y, t) obstacles already announced
+        self.soft_seen: set = set()
+
+        # sensors
         self.x = self.y = self.z = self.yaw = 0.0
-        self.tilt = self.pitch = 0.0
+        self.tilt = self.pitch = self.roll = 0.0
+        self.gyro_z = 0.0
         self.speed = 0.0
         self.speed_fwd = 0.0
+        self.v_wheel = 0.0
+        self.slip = 0.0
+        self.spin_load = 0.0
+        self.motor_load = 0.0
+        self.lidar_hits = 0
+        self.lidar_eff = self.cfg.lidar_range
+        self.far_hist: deque = deque(maxlen=3)
+        self.degraded = False
+        self.spectro = None                # (target index, distance) nearest target seen this sweep
+        self.scan_pts = np.zeros((0, 3))
+        self.scan_changes = 0
+
+        # hazards: hardware state set by the world, and the rover's reactions
+        self.motor_fault = False           # motor controller offline (seen through motor feedback)
+        self._brakes_locked = False
+        self.fault_prev = "exploring"
+        self.trail: deque = deque(maxlen=80)
+        self.slip_since = None
+        self.slip_xy = None
+        self.slip_peak = 0.0
+        self.slip_n = 0
+        self.slip_spin = np.zeros(4)
+        self.slip_load = np.zeros(4)
+        self.sand_zone = None
+        self.sand_t0 = 0.0
+        self.sand_freed = False
+        self.escape: list = []
+
+        # uncertainty: the last thing perception did not expect, and the cautious slowdown it caused
+        self.anomaly = None                # {"t", "kind", "at", ...details}
+        self.anomaly_log: deque = deque(maxlen=20)
+        self.anomaly_hooks: list = []      # callables (rover, anomaly dict), e.g. a reasoning layer
+        self.caution_until = -1e9
+        self.caution_v = self.cfg.caution_v
+
+        # charging telemetry (the lander's panels can be dusty)
+        self.battery_margin = self.cfg.battery_margin
+        self.charge_hist: deque = deque(maxlen=12)
+        self.slow_charge = False
+
+        # compute budget
+        self.budget_s = self.cfg.brain_budget_ms / 1000.0
+        self._c0 = None
+        self._hw = 0.0
+        self.brain_last = 0.0
+        self.brain_hist: deque = deque(maxlen=int(10 * self.cfg.agent_hz) + 5)
+        self.brain_all: list = []
+        self.share_until = -1e9
+        self.last_budget_warn = -1e9
+        self.t_now = 0.0
+        self.exp_used = 0
+
         self.read_pose()
         self.last_xy = (self.x, self.y)
 
     # ================================================================== sensing
     def read_pose(self) -> None:
+        """Position from GPS-like localisation (ground truth); attitude and heading from the IMU."""
         d = self.sim.data
         q = d.qpos
         a = self.qadr
         self.x, self.y, self.z = float(q[a]), float(q[a + 1]), float(q[a + 2])
-        R = d.xmat[self.body]
-        self.yaw = math.atan2(R[3], R[0])
-        self.tilt = math.degrees(math.acos(max(-1.0, min(1.0, R[8]))))
-        self.pitch = math.degrees(math.asin(max(-1.0, min(1.0, R[6]))))
+        sd = d.sensordata
+        w, qx, qy, qz = (float(v) for v in sd[self.imu_q:self.imu_q + 4])
+        r00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+        r10 = 2.0 * (qx * qy + w * qz)
+        r20 = 2.0 * (qx * qz - w * qy)
+        r21 = 2.0 * (qy * qz + w * qx)
+        r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
+        self.yaw = math.atan2(r10, r00)
+        noise = self.imu_rng.normal(0.0, 0.1, 2)
+        self.pitch = math.degrees(math.asin(max(-1.0, min(1.0, r20)))) + float(noise[0])
+        self.roll = math.degrees(math.atan2(r21, r22)) + float(noise[1])
+        cr = math.cos(math.radians(self.pitch)) * math.cos(math.radians(self.roll))
+        if r22 < 0.0:
+            cr = -abs(cr)                  # upside down: keep the IMU's sign
+        self.tilt = math.degrees(math.acos(max(-1.0, min(1.0, cr))))
+        self.gyro_z = float(sd[self.imu_g + 2])
         v = d.qvel
         b = self.vadr
         vx, vy, vz = float(v[b]), float(v[b + 1]), float(v[b + 2])
-        self.speed_fwd = vx * R[0] + vy * R[3] + vz * R[6]
+        self.speed_fwd = vx * r00 + vy * r10 + vz * r20
         self.speed = math.hypot(vx, vy)
+
+    def _read_drive_sensors(self, t: float) -> None:
+        """Wheel encoders, motor feedback and the slip they imply."""
+        d = self.sim.data
+        cfg = self.cfg
+        w = d.qvel[self.wdofs]
+        tau = np.abs(d.actuator_force[self.acts])
+        self.v_wheel = float(w.mean()) * cfg.wheel_radius
+        self.motor_load = min(1.0, float(tau.mean()) / cfg.motor_torque)
+        # wheels turning faster than the rover moves, and how hard their motors work (smoothed): digging
+        # into sand takes torque, a wheel spinning in the air takes almost none
+        spin = w * cfg.wheel_radius > self.speed_fwd + 0.2
+        n_spin = int(spin.sum())
+        self.spin_load = 0.5 * self.spin_load + 0.5 * (float(tau[spin].mean()) / cfg.motor_torque if n_spin else 0.0)
+        if abs(self.v_wheel) > cfg.slip_min_wheel_speed:
+            raw = max(0.0, min(1.0, 1.0 - self.speed_fwd / self.v_wheel))
+        else:
+            raw = 0.0
+        self.slip = 0.5 * self.slip + 0.5 * raw          # smoothed over about a second
+        # soft ground: wheels turning well, body barely moving, on gentle ground, not turning.
+        # Near soft ground the fleet already knows about, weaker evidence is enough.
+        driving = self.state in DRIVING and self.cmd_v > 0.2 and not self.motor_fault
+        turning = abs(self.gyro_z) > 0.8               # body really rotating (IMU gyro)
+        thr = cfg.slip_threshold
+        if self.fleet.soft_zones and self.fleet.soft_zone_at(self.x, self.y, margin=1.5) is not None:
+            thr = 0.75 * thr
+        suspect = (driving and not turning and self.tilt < 14.0 and self.v_wheel > cfg.slip_min_wheel_speed
+                   and self.slip > thr and n_spin >= 2 and self.spin_load > 0.2)
+        if suspect:
+            if self.slip_since is None:
+                self.slip_since = t
+                self.slip_xy = (self.x, self.y)
+                self.slip_peak = 0.0
+                self.slip_n = 0
+                self.slip_spin = np.zeros(4)
+                self.slip_load = np.zeros(4)
+            self.slip_peak = max(self.slip_peak, self.slip)
+            # wheel loads while it lasts (contact forces flicker, so they are averaged over the window)
+            self.slip_n += 1
+            self.slip_spin += spin
+            self.slip_load += np.where(spin, self._hw_call(self.wheel_loads), 0.0)
+        else:
+            self.slip_since = None
+
+    def _slip_on_ground(self) -> bool:
+        """Were the wheels that kept spinning actually on the ground? Sunk in sand they carry their share
+        of the weight; a rover hung up on a rock spins wheels that hang in the air."""
+        share = 0.25 * self.mass * self.cfg.gravity / 4.0
+        busy = self.slip_spin >= 0.5 * self.slip_n
+        if not busy.any():
+            return False
+        mean = self.slip_load[busy] / np.maximum(self.slip_spin[busy], 1)
+        return bool((mean > share).all())
+
+    def wheel_loads(self) -> list:
+        """Normal force on each wheel (N), from the wheel contacts: simulated strain gauges."""
+        m, d = self.sim.model, self.sim.data
+        loads = [0.0, 0.0, 0.0, 0.0]
+        gidx = self.wheel_gidx
+        for k in range(d.ncon):
+            c = d.contact[k]
+            w = gidx.get(c.geom1, gidx.get(c.geom2))
+            if w is not None:
+                mujoco.mj_contactForce(m, d, k, self._f6)
+                loads[w] += abs(float(self._f6[0]))
+        return loads
+
+    def _hw_call(self, fn, *args):
+        """Run simulated sensor hardware (ray casts) outside the brain's compute budget."""
+        c = time.perf_counter()
+        out = fn(*args)
+        self._hw += time.perf_counter() - c
+        return out
 
     def scan(self, t: float) -> None:
         """One LiDAR sweep (one mj_multiRay call). The head is gimballed: it yaws with the rover but
         stays level. Hits on target markers within spectrometer range count as discoveries."""
         cfg = self.cfg
         m, d = self.sim.model, self.sim.data
+        hz = self.sim.hazards
+        rng_max = hz.lidar_range() if hz is not None else cfg.lidar_range
         pnt = d.site_xpos[self.site].copy()
         az = self.yaw + (np.arange(self.n_az) + self.rng.uniform()) * (2 * math.pi / self.n_az)
         el = self.el + self.rng.uniform(-0.6, 0.6, len(self.el)) * (math.pi / 180.0)
@@ -139,22 +325,42 @@ class Rover:
         vec[:, :, 1] = ce * np.sin(az)[None, :]
         vec[:, :, 2] = se
         vec = vec.reshape(-1, 3)
-        mujoco.mj_multiRay(m, d, pnt, vec.ravel(), LIDAR_GROUPS, 1, -1, self.ray_gid, self.ray_dist, None,
-                           self.nray, cfg.lidar_range)
+        self._hw_call(mujoco.mj_multiRay, m, d, pnt, vec.ravel(), LIDAR_GROUPS, 1, -1, self.ray_gid,
+                      self.ray_dist, None, self.nray, rng_max)
         gid = self.ray_gid
         dist = self.ray_dist
-        hit = (gid >= 0) & (dist >= 0) & (dist <= cfg.lidar_range)
+        hit = (gid >= 0) & (dist >= 0) & (dist <= rng_max)
+        drop, sigma = hz.lidar_noise() if hz is not None else (0.0, 0.0)
+        if drop > 0.0:                     # dust: lost returns and noisy ranges
+            hit &= self.rng.uniform(size=self.nray) >= drop
+            dist = dist + self.rng.normal(0.0, sigma, self.nray)
+            hit &= (dist > 0.05) & (dist <= rng_max)
+        self.lidar_hits = int(hit.sum())
         tmap = self.sim.world.target_geom_ids
+        self.spectro = None
         if tmap:
             is_t = np.isin(gid, self.sim.target_gid_array)
             th = np.flatnonzero(hit & is_t & (dist <= cfg.spectro_range))
+            best = None
             for k in th:
-                self.fleet.on_target_seen(t, self, tmap[int(gid[k])], float(dist[k]))
+                tidx = tmap[int(gid[k])]
+                if best is None or dist[k] < best[1]:
+                    best = (tidx, float(dist[k]))
+                self.fleet.on_target_seen(t, self, tidx, float(dist[k]))
+            self.spectro = best
             hit &= ~is_t
         idx = np.flatnonzero(hit)
+        # how far the ground and rocks still echo back (visibility); target markers are ignored, the
+        # head can pass right through one when the rover drives over a target
+        if len(idx) >= 30:
+            self.far_hist.append(float(dist[idx].max()))
         if len(idx):
             pts = pnt[None, :] + vec[idx] * dist[idx, None]
-            self.fleet.map.integrate(pts)
+            self.scan_pts = pts
+            self.scan_changes = self.fleet.map.integrate(pts, t)
+        else:
+            self.scan_pts = np.zeros((0, 3))
+            self.scan_changes = 0
 
     def bumper(self):
         """Three short rays from the chassis nose at wheel height: rocks right ahead?"""
@@ -165,12 +371,73 @@ class Rover:
         for k, a in enumerate((-0.4, 0.0, 0.4)):
             v = R @ np.array([math.cos(a), math.sin(a), 0.0])
             gid = np.zeros(1, np.int32)
-            dist = mujoco.mj_ray(m, d, origin, v, BUMPER_GROUPS, 1, -1, gid)
+            dist = self._hw_call(mujoco.mj_ray, m, d, origin, v, BUMPER_GROUPS, 1, -1, gid)
             if 0 <= dist < 0.8 and m.geom_group[gid[0]] == GROUP_ROCK:
                 p = origin + v * dist
                 if best is None or dist < best[0]:
                     best = (dist, float(p[0]), float(p[1]))
         return best
+
+    def _check_visibility(self, t: float) -> None:
+        """Infer LiDAR visibility from the rover's own returns: in dust, nothing comes back from
+        beyond a few metres. Degraded = unsure: slow down, stay on mapped ground, stay close."""
+        cfg = self.cfg
+        if len(self.far_hist) < self.far_hist.maxlen:
+            return
+        far_max, far_min = max(self.far_hist), min(self.far_hist)
+        nominal = cfg.lidar_range
+        if not self.degraded and far_max < 0.55 * nominal:
+            self.degraded = True
+            self.lidar_eff = round(far_max, 1)
+            if self.state in PARKED:
+                tail = "Will drive slowly on mapped ground."
+            else:
+                tail = f"Slowing down, then {cfg.degraded_v_max:.1f} m/s on mapped ground only."
+            self.on_anomaly(t, "low_visibility", {"lidar_range": round(far_max, 1)}, tail)
+            self._replan_now(t)
+        elif self.degraded and far_min > 0.75 * nominal:
+            self.degraded = False
+            self.lidar_eff = nominal
+            self.fleet.log(t, "info", f"{self.id} visibility back to {nominal:.0f} m. Resuming normal speed.",
+                           self.id, at=(self.x, self.y))
+            self._replan_now(t)
+        elif self.degraded:
+            self.lidar_eff = round(far_max, 1)
+
+    def on_anomaly(self, t: float, kind: str, details: dict, then: str = "") -> dict:
+        """Perception flagged something it did not expect. Record it, slow down at once (before any
+        re-planning: about caution_v m/s, or a brief stop for slip), and log what was seen plus
+        `then`, what the rover does about it. kind: "new_obstacle", "slip" or "low_visibility".
+        Every function in anomaly_hooks is then called with (rover, anomaly dict)."""
+        assert kind in ANOMALY_KINDS, kind
+        at = details.get("at", (self.x, self.y))
+        a = {"t": round(float(t), 1), "kind": kind, "type": ANOMALY_TYPE[kind],
+             "at": [round(float(at[0]), 1), round(float(at[1]), 1)]}
+        a.update({k: v for k, v in details.items() if k != "at"})
+        self.anomaly = a
+        self.anomaly_log.append(a)
+        self.caution_until = t + CAUTION_S[kind]
+        self.caution_v = 0.0 if kind == "slip" else self.cfg.caution_v
+        if kind == "new_obstacle":
+            seen = (f"{self.id} sees new rocks blocking its path {details.get('dist', 0.0):.0f} m ahead "
+                    f"(LiDAR, {details.get('cells', 0)} map cells changed).")
+        elif kind == "slip":
+            seen = f"{self.id} wheels spinning but not moving (slip {details.get('slip', 0.0) * 100:.0f}%)."
+        else:
+            seen = f"{self.id} LiDAR returns down to {details.get('lidar_range', 0.0):.0f} m."
+        self.fleet.log(t, "warn", f"{seen} {then}".strip(), self.id, at=at)
+        for hook in list(self.anomaly_hooks):
+            try:
+                hook(self, a)
+            except Exception:              # a broken add-on must never stop the rover
+                pass
+        return a
+
+    def _replan_now(self, t: float) -> None:
+        self.searches.clear()
+        self.pending_goal_key = None
+        self.plan_t = -1e9
+        self.next_goal_eval = t
 
     # ================================================================== energy
     def energy_for_distance(self, dist: float) -> float:
@@ -183,7 +450,8 @@ class Rover:
         cfg = self.cfg
         parked = self.state == "idle" and math.hypot(self.x - self.dock[0], self.y - self.dock[1]) < 1.6
         if self.state == "charging" or parked:
-            self.battery = min(1.0, self.battery + dt / cfg.charge_time_s)
+            power = self.sim.hazards.charge_factor() if self.sim.hazards is not None else 1.0
+            self.battery = min(1.0, self.battery + power * dt / cfg.charge_time_s)
             return
         motor = cfg.battery_motor_k * energy_j
         self.battery = max(0.0, self.battery - cfg.battery_base_drain * dt - motor)
@@ -198,9 +466,15 @@ class Rover:
     def home_distance(self, t: float) -> float:
         moved = math.hypot(self.x - self.home_dist_xy[0], self.y - self.home_dist_xy[1])
         if self.home_dist is None or t - self.home_dist_t > 12.0 or moved > 8.0:
+            est = (self.home_dist + moved if self.home_dist is not None
+                   else 1.5 * math.hypot(self.x - self.dock[0], self.y - self.dock[1]))
             path = self.fleet.plan(t, self, self.dock, max_exp=9000)
             if path is None:
                 path = self.fleet.plan(t, self, self.dock, relax=4.0, max_exp=9000)
+            if path is PENDING:
+                self.home_pending = True        # out of compute this cycle: estimate, finish next cycle
+                return est
+            self.home_pending = False
             d = path_length([(self.x, self.y)] + path) if path else 1.5 * math.hypot(self.x - self.dock[0], self.y - self.dock[1])
             self.home_dist = d
             self.home_dist_t = t
@@ -208,13 +482,91 @@ class Rover:
             return d
         return self.home_dist + moved
 
+    # ================================================================== compute budget
+    def plan_limits(self):
+        """(wall clock deadline, expansion cap) for planning in this decision cycle. With the wall
+        clock the planner stops when this cycle's share of the budget is used up; with the model
+        clock it may do as many A* expansions as fit in that share at exp_cost_us each."""
+        if self._c0 is None:
+            return None, None
+        cfg = self.cfg
+        share = cfg.plan_share * (0.5 if self.t_now < self.share_until else 1.0)
+        if cfg.plan_clock == "model":
+            cap = int(self.budget_s * share / (cfg.exp_cost_us * 1e-6)) - self.exp_used
+            return None, max(0, cap)
+        used = time.perf_counter() - self._c0 - self._hw
+        return time.perf_counter() + max(0.0005, self.budget_s * share - used), None
+
+    def _record_brain(self, t: float, ms: float) -> None:
+        self.brain_last = ms
+        h = self.brain_hist
+        h.append((t, ms))
+        while h and h[0][0] < t - 10.0:
+            h.popleft()
+        self.brain_all.append(ms)
+        budget = self.cfg.brain_budget_ms
+        if ms > budget:
+            over = sum(1 for _, v in h if v > budget)
+            if over >= 3 and t - self.last_budget_warn > 60.0:
+                self.last_budget_warn = t
+                if self.cfg.plan_clock == "wall":
+                    self.share_until = t + 30.0
+                peak = max(v for _, v in h)
+                self.fleet.log(t, "warn", f"{self.id} brain went over its {budget:.0f} ms budget {over} times in "
+                                          f"10 s (peak {peak:.0f} ms). Planning in smaller slices.", self.id)
+
+    def brain_msg(self) -> dict:
+        h = self.brain_hist
+        vals = [v for _, v in h] or [0.0]
+        budget = self.cfg.brain_budget_ms
+        return {"last_ms": round(self.brain_last, 1), "avg_ms": round(sum(vals) / len(vals), 1),
+                "peak_ms": round(max(vals), 1), "over": sum(1 for v in vals if v > budget)}
+
     # ================================================================== main tick
-    def tick(self, t: float, dt: float, energy_j: float) -> None:
+    def tick(self, t: float, dt: float, energy_j: float, duty: bool = False) -> None:
+        """One decision cycle. duty: this rover also runs the shared fleet bookkeeping this cycle
+        (frontiers, reachability), and that time counts toward its brain."""
+        self._hw = 0.0
+        self.exp_used = 0
+        self.t_now = t
+        self._c0 = time.perf_counter()
+        try:
+            self._tick(t, dt, energy_j, duty)
+        finally:
+            ms = (time.perf_counter() - self._c0 - self._hw) * 1000.0
+            self._c0 = None
+            self._record_brain(t, ms)
+
+    def _tick(self, t: float, dt: float, energy_j: float, duty: bool) -> None:
         self.read_pose()
         self._battery(t, dt, energy_j)
         self.odometer += math.hypot(self.x - self.last_xy[0], self.y - self.last_xy[1])
         self.last_xy = (self.x, self.y)
+        if self.rec_phase != "sand" and (not self.trail or
+                                          math.hypot(self.x - self.trail[-1][0], self.y - self.trail[-1][1]) > 0.3):
+            self.trail.append((self.x, self.y))
         self.scan(t)
+        if duty:
+            self.fleet.update(t)
+        for k in [k for k, s in self.searches.items() if t - s.t0 > 3.5]:
+            del self.searches[k]
+        if len(self.plan_fails) > 20:
+            self.plan_fails = {k: v for k, v in self.plan_fails.items() if t - v[0] < 3.0}
+        self._read_drive_sensors(t)
+        self._check_visibility(t)
+        self.hold_for_plan = False
+        self.block_info = None
+
+        # motor controller status (motor feedback)
+        if self.motor_fault:
+            if self.state != "fault":
+                self._enter_fault(t)
+            self._set_cmd(0.0, 0.0)
+            self._apply()
+            return
+        if self.state == "fault":
+            self._reboot(t)
+
         if self.state == "idle":
             self._set_cmd(0.0, 0.0)
             if self.battery > 0.3 and not self.fleet.complete and t >= self.next_goal_try:
@@ -229,7 +581,7 @@ class Rover:
             self.state = "idle"
             self._drop_target(t)
             self.goal, self.path = None, []
-            self.fleet.log(t, "warn", f"{self.id} battery depleted. Stopped in the field.", self.id)
+            self.fleet.log(t, "warn", f"{self.id} battery depleted. Stopped in the field.", self.id, at=(self.x, self.y))
             self._set_cmd(0.0, 0.0)
             self._apply()
             return
@@ -249,6 +601,12 @@ class Rover:
                 self._go_home(t, "battery")
 
         self._track(t)
+        if self.slip_since is not None and t - self.slip_since >= self.cfg.slip_time_s:
+            if self._slip_on_ground() and self.bumper() is None:
+                self._on_soft_ground(t)
+                self._apply()
+                return
+            self.slip_since = None             # hung up on a rock, not sand: leave it to the stall logic
         if self._detect_stall(t):
             self._apply()
             return
@@ -269,9 +627,9 @@ class Rover:
     # ================================================================== state logic
     def _need_return(self, t: float) -> bool:
         if t >= self.next_home_check:
-            self.next_home_check = t + 3.0
             self.need_home = self.energy_for_distance(self.home_distance(t))
-        return self.battery < self.need_home + self.cfg.battery_margin
+            self.next_home_check = t + (0.2 if self.home_pending else 3.0)
+        return self.battery < self.need_home + self.battery_margin
 
     def _go_home(self, t: float, reason: str) -> None:
         self._drop_target(t, "battery low" if reason in ("battery", "range") else None)
@@ -283,36 +641,62 @@ class Rover:
         self.plan_t = -1e9
         self.dwell_until = None
         self.next_goal_try = t + 4.0
+        here = (self.x, self.y)
         if reason == "battery":
             self.fleet.log(t, "info", f"{self.id} battery at {self.battery * 100:.0f}%, needs about "
                                       f"{self.need_home * 100:.0f}% to get home plus a "
-                                      f"{self.cfg.battery_margin * 100:.0f}% margin. Returning to the lander.",
-                           self.id)
+                                      f"{self.battery_margin * 100:.0f}% margin. Returning to the lander.",
+                           self.id, at=here)
         elif reason == "range":
             self.fleet.log(t, "info", f"{self.id} battery at {self.battery * 100:.0f}% is not enough to reach the "
-                                      f"remaining frontiers and get back. Returning to charge.", self.id)
+                                      f"remaining frontiers and get back. Returning to charge.", self.id, at=here)
         elif reason == "regroup":
             self.fleet.log(t, "info", f"{self.id} can't reach any frontier from here. "
-                                      f"Heading toward the lander to find a way round.", self.id)
+                                      f"Heading toward the lander to find a way round.", self.id, at=here)
 
-    def _drop_target(self, t: float, reason: str | None = None) -> None:
+    def _drop_target(self, t: float, reason: str | None = None, retry_s: float = 20.0) -> None:
         if self.target_idx is not None:
-            self.fleet.release_target(t, self, self.target_idx, reason)
+            self.fleet.release_target(t, self, self.target_idx, reason, retry_s)
             self.target_idx = None
             self.dwell_until = None
 
+    def _check_charge_rate(self, t: float) -> None:
+        """Watch the battery's own charge rate while docked. Slow charging (dust on the lander's
+        panels) means a trip home leaves less time to recover: keep a bigger reserve until it clears."""
+        cfg = self.cfg
+        if self.battery >= 0.99:
+            self.charge_hist.clear()
+            return
+        self.charge_hist.append((t, self.battery))
+        if len(self.charge_hist) < self.charge_hist.maxlen:
+            return
+        (t0, b0), (t1, b1) = self.charge_hist[0], self.charge_hist[-1]
+        share = (b1 - b0) / max(t1 - t0, 1e-6) * cfg.charge_time_s      # 1.0 = normal charging power
+        if not self.slow_charge and share < 0.6:
+            self.slow_charge = True
+            self.battery_margin = max(cfg.battery_margin, cfg.slow_charge_margin)
+            self.fleet.log(t, "warn", f"{self.id} charging at {share * 100:.0f}% of normal (dust on the lander's "
+                                      f"panels). Raising return margin to {self.battery_margin * 100:.0f}%.",
+                           self.id, at=self.dock)
+        elif self.slow_charge and share > 0.9:
+            self.slow_charge = False
+            self.battery_margin = cfg.battery_margin
+            self.fleet.log(t, "info", f"{self.id} charging at full rate again. Return margin back to "
+                                      f"{self.battery_margin * 100:.0f}%.", self.id, at=self.dock)
+
     def _charging(self, t: float) -> None:
         self._set_cmd(0.0, 0.0)
+        self._check_charge_rate(t)
         if self.battery >= 0.995:
             self.battery = 1.0
             if self.fleet.complete:
                 self.state = "idle"
-                self.fleet.log(t, "info", f"{self.id} fully charged and parked at the lander.", self.id)
+                self.fleet.log(t, "info", f"{self.id} fully charged and parked at the lander.", self.id, at=self.dock)
             else:
                 self.state = "exploring"
                 self.goal, self.path = None, []
                 self.next_goal_try = t
-                self.fleet.log(t, "info", f"{self.id} fully charged. Heading back out.", self.id)
+                self.fleet.log(t, "info", f"{self.id} fully charged. Heading back out.", self.id, at=self.dock)
 
     def _return(self, t: float) -> bool:
         dd = math.hypot(self.x - self.dock[0], self.y - self.dock[1])
@@ -328,16 +712,19 @@ class Rover:
             self.goal = None
             if self.fleet.complete and self.battery > 0.9:
                 self.state = "idle"
-                self.fleet.log(t, "info", f"{self.id} parked at the lander.", self.id)
+                self.fleet.log(t, "info", f"{self.id} parked at the lander.", self.id, at=self.dock)
             else:
                 self.state = "charging"
-                self.fleet.log(t, "info", f"{self.id} docked at {self.battery * 100:.0f}%. Charging.", self.id)
+                self.fleet.log(t, "info", f"{self.id} docked at {self.battery * 100:.0f}%. Charging.", self.id,
+                               at=self.dock)
             return True
         if self.return_reason == "regroup" and t >= self.next_goal_try:
             # on the way back, keep checking whether a frontier has become reachable
             self.next_goal_try = t + 4.0
             res = self.fleet.choose_goal(t, self)
-            if res is not None:
+            if res is PENDING:
+                self.next_goal_try = t          # finish that plan next cycle
+            elif res is not None:
                 goal, path, size = res
                 self.state = "exploring"
                 self.return_reason = None
@@ -345,20 +732,36 @@ class Rover:
                 self.goal, self.goal_size, self.goal_t = goal, size, t
                 self.next_goal_eval = t + 15.0
                 self._set_path(t, path)
-                self.fleet.log(t, "info", f"{self.id} found a way through. Back to exploring.", self.id)
+                self.fleet.log(t, "info", f"{self.id} found a way through. Back to exploring.", self.id,
+                               at=(self.x, self.y))
                 return False
         self.goal = self.dock
         if self._need_replan(t):
-            self._set_path(t, self._plan_home(t))
+            path = self._plan_home(t)
+            self._after_replan(t, path)
+            if path is PENDING:
+                self._hold_if_blocked()
+            elif path is None:
+                if self.block_info is not None and self.block_info[3] != "terrain":
+                    self.path = []             # do not drive into what blocked us; try again shortly
+                    self.plan_t = t
+                else:
+                    self._last_relax = 4.0     # nothing found: head straight for the lander, carefully
+                    self._set_path(t, [(self.x, self.y), self.dock])
+            else:
+                self._set_path(t, path)
         return False
 
-    def _plan_home(self, t: float, max_exp: int = 14000) -> list:
+    def _plan_home(self, t: float, max_exp: int = 14000):
         """Path to the dock. If the learned limit boxes us in, allow slightly steeper ground."""
         for relax in (0.0, 2.0, 4.0):
             path = self.fleet.plan(t, self, self.dock, relax=relax, max_exp=max_exp)
+            if path is PENDING:
+                return PENDING
             if path is not None:
+                self._last_relax = relax
                 return path
-        return [(self.x, self.y), self.dock]
+        return None
 
     def _explore(self, t: float) -> None:
         f = self.fleet
@@ -366,22 +769,28 @@ class Rover:
         if t >= self.next_target_check:
             self.next_target_check = t + 3.0
             k, d = f.unclaimed_target(t, self)
-            if k is not None and d < 30.0 and self.can_investigate(t, f.targets[k]):
+            reach = 8.0 if self.degraded else 30.0     # no far investigations while unsure
+            if k is not None and d < reach and self.can_investigate(t, f.targets[k]):
                 ts = f.targets[k]
                 ts.status = "investigating"
                 ts.investigator = self.id
                 self.start_investigation(t, k)
                 f.log(t, "info", f"{self.id} heading to sample {ts.spec.id} ({KIND_LABEL[ts.spec.kind]}, "
-                                 f"found by {ts.found_by}), {d:.0f} m away.", self.id)
+                                 f"found by {ts.found_by}), {d:.0f} m away.", self.id, at=(ts.spec.x, ts.spec.y))
                 return
         need = self.goal is None
         if not need:
             dgoal = math.hypot(self.goal[0] - self.x, self.goal[1] - self.y)
             if dgoal < 1.5 or not self._goal_still_frontier() or t >= self.next_goal_eval:
                 need = True
+        replan = self.goal is not None and self._need_replan(t)
         if need and t >= self.next_goal_try:
             res = f.choose_goal(t, self)
+            if res is PENDING:
+                self._hold_if_blocked()       # out of compute: keep the current plan, finish next cycle
+                return
             if res is None:
+                self._after_replan(t, None)
                 self.goal, self.path = None, []
                 self.next_goal_try = t + 2.0
                 if self.goal_fail_reason == "battery" and self.battery < 0.9:
@@ -398,10 +807,12 @@ class Rover:
                 return
             self.no_goal_since = None
             goal, path, size = res
+            self._after_replan(t, path)
             old = self.goal
             self.goal, self.goal_size, self.goal_t = goal, size, t
             self.next_goal_eval = t + 15.0
             self._set_path(t, path)
+            f.takeover_note(t, self, goal)
             big_change = old is None or math.hypot(goal[0] - old[0], goal[1] - old[1]) > 15.0
             if t - self.last_goal_event_t > 75.0 and big_change:
                 self.last_goal_event_t = t
@@ -409,11 +820,14 @@ class Rover:
                 from .fleet import compass
                 extra = " near a sampled target" if f.bonus_area(goal[0], goal[1]) else ""
                 f.log(t, "info", f"{self.id} heading to a frontier {math.hypot(dx, dy):.0f} m {compass(dx, dy)}"
-                                 f"{extra} ({size} cells).", self.id)
+                                 f"{extra} ({size} cells).", self.id, at=goal)
             return
-        if self.goal is not None and self._need_replan(t):
+        if replan:
             path = f.plan(t, self, self.goal)
-            if path is None:
+            self._after_replan(t, path)
+            if path is PENDING:
+                self._hold_if_blocked()
+            elif path is None:
                 self.blacklist[f._bucket(*self.goal)] = t + 40.0
                 self.goal, self.path = None, []
                 self.next_goal_try = t
@@ -428,7 +842,9 @@ class Rover:
         if self.state != "exploring" or self.target_idx is not None:
             return False
         d = math.hypot(ts.spec.x - self.x, ts.spec.y - self.y)
-        need = self.energy_for_distance(1.3 * d + 1.3 * math.hypot(ts.spec.x, ts.spec.y)) + self.cfg.battery_margin + 0.05
+        if self.degraded and d > 8.0:
+            return False
+        need = self.energy_for_distance(1.3 * d + 1.3 * math.hypot(ts.spec.x, ts.spec.y)) + self.battery_margin + 0.05
         return self.battery > need
 
     def start_investigation(self, t: float, tidx: int) -> None:
@@ -440,6 +856,7 @@ class Rover:
         self.plan_t = -1e9
         self.dwell_until = None
         self.inv_fails = 0
+        self.next_inv_plan = t
 
     def _investigate(self, t: float) -> bool:
         f = self.fleet
@@ -464,10 +881,19 @@ class Rover:
             self.path = []
             return True
         self.goal = (ts.spec.x, ts.spec.y)
+        if not self.path and t < self.next_inv_plan:
+            self._set_cmd(0.0, 0.0)
+            return True
         if self._need_replan(t):
             path = f.plan(t, self, self.goal)
-            if path is None:
+            self._after_replan(t, path)
+            if path is PENDING:
+                self._hold_if_blocked()
+            elif path is None:
                 self.inv_fails += 1
+                if self.block_info is not None:
+                    self.path = []                 # never keep driving into what blocked us
+                    self.next_inv_plan = t + 2.0
                 if self.inv_fails >= 3:
                     self._drop_target(t, "no safe path found")
                     self.state = "exploring"
@@ -478,10 +904,115 @@ class Rover:
                 self._set_path(t, path)
         return False
 
+    # ================================================================== soft ground (wheel slip)
+    def _on_soft_ground(self, t: float) -> None:
+        cfg, f = self.cfg, self.fleet
+        R = cfg.soft_zone_radius
+        slip = max(self.slip_peak, self.slip)
+        self.on_anomaly(t, "slip", {"slip": round(slip, 2), "wheel_speed": round(self.v_wheel, 2),
+                                    "ground_speed": round(self.speed_fwd, 2)},
+                        "Soft ground. Backing out and marking it for the fleet.")
+        # the soft ground starts about where the front wheels began to slip and lies ahead; its size is
+        # unknown, so assume a generous patch around that
+        ex, ey = self.slip_xy if self.slip_xy is not None else (self.x, self.y)
+        cx = ex + math.cos(self.yaw) * (cfg.wheel_x + 0.65 * R)
+        cy = ey + math.sin(self.yaw) * (cfg.wheel_x + 0.65 * R)
+        zone = f.soft_zone_at(cx, cy, margin=-1.0)
+        if zone is None:
+            f.add_soft_zone(t, self, cx, cy, R)
+            zone = f.soft_zones[-1]
+        self.soft_seen.add(zone[:2])
+        if self.state != "recovering":
+            self.prev_state = self.state
+        if self.prev_state == "exploring":
+            self.goal = None
+        self.state = "recovering"
+        self.rec_phase = "sand"
+        self.sand_zone = zone
+        self.sand_t0 = t
+        self.sand_freed = False
+        self.escape = list(reversed(self.trail))      # newest first: drive back the way we came
+        self.path = []
+        self.searches.clear()
+        self.slip_since = None
+        self.hist.clear()
+        self._set_cmd(0.0, 0.0)
+
+    def _sand_escape(self, t: float) -> None:
+        cfg = self.cfg
+        zx, zy, zr = self.sand_zone[0], self.sand_zone[1], self.sand_zone[2]
+        if math.hypot(self.x - zx, self.y - zy) >= zr + 0.9:
+            self._set_cmd(0.0, 0.0)
+            self.rec_phase = None
+            self.state = self.prev_state if self.prev_state not in ("recovering", "fault") else "exploring"
+            self.stall_cooldown = t + 2.0
+            self.plan_t = -1e9
+            self.next_goal_try = t
+            self.next_inv_plan = t
+            self.hist.clear()
+            self.fleet.log(t, "info", f"{self.id} backed out of the soft ground. Planning around it.", self.id,
+                           at=(self.x, self.y))
+            return
+        if t - self.sand_t0 > cfg.sand_free_s and not self.sand_freed:
+            self.sand_freed = True
+            if self.sim.hazards is not None:
+                self.sim.hazards.free_rover(self.id, t)
+            self.fleet.log(t, "warn", f"{self.id} dug itself out.", self.id, at=(self.x, self.y))
+        if t - self.sand_t0 > cfg.sand_free_s + 30.0:
+            self.sand_zone = (self.x, self.y, 0.0)     # give up on backing out; carry on from here
+            return
+        while self.escape and math.hypot(self.escape[0][0] - self.x, self.escape[0][1] - self.y) < 0.7:
+            self.escape.pop(0)
+        if self.escape:
+            tx, ty = self.escape[0]
+        else:
+            tx, ty = self.x - 1.5 * math.cos(self.yaw), self.y - 1.5 * math.sin(self.yaw)
+        e = wrap(math.atan2(ty - self.y, tx - self.x) - (self.yaw + math.pi))
+        self._set_cmd(-0.25 * max(0.4, math.cos(e)), max(-0.6, min(0.6, 1.5 * e)))
+
+    # ================================================================== motor fault
+    def _enter_fault(self, t: float) -> None:
+        f = self.fleet
+        st = self.state if self.state != "recovering" else self.prev_state
+        had_frontier = self.goal is not None and st == "exploring"
+        self.fault_prev = st if st not in ("fault", "recovering") else "exploring"
+        tid = None if self.target_idx is None else f.targets[self.target_idx].spec.id
+        f.rover_faulted(t, self)
+        self._drop_target(t, None, retry_s=0.0)
+        self.goal, self.path = None, []
+        self.searches.clear()
+        self.pending_goal_key = None
+        self.rec_phase = None
+        self.dwell_until = None
+        self.state = "fault"
+        if tid:
+            what = f"Brakes on, releasing {tid} to the fleet."
+        elif had_frontier:
+            what = "Brakes on, releasing its frontier to the fleet."
+        else:
+            what = "Brakes on, telling the fleet it is parked here."
+        f.log(t, "warn", f"{self.id} motor controller not responding. {what}", self.id, at=(self.x, self.y))
+
+    def _reboot(self, t: float) -> None:
+        at_dock = math.hypot(self.x - self.dock[0], self.y - self.dock[1]) < 1.6
+        if self.fault_prev == "charging" and at_dock and self.battery < 0.995:
+            self.state = "charging"
+        elif self.fault_prev == "idle" and self.fleet.complete:
+            self.state = "idle"
+        else:
+            self.state = "exploring"
+        self.next_goal_try = t
+        self.next_goal_eval = t
+        self.plan_t = -1e9
+        self.stall_cooldown = t + 2.0
+        self.hist.clear()
+        self.fleet.log(t, "info", f"{self.id} rebooted. Back online.", self.id, at=(self.x, self.y))
+
     # ================================================================== recovery, stalls, flips
     def _track(self, t: float) -> None:
         intended_fwd = self.cmd_v > 0.2 and self.path
-        self.hist.append((t, self.x, self.y, self.yaw, self.pitch, bool(intended_fwd), self.cmd_w, self.tilt))
+        self.hist.append((t, self.x, self.y, self.yaw, self.pitch, bool(intended_fwd), self.cmd_w, self.tilt,
+                          self.motor_load))
         self.climb_hist.append((self.x, self.y, self.pitch, self.speed_fwd))
         if len(self.climb_hist) == self.climb_hist.maxlen:
             x0, y0 = self.climb_hist[0][0], self.climb_hist[0][1]
@@ -501,7 +1032,7 @@ class Rover:
                 self._on_stall(t)
                 return True
         # generic stuck check: no real movement (or turning) for 9 s while trying to drive somewhere
-        if self.path and self.state in ("exploring", "investigating", "returning"):
+        if self.path and self.state in DRIVING:
             if self.stuck_ref is None or math.hypot(self.x - self.stuck_ref[1], self.y - self.stuck_ref[2]) > 0.4 \
                     or abs(wrap(self.yaw - self.stuck_ref[3])) > 0.6:
                 self.stuck_ref = (t, self.x, self.y, self.yaw)
@@ -517,6 +1048,7 @@ class Rover:
         """No forward progress for a few seconds while driving forward. Work out why."""
         f = self.fleet
         h = list(self.hist)
+        here = (self.x, self.y)
         # traffic: another rover right in front
         for o in f.rovers:
             if o is not self and math.hypot(o.x - self.x, o.y - self.y) < 1.9:
@@ -526,13 +1058,16 @@ class Rover:
         bump = self.bumper()
         self.recent_stalls.append((t, self.x, self.y))
         if bump is not None:
-            _, bx, by = bump
+            bd, bx, by = bump
             f.map.mark_blocked(bx, by, 0.6)
-            f.log(t, "info", f"{self.id} blocked by a rock. Marking it as an obstacle and rerouting.", self.id)
+            f.log(t, "info", f"{self.id} blocked by a rock (bumper ray hit at {bd:.1f} m). Marking it as an obstacle "
+                             f"and rerouting.", self.id, at=(bx, by))
             self._start_recovery(t, (bx, by))
             return
         pitches = sorted(e[4] for e in h)
         p_med, p_max = pitches[len(pitches) // 2], pitches[-1]
+        loads = sorted(e[8] for e in h)
+        load = loads[int(0.8 * (len(loads) - 1))]
         turning = sum(abs(e[6]) for e in h) / max(len(h), 1) > 0.45
         ax = self.x + 0.7 * math.cos(self.yaw)
         ay = self.y + 0.7 * math.sin(self.yaw)
@@ -542,19 +1077,20 @@ class Rover:
             # nose up on a steady slope with full power and no progress: the slope beat the motors.
             # The tilt (pitch and roll together) is the slope the planner's map measures.
             tilts = sorted(e[7] for e in h)
-            if not f.report_slope_stall(t, self, max(p_med, tilts[len(tilts) // 2])):
+            if not f.report_slope_stall(t, self, max(p_med, tilts[len(tilts) // 2]), load):
                 f.map.mark_blocked(ax, ay, 0.5)    # steeper than the map said: avoid this exact spot
             self._start_recovery(t, None)
             return
         if p_med >= 12.0 or (turning and p_med >= 8.0):
             # wheels lost grip while turning or on uneven ground: not evidence about the slope limit
-            f.log(t, "info", f"{self.id} lost grip on a {p_med:.0f} deg slope. Backing off to try another line.",
-                  self.id)
+            f.log(t, "info", f"{self.id} lost grip on a {p_med:.0f} deg slope (IMU pitch). Backing off to try "
+                             f"another line.", self.id, at=here)
             self._start_recovery(t, None)
             return
         # unexplained stall on flat ground: treat the spot ahead as an obstacle
         f.map.mark_blocked(ax, ay, 0.5)
-        f.log(t, "info", f"{self.id} stuck on rough ground. Marking the spot as untraversable.", self.id)
+        f.log(t, "info", f"{self.id} stuck on rough ground (no progress in {self.cfg.stall_window_s:.0f} s, motors at "
+                         f"{load * 100:.0f}%). Marking the spot as untraversable.", self.id, at=(ax, ay))
         self._start_recovery(t, (ax, ay))
 
     def _start_recovery(self, t: float, obstacle) -> None:
@@ -579,7 +1115,9 @@ class Rover:
             self.goal = None
 
     def _recovering(self, t: float) -> None:
-        if self.rec_phase == "reverse":
+        if self.rec_phase == "sand":
+            self._sand_escape(t)
+        elif self.rec_phase == "reverse":
             self._set_cmd(-0.4, 0.0)
             if t >= self.rec_until:
                 self.rec_phase = "turn"
@@ -602,14 +1140,17 @@ class Rover:
                 self.flip_since = t
             elif t - self.flip_since > self.cfg.flip_time_s:
                 self.flip_since = None
-                self.sim.reset_rover_upright(self)
+                tilt = self.tilt
+                self._hw_call(self.sim.reset_rover_upright, self)
                 self.read_pose()
-                self.fleet.log(t, "warn", f"{self.id} tipped over. Self-righting and replanning.", self.id)
+                self.fleet.log(t, "warn", f"{self.id} tipped over (IMU tilt {tilt:.0f} deg). Self-righting and "
+                                          f"replanning.", self.id, at=(self.x, self.y))
                 self.path = []
                 self.plan_t = -1e9
                 self.hist.clear()
                 if self.state == "recovering":
                     self.state = self.prev_state
+                    self.rec_phase = None
                 self.stall_cooldown = t + 2.0
                 return True
         else:
@@ -618,21 +1159,72 @@ class Rover:
 
     # ================================================================== driving
     def _need_replan(self, t: float) -> bool:
+        self.block_info = None
         if not self.path or self.wp >= len(self.path):
             return True
-        if self.plan_limit_version != self.fleet.limit_version:
+        f = self.fleet
+        if self.plan_limit_version != f.limit_version:
+            return True
+        if f._cost is None or t - f._cost_t > 0.6:
+            f.cost(t)                       # keep the shared cost grid fresh for everyone's checks
+        b = f.blocked_ahead(t, self, f.slope_limit + self.plan_relax)
+        if b is not None:
+            self.block_info = b
+            x, y, dist, why = b
+            if self.reroute is None:
+                old = path_length([(self.x, self.y)] + self.path[max(self.wp, 0):])
+                if why == "rocks" and t - self.last_rocks_t > 8.0 and not any(
+                        math.hypot(x - ax, y - ay) < 4.0 and t - at < 120.0 for ax, ay, at in self.rocks_seen):
+                    self.rocks_seen = [r for r in self.rocks_seen if t - r[2] < 120.0] + [(x, y, t)]
+                    self.reroute = ("rocks", x, y, dist, old, None)
+                    i, j = f.map.ij(x, y)
+                    cells = int((f.map.changed_t[max(j - 3, 0):j + 4, max(i - 3, 0):i + 4] >= t - 20.0).sum())
+                    self.on_anomaly(t, "new_obstacle", {"at": (x, y), "dist": round(dist, 1), "cells": cells},
+                                    f"Slowing to {self.cfg.caution_v:.1f} m/s and replanning.")
+                elif why == "soft":
+                    z = f.soft_zone_at(x, y)
+                    if z is not None and z[:2] not in self.soft_seen:
+                        self.soft_seen.add(z[:2])
+                        self.reroute = ("soft", x, y, dist, old, z[3])
             return True
         if t - self.plan_t > 2.5:
             return True
-        if self.fleet.path_blocked(self.path, max(self.wp - 1, 0), horizon=8):
-            return True
         return False
+
+    def _after_replan(self, t: float, path) -> None:
+        """Announce a re-route caused by something newly perceived on the path (once the new
+        plan is ready), with the sensor reason and the extra distance."""
+        ri = self.reroute
+        if ri is None or path is PENDING:
+            return
+        self.reroute = None
+        why, x, y, dist, old_len, owner = ri
+        if path is None:
+            what = "the new rocks" if why == "rocks" else f"the soft ground {owner} reported"
+            msg = f"{self.id} finds no way past {what}. Picking another goal."
+        else:
+            extra = path_length([(self.x, self.y)] + list(path)) - old_len
+            tail = f" (+{extra:.0f} m)" if extra >= 1.0 else ""
+            if why == "rocks":
+                msg = f"{self.id} rerouting around the new rocks{tail}."
+            else:
+                msg = f"{self.id} rerouting around soft ground reported by {owner}{tail}."
+        if why == "rocks":
+            self.last_rocks_t = t
+        self.fleet.log(t, "info", msg, self.id, at=(x, y))
+
+    def _hold_if_blocked(self) -> None:
+        """The new plan is not ready yet: if the old path runs into something close, wait."""
+        if self.block_info is not None and self.block_info[2] < 3.5:
+            self.hold_for_plan = True
 
     def _set_path(self, t: float, path: list) -> None:
         self.path = list(path)
         self.wp = 1 if len(self.path) > 1 else 0
         self.plan_t = t
         self.plan_limit_version = self.fleet.limit_version
+        self.plan_relax = self._last_relax
+        self._last_relax = 0.0
 
     def _carrot(self):
         pts = self.path
@@ -665,16 +1257,18 @@ class Rover:
             self._set_cmd(0.0, 0.0)
             return
         e = wrap(math.atan2(c[1] - self.y, c[0] - self.x) - self.yaw)
+        v_max = cfg.degraded_v_max if self.degraded else cfg.v_max
+        w_max = 0.5 * cfg.w_max if self.degraded else cfg.w_max      # turn gently too when it cannot see far
         # Skid steer on a slope: a tight arc leaves the inner wheels with almost no speed target, so
         # only the outer pair pushes and the rover bogs down. On sloped ground make big corrections in
         # place and keep arcs wide enough that all four wheels drive forward.
         sloped = self.tilt > 7.0
         if abs(e) > (0.6 if sloped else 0.85):
             v = 0.0
-            w = math.copysign(cfg.w_max, e)
+            w = math.copysign(w_max, e)
         else:
-            v = cfg.v_max * max(0.0, math.cos(e)) ** 2
-            w = max(-cfg.w_max, min(cfg.w_max, 2.2 * e))
+            v = v_max * max(0.0, math.cos(e)) ** 2
+            w = max(-w_max, min(w_max, 2.2 * e))
             if sloped:
                 w = max(-0.9 * v, min(0.9 * v, w))
         dgoal = math.hypot(self.goal[0] - self.x, self.goal[1] - self.y)
@@ -682,6 +1276,10 @@ class Rover:
             v = min(v, 0.2 + 0.5 * dgoal)
         if abs(self.pitch) > 10.0:
             v *= 0.8
+        if t < self.caution_until:
+            v = min(v, self.caution_v)       # just saw something unexpected: go slow while re-planning
+        if self.hold_for_plan:
+            v, w = 0.0, 0.0                  # something blocks the path just ahead; wait for the new plan
         intended_v = v
         # give way: lower id has priority, parked rovers are obstacles
         blocked_by = None
@@ -690,7 +1288,7 @@ class Rover:
                 continue
             dd = math.hypot(o.x - self.x, o.y - self.y)
             if dd < 2.2 and abs(wrap(math.atan2(o.y - self.y, o.x - self.x) - self.yaw)) < 0.8:
-                moving = o.speed >= 0.05 and o.state not in ("idle", "charging")
+                moving = o.speed >= 0.05 and o.state not in PARKED
                 # moving rovers: lower id has right of way. Parked ones: the planner routes round
                 # them, so only stop if we are about to touch.
                 if dd < 1.3 or (moving and o.idx < self.idx) or (not moving and dd < 1.5):
@@ -721,10 +1319,23 @@ class Rover:
         cfg = self.cfg
         m, d = self.sim.model, self.sim.data
         r = cfg.wheel_radius
-        wl = (self.cmd_v - self.cmd_w * cfg.track_eff) / r
-        wr = (self.cmd_v + self.cmd_w * cfg.track_eff) / r
         T = cfg.motor_torque
         Tb = 3.0 * T
+        if self.motor_fault:                 # controller offline: the parking brakes lock the wheels
+            for a in self.acts:
+                d.ctrl[a] = 0.0
+                m.actuator_forcerange[a] = (-Tb, Tb)
+                m.actuator_gainprm[a][0] = BRAKE_KV
+                m.actuator_biasprm[a][2] = -BRAKE_KV
+            self._brakes_locked = True
+            return
+        if self._brakes_locked:
+            for a in self.acts:
+                m.actuator_gainprm[a][0] = cfg.motor_kv
+                m.actuator_biasprm[a][2] = -cfg.motor_kv
+            self._brakes_locked = False
+        wl = (self.cmd_v - self.cmd_w * cfg.track_eff) / r
+        wr = (self.cmd_v + self.cmd_w * cfg.track_eff) / r
         for k, a in enumerate(self.acts):
             wt = wl if k < 2 else wr
             d.ctrl[a] = wt
@@ -737,9 +1348,31 @@ class Rover:
                 m.actuator_forcerange[a] = (-Tb, Tb)
 
     # ================================================================== protocol
+    def sensors_msg(self) -> dict:
+        sp = None
+        if self.spectro is not None:
+            sp = {"id": self.fleet.targets[self.spectro[0]].spec.id, "dist": round(self.spectro[1], 1)}
+        return {
+            "lidar_range": round(float(self.lidar_eff), 1), "lidar_hits": int(self.lidar_hits),
+            "pitch": round(self.pitch, 1), "roll": round(self.roll, 1),
+            "wheel_speed": round(abs(self.v_wheel), 2), "ground_speed": round(self.speed, 2),
+            "slip": round(self.slip, 2), "motor_load": round(self.motor_load, 2),
+            "spectro": sp,
+        }
+
+    def scan_msg(self) -> list:
+        pts = self.scan_pts
+        n = len(pts)
+        if n == 0:
+            return []
+        k = self.cfg.scan_points
+        if n > k:
+            pts = pts[np.linspace(0, n - 1, k).astype(np.int64)]
+        return np.round(pts, 1).ravel().tolist()
+
     def to_msg(self) -> dict:
         pts = []
-        if self.path and self.state not in ("charging", "idle"):
+        if self.path and self.state not in ("charging", "idle", "fault"):
             rest = self.path[max(self.wp, 0):]
             pts = downsample([(self.x, self.y)] + rest, 30)
         return {
@@ -752,4 +1385,7 @@ class Rover:
             "goal": None if self.goal is None else [round(self.goal[0], 2), round(self.goal[1], 2)],
             "path": [[round(p[0], 2), round(p[1], 2)] for p in pts],
             "target_id": None if self.target_idx is None else self.fleet.targets[self.target_idx].spec.id,
+            "sensors": self.sensors_msg(),
+            "scan": self.scan_msg(),
+            "brain": self.brain_msg(),
         }

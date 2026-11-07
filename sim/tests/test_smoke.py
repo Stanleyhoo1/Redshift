@@ -20,14 +20,20 @@ from redshift.sim import Simulation  # noqa: E402
 SIM_SECONDS = 400.0
 MSG_EVERY = 0.6        # sim seconds between tick messages (5 Hz at 3x real time)
 
-INIT_KEYS = {"type", "world", "map", "lander", "rovers", "known", "targets", "events", "fleet"}
-TICK_KEYS = {"type", "t", "rovers", "cells", "frontiers", "targets", "events", "fleet"}
-ROVER_KEYS = {"id", "x", "y", "z", "yaw", "speed", "battery", "state", "goal", "path", "target_id"}
+# protocol v1 keys plus the "Version 2 additions" (hazards, sensors, edge budget)
+INIT_KEYS = {"type", "world", "map", "lander", "rovers", "known", "targets", "events", "fleet", "hazards"}
+TICK_KEYS = {"type", "t", "rovers", "cells", "frontiers", "targets", "events", "fleet", "hazards"}
+ROVER_KEYS = {"id", "x", "y", "z", "yaw", "speed", "battery", "state", "goal", "path", "target_id",
+              "sensors", "scan", "brain"}
+SENSOR_KEYS = {"lidar_range", "lidar_hits", "pitch", "roll", "wheel_speed", "ground_speed", "slip", "motor_load",
+               "spectro"}
+BRAIN_KEYS = {"last_ms", "avg_ms", "peak_ms", "over"}
 TARGET_KEYS = {"id", "x", "y", "kind", "status", "found_by", "found_t"}
-EVENT_KEYS = {"t", "rover", "level", "msg"}
+EVENT_KEYS = {"t", "rover", "level", "msg"}           # plus an optional "at": [x, y]
 FLEET_KEYS = {"explored_pct", "slope_limit_deg", "slope_limit_initial_deg", "targets_found", "targets_total",
-              "sim_speed"}
-STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle"}
+              "sim_speed", "budget_ms", "cycle_ms", "soft_zones"}
+STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle", "fault"}
+LEVELS = {"info", "warn", "discovery", "hazard"}
 EM_DASH = chr(0x2014)   # banned everywhere in this project
 
 _RESULT = None
@@ -92,10 +98,29 @@ def _check_cells(cells, nx, ny):
 
 def _check_events(events):
     for e in events:
-        assert set(e) == EVENT_KEYS, e
-        assert e["level"] in ("info", "warn", "discovery"), e
+        assert EVENT_KEYS <= set(e) <= EVENT_KEYS | {"at"}, e
+        assert e["level"] in LEVELS, e
         assert isinstance(e["msg"], str) and e["msg"], e
         assert EM_DASH not in e["msg"], e
+        if "at" in e:
+            assert len(e["at"]) == 2 and all(math.isfinite(v) for v in e["at"]), e
+        if e["level"] == "hazard":
+            assert e["rover"] is None, e
+        elif e["rover"] is not None:
+            assert e["msg"].startswith(e["rover"] + " "), e
+
+
+def _check_rover_v2(r):
+    s = r["sensors"]
+    assert set(s) == SENSOR_KEYS, set(s) ^ SENSOR_KEYS
+    for k in SENSOR_KEYS - {"spectro"}:
+        assert isinstance(s[k], (int, float)) and math.isfinite(s[k]), (k, s[k])
+    assert 0.0 <= s["slip"] <= 1.0 and 0.0 <= s["motor_load"] <= 1.0 and s["lidar_range"] > 0
+    assert s["spectro"] is None or (set(s["spectro"]) == {"id", "dist"} and isinstance(s["spectro"]["id"], str))
+    scan = r["scan"]
+    assert len(scan) % 3 == 0 and len(scan) <= 900, len(scan)
+    assert all(isinstance(v, (int, float)) and round(v, 1) == v for v in scan[:60])
+    assert set(r["brain"]) == BRAIN_KEYS and r["brain"]["over"] >= 0
 
 
 def test_no_nan_poses():
@@ -156,6 +181,7 @@ def test_messages_match_protocol():
         for t in m["targets"]:
             assert set(t) == TARGET_KEYS, t
         assert set(m["fleet"]) == FLEET_KEYS
+        assert isinstance(m["hazards"], list)
     assert len(R.ticks) > 100
     for m in R.ticks:
         json.dumps(m, allow_nan=False)
@@ -169,6 +195,7 @@ def test_messages_match_protocol():
             assert r["goal"] is None or (len(r["goal"]) == 2 and all(math.isfinite(v) for v in r["goal"]))
             assert len(r["path"]) <= 30 and all(len(p) == 2 for p in r["path"])
             assert r["target_id"] is None or isinstance(r["target_id"], str)
+            _check_rover_v2(r)
         _check_cells(m["cells"], nx, ny)
         for f in m["frontiers"]:
             assert len(f) == 3 and isinstance(f[2], int) and f[2] > 0, f
@@ -177,6 +204,26 @@ def test_messages_match_protocol():
             assert t["status"] in ("found", "investigating", "sampled") and t["kind"] in ("mineral", "ice", "vent")
         _check_events(m["events"])
         assert set(m["fleet"]) == FLEET_KEYS
+        f = m["fleet"]
+        assert f["budget_ms"] == cfg.brain_budget_ms and f["cycle_ms"] == 200.0 and isinstance(f["soft_zones"], list)
+        assert m["hazards"] == []          # nothing triggered in this run
+
+
+def test_no_false_hazard_reactions():
+    """Without hazards: no soft ground, no degraded LiDAR, no faults, no map change detections."""
+    R = run()
+    msgs = [e["msg"] for e in R.sim.fleet.events]
+    assert not any("Soft ground" in m or "LiDAR returns down" in m or "new rocks" in m for m in msgs), msgs
+    assert R.sim.fleet.soft_zones == []
+    assert R.sim.map.changes <= 3, R.sim.map.changes
+
+
+def test_brain_within_budget():
+    R = run()
+    for r in R.sim.rovers:
+        a = sorted(r.brain_all)
+        p95 = a[int(0.95 * (len(a) - 1))]
+        assert p95 < R.sim.cfg.brain_budget_ms, (r.id, p95)
 
 
 def test_deltas_rebuild_the_map():

@@ -43,3 +43,9 @@ export const useApp = (selector) => useSyncExternalStore(appStore.subscribe, () 
 // Displayed (interpolated) rover poses, written by the 3D rovers every frame and read
 // by the camera rig for follow mode. Plain mutable map, no React involved.
 export const roverPoses = new Map()
+
+// Where the HUD panels sit over the 3D view, in px relative to the view's top left:
+// { left, top, right, bottom } per panel, or null when the panel is not shown. Written
+// by the panels (useHudRect), read by the camera rig every frame to keep the picture
+// centred in the space the panels leave free.
+export const hudLayout = { controls: null, hazards: null, sensors: null, version: 0 }
