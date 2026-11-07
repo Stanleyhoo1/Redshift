@@ -17,7 +17,7 @@ def cost_grid(b, relaxed=False):
     r = b.plan_risk_arr()
     sl = b.channels[SLOPE]
     w = b.channels[WATER]
-    c = 1 + 9 * r * r + 6 * sl + np.where(b.last_seen < 0, 0.6, 0.0)
+    c = 1 + 9 * r * r + 6 * sl + np.where(b.last_seen < 0, np.where(b.water_dist < 6, 5.0, 0.6), 0.0)
     b2 = blocked.reshape(G, G)
     near = np.zeros((G, G), dtype=bool)
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):

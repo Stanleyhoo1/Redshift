@@ -48,3 +48,13 @@
 - Slope risk relaxed to (deg-15)/15 (blocks at 24°) and the tilt reflex to 26°. The old 20° block made the generated 19° river banks a wall and boxed the rover in for a minute at a time.
 - Flee with no reachable refuge now drives the escape heading instead of spinning in place.
 - Fire is "close" (flee >= 0.8) within 35 m.
+
+## Earthquake, tornado, meteors (M6)
+- Sim fairness fixes found by testing (the brain was not at fault):
+  - tornado spawn: a far point clamped to the map edge could put touchdown ~10 m from a rover near the edge; now samples a point 60-90 m away inside the map.
+  - water depth was a per-cell step: crossing into a river cell went from 0 to 0.5 m instantly (no reflex can react). Depth is now the cell's water surface minus the bilinear ground at the exact point.
+  - collision: a contact only blocks a move that brings the rover closer to it, so the rover slides past trees instead of wedging for 20 s.
+  - meteor impacts ignite forest 10 % of the time (was 25 %: a heavy shower turned into a dozen wildfires).
+- Brain: meteor dodge never heads into water/obstacles/steep ground, and water deeper than 0.35 m beats a dodge. Tilt reflex checks for water before reversing. Refuges near the projected tornado track are penalised. Probe placement is damped by the flee score.
+- Unseen cells within 6 m of seen water cost 5 (not 0.6) to plan through: a fleeing rover in smoke drove into an unseen river strip. Side effect: survey coverage with no disaster dropped a little (~27 % -> ~23 % in 180 s on 8 seeds).
+- Known limits: dense meteor showers can still score a direct hit (the streak warning is ~3 s and the rover turns at 1.6 rad/s); being caught between a fire and the river remains the most common wildfire failure.

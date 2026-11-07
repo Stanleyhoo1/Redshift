@@ -69,8 +69,8 @@ export class Safety {
       const d = Math.hypot(s.x - rd.x, s.y - rd.y);
       if (d < s.size + 4 && (!worst || d - s.size < worst.d - worst.size)) worst = { d, ttl: s.ttl, x: s.x, y: s.y, size: s.size };
     }
-    if (worst) {
-      const away = worst.d > 0.5 ? Math.atan2(rd.y - worst.y, rd.x - worst.x) : rd.yaw;
+    if (worst && rd.depth <= 0.35) {
+      const away = this.dodgeHeading(rd, b, worst.d > 0.5 ? Math.atan2(rd.y - worst.y, rd.x - worst.x) : rd.yaw);
       return { name: 'meteor_dodge', cmd: escapeHeading(rd, away), text: `Camera: meteor streak, impact ${worst.d.toFixed(1)} m ${compass(Math.atan2(worst.y - rd.y, worst.x - rd.x))} in ${worst.ttl.toFixed(1)} s → DODGE ${compass(away)}` };
     }
     // 2. standing in water deeper than the reflex limit (hard limit 0.5 m)
@@ -105,7 +105,10 @@ export class Safety {
       // back straight down the way we came (we arrived from gentler ground) and remember this slope
       const ax = rd.x + 2.5 * Math.cos(rd.yaw), ay = rd.y + 2.5 * Math.sin(rd.yaw);
       if (b.inside(ax, ay)) b.obst[b.idx(ax, ay)] = 1;
-      const back = Math.abs(rd.pitch) > Math.abs(rd.roll) ? (rd.pitch > 0 ? -1.0 : 1.0) : -1.0;
+      let back = Math.abs(rd.pitch) > Math.abs(rd.roll) ? (rd.pitch > 0 ? -1.0 : 1.0) : -1.0;
+      // never back blindly into water
+      const bx = rd.x + Math.sign(back) * 3 * Math.cos(rd.yaw), by = rd.y + Math.sign(back) * 3 * Math.sin(rd.yaw);
+      if (b.inside(bx, by) && b.water[b.idx(bx, by)] > 0.05) back = -back * 0.8;
       return { name: 'tilt', cmd: { linear: { x: back, y: 0, z: 0 }, angular: { x: 0, y: 0, z: Math.abs(rd.roll) > Math.abs(rd.pitch) ? 0.8 * Math.sign(rd.roll) : 0 } }, text: `IMU tilt ${rd.tiltDeg.toFixed(0)}° > ${CFG.reflexTilt}° → back off the slope, mark it impassable` };
     }
     // 6. stale data: we don't know what's around us any more
@@ -125,6 +128,25 @@ export class Safety {
    * Escape heading that trades off heat and water: away from hot sectors (weighted T/d²),
    * not into water deeper than `maxDepth`, not into obstacles.
    */
+  /** away from the impact point, but not into water / obstacles / steep ground */
+  private dodgeHeading(rd: Readings, b: Belief, away: number): number {
+    let best = away, bestS = -Infinity;
+    for (let k = 0; k < 16; k++) {
+      const a = away + (k - 8) * Math.PI / 16;
+      let s = 2 * Math.cos(a - away) + Math.min(clearance(rd, a), 10) / 10;
+      for (const d of [3, 6]) {
+        const px = rd.x + d * Math.cos(a), py = rd.y + d * Math.sin(a);
+        if (!b.inside(px, py)) { s -= 10; continue; }
+        const i = b.idx(px, py);
+        if (b.water[i] > 0.15) s -= 10;
+        if (b.blocked(i)) s -= 4;
+        if (b.channels[CH.slope][i] >= 0.6) s -= 6;
+      }
+      if (s > bestS) { bestS = s; best = a; }
+    }
+    return best;
+  }
+
   escapeSearch(rd: Readings, b: Belief, maxDepth: number): number {
     let best = rd.yaw + Math.PI, bestS = -Infinity;
     for (let k = 0; k < 24; k++) {

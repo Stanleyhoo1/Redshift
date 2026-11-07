@@ -110,14 +110,17 @@ export class Rover {
     this.battery = Math.max(0, this.battery - dt * (0.10 + 0.22 * Math.abs(this.v) / ROVER.maxV + (d2 > 0.05 ? 0.1 : 0)));
   }
 
-  /** contact test on the leading edge only (points facing the direction of travel), so side contact can slide */
-  collides(world: World, x: number, y: number, dir: number): boolean {
-    for (let a = 0; a < 12; a++) {
-      const ang = a * Math.PI / 6;
-      if (Math.cos(ang - dir) < 0.25) continue;
+  /**
+   * Blocking contact test: a footprint point that lands in an obstacle only blocks the move if the
+   * move brings the rover centre closer to that point (driving into it). Sliding past or backing away is allowed.
+   */
+  collides(world: World, x: number, y: number, _dir = 0): boolean {
+    for (let a = 0; a < 16; a++) {
+      const ang = a * Math.PI / 8;
       const px = x + ROVER.radius * Math.cos(ang), py = y + ROVER.radius * Math.sin(ang);
       const o = world.occAt(px, py);
-      if (o !== Occ.Free && o !== Occ.Rubble) return true;
+      if (o === Occ.Free || o === Occ.Rubble) continue;
+      if (Math.hypot(px - x, py - y) < Math.hypot(px - this.x, py - this.y) - 1e-4) return true;
     }
     return false;
   }

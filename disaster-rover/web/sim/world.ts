@@ -99,7 +99,12 @@ export class World {
     const e = 1.0;
     return [(this.heightAt(x + e, y) - this.heightAt(x - e, y)) / (2 * e), (this.heightAt(x, y + e) - this.heightAt(x, y - e)) / (2 * e)];
   }
-  waterAt(x: number, y: number) { return this.water[this.cellIndexAt(x, y)]; }
+  /** depth at a point: the cell's water surface minus the (bilinear) ground there, so depth varies smoothly at shorelines */
+  waterAt(x: number, y: number) {
+    const i = this.cellIndexAt(x, y), w = this.water[i];
+    if (w <= 0) return 0;
+    return Math.max(0, this.height[i] + w - this.heightAt(x, y));
+  }
   /** Height including structures, as a depth camera would see it (DSM). */
   surfaceAt(x: number, y: number): number {
     const o = this.occAt(x, y);

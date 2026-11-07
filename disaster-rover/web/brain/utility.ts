@@ -54,7 +54,14 @@ export function buildCtx(b: Belief, rd: Readings, P: Predictions, reach: Float32
     if (pr < 0.3 && b.predWater[i] < 0.15) {
       let toward = 0;
       for (const a of away) toward = Math.max(toward, Math.cos(Math.atan2(y - rd.y, x - rd.x) - a));
-      const v = Math.min(b.hazDist[i], 45) - 0.2 * c - 40 * pr - 15 * Math.max(0, toward) + (P.flood.active && !isNaN(b.elev[i]) ? Math.min(4, b.elev[i] - P.flood.predStage) * 2 : 0);
+      // a moving vortex: stay off its projected 60 s track
+      let track = 0;
+      if (P.tornado.active) {
+        const T = P.tornado, ex = T.vx * 60, ey = T.vy * 60, L2 = ex * ex + ey * ey;
+        const u = L2 > 1 ? Math.max(0, Math.min(1, ((x - T.x) * ex + (y - T.y) * ey) / L2)) : 0;
+        track = 20 * Math.max(0, 1 - Math.hypot(x - T.x - u * ex, y - T.y - u * ey) / 35);
+      }
+      const v = Math.min(b.hazDist[i], 45) - 0.2 * c - 40 * pr - 15 * Math.max(0, toward) - track + (P.flood.active && !isNaN(b.elev[i]) ? Math.min(4, b.elev[i] - P.flood.predStage) * 2 : 0);
       if (!safe || v > safe.value) safe = { x, y, value: v, cost: c, why: `${Math.min(b.hazDist[i], 99).toFixed(0)} m from hazards` };
     }
     // high ground: elevation above the predicted flood stage
@@ -157,6 +164,8 @@ export function score(ctx: Ctx, P: Predictions, rd: Readings, goal: Goal | null,
     const behind = placed < Math.min(6, rd.t / 24) ? 0.12 : 0;
     s.place_probe = clamp01(ctx.probe.value * (1 - ctx.dangerNear) * (ctx.probe.cost < 45 ? 1 : 0.7) * 0.9 + behind);
   }
+  // dropping a probe never outranks getting out of the way of something imminent
+  s.place_probe *= 1 - 0.6 * s.flee;
   if (lowBatt) s.return_to_safety = 0.6 + (CFG.batteryLow - ctx.battery) / 50;
   if (ctx.health < 35) s.return_to_safety = Math.max(s.return_to_safety, 0.55);
 

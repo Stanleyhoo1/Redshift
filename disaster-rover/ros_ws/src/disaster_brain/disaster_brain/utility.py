@@ -60,7 +60,13 @@ def build_ctx(b, rd, P, reach, probes, home, goal):
         ang = np.arctan2(b.ys - rd.y, b.xs - rd.x)
         for a in away:
             toward = np.maximum(toward, np.cos(ang - a))
-        v = np.minimum(b.haz_dist, 45) - 0.2 * np.where(reach_ok, reach, 0) - 40 * pr - 15 * np.maximum(0, toward) + bonus
+        track = np.zeros(N)
+        if to['active']:
+            ex, ey = to['vx'] * 60, to['vy'] * 60
+            L2 = ex * ex + ey * ey
+            u = np.clip(((b.xs - to['x']) * ex + (b.ys - to['y']) * ey) / L2, 0, 1) if L2 > 1 else np.zeros(N)
+            track = 20 * np.maximum(0, 1 - np.hypot(b.xs - to['x'] - u * ex, b.ys - to['y'] - u * ey) / 35)
+        v = np.minimum(b.haz_dist, 45) - 0.2 * np.where(reach_ok, reach, 0) - 40 * pr - 15 * np.maximum(0, toward) - track + bonus
         v = np.where(m, v, -np.inf)
         i = int(np.argmax(v))
         safe = _spot(i, v[i], reach[i], '%.0f m from hazards' % min(b.haz_dist[i], 99))
@@ -181,6 +187,7 @@ def score(ctx, P, rd, goal, placed):
     if ctx['probesLeft'] > 0 and ctx['probe'] and rd.t > 8:
         behind = 0.12 if placed < min(6, rd.t / 24) else 0.0
         s['place_probe'] = clamp01(ctx['probe']['value'] * (1 - ctx['dangerNear']) * (1.0 if ctx['probe']['cost'] < 45 else 0.7) * 0.9 + behind)
+    s['place_probe'] *= 1 - 0.6 * s['flee']
     if low_batt:
         s['return_to_safety'] = 0.6 + (CFG['batteryLow'] - ctx['battery']) / 50
     if ctx['health'] < 35:

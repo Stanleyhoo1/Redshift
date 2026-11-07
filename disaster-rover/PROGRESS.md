@@ -10,8 +10,10 @@
 
 - M5: flood + wildfire tuned with `npm run bench`. Local TS, 8 seeds, intensity 0.6: no disaster 8/8, flood 8/8, fire 6/8, flood+fire 7/8. ROS 2 brain via rosbridge: flood seed 3, fire seed 3, flood+fire seeds 2/4/5 all survived, 0 missed frames.
 
+- M6: earthquake (IMU residual -> hold still in the open / flee structures; rubble + cracks via LiDAR), tornado (funnel sightings + wind/pressure -> track, closest-approach prediction, refuges off its 60 s track, wind reflex), meteors (impact flashes -> drifting impact zone; incoming-streak dodge reflex). Local TS, 8 seeds: quake 8/8, tornado 8/8, meteor 6/8, all five at once 5/8. ROS 2 brain seed 4: quake, tornado, meteor all survived, 0 missed frames. Browser smoke test with every chaos button: no console errors.
+
 ## Next
-- M6 earthquake, tornado, meteors.
+- M7 probes.
 
 ## Blockers
 - (resolved) Pushing was blocked earlier; The repo `redshift` is not under `kayaclaridge-sys`; the only match is `Stanleyhoo1/Redshift` (you have WRITE access, found via `gh api user/repos`). Cloning and the local branch `naturaldisasterdemo` worked, but `git push -u origin naturaldisasterdemo` was refused by the Claude Code permission guard ("create public surface" on a repo owned by another account). All milestone commits are on the local `naturaldisasterdemo` branch in `~/redshift`. The owner pushed the branch; pushes to `naturaldisasterdemo` now go after each milestone.

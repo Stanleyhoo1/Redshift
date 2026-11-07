@@ -37,7 +37,8 @@ export function cellCost(b: Belief, i: number, startI: number, relaxed = false):
   const r = b.planRisk(i), sl = b.channels[CH.slope][i], w = b.channels[CH.water][i];
   // relaxed (escape) mode also accepts steeper ground, still well under the 34° rollover
   if ((r > 0.85 && !relaxed) || sl >= (relaxed ? 0.85 : 0.6) || w > 0.7) return Infinity;
-  let c = 1 + 9 * r * r + 6 * sl + (b.lastSeen[i] < 0 ? 0.6 : 0);
+  // unseen ground next to seen water may well be more river: expensive
+  let c = 1 + 9 * r * r + 6 * sl + (b.lastSeen[i] < 0 ? (b.waterDist[i] < 6 ? 5 : 0.6) : 0);
   // keep a margin from obstacles (the 2 m grid is coarse vs the 0.9 m rover radius)
   const G = CFG.G, x = i % G, y = (i / G) | 0;
   if ((x > 0 && b.blocked(i - 1)) || (x < G - 1 && b.blocked(i + 1)) || (y > 0 && b.blocked(i - G)) || (y < G - 1 && b.blocked(i + G))) c += 2.5;

@@ -97,8 +97,13 @@ export class Disasters {
       this.log(t, kind, `Earthquake M${(5 + 2.5 * I).toFixed(1)}`);
     } else if (kind === 'tornado') {
       // spawn at a map edge region and head roughly across the map, passing near-ish the rover
-      const ang = rng.range(-Math.PI, Math.PI);
-      const x = Math.max(-90, Math.min(90, roverX + 85 * Math.cos(ang))), y = Math.max(-90, Math.min(90, roverY + 85 * Math.sin(ang)));
+      // touch down 60-90 m away, inside the map (clamping a far point to the edge could put it right next to the rover)
+      let x = 0, y = 0;
+      for (let k = 0; k < 60; k++) {
+        const ang = rng.range(-Math.PI, Math.PI), d = rng.range(60, 90);
+        x = roverX + d * Math.cos(ang); y = roverY + d * Math.sin(ang);
+        if (Math.abs(x) < 92 && Math.abs(y) < 92) break;
+      }
       const aim = Math.atan2(roverY - y, roverX - x) + rng.range(-0.35, 0.35);
       const sp = 2.2 + 2 * I;
       this.tornadoes.push({ x, y, vx: sp * Math.cos(aim), vy: sp * Math.sin(aim), R: 5 + 3 * I, vmax: 40 + 30 * I, t0: t, life: 70 + 30 * I, active: true, trail: [] });
@@ -218,7 +223,7 @@ export class Disasters {
       if (d < mt.r) hit(200, 'hit by a meteor', true);
       else if (d < mt.r * 2.2) hit(30 * (1 - (d - mt.r) / (mt.r * 1.2)) + 5, 'meteor blast');
       const ci = w.cellIndexAt(mt.x, mt.y);
-      if (w.fuel[ci] > 0.6 && rng.next() < 0.25) { this.ignite(ci, t); if (!this.fireActive) { this.fireActive = true; this.fireT0 = t; this.log(t, 'fire', 'Meteor impact started a fire'); } }
+      if (w.fuel[ci] > 0.6 && rng.next() < 0.1) { this.ignite(ci, t); if (!this.fireActive) { this.fireActive = true; this.fireT0 = t; this.log(t, 'fire', 'Meteor impact started a fire'); } }
     }
     this.meteors = this.meteors.filter(mt => !mt.done);
     this.flashes = this.flashes.filter(f => t - f.t < 1.0);

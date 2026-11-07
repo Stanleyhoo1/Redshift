@@ -66,9 +66,9 @@ class Safety:
             d = math.hypot(s['x'] - rd.x, s['y'] - rd.y)
             if d < s['size'] + 4 and (worst is None or d - s['size'] < worst[0] - worst[4]):
                 worst = (d, s['ttl'], s['x'], s['y'], s['size'])
-        if worst:
+        if worst and rd.depth <= 0.35:
             d, ttl, wx, wy, _ = worst
-            away = math.atan2(rd.y - wy, rd.x - wx) if d > 0.5 else rd.yaw
+            away = self._dodge_heading(rd, b, math.atan2(rd.y - wy, rd.x - wx) if d > 0.5 else rd.yaw)
             return dict(name='meteor_dodge', cmd=escape_heading(rd, away),
                         text='Camera: meteor streak, impact %.1f m %s in %.1f s → DODGE %s' % (d, compass(math.atan2(wy - rd.y, wx - rd.x)), ttl, compass(away)))
         # 2. water
@@ -105,6 +105,10 @@ class Safety:
             if b.inside(ax, ay):
                 b.obst[b.idx(ax, ay)] = 1.0
             back = (-1.0 if rd.pitch > 0 else 1.0) if abs(rd.pitch) > abs(rd.roll) else -1.0
+            bx = rd.x + math.copysign(3, back) * math.cos(rd.yaw)
+            by = rd.y + math.copysign(3, back) * math.sin(rd.yaw)
+            if b.inside(bx, by) and b.water[b.idx(bx, by)] > 0.05:
+                back = -back * 0.8
             w = 0.8 * math.copysign(1.0, rd.roll) if abs(rd.roll) > abs(rd.pitch) else 0.0
             return dict(name='tilt', cmd=tw(back, w), text='IMU tilt %.0f° > %.0f° → back off the slope, mark it impassable' % (rd.tilt_deg, CFG['reflexTilt']))
         # 6. stale data
@@ -124,6 +128,27 @@ class Safety:
         else:
             self.low_conf_since = -1.0
         return None
+
+    def _dodge_heading(self, rd, b, away):
+        best, best_s = away, -1e18
+        for k in range(16):
+            a = away + (k - 8) * math.pi / 16
+            s = 2 * math.cos(a - away) + min(clearance(rd, a), 10) / 10
+            for d in (3, 6):
+                px, py = rd.x + d * math.cos(a), rd.y + d * math.sin(a)
+                if not b.inside(px, py):
+                    s -= 10
+                    continue
+                i = b.idx(px, py)
+                if b.water[i] > 0.15:
+                    s -= 10
+                if b.blocked(i):
+                    s -= 4
+                if b.channels[SLOPE][i] >= 0.6:
+                    s -= 6
+            if s > best_s:
+                best_s, best = s, a
+        return best
 
     def escape_search(self, rd, b, max_depth):
         best, best_s = rd.yaw + math.pi, -1e18
