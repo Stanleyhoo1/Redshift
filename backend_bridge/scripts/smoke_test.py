@@ -74,6 +74,17 @@ class Smoke:
     def robot(self, r: str) -> dict:
         return ((self.s.telemetry or {}).get('robots') or {}).get(r) or {}
 
+    def rockslide_diag(self, t: float, rover: str, before: dict) -> str:
+        """Why no path_blocked trace: rover state/path at injection, where the rocks fell, what it traced since."""
+        pose, path = before.get('pose') or {}, before.get('path') or []
+        ev = next((e for e in self.s.events if e.get('op') == 'spawn_rockslide' and e.get('t', 0) >= t - 1), {})
+        imp = ev.get('impact')
+        near = min((((imp[0] - q[0]) ** 2 + (imp[1] - q[1]) ** 2) ** 0.5 for q in path), default=None) if imp else None
+        since = [f"{tr['kind']}@{tr.get('state')}" for tr in self.s.traces if tr['robot'] == rover and tr['t'] >= t - 0.5]
+        return (f"at inject: state={before.get('state')} path_pts={len(path)} pose=({pose.get('x', 0):.1f},"
+                f"{pose.get('y', 0):.1f}); impact={imp} ({near if near is None else round(near, 1)} m from path), "
+                f"{len(ev.get('rocks', []))} rocks; now state={self.robot(rover).get('state')}; traces since: {since[:8]}")
+
     def trace_after(self, t_start: float, robot: str, kinds: tuple):
         for tr in self.s.traces:
             if tr['robot'] == robot and tr['kind'] in kinds and tr['t'] >= t_start - 0.5:
@@ -115,11 +126,13 @@ class Smoke:
 
             # ---- unscripted change 1: rockslide across the planned path
             await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING' and len(self.robot(rover).get('path') or []) > 5, 40)
+            before = self.robot(rover)
             t = time.time()
             r = (await self.http.post('/api/inject/rockslide', json={'robot': rover})).json()
             self.check('rockslide injected', r.get('ok'), r.get('detail', ''))
             tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('path_blocked',)), 12)
-            self.check('rockslide → REPLANNING trace', tr is not None, f'{dt:.1f} s: {tr["input"] if tr else ""}')
+            self.check('rockslide → REPLANNING trace', tr is not None,
+                       f'{dt:.1f} s: {tr["input"]}' if tr else self.rockslide_diag(t, rover, before))
             tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('replanned',)), 15)
             self.check('re-planned route', tr is not None, f'{dt:.1f} s: {tr["action"] if tr else ""}')
             ev = next((e for e in self.s.events if e.get('op') == 'spawn_rockslide' and e.get('t', 0) >= t - 1), None)
@@ -135,18 +148,37 @@ class Smoke:
             self.check('dust → CAUTION / LIDAR_ONLY', tr is not None and bool(mode),
                        f'{dt:.1f} s: {tr["input"] if tr else ""}')
             tr, dt = await self.wait(lambda: self.trace_after(t, rover, ('caution_exit',)), 40)
-            self.check('dust clears → fused navigation restored', tr is not None, f'{dt:.1f} s after inject')
+            rs = self.robot(rover)
+            self.check('dust clears → fused navigation restored', tr is not None, f'{dt:.1f} s after inject' + (
+                '' if tr else f"; now state={rs.get('state')} mode={rs.get('mode')} uncertainty={rs.get('uncertainty')} "
+                f"env={((self.s.telemetry or {}).get('mission') or {}).get('env')}; traces since: "
+                f"{[x['kind'] for x in self.s.traces if x['robot'] == rover and x['t'] >= t - 0.5][:10]}"))
 
             # ---- failure: tip/slip jolt → safe-hold recovery
             await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING', 30)
+            before = self.robot(rover)
             t = time.time()
             r = (await self.http.post('/api/inject/tip', json={'robot': rover})).json()
             self.check('tip/slip jolt injected', r.get('ok'), r.get('detail', ''))
+            peak = {'roll': 0.0}
+
+            def safe_hold_seen():       # also tracks the peak roll the 15 Hz telemetry shows, for the failure report
+                roll = (self.robot(rover).get('imu') or {}).get('roll_deg')
+                if roll is not None:
+                    peak['roll'] = max(peak['roll'], abs(roll))
+                return self.trace_after(t, rover, ('safe_hold',))
             chain = [('safe_hold', 4), ('recovery_reverse', 10), ('hazard_marked', 30), ('scout_tasked', 2),
                      ('scan_complete', 60), ('resume', 5)]
             for kind, tmo in chain:
-                tr, dt = await self.wait(lambda kind=kind: self.trace_after(t, rover, (kind,)), tmo)
-                self.check(f'recovery: {kind}', tr is not None, f'{time.time() - t:.1f} s: {tr["input"] if tr else ""}')
+                pred = safe_hold_seen if kind == 'safe_hold' else (lambda kind=kind: self.trace_after(t, rover, (kind,)))
+                tr, dt = await self.wait(pred, tmo, poll=0.05)
+                detail = f'{time.time() - t:.1f} s: {tr["input"]}' if tr else f'{time.time() - t:.1f} s: '
+                if tr is None and kind == 'safe_hold':
+                    ev = next((e for e in self.s.events if e.get('op') == 'jolt' and e.get('t', 0) >= t - 1), None)
+                    detail += (f"state before={before.get('state')} speed={before.get('speed')}; jolt event={ev}; "
+                               f"peak |roll| seen {peak['roll']:.1f}° (tip alarm {self.robot(rover).get('tip_alarm_deg')}°); "
+                               f"now state={self.robot(rover).get('state')}")
+                self.check(f'recovery: {kind}', tr is not None, detail)
                 if tr is None:
                     break
             perm = self.s.map_stats.get('permanent_hazards', [])

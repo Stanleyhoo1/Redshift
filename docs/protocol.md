@@ -104,6 +104,10 @@ Commands (published by the backend; executed by `world_interface_node` (Gazebo) 
 {"op":"anomaly","dust_level":0.85,"duration_s":25,"seismic_s":4}
 {"op":"clear_anomaly"}
 ```
+`spawn_rockslide` drops a ~7 m-wide line of boulders across the robot's planned path (`scene_events.rockslide_layout`):
+7 m ahead along the route, or 60 % of the remaining route when that is shorter (never under 3 m), so the line never
+lands beyond the path's end; along the heading when there is no path.
+
 Events (one per executed command):
 ```json
 {"op":"spawn_rockslide","ok":true,"robot":"rover_0","impact":[x,y],"rocks":[[x,y,r]],"t":0.0}

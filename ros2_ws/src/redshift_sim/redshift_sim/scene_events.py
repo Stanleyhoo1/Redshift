@@ -29,13 +29,8 @@ def jolt_wrench_world(yaw: float, g_mult: float = 2.2):
     return [0.0, 0.0, 0.0], [c * tq, s * tq, 0.0]
 
 
-def _point_along(path: np.ndarray, pose, ahead_m: float):
-    """Project the robot onto the polyline, walk `ahead_m` forward; returns (point, unit tangent)."""
-    x, y, yaw = pose
-    if path is None or len(path) < 2:
-        t = np.array([math.cos(yaw), math.sin(yaw)])
-        return np.array([x, y]) + ahead_m * t, t
-    p = np.asarray(path, dtype=np.float64)
+def _project(p: np.ndarray, x: float, y: float):
+    """Closest point of the polyline to (x, y): (segment index, fraction along it, segment vectors, lengths)."""
     seg = p[1:] - p[:-1]
     seg_len = np.linalg.norm(seg, axis=1)
     best, best_d, best_t = 0, math.inf, 0.0
@@ -47,6 +42,25 @@ def _point_along(path: np.ndarray, pose, ahead_m: float):
         d = math.hypot(q[0] - x, q[1] - y)
         if d < best_d:
             best, best_d, best_t = k, d, tt
+    return best, best_t, seg, seg_len
+
+
+def remaining_m(path, pose) -> float:
+    """Route length still ahead of the robot (0 without a usable path)."""
+    if path is None or len(path) < 2:
+        return 0.0
+    k, tt, _, seg_len = _project(np.asarray(path, dtype=np.float64), pose[0], pose[1])
+    return float((1.0 - tt) * seg_len[k] + seg_len[k + 1:].sum())
+
+
+def _point_along(path: np.ndarray, pose, ahead_m: float):
+    """Project the robot onto the polyline, walk `ahead_m` forward; returns (point, unit tangent)."""
+    x, y, yaw = pose
+    if path is None or len(path) < 2:
+        t = np.array([math.cos(yaw), math.sin(yaw)])
+        return np.array([x, y]) + ahead_m * t, t
+    p = np.asarray(path, dtype=np.float64)
+    best, best_t, seg, seg_len = _project(p, x, y)
     remaining = ahead_m
     k, tt = best, best_t
     while True:
@@ -66,13 +80,23 @@ def _point_along(path: np.ndarray, pose, ahead_m: float):
     return p[-1] + remaining * tangent, tangent
 
 
+ROUTE_FRACTION = 0.6     # on a short route the line falls at most this far along what remains (room before the goal)
+MIN_AHEAD_M = 3.0         # never closer than this to the robot
+
+
 def rockslide_layout(path_xy, pose, ahead_m: float = 7.0, width_m: float = 7.0, n: int = 6, seed=None):
     """A line of boulders across the robot's planned path `ahead_m` metres ahead.
 
-    Returns (rocks [(x, y, radius)], impact (x, y)).
+    If less route than that remains (the robot is about to reach its goal), the line moves back onto the route,
+    ROUTE_FRACTION of the way along what is left but at least MIN_AHEAD_M ahead, so it still cuts the path rather
+    than landing beyond its end. With no path, or under MIN_AHEAD_M of it left, it falls `ahead_m` along the heading /
+    last segment. Returns (rocks [(x, y, radius)], impact (x, y)).
     """
     rng = np.random.default_rng(seed)
     path = None if path_xy is None else np.asarray(path_xy, dtype=np.float64).reshape(-1, 2)
+    left = remaining_m(path, pose)
+    if left > MIN_AHEAD_M:
+        ahead_m = min(ahead_m, max(MIN_AHEAD_M, ROUTE_FRACTION * left))
     point, tangent = _point_along(path, pose, ahead_m)
     normal = np.array([-tangent[1], tangent[0]])
     rocks = []

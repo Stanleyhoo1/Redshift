@@ -35,6 +35,26 @@ def test_rockslide_short_path_extends_along_last_segment():
     assert impact == pytest.approx((7.0, 0.0), abs=0.01)
 
 
+def test_rockslide_stays_on_a_short_remaining_route():
+    # 6 m left to the goal: the line moves back onto the route (60 % of it) instead of landing past the end
+    path = np.array([[0.0, 0.0], [6.0, 0.0]])
+    rocks, impact = rockslide_layout(path, pose=(0.0, 0.0, 0.0), ahead_m=7.0, seed=5)
+    assert impact == pytest.approx((3.6, 0.0), abs=0.01)
+    assert all(abs(r[0] - 3.6) < 1.0 for r in rocks)
+
+
+def test_rockslide_keeps_room_before_the_goal():
+    path = np.array([[0.0, 0.0], [10.0, 0.0]])          # 10 m left: 6 m ahead, goal stays 4 m clear
+    _, impact = rockslide_layout(path, pose=(0.0, 0.0, 0.0), ahead_m=7.0, seed=6)
+    assert impact == pytest.approx((6.0, 0.0), abs=0.01)
+
+
+def test_rockslide_never_lands_on_the_robot():
+    path = np.array([[0.0, 0.0], [4.0, 0.0]])           # 4 m left: clamp to the 3 m minimum stand-off
+    _, impact = rockslide_layout(path, pose=(0.0, 0.0, 0.0), ahead_m=7.0, seed=7)
+    assert impact == pytest.approx((3.0, 0.0), abs=0.01)
+
+
 def test_jolt_profile():
     # tuned: cut 21.4 deg -> ~33.8 deg peak, 5 deg past the 2.2 g tip alarm (28.8 deg)
     assert jolt_cut_angle_deg(28.8) == pytest.approx(21.4, abs=0.1)
