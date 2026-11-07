@@ -388,15 +388,13 @@ def annotate(rgb, dets, info: dict):
         ty = max(tht + 2, y - 2)
         cv2.rectangle(img, (x, ty - tht - 2), (x + tw + 2, ty + 1), col, -1)
         cv2.putText(img, label, (x + 1, ty - 1), cv2.FONT_HERSHEY_SIMPLEX, fs, (10, 10, 10), 1, cv2.LINE_AA)
-    bar = img[:int(16 * fs / 0.35)].astype(np.float32) * 0.35
-    img[:bar.shape[0]] = bar.astype(np.uint8)
-    hud = (f"{str(info.get('robot', '')).upper()}  {info.get('mode', '')}  U {info.get('uncertainty', 0):.2f}  "
-           f"{info.get('fps', 0):.1f}Hz")
-    cv2.putText(img, hud, (4, int(12 * fs / 0.35)), cv2.FONT_HERSHEY_SIMPLEX, fs, (235, 235, 235), 1, cv2.LINE_AA)
+    # Mode, uncertainty and frame rate are shown by Mission Control's own badges in the frame corners, so the
+    # burned-in text is limited to centred callouts that never sit under them.
     sl = info.get('slope_ahead_deg')
     if sl is not None:
         txt = f'SLOPE AHEAD {sl:+.1f}deg'
-        cv2.putText(img, txt, (4, h - 6), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 220, 120), 1, cv2.LINE_AA)
+        (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
+        cv2.putText(img, txt, ((w - tw) // 2, h - 6), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 220, 120), 1, cv2.LINE_AA)
     if lidar_only:
         msg = 'CAM DEGRADED - LIDAR ONLY'
         (tw, tht), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, fs * 1.3, th)

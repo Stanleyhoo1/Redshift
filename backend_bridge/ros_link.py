@@ -21,6 +21,7 @@ try:
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
     from rclpy.qos import qos_profile_sensor_data as SENSOR_QOS
+    from rclpy.signals import SignalHandlerOptions
     from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
     from std_msgs.msg import String
     HAVE_ROS = True
@@ -40,7 +41,8 @@ class RosLink:
         self.on_trace, self.on_event = on_trace, on_event
         self.lock = threading.RLock()
         self._ids = itertools.count(1)
-        rclpy.init()
+        # uvicorn owns SIGINT/SIGTERM: its lifespan aborts the mission, then shutdown() tears ROS down in order
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
         self.node = rclpy.create_node('redshift_backend')
         n = self.node
         self.cmd_pub = n.create_publisher(String, '/world/command', 10)
