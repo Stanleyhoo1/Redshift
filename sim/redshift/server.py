@@ -43,9 +43,9 @@ TICK_HZ = 5.0
 def _auto_reset_s() -> float:
     """Seconds to wait after exploration ends (all rovers parked) before starting a new planet. 0 = off."""
     try:
-        return max(0.0, float(os.environ.get("AUTO_RESET_S", "60") or 0))
+        return max(0.0, float(os.environ.get("AUTO_RESET_S", "0") or 0))
     except ValueError:
-        return 60.0
+        return 0.0
 
 
 AUTO_RESET_S = _auto_reset_s()

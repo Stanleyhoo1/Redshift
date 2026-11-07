@@ -118,7 +118,7 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `GRAVITY_G` | 2.0 | gravity in Earth g |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer |
 | `BRAIN_BUDGET_MS` | 40 | compute budget per rover per decision cycle (ms) |
-| `AUTO_RESET_S` | 60 | once exploration is complete and every rover is parked, wait this many seconds, then start a new random planet (server only, 0 = off) |
+| `AUTO_RESET_S` | 0 | off by default. If set, once exploration is complete and every rover is parked, wait this many seconds, then start a new random planet (server only) |
 | `GEMMA_ENABLED` | 1 | 0 = rules only (no Gemma, no questions; typed commands still work through the keyword parser) |
 | `GEMMA_URL` | `http://host.docker.internal:11434` | Ollama; `http://localhost:11434` is tried next |
 | `GEMMA_MODEL` | `gemma4:e2b` | falls back to `gemma4:e4b`, then `gemma3:4b`, if not installed |
@@ -277,8 +277,9 @@ expansions instead (3 us each, measured here), which makes runs repeat exactly; 
   rover in the way (back off). If it tips over it rights itself. If steep ground boxes it in, it
   heads for the lander, allowing slightly steeper ground, until a frontier is reachable again.
 - **Done.** When no frontier can be reached from the lander, exploration is complete and every
-  rover parks at the lander. The server then waits `AUTO_RESET_S` seconds and lands the fleet on a
-  new random planet, so an unattended demo keeps going.
+  rover parks at the lander and the sim stays as it is until someone presses Reset. (Optional:
+  set `AUTO_RESET_S`, e.g. 60, to land the fleet on a new random planet that long after
+  exploration finishes, so an unattended demo keeps going.)
 
 Every decision is logged as a short event that the UI shows live, with the sensor reading behind
 it and, where it makes sense, the place (`at`) so the UI can fly the camera there.

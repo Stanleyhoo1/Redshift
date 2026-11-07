@@ -7,7 +7,7 @@ services:
       SIM_SPEED: ${SIM_SPEED:-3.0}
       MAP_SIZE: ${MAP_SIZE:-80}
       GRAVITY_G: ${GRAVITY_G:-2.0}
-      AUTO_RESET_S: ${AUTO_RESET_S:-60}
+      AUTO_RESET_S: ${AUTO_RESET_S:-0}
       GEMMA_ENABLED: ${GEMMA_ENABLED:-1}
       GEMMA_URL: ${GEMMA_URL:-http://host.docker.internal:11434}
       GEMMA_MODEL: ${GEMMA_MODEL:-gemma4:e2b}

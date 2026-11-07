@@ -235,4 +235,4 @@ Nothing required. The server must ignore any text the client sends.
 | `GEMMA_MODEL` | gemma4:e2b | preferred model; falls back to gemma4:e4b, then gemma3:4b if not installed |
 | `GEMMA_FAKE` | 0 | 1 = deterministic fake model (demo and tests without Ollama) |
 | `OPERATOR_TIMEOUT_S` | 20 | wall seconds a rover waits for an operator answer before taking the safe default |
-| `AUTO_RESET_S` | 60 | after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` (0 = off) |
+| `AUTO_RESET_S` | 0 | off by default (the sim only resets on `POST /api/reset`); if set, after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` |
