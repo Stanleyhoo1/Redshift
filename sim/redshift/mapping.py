@@ -15,6 +15,17 @@ Overwritten samples remember when, so a rover can tell "new rocks" from ground i
 seen before.
 
 A separate soft layer holds soft ground the fleet found through wheel slip (LiDAR cannot see it).
+
+Thin tall things (alien spires) can hide between hit centres: a sample may keep a ground hit even
+though a spire stands in its footprint. So each sample also remembers the lowest and highest hit
+anywhere in its footprint; a big spread means something tall stands there, and the sample is mapped
+as an obstacle. Tall stuff seen in a sample a while ago is static, so it never counts as a change.
+
+Liquid gives no LiDAR returns at all, so a lake shows up as a hole in this map. Two more layers
+record what the fleet makes of such holes: `noret` counts sweeps in which a ray that should have hit
+the ground in a sample got nothing back (evidence of a hole), and `water` marks samples the fleet
+has identified as liquid (impassable for everyone). Unknown samples with enough no-return evidence
+no longer count as unexplored, so frontiers along a lake are not chased forever.
 """
 from __future__ import annotations
 
@@ -36,6 +47,10 @@ CHANGE_MAX_SLOPE = 18.0  # only smooth samples can change: on rough ground, hits
 CHANGE_NEAR_S = 60.0     # ... or samples next to one that changed lately (lets a whole boulder fill in)
 CHANGE_CONFIRMED = 3     # a first change needs the old surface to have been confirmed this many times
 CHANGE_COOLDOWN_S = 30.0  # a sample changes at most once in this long (no flicker at boulder edges)
+NORET_HOLE = 3       # sweeps with a missing return before an unknown sample counts as a seen hole
+TALL_FOOT = 0.35     # hits this close to a sample centre count for its "tall stuff" check ...
+TALL_DZ = 0.6        # ... and a spread of hit heights this big there means something tall stands in it
+TALL_OLD_S = 5.0     # tall stuff seen in a sample longer ago than this is static, not a change
 _NBR = [(dj, di) for dj in (-1, 0, 1) for di in (-1, 0, 1)]
 
 
@@ -63,6 +78,11 @@ class FleetMap:
         self.near_chg_t = np.full(shape, -1e9, np.float32)  # when a sample's neighbour last changed
         self.soft = np.zeros(shape, bool)             # soft ground reported by the fleet
         self.avoid = np.zeros(shape, bool)            # areas the operator put off limits (known or not)
+        self.water = np.zeros(shape, bool)            # liquid the fleet identified (impassable)
+        self.noret = np.zeros(shape, np.int16)        # sweeps with no return where ground was expected
+        self.fmin = np.full(shape, np.inf, np.float32)   # lowest / highest hit anywhere in the footprint
+        self.fmax = np.full(shape, -np.inf, np.float32)
+        self.tall_t = np.full(shape, np.inf, np.float32)  # when something tall was first seen in the footprint
         self.scan_seq = 0
         self.changes = 0                              # samples overwritten so far
         self.sent_h = np.full(shape, np.nan, np.float32)
@@ -110,6 +130,15 @@ class FleetMap:
         dy = ((fj - j) * self.res).astype(np.float32)
         off = np.hypot(dx, dy)
         flat = j * self.nx + i
+        foot = off <= TALL_FOOT
+        if foot.any():
+            ff, zf = flat[foot], z[foot].astype(np.float32)
+            fmin, fmax, tt = self.fmin.ravel(), self.fmax.ravel(), self.tall_t.ravel()
+            np.minimum.at(fmin, ff, zf)
+            np.maximum.at(fmax, ff, zf)
+            uf = np.unique(ff)
+            newly = (fmax[uf] - fmin[uf] > TALL_DZ) & ~np.isfinite(tt[uf])
+            tt[uf[newly]] = t
         order = np.lexsort((off, flat))
         flat_s = flat[order]
         first = np.ones(len(flat_s), bool)
@@ -125,7 +154,7 @@ class FleetMap:
             jump = z[sel] - self.h.ravel()[f]
             better &= ~(known_f & (jump > 1.5))
             big = better & known_f & (jump > CHANGE_SEED_DZ) & (self.chg_conf.ravel()[f] >= CHANGE_CONFIRMED) \
-                & (self.changed_t.ravel()[f] < t - CHANGE_COOLDOWN_S)
+                & (self.changed_t.ravel()[f] < t - CHANGE_COOLDOWN_S) & (self.tall_t.ravel()[f] >= t - TALL_OLD_S)
             if big.any():
                 self._stamp_changes(f[big], t)
         upd = sel[better]
@@ -165,6 +194,7 @@ class FleetMap:
         ft = flat[top]
         cand = (self.known.ravel()[ft] & (self.hoff.ravel()[ft] < FILL_OFFSET)
                 & (self.changed_t.ravel()[ft] < t - CHANGE_COOLDOWN_S)
+                & (self.tall_t.ravel()[ft] >= t - TALL_OLD_S)       # static tall stuff is not a change
                 & ((self.slope.ravel()[ft] <= CHANGE_MAX_SLOPE) | (self.near_chg_t.ravel()[ft] >= t - CHANGE_NEAR_S)))
         if len(updated):
             cand &= ~np.isin(ft, updated)
@@ -296,6 +326,8 @@ class FleetMap:
         plane = np.degrees(np.arctan(np.hypot(gx, gy)))
         stepdeg = np.degrees(np.arctan(step / res))
         slope = np.maximum(plane, np.where(step > 0.06, stepdeg, 0.0))
+        tallp = np.isfinite(self.tall_t[pj0:pj1 + 1, pi0:pi1 + 1])
+        slope = np.where(tallp, np.maximum(slope, 50.0), slope)     # something tall stands in the footprint
         # hole filling: unknown samples well surrounded by known ones
         fill = (~Kc) & (S1 >= 5) & good
         # write back only the inner window
@@ -359,14 +391,74 @@ class FleetMap:
         self.version += 1
         return int(self.avoid[j0:j1 + 1, i0:i1 + 1].sum()) - before
 
+    def mark_water(self, x: float, y: float, radius: float) -> int:
+        """Identified liquid: samples in the circle that have no real LiDAR return (unknown, or only
+        hole-filled) become water, impassable for every rover. Returns new samples marked."""
+        i, j = self.ij(x, y)
+        k = int(math.ceil(radius / self.res))
+        j0, j1 = max(0, j - k), min(self.ny - 1, j + k)
+        i0, i1 = max(0, i - k), min(self.nx - 1, i + k)
+        yy, xx = np.mgrid[j0:j1 + 1, i0:i1 + 1]
+        m = (xx - i) ** 2 + (yy - j) ** 2 <= (radius / self.res) ** 2 + 1e-6
+        win = (slice(j0, j1 + 1), slice(i0, i1 + 1))
+        m &= ~self.known[win] | (self.hoff[win] >= FILL_OFFSET)
+        before = int(self.water[win].sum())
+        self.water[win] |= m
+        self.version += 1
+        return int(self.water[win].sum()) - before
+
+    def add_noret(self, pts_xy: np.ndarray) -> None:
+        """Expected ground points (N, 2) whose rays came back empty this sweep."""
+        if len(pts_xy) == 0:
+            return
+        i = np.rint((pts_xy[:, 0] - self.ox) / self.res).astype(np.int64)
+        j = np.rint((pts_xy[:, 1] - self.oy) / self.res).astype(np.int64)
+        ok = (i >= 0) & (i < self.nx) & (j >= 0) & (j < self.ny)
+        f = np.unique(j[ok] * self.nx + i[ok])
+        nr = self.noret.ravel()
+        nr[f] = np.minimum(nr[f] + 1, 1000)
+
+    def holes(self) -> np.ndarray:
+        """Unknown samples that repeatedly gave no return (liquid or a drop-off nobody can see into)."""
+        return (self.noret >= NORET_HOLE) & ~self.known
+
     def recently_changed(self, i: int, j: int, since: float, r: int = 1, min_count: int = 1) -> bool:
         """Were at least min_count samples within r cells of (i, j) overwritten by change detection
         after `since`?"""
         win = self.changed_t[max(j - r, 0):j + r + 1, max(i - r, 0):i + r + 1]
         return int((win >= since).sum()) >= min_count
 
+    def change_shape(self, x: float, y: float, since: float, r: int = 8):
+        """Shape of the samples that changed lately within r cells of (x, y), from their positions and
+        heights: {"shape": "long" | "rocks", "length": m, "height": m}, or None. "long" is one
+        continuous, narrow, elongated obstacle (a fallen spire); a row of boulders has gaps."""
+        i, j = self.ij(x, y)
+        j0, i0 = max(j - r, 0), max(i - r, 0)
+        win = (slice(j0, j + r + 1), slice(i0, i + r + 1))
+        done = self.changed_t[win] >= since
+        # plus samples with fresh, not yet confirmed evidence of a change: the outline fills in sooner
+        pend = (self.chg_n[win] >= 1) & (self.scan_seq - self.chg_seq[win] <= CHANGE_GAP) & self.known[win]
+        ch = done | pend
+        jj, ii = np.nonzero(ch)
+        if len(jj) < 3:
+            return None
+        pts = np.stack([self.ox + (ii + i0) * self.res, self.oy + (jj + j0) * self.res], axis=1)
+        c = pts.mean(axis=0)
+        w, v = np.linalg.eigh(np.cov((pts - c).T) + 1e-9 * np.eye(2))
+        u, n = v[:, 1], v[:, 0]
+        proj = np.sort((pts - c) @ u)
+        perp = (pts - c) @ n
+        length = float(proj[-1] - proj[0]) + self.res
+        width = float(perp.max() - perp.min()) + self.res
+        gap = float(np.diff(proj).max()) if len(proj) > 1 else 0.0
+        hw = np.where(pend & ~done, self.chg_z[win], self.h[win])
+        base = self.h[win][self.known[win] & ~ch]
+        height = float(hw[ch].max() - (np.median(base) if base.size else hw[ch].min()))
+        long_ = length >= 1.8 and width <= 1.3 and length >= 2.2 * width and gap <= 0.8
+        return {"shape": "long" if long_ else "rocks", "length": round(length, 1), "height": round(max(height, 0.0), 1)}
+
     def traversable(self, limit_deg: float) -> np.ndarray:
-        return self.known & (self.slope <= limit_deg) & ~self.blocked & ~self.soft & ~self.avoid
+        return self.known & (self.slope <= limit_deg) & ~self.blocked & ~self.soft & ~self.avoid & ~self.water
 
     # ------------------------------------------------------------------ deltas for the protocol
     def take_changed_cells(self) -> list:
@@ -402,7 +494,7 @@ class FleetMap:
         """Frontier samples: known, traversable, next to a sizeable unknown region.
         Returns [(x, y, size, flat_index)] with the centre snapped onto a frontier sample."""
         trav = self.traversable(limit_deg)
-        unk = ~self.known
+        unk = ~self.known & ~self.water & (self.noret < NORET_HOLE)    # identified water and seen holes are not "unexplored"
         # morphological opening of the unknown mask (3x3) drops speckle holes inside explored areas
         e = np.ones((self.ny + 2, self.nx + 2), bool)
         e[1:-1, 1:-1] = unk

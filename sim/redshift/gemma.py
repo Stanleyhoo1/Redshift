@@ -14,7 +14,10 @@ or Gemma 3 4B on older Ollama) on ONE background thread beside the rules. It
       "ask_operator" when it is not sure (confidence below 0.55), and
   (c) turns the operator's typed messages ("rover 2 go to 10, -5") into structured commands,
       or "unclear" with a clarifying question. A regex parser does the same when Gemma is
-      offline or answers something invalid.
+      offline or answers something invalid, and
+  (d) describes something the LiDAR tracker saw moving (camera image plus track numbers): a
+      lifeform or not, a short label ("possible lifeform, six legs, about 1.2 m"), what to do
+      (approach to observe, observe from here, ignore) and a confidence.
 
 The rules never wait on Gemma. submit_choice(), submit_interpretation(), submit_command() and
 poll() return at once (tens of microseconds). If Gemma is disabled, offline, still loading, slow
@@ -30,6 +33,7 @@ Interface (GEMMA.md shows where the rovers call it)
     tk = gp.submit_interpretation("r1", t, perception, anomaly, jpeg_or_None,
                                   ["reroute", "back_out", "proceed_slowly", "wait"])
     tk = gp.submit_command(t, "rover 2 go to 10, -5", fleet_context)
+    tk = gp.submit_description("r3", t, perception, observation, jpeg_or_None)
     res = gp.poll(tk)          # None while pending, then a Result; never blocks
     gp.stats()                 # {"model", "online", "state", "calls", "ok", "fallbacks", "avg_ms", ...}
 
@@ -86,7 +90,8 @@ from dataclasses import asdict, dataclass, field
 __all__ = [
     "ACTIONS", "CANDIDATE_KINDS", "CLASSES", "COMMANDS", "DIRECTIONS", "GemmaConfig", "Result", "Request",
     "GemmaPlanner", "OllamaBackend", "FakeBackend", "GemmaError", "GemmaTimeout", "GemmaOffline",
-    "make_choice_request", "make_interpretation_request", "make_command_request", "build_prompt",
+    "make_choice_request", "make_interpretation_request", "make_command_request", "make_description_request",
+    "build_prompt", "DESCRIBE_CLASSES", "DESCRIBE_ACTIONS",
     "build_schema", "validate", "run_request", "parse_command", "cited_numbers", "render_readings",
     "colour_name", "latency_summary", "estimate_tokens", "get_planner", "planner_from_env", "close_planner",
 ]
@@ -98,7 +103,10 @@ FALLBACK_MODELS = ("gemma4:e2b", "gemma4:e4b", "gemma3:4b")
 
 CANDIDATE_KINDS = ("frontier", "target", "return", "wait")
 ACTIONS = ("reroute", "back_out", "proceed_slowly", "wait", "ask_operator")
-CLASSES = ("rock", "steep_slope", "soft_ground", "dust", "other_rover", "crater_edge", "clear", "unknown")
+CLASSES = ("rock", "steep_slope", "soft_ground", "dust", "liquid", "other_rover", "crater_edge", "clear", "unknown")
+DESCRIBE_CLASSES = ("lifeform", "rock", "other_rover", "dust", "unknown")
+DESCRIBE_ACTIONS = ("approach", "observe", "ignore", "ask_operator")
+MAX_LABEL_WORDS = 10
 COMMANDS = ("go_to", "explore_direction", "sample_target", "return_home", "hold", "resume", "avoid_area",
             "unclear")
 DIRECTIONS = ("north", "south", "east", "west", "north-east", "north-west", "south-east", "south-west")
@@ -127,13 +135,14 @@ SYSTEM_CHOICE = SYSTEM_BASE + (
     '"choice": "f2", "confidence": 0.8}'
 )
 SYSTEM_INTERPRET = SYSTEM_BASE + (
-    "Its sensors flagged an anomaly. Use the camera image if there is one and the readings. "
+    "An anomaly was flagged. Use the camera image (if any) and the readings. "
     "Classify the cause, pick one option, give a confidence from 0 to 1. "
     "Soft ground or wheel slip means back_out. New rocks on the path mean reroute. "
     "Dust or low visibility means proceed_slowly. "
-    "If you cannot tell what it is, give a low confidence and choose ask_operator. "
+    "No LiDAR returns plus blue in the camera means liquid: reroute. "
+    "If unsure, give a low confidence and choose ask_operator. "
     "Reply with JSON only: classification, reason, action, confidence. "
-    "The reason has at most 25 words and must quote a reading exactly as written, number and unit. "
+    "The reason (max 25 words) must quote a reading exactly as written, number and unit. "
     'Example reason: "slip 52% while ground speed 0.05 m/s: the wheels spin in soft ground."'
 )
 SYSTEM_COMMAND = (
@@ -148,6 +157,17 @@ SYSTEM_COMMAND = (
     "Use only numbers and ids from the message or the lists. Put 0 or none in fields the command does not use. "
     "If the message is ambiguous, choose unclear and ask in question; otherwise question is empty. "
     "ack is one short sentence confirming the command. Reply with JSON only."
+)
+
+SYSTEM_DESCRIBE = SYSTEM_BASE + (
+    "Its LiDAR tracker saw something moving on its own. Use the camera image and the track readings. "
+    "Say if it is a lifeform, give a short label (max 10 words: what it looks like, its size), pick an "
+    "action: approach (observe from a safe distance), observe (from here) or ignore, and a confidence "
+    "from 0 to 1 (low if you cannot tell). Reply with JSON only: classification, label, reason, action, "
+    "confidence. The reason (max 25 words) must quote a reading exactly as written, number and unit. "
+    'Example: {"classification": "lifeform", "label": "possible lifeform, six legs, about 1.2 m", '
+    '"reason": "speed 0.3 m/s, size 1.2 m, legs in the camera.", '
+    '"action": "approach", "confidence": 0.8}'
 )
 
 EM_DASH = chr(0x2014)     # banned in all project text; replaced if the model writes one
@@ -234,7 +254,7 @@ class GemmaConfig:
 class Request:
     """One question for Gemma. Built (and the inputs snapshotted) at submit time."""
     ticket: int
-    kind: str                        # "choice" | "interpretation" | "command"
+    kind: str                        # "choice" | "interpretation" | "command" | "describe"
     rover_id: str
     t: float                         # sim time of the submit
     payload: dict                    # compact data the prompt is made from
@@ -273,6 +293,7 @@ class Result:
     model_action: str | None = None  # what Gemma picked before the low-confidence rule
     command: dict | None = None      # command: {"type": "go_to", "rover": "r2", "x": 10.0, "y": -5.0}
     model_command: dict | None = None    # Gemma's command before the low-confidence rule made it unclear
+    label: str | None = None         # describe: short description ("possible lifeform, six legs, about 1.2 m")
     ack: str | None = None           # command: one short sentence for the operator
     text: str | None = None          # command: the operator's message
     confidence: float = 0.0
@@ -371,7 +392,7 @@ _PCT_KEYS = {"battery", "slip", "motor_load", "charge", "battery_after_return"}
 _DEG_KEYS = {"pitch", "roll", "tilt", "heading", "slope", "slope_max", "slope_limit", "max_slope"}
 _MPS_KEYS = {"wheel_speed", "ground_speed", "speed", "v"}
 _M_KEYS = {"lidar_range", "dist", "distance", "range", "home_distance", "home_dist", "radius", "nominal_range",
-           "visibility", "x", "y", "z"}
+           "visibility", "x", "y", "z", "size", "height", "edge_spread", "length"}
 _S_KEYS = {"duration", "age", "stalled_for", "elapsed"}
 _SUFFIX_UNITS = (("_deg", "deg"), ("_mps", "m/s"), ("_pct", "%"), ("_m", "m"), ("_s", "s"))
 
@@ -599,6 +620,23 @@ def make_interpretation_request(ticket: int, rover_id: str, t: float, perception
                    image_b64=img, default=default)
 
 
+def make_description_request(ticket: int, rover_id: str, t: float, perception: dict, observation: dict,
+                             image_jpeg: bytes | None, default: str = "observe") -> Request:
+    """Something moving: what is it? observation: track numbers (distance, speed, size, ...)."""
+    if default not in DESCRIBE_ACTIONS:
+        raise ValueError(f"default {default!r} not in {DESCRIBE_ACTIONS}")
+    if image_jpeg is not None and not isinstance(image_jpeg, (bytes, bytearray, memoryview)):
+        raise ValueError("image_jpeg must be bytes or None")
+    payload = {"rover": str(rover_id), "sensors": compact(perception or {}) or {},
+               "observation": compact(observation or {}) or {}, "options": list(DESCRIBE_ACTIONS),
+               "classes": list(DESCRIBE_CLASSES)}
+    img = base64.b64encode(bytes(image_jpeg)).decode("ascii") if image_jpeg else None
+    rendered = render_readings(payload["sensors"]) + " " + render_readings(payload["observation"])
+    return Request(ticket=ticket, kind="describe", rover_id=str(rover_id), t=float(t), payload=payload,
+                   inputs=input_numbers(payload) + input_numbers(rendered), options=DESCRIBE_ACTIONS,
+                   classes=DESCRIBE_CLASSES, image_b64=img, default=default)
+
+
 def _fleet_context(ctx: dict) -> dict:
     """Small copy of the fleet context for the command prompt: rovers (id, name, colour name,
     position, state, battery), known targets, lander, map size."""
@@ -707,6 +745,14 @@ def build_prompt(req: Request) -> tuple:
         cands = "\n".join(f"{c['id']} ({c['kind']}): {c['summary']}" for c in p["candidates"])
         return SYSTEM_CHOICE, (f"{head}\nCandidates:\n{cands}\n"
                                "Pick one candidate id. Quote at least one reading above with its number and unit.")
+    if req.kind == "describe":
+        ob = dict(p["observation"])
+        lines = [head, f"Moving object (LiDAR track): {render_readings(ob) or 'no numbers'}",
+                 "Camera image attached." if req.image_b64 else "No camera image.",
+                 "Classes: " + ", ".join(p["classes"]),
+                 "Actions: " + ", ".join(o for o in p["options"] if o != "ask_operator"),
+                 "Describe it and pick one action. Quote at least one reading above with its number and unit."]
+        return SYSTEM_DESCRIBE, "\n".join(lines)
     an = dict(p["anomaly"])
     typ = str(an.pop("type", "anomaly"))
     lines = [head, f"Anomaly: {typ}" + (f": {render_readings(an)}" if an else ""),
@@ -728,6 +774,12 @@ def build_schema(req: Request) -> dict:
         props = {"classification": {"type": "string", "enum": list(req.classes)},
                  "reason": {"type": "string"},
                  "action": {"type": "string", "enum": list(req.options)},
+                 "confidence": {"type": "number"}}
+    elif req.kind == "describe":
+        props = {"classification": {"type": "string", "enum": list(req.classes)},
+                 "label": {"type": "string"},
+                 "reason": {"type": "string"},
+                 "action": {"type": "string", "enum": [o for o in req.options if o != "ask_operator"]},
                  "confidence": {"type": "number"}}
     else:   # flat on purpose: unions (anyOf) are not reliably supported by every grammar engine
         rover = ({"type": "string", "enum": list(req.ids) + ["all", "none"]} if req.ids else {"type": "string"})
@@ -938,7 +990,7 @@ def fallback(req: Request, error: str, latency_ms: float = 0.0, model: str = "")
                latency_ms=round(latency_ms, 1), error=error, model=model)
     if req.kind == "choice":
         r.choice = req.default
-    elif req.kind == "interpretation":
+    elif req.kind in ("interpretation", "describe"):
         r.action = req.default
     else:
         p = req.parsed or _unclear(_HELP)
@@ -1163,6 +1215,18 @@ def validate(req: Request, content: str, min_confidence: float = 0.55, model: st
     cls = cls.strip().lower().replace(" ", "_")
     if cls not in req.classes:
         return bad(f"classification {cls!r} not in {list(req.classes)}")
+    if req.kind == "describe":
+        label = data.get("label")
+        if not isinstance(label, str) or not label.strip():
+            return bad("missing label")
+        action = data.get("action")
+        if action not in req.options or action == "ask_operator":
+            return bad(f"action {action!r} not in {[o for o in req.options if o != 'ask_operator']}")
+        res.classification = cls
+        res.label = _clean_text(label, MAX_LABEL_WORDS).rstrip(".")
+        res.model_action = action
+        res.action = "ask_operator" if conf < min_confidence else action
+        return res
     action = data.get("action")
     if not isinstance(action, str) or not action:
         return bad("missing action")
@@ -1391,6 +1455,8 @@ class FakeBackend(Backend):
             ans = self._choice(req)
         elif req.kind == "interpretation":
             ans = self._interpret(req)
+        elif req.kind == "describe":
+            ans = self._describe(req)
         else:
             ans = self._command(req)
         return json.dumps(ans), {"prompt_eval_count": estimate_tokens(system + user), "eval_count": 40}
@@ -1423,7 +1489,7 @@ class FakeBackend(Backend):
             bits.append(f"battery {frac * 100:.0f}%")
         # quote the summary's numbers that matter (cells, slope, battery after return or on arrival)
         parts = [p.strip() for p in pick["summary"].split(",")]
-        keep = [p for p in parts if re.search(r"cells|slope|battery", p)] or parts[:2]
+        keep = [p for p in parts if re.search(r"cells|slope|battery|value|tubes", p)] or parts[:2]
         bits.extend(keep[:3])
         return {"reason": ", ".join(bits), "choice": pick["id"], "confidence": 0.8}
 
@@ -1432,7 +1498,16 @@ class FakeBackend(Backend):
         anom = req.payload.get("anomaly", {})
         typ = str(anom.get("type", "")).lower()
         lr = sens.get("lidar_range")
-        if "slip" in typ or "sand" in typ:
+        liq = anom.get("camera_liquid_pct")
+        spread = anom.get("edge_spread")
+        if "no_return" in typ:
+            seen_liquid = (isinstance(liq, (int, float)) and liq >= 3.0) or (
+                liq is None and isinstance(spread, (int, float)) and spread < 0.12)
+            if seen_liquid:
+                cls, act, conf, keys = "liquid", "reroute", 0.85, ("camera_liquid_pct", "distance", "rays_missing")
+            else:
+                cls, act, conf, keys = "crater_edge", "reroute", 0.6, ("distance", "rays_missing")
+        elif "slip" in typ or "sand" in typ:
             cls, act, conf, keys = "soft_ground", "back_out", 0.8, ("slip", "ground_speed")
         elif "obstacle" in typ or "stall" in typ or "rock" in typ:
             cls, act, conf, keys = "rock", "reroute", 0.8, ("distance", "motor_load", "ground_speed")
@@ -1459,6 +1534,20 @@ class FakeBackend(Backend):
         label = cls.replace("_", " ")
         return {"classification": cls, "reason": f"Looks like {label}: " + ", ".join(bits[:2]),
                 "action": act, "confidence": conf}
+
+    def _describe(self, req: Request) -> dict:
+        """The fake cannot see legs: it goes by the track numbers (moving on its own, animal sized)."""
+        ob = req.payload.get("observation", {})
+        sp, size = ob.get("speed"), ob.get("size")
+        num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)    # noqa: E731
+        bits = [_fmt_reading(k, ob[k]) for k in ("speed", "size", "distance") if num(ob.get(k))]
+        if num(sp) and num(size) and sp >= 0.08 and 0.4 <= size <= 2.5:
+            return {"classification": "lifeform", "label": f"possible lifeform, about {size:.1f} m, moving on its own",
+                    "reason": "Moves by itself and is animal sized: " + ", ".join(bits[:2]),
+                    "action": "approach", "confidence": 0.8}
+        return {"classification": "unknown", "label": "moving object, unclear",
+                "reason": "Cannot tell from " + (", ".join(bits[:2]) or "the readings"),
+                "action": "observe", "confidence": 0.4}
 
     def _command(self, req: Request) -> dict:
         p = parse_command(req.text or "", req.payload.get("fleet"))
@@ -1534,7 +1623,7 @@ class GemmaPlanner:
     that waited longer than GEMMA_TIMEOUT_S in the queue is dropped (fallback). When the model
     is not ready (disabled, offline, model missing, warming), submits resolve to a fallback at once."""
 
-    _PRIORITY = ("command", "interpretation", "choice")
+    _PRIORITY = ("command", "interpretation", "describe", "choice")
 
     def __init__(self, config: GemmaConfig | None = None, backend: Backend | None = None, start: bool = True):
         self.cfg = config or GemmaConfig.from_env()
@@ -1676,6 +1765,18 @@ class GemmaPlanner:
             dflt = default if default in ACTIONS else next(
                 (o for o in ("proceed_slowly", "wait") if o in opts), opts[0] if opts else "wait")
             stub = Request(ticket, "interpretation", str(rover_id), float(t or 0.0), {}, [], default=dflt)
+            return self._resolve_now(stub, f"bad input: {e}")
+        return self._enqueue(req)
+
+    def submit_description(self, rover_id: str, t: float, perception: dict, observation: dict,
+                           image_jpeg: bytes | None, default: str = "observe") -> int:
+        """Ask Gemma what a moving LiDAR track is (lifeform or not, short label, action). observation:
+        {"distance": m, "speed": m/s, "size": m, ...}. Returns a ticket. Never blocks, never raises."""
+        ticket = next(self._tickets)
+        try:
+            req = make_description_request(ticket, rover_id, t, perception, observation, image_jpeg, default)
+        except Exception as e:                # noqa: BLE001
+            stub = Request(ticket, "describe", str(rover_id), float(t or 0.0), {}, [], default="observe")
             return self._resolve_now(stub, f"bad input: {e}")
         return self._enqueue(req)
 

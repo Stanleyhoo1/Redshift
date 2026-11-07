@@ -32,6 +32,12 @@ export function emptyState() {
     chatSeq: 0,
     chatInitSeq: 0, // messages with a key above this arrived live
     requests: [], // open clarification questions, each with a wall-clock `deadline`
+    // v4 (stay empty with older sims)
+    v4: false, // the sim has sent features, lifeforms or tracks at least once
+    features: EMPTY_FEATURES, // { water: [{ id, kind, level, outline }], spires: [{ id, x, y, height, radius, standing }] }
+    lifeforms: [], // ground truth creatures
+    tracks: [], // what the fleet believes it is tracking
+    fallen: {}, // spire id -> { x0, y0, x1, y1, t, hazard }: every spire seen falling since the last init
     limit: { current: null, initial: null, prev: null, changedAt: null },
     t: 0,
     terrain: null,
@@ -41,6 +47,8 @@ export function emptyState() {
     lastMsgAt: 0,
   }
 }
+
+const EMPTY_FEATURES = { water: [], spires: [] }
 
 const num = (v, fallback) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
 
@@ -137,17 +145,20 @@ export function sampleGround(T, x, y) {
   const j0 = Math.min(T.ny - 2, Math.floor(fy))
   const tx = fx - i0
   const ty = fy - j0
-  const k00 = j0 * T.nx + i0
-  const ks = [k00, k00 + 1, k00 + T.nx, k00 + T.nx + 1]
-  const ws = [(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty]
+  // Called many times per frame by the 3D view: no temporary arrays.
+  const K = T.known
+  const H = T.h
+  const k = j0 * T.nx + i0
   let sum = 0
   let wsum = 0
-  for (let q = 0; q < 4; q++) {
-    if (T.known[ks[q]]) {
-      sum += T.h[ks[q]] * ws[q]
-      wsum += ws[q]
-    }
-  }
+  let w = (1 - tx) * (1 - ty)
+  if (K[k]) (sum += H[k] * w), (wsum += w)
+  w = tx * (1 - ty)
+  if (K[k + 1]) (sum += H[k + 1] * w), (wsum += w)
+  w = (1 - tx) * ty
+  if (K[k + T.nx]) (sum += H[k + T.nx] * w), (wsum += w)
+  w = tx * ty
+  if (K[k + T.nx + 1]) (sum += H[k + T.nx + 1] * w), (wsum += w)
   if (wsum < 1e-6) return null
   return sum / wsum
 }
@@ -189,6 +200,9 @@ function pushTrail(trail, x, y, z) {
     const dx = trail.buf[last] - x
     const dy = trail.buf[last + 1] - y
     if (dx * dx + dy * dy < 0.15 * 0.15) return false
+    // A rover never drives 6 m in one tick: it was moved (a reset, a test hook). Start over
+    // rather than draw a straight line across the map.
+    if (dx * dx + dy * dy > 36) trail.count = 0
   }
   const o = trail.head * 3
   trail.buf[o] = x
@@ -368,6 +382,12 @@ export function sanitizeHazards(list) {
       known: !!h.known,
       remaining: num(h.remaining, null),
       active: h.active !== false,
+      // v4 spire_fall: the spire and its base and tip once it lies down
+      spire: h.spire == null ? null : String(h.spire),
+      x0: num(h.x0, null),
+      y0: num(h.y0, null),
+      x1: num(h.x1, null),
+      y1: num(h.y1, null),
     })
   }
   return out
@@ -390,7 +410,81 @@ function sanitizeRover(r, prev) {
     sensors: isObj(r.sensors) ? r.sensors : null,
     scan: sanitizeScan(r.scan),
     brain: isObj(r.brain) ? r.brain : null,
+    // v4 and v4b (null when the sim does not send them)
+    track_id: r.track_id == null ? null : String(r.track_id),
+    samples: Array.isArray(r.samples) ? r.samples.filter((id) => id != null).map(String) : null,
+    capacity: Number.isFinite(r.capacity) && r.capacity > 0 ? Math.round(r.capacity) : null,
+    sampling: isObj(r.sampling) && r.sampling.target != null ? { target: String(r.sampling.target), instrument: r.sampling.instrument == null ? null : String(r.sampling.instrument), progress: Math.max(0, Math.min(1, num(r.sampling.progress, 0))) } : null,
   }
+}
+
+// v4 static features (init, or a tick that resends them). Same object when unchanged.
+export function sanitizeFeatures(f, prev) {
+  if (!isObj(f)) return prev ?? EMPTY_FEATURES
+  const water = (Array.isArray(f.water) ? f.water : [])
+    .filter((w) => isObj(w) && Number.isFinite(w.level) && Array.isArray(w.outline))
+    .map((w, i) => ({ id: w.id == null ? `w${i + 1}` : String(w.id), kind: w.kind === 'river' ? 'river' : 'lake', level: w.level, outline: w.outline.filter(isXY).map((p) => [p[0], p[1]]) }))
+    .filter((w) => w.outline.length >= 3)
+  const spires = (Array.isArray(f.spires) ? f.spires : [])
+    .filter((p) => isObj(p) && Number.isFinite(p.x) && Number.isFinite(p.y))
+    .map((p, i) => ({ id: p.id == null ? `s${i + 1}` : String(p.id), x: p.x, y: p.y, height: num(p.height, 3) > 0.2 ? num(p.height, 3) : 3, radius: num(p.radius, 0.35) > 0.02 ? num(p.radius, 0.35) : 0.35, standing: p.standing !== false }))
+  // A resend after a spire fall changes only the spires: keep the water (and its meshes).
+  const sameWater = prev && JSON.stringify(prev.water) === JSON.stringify(water)
+  const sameSpires = prev && JSON.stringify(prev.spires) === JSON.stringify(spires)
+  if (sameWater && sameSpires) return prev
+  return { water: sameWater ? prev.water : water, spires: sameSpires ? prev.spires : spires }
+}
+
+const LIFE_KINDS = new Set(['grazer'])
+function sanitizeLifeforms(list) {
+  if (!Array.isArray(list)) return null
+  return list
+    .filter((l) => isObj(l) && l.id != null && Number.isFinite(l.x) && Number.isFinite(l.y))
+    .map((l) => ({ id: String(l.id), kind: LIFE_KINDS.has(l.kind) ? l.kind : String(l.kind || 'grazer'), x: l.x, y: l.y, z: num(l.z, null), yaw: num(l.yaw, 0), speed: num(l.speed, 0), size: num(l.size, 1) > 0.1 ? num(l.size, 1) : 1 }))
+}
+
+function sanitizeTracks(list) {
+  if (!Array.isArray(list)) return null
+  return list
+    .filter((k) => isObj(k) && k.id != null && Number.isFinite(k.x) && Number.isFinite(k.y))
+    .map((k) => ({
+      id: String(k.id),
+      x: k.x,
+      y: k.y,
+      vx: num(k.vx, 0),
+      vy: num(k.vy, 0),
+      size: num(k.size, 1) > 0.1 ? num(k.size, 1) : 1,
+      last_seen: num(k.last_seen, null),
+      observer: k.observer == null ? null : String(k.observer),
+      label: k.label == null || k.label === '' ? null : String(k.label),
+      status: k.status === 'lost' ? 'lost' : 'tracking',
+    }))
+}
+
+// Spires seen falling (spire_fall hazards), remembered until the next init even if the
+// sim later drops the hazard from its list.
+function updateFallen(prev, hazards) {
+  let out = prev
+  for (const h of hazards) {
+    if (h.type !== 'spire_fall' || ![h.x0, h.y0, h.x1, h.y1].every(Number.isFinite)) continue
+    const key = h.spire ?? h.id
+    const was = out[key]
+    if (was && was.hazard === h.id && was.x1 === h.x1 && was.y1 === h.y1) continue
+    if (out === prev) out = { ...prev }
+    out[key] = { x0: h.x0, y0: h.y0, x1: h.x1, y1: h.y1, t: h.t, hazard: h.id }
+  }
+  return out
+}
+
+// v4 fields, shared by init and tick. Each one may be missing (older sims).
+function applyV4(s, prev, msg) {
+  if ('features' in msg || 'lifeforms' in msg || 'tracks' in msg) s.v4 = true
+  if ('features' in msg) s.features = sanitizeFeatures(msg.features, prev.features)
+  const life = sanitizeLifeforms(msg.lifeforms)
+  if (life) s.lifeforms = life
+  const tracks = sanitizeTracks(msg.tracks)
+  if (tracks) s.tracks = JSON.stringify(tracks) === JSON.stringify(prev.tracks) ? prev.tracks : tracks
+  s.fallen = updateFallen(prev.fallen, s.hazards)
 }
 
 // Sim time right now, estimated between ticks (ticks carry `t` about 5 times a second).
@@ -429,6 +523,7 @@ export function applyInit(prev, msg, now) {
   s.chatSeq = prev?.chatSeq ?? 0 // keys keep growing across inits
   s.chatInitSeq = s.chatSeq
   applyV3(s, s, msg, now, true)
+  applyV4(s, s, msg)
   return s
 }
 
@@ -501,6 +596,12 @@ export function applyTick(prev, msg, now) {
   if (msg.fleet && typeof msg.fleet === 'object') {
     s.fleet = { ...prev.fleet, ...msg.fleet }
     s.limit = limitFromFleet(s.fleet, prev.limit, now, true)
+    // v4: the identified water is resent every tick; keep the old array while it is the
+    // same, so the water mask is only redrawn when the fleet identifies more.
+    const wz = s.fleet.water_zones
+    if (Array.isArray(wz) && Array.isArray(prev.fleet.water_zones) && wz.length === prev.fleet.water_zones.length && JSON.stringify(wz) === JSON.stringify(prev.fleet.water_zones)) {
+      s.fleet.water_zones = prev.fleet.water_zones
+    }
   }
   if (Array.isArray(msg.hazards)) {
     // Sent every tick; keep the old array when nothing changed so selectors stay quiet.
@@ -508,6 +609,7 @@ export function applyTick(prev, msg, now) {
     s.hazards = JSON.stringify(next) === JSON.stringify(prev.hazards) ? prev.hazards : next
   }
   applyV3(s, prev, msg, now, false)
+  applyV4(s, prev, msg)
   return s
 }
 

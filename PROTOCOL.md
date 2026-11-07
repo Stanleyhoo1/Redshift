@@ -20,7 +20,7 @@ The browser always connects to a relative URL: `ws(s)://<location.host>/ws` and 
 - The map is a grid of height samples (vertices): `nx` by `ny`, spacing `res` metres.
 - Sample `(i, j)`: `i` indexes x, `j` indexes y. World position: `x = origin[0] + i * res`, `y = origin[1] + j * res`.
 - Flat arrays are row major by `j`: `index = j * nx + i`.
-- Default: map size 80 m, `res = 0.5`, so `nx = ny = 161`, `origin = [-40, -40]`.
+- Default: map size 120 m, `res = 0.5`, so `nx = ny = 241`, `origin = [-60, -60]` (older builds used 80 m, 161, -40). Clients must read the size from `init.map`, never assume it.
 - A "cell" in messages is `[i, j, h, slope_deg]`: grid indices (ints), measured height in metres (float, 2 decimals), local slope in degrees (float, 1 decimal).
 
 ## Server -> client messages (JSON text frames on /ws)
@@ -202,6 +202,95 @@ Body `{"text": "...", "rover": "r2"}` (`rover` optional). Returns `{"ok": true, 
 
 Body `{"id": "q3", "option": "reroute"}`. Returns `{"ok": true}`, 404 for an unknown request, 409 if it already expired or was answered.
 
+## Version 4 additions (lifeforms, water, alien spires)
+
+All optional for clients.
+
+### `features` (in `init`; ground truth of static features, for rendering and the Reality overlay)
+
+```json
+{
+  "water": [{"id": "w1", "kind": "lake", "level": -1.4, "outline": [[10.0, 20.0], [14.5, 22.0], [12.0, 26.5]]}],
+  "spires": [{"id": "s1", "x": -12.0, "y": 8.5, "height": 3.2, "radius": 0.35, "standing": true}]
+}
+```
+
+- `water`: liquid bodies (`kind`: `"lake" | "river"`), flat surface at height `level`, `outline` a closed polygon in world metres. LiDAR gets no returns from liquid, so these show up as holes in the rovers' map until a rover identifies them.
+- `spires`: tall alien crystal spires (LiDAR sees them like rocks). `standing` false once one has fallen (see the `spire_fall` hazard).
+
+### Rover additions
+
+- New state `"observing"`: the rover is watching a lifeform from a safe distance.
+- Optional `"track_id"` on the rover: the lifeform track it is observing, or null.
+
+### `lifeforms` (in `init` and every `tick`; ground truth, full list, small)
+
+```json
+[{"id": "l1", "kind": "grazer", "x": 5.2, "y": -14.0, "z": 0.3, "yaw": 0.8, "speed": 0.3, "size": 1.2}]
+```
+
+For rendering creatures (the UI decides when to show them: e.g. when a rover is tracking them, or with Reality on).
+
+### `tracks` (in `init` and every `tick`; what the fleet believes from its sensors)
+
+```json
+[{"id": "k1", "x": 5.0, "y": -13.8, "vx": 0.2, "vy": 0.1, "size": 1.1, "last_seen": 412.3,
+  "observer": "r2", "label": "possible lifeform, six legs, about 1.2 m", "status": "tracking"}]
+```
+
+- A track starts when LiDAR returns move between scans (something that moves on its own). `label` comes from Gemma (camera image) or the rules ("moving object").
+- `status`: `"tracking" | "lost"`. `observer`: the rover currently observing it, or null.
+
+### Fleet additions
+
+- `water_zones`: water the fleet has identified, `[[x, y, radius], ...]` (impassable for every rover).
+- `lifeforms_seen`: count of distinct lifeforms the fleet has confirmed.
+
+### Hazard additions
+
+- New hazard type `"spire_fall"`: a spire topples across a rover's route. Shape: `{"id", "type": "spire_fall", "t", "rover", "spire": "s3", "x0", "y0", "x1", "y1", "active": true}` (base and tip of the fallen spire). Falls over about 1.5 s from `t`.
+- New request type for `POST /api/hazard`: `"lifeform"` moves a small herd of creatures into view of the target rover (a demo convenience; the rovers still have to notice them themselves). Its hazard entry: `{"id", "type": "lifeform", "t", "rover", "x", "y", "active": true}`.
+
+### Point and click placement
+
+`POST /api/hazard` accepts optional `"x"` and `"y"` (world metres, e.g. where the user clicked on the map):
+
+```json
+{"type": "rockfall", "x": 12.5, "y": -30.0}
+```
+
+- `rockfall`, `sand`, `spire_fall` and `lifeform` are placed at (or as close as safely possible to) that point. A rockfall at a point lays its boulders across the route of the nearest rover heading that way if there is one, otherwise as a cluster there. A spire fall topples the nearest standing spire within about 6 m toward the point, or drops a new spire there.
+- `dust_storm` is global and ignores the point. `rover_fault` ignores the point and uses `rover`.
+- 400 with a clear `error` if the point is off the map, on the lander, within 2 m of a rover, or unsuitable (e.g. sand on a steep slope).
+
+## Version 4b additions (sample collection and caching)
+
+All optional for clients.
+
+- Each rover carries a few sample tubes (default 3). Sampling uses an instrument that depends on the target kind: mineral = `"drill"` (core), ice = `"scoop"`, vent = `"sniffer"` (gas), trace = `"swab"`. It takes several sim seconds, then the rover analyses the sample on board.
+- New target kind `"trace"`: organic traces left near lifeform herds (sampling the trace is allowed; the creatures themselves are never sampled).
+- Full tubes must be delivered to the lander's sample cache before more can be taken. Rovers weigh science value against distance, battery and free tubes (and ask Gemma for a second opinion) when deciding what to sample.
+
+Target additions (in `targets[]`):
+
+```json
+{"id": "t3", "kind": "mineral", "status": "sampled", "instrument": "drill", "value": 8,
+ "analysis": "Olivine-rich basalt with water-bearing clays", "carried_by": "r2", "cached": false}
+```
+
+- `value`: science value 1 to 10 once analysed (null before). `analysis`: one short line (null before). `carried_by`: rover carrying the tube, or null. `cached`: true once delivered to the lander.
+
+Rover additions:
+
+```json
+{"samples": ["t3", "t6"], "capacity": 3,
+ "sampling": {"target": "t3", "instrument": "drill", "progress": 0.4}}
+```
+
+- `samples`: target ids in the rover's tubes. `sampling`: present only while an instrument is running.
+
+Fleet additions: `"samples_cached"`, `"samples_carried"` (counts) and `"science_score"` (sum of `value` of cached samples).
+
 ### `GET /api/camera/{rover_id}.jpg`
 
 Live image rendered by MuJoCo from the rover's point of view, at the current sim state.
@@ -226,7 +315,7 @@ Nothing required. The server must ignore any text the client sends.
 | `SEED` | 42 | terrain and target layout |
 | `NUM_ROVERS` | 3 | rovers in the fleet |
 | `SIM_SPEED` | 3.0 | sim seconds per wall second |
-| `MAP_SIZE` | 80 | map width in metres |
+| `MAP_SIZE` | 120 | map width in metres |
 | `GRAVITY_G` | 2.0 | gravity in Earth g |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer (only when running outside Docker) |
 | `BRAIN_BUDGET_MS` | 40 | stated compute budget per rover per decision cycle |

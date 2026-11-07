@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useSim } from '../state/store.js'
-import { fixed } from '../lib/format.js'
+import { fixed, mmss } from '../lib/format.js'
 import { FleetStats } from './FleetStats.jsx'
 import { RoverList } from './RoverList.jsx'
 import { EventLog } from './EventLog.jsx'
 import { CommsPanel } from './Comms.jsx'
 import { PlannerPill } from './Planner.jsx'
+import { SamplesPanel } from './Samples.jsx'
 
 const WORD = 'Redshift'
 const INK = [232, 238, 245]
@@ -31,8 +32,24 @@ function Wordmark() {
   )
 }
 
+// With sample science (v4b) the stats grid shows the score, so sim time moves up here.
+function SimClock() {
+  const t = useSim((s) => s.t)
+  const speed = useSim((s) => s.fleet.sim_speed)
+  return (
+    <div className="facts-time" title="Sim time and speed">
+      <dt>Sim time</dt>
+      <dd>
+        {mmss(t)}
+        {Number.isFinite(speed) && <span className="facts-dim"> {fixed(speed, 0)}x</span>}
+      </dd>
+    </div>
+  )
+}
+
 function WorldFacts() {
   const world = useSim((s) => s.world)
+  const science = useSim((s) => Number.isFinite(s.fleet.science_score))
   const g = Number.isFinite(world?.gravity_g) ? world.gravity_g : Number.isFinite(world?.gravity) ? world.gravity / 9.81 : null
   return (
     <dl className="facts">
@@ -40,7 +57,7 @@ function WorldFacts() {
         <dt>World</dt>
         <dd>{world?.name || '--'}</dd>
       </div>
-      <div>
+      <div className="facts-g">
         <dt>Gravity</dt>
         <dd>{g === null ? '--' : `${fixed(g, 1)} g`}</dd>
       </div>
@@ -48,6 +65,7 @@ function WorldFacts() {
         <dt>Seed</dt>
         <dd>{world?.seed ?? '--'}</dd>
       </div>
+      {science && <SimClock />}
     </dl>
   )
 }
@@ -72,6 +90,13 @@ function useUnread(tab) {
 function LowerTabs({ tab, setTab, onFocusEvent }) {
   const events = useSim((s) => s.events.length)
   const asking = useSim((s) => s.requests.length)
+  // v4b: the Samples tab, when the sim collects samples.
+  const hasSamples = useSim((s) => Number.isFinite(s.fleet.science_score) || Object.values(s.rovers).some((r) => r.capacity))
+  const nSamples = useSim((s) => s.targets.filter((t) => t.status === 'sampled' || t.cached || t.carried_by).length)
+  const tabs = hasSamples ? ['events', 'comms', 'samples'] : ['events', 'comms']
+  useEffect(() => {
+    if (tab === 'samples' && !hasSamples) setTab('events')
+  }, [tab, hasSamples, setTab])
   const unread = useUnread(tab)
   const input = useRef(null)
 
@@ -91,14 +116,15 @@ function LowerTabs({ tab, setTab, onFocusEvent }) {
   const tabKeys = (e) => {
     if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
       e.preventDefault()
-      const next = tab === 'events' ? 'comms' : 'events'
+      const i = tabs.indexOf(tab)
+      const next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length]
       setTab(next)
       document.getElementById(`tab-${next}`)?.focus()
     }
   }
 
   return (
-    <section className="lower" data-tab={tab} aria-label="Event log and operator comms">
+    <section className="lower" data-tab={tab} aria-label="Event log, operator comms and samples">
       <div className="tabs" role="tablist" aria-label="Sidebar" onKeyDown={tabKeys}>
         <button type="button" role="tab" id="tab-events" className="tab" aria-selected={tab === 'events'} aria-controls="panel-events" tabIndex={tab === 'events' ? 0 : -1} onClick={() => setTab('events')}>
           Events
@@ -127,9 +153,16 @@ function LowerTabs({ tab, setTab, onFocusEvent }) {
             )
           )}
         </button>
+        {hasSamples && (
+          <button type="button" role="tab" id="tab-samples" className="tab" aria-selected={tab === 'samples'} aria-controls="panel-samples" tabIndex={tab === 'samples' ? 0 : -1} onClick={() => setTab('samples')} title="Samples taken, best first">
+            Samples
+            {nSamples > 0 && <span className="tab-n">{nSamples}</span>}
+          </button>
+        )}
       </div>
       <EventLog onFocusEvent={onFocusEvent} hidden={tab !== 'events'} />
       <CommsPanel hidden={tab !== 'comms'} inputRef={input} />
+      {hasSamples && <SamplesPanel hidden={tab !== 'samples'} onFocusEvent={onFocusEvent} />}
     </section>
   )
 }

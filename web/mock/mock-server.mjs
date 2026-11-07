@@ -13,13 +13,25 @@
 // numbers, operator chat (POST /api/chat, keyword parsing with refusals and questions)
 // and clarification requests (`requests`, POST /api/answer) after rockfalls, soft sand
 // and once about 40 s after the start, with a wall-clock countdown to the safe default.
+// Version 4 additions: lakes and a river carved into the terrain (LiDAR gets no returns
+// from liquid, so they stay holes until a rover identifies them; `fleet.water_zones`
+// grows as rovers look at more of the water), groves of crystal spires (LiDAR obstacles,
+// `spire_fall` hazard), wandering herds of grazers (`lifeforms`), fleet `tracks` that start
+// when a rover's LiDAR sees something move, a first-sighting question, rovers that switch
+// to "observing" and follow at about 6 m, and point-and-click placement (x, y) for every
+// hazard type with the 400 answers from the protocol.
+// Version 4b additions: sample tubes (3 per rover), instruments by target kind (drill,
+// scoop, sniffer, swab) with progress, on-board analyses with a science value, organic
+// "trace" targets near herds, and deliveries to the lander's sample cache.
 //
 // Run: node mock/mock-server.mjs
 // Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
 //      GEMMA_ENABLED, GEMMA_MODEL, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S,
-//      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_PROTOCOL (2 = a v2 sim)
+//      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
+//      MOCK_PROTOCOL (2 or 3 = an older sim without the later fields)
 // Mock-only test hooks (not part of the protocol): POST /api/_mock/planner {"state"},
-// POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"}.
+// POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"},
+// POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question).
 
 import http from 'node:http'
 import { WebSocketServer } from 'ws'
@@ -28,16 +40,16 @@ const PORT = Number(process.env.PORT || 8000)
 const TICK_HZ = 5
 const SIM_SPEED = Number(process.env.SIM_SPEED || 3)
 const NUM_ROVERS = Math.max(1, Math.min(8, Number(process.env.NUM_ROVERS || 3) | 0))
-const MAP_SIZE = Number(process.env.MAP_SIZE || 80)
+const MAP_SIZE = Number(process.env.MAP_SIZE || 120)
 const GRAVITY_G = Number(process.env.GRAVITY_G || 2)
 const RES = 0.5
 const SENSOR_RADIUS = 10
-const NUM_TARGETS = 6
+const NUM_TARGETS = 8 // plus one organic trace per herd (v4b)
 const INITIAL_SLOPE_LIMIT = 30
 const MIN_SLOPE_LIMIT = 18
 const LANDER = { x: 0, y: 0, radius: 2.5 }
 const ROVER_COLORS = ['#ff7a45', '#ffd23f', '#ff5fa2', '#7cf29a', '#b39dff', '#4dd0e1', '#f4f4f4', '#ffa8a8']
-const KIND_LABEL = { mineral: 'mineral deposit', ice: 'ice patch', vent: 'thermal vent' }
+const KIND_LABEL = { mineral: 'mineral deposit', ice: 'ice patch', vent: 'thermal vent', trace: 'organic trace' }
 
 // Version 2: sensors, edge budget and hazards.
 const LIDAR_RANGE = 8
@@ -52,7 +64,6 @@ const CYCLE_MS = 200
 const BRAIN_WINDOW_S = 10
 const DUST_S = 90
 const FAULT_S = 90
-const HAZARD_TYPES = ['rockfall', 'sand', 'dust_storm', 'rover_fault']
 
 // Version 3: local Gemma planner, operator chat and clarification requests.
 const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma4:e2b'
@@ -60,7 +71,47 @@ const GEMMA_BUDGET_MS = Number(process.env.GEMMA_BUDGET_MS || 3000)
 const GEMMA_WARMUP_S = Number(process.env.MOCK_GEMMA_WARMUP_S || 10)
 const OPERATOR_TIMEOUT_S = Number(process.env.OPERATOR_TIMEOUT_S || 20)
 const FIRST_QUESTION_S = Number(process.env.MOCK_FIRST_QUESTION_S || 40)
-const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 3) // 2 = behave like a version 2 sim (no v3 fields or endpoints)
+const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 4) // 2 or 3 = behave like an older sim (no later fields or endpoints)
+const HAZARD_TYPES = ['rockfall', 'sand', 'dust_storm', 'rover_fault', ...(PROTOCOL >= 4 ? ['spire_fall', 'lifeform'] : [])]
+
+// Version 4: water, spires, lifeforms and tracks.
+const IDENTIFY_RANGE = 4.5 // m from the water's edge at which a rover works out it is liquid
+const COVER_SPACING = 3.4 // water_zones are discs on this grid over each body of water
+const COVER_RADIUS = 3.1
+const TRACK_LOST_S = 6 // sim s without a LiDAR sighting before a track is lost
+const TRACK_DROP_S = 30 // and then dropped
+const OBSERVE_DIST = 6
+const OBSERVE_S = 45
+const MAX_LIFEFORMS = 30
+
+// Version 4b: sample collection.
+const TUBES = 3
+const INSTRUMENT_FOR = { mineral: 'drill', ice: 'scoop', vent: 'sniffer', trace: 'swab' }
+const SAMPLE_SCALE = Math.max(0.1, Number(process.env.MOCK_SAMPLE_SCALE || 1)) // mock only: longer sampling for screenshots on slow machines
+const SAMPLE_S = Object.fromEntries(Object.entries({ drill: 16, scoop: 9, sniffer: 11, swab: 7 }).map(([k, v]) => [k, Math.round(v * SAMPLE_SCALE)]))
+const ANALYSES = {
+  mineral: [
+    [8, 'Olivine-rich basalt with water-bearing clays'],
+    [6, 'Iron oxide crust over fine-grained basalt'],
+    [9, 'Layered sulfates: long-lived standing water'],
+    [4, 'Plain basalt, heavily weathered'],
+  ],
+  ice: [
+    [7, 'Water ice with 3% perchlorate salts'],
+    [9, 'Clean water ice, trapped gas bubbles'],
+    [5, 'Frost over dusty regolith'],
+  ],
+  vent: [
+    [8, 'Methane and hydrogen sulfide, warm outflow'],
+    [6, 'Sulfur dioxide plume, 41 C at the mouth'],
+    [3, 'Mostly carbon dioxide, faint heat'],
+  ],
+  trace: [
+    [10, 'Complex organics: amino-acid-like chains'],
+    [9, 'Mucus-like film with cell-sized structures'],
+    [7, 'Organic-rich droppings, high nitrogen'],
+  ],
+}
 const ENERGY_PER_M = 0.0064 // battery fraction per metre driven (0.0032 per s at about 0.5 m/s)
 const BATTERY_RESERVE = 0.2
 const wallNow = () => performance.now() / 1000
@@ -142,6 +193,30 @@ function fbm(noise, x, y, octaves, gain) {
   return sum / norm
 }
 
+// Plane geometry for water outlines and fallen spires.
+function pointInPoly(x, y, poly) {
+  let inside = false
+  for (let a = 0, b = poly.length - 1; a < poly.length; b = a++) {
+    const [xa, ya] = poly[a]
+    const [xb, yb] = poly[b]
+    if (ya > y !== yb > y && x < ((xb - xa) * (y - ya)) / (yb - ya) + xa) inside = !inside
+  }
+  return inside
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax
+  const dy = by - ay
+  const len2 = dx * dx + dy * dy || 1e-9
+  const t = clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1)
+  return Math.hypot(ax + dx * t - px, ay + dy * t - py)
+}
+function distToPoly(x, y, poly) {
+  let d = Infinity
+  for (let a = 0, b = poly.length - 1; a < poly.length; b = a++) d = Math.min(d, segDist(x, y, poly[b][0], poly[b][1], poly[a][0], poly[a][1]))
+  return d
+}
+const compass = (dx, dy) => ['east', 'north-east', 'north', 'north-west', 'west', 'south-west', 'south', 'south-east'][((Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) % 8) + 8) % 8]
+
 // ---------------------------------------------------------------------------
 // World generation
 
@@ -220,6 +295,20 @@ function generateWorld(seed) {
     }
   }
 
+  // v4: two lakes and a short river, carved into the terrain at a flat water level.
+  const water = PROTOCOL >= 4 ? carveWater(rand, heights, n, ox, oy) : []
+  const waterId = new Int8Array(n * n).fill(-1)
+  water.forEach((w, wi) => {
+    const xs = w.outline.map((p) => p[0])
+    const ys = w.outline.map((p) => p[1])
+    for (let j = Math.max(0, Math.floor((Math.min(...ys) - oy) / RES)); j <= Math.min(n - 1, Math.ceil((Math.max(...ys) - oy) / RES)); j++) {
+      for (let i = Math.max(0, Math.floor((Math.min(...xs) - ox) / RES)); i <= Math.min(n - 1, Math.ceil((Math.max(...xs) - ox) / RES)); i++) {
+        if (pointInPoly(ox + i * RES, oy + j * RES, w.outline)) waterId[j * n + i] = wi
+      }
+    }
+  })
+  const nearWater = (x, y, d) => water.some((w) => pointInPoly(x, y, w.outline) || distToPoly(x, y, w.outline) < d)
+
   const slopes = computeSlopes(heights, n, RES)
   let minH = Infinity
   let maxH = -Infinity
@@ -243,10 +332,209 @@ function generateWorld(seed) {
     const j = Math.round((y - oy) / RES)
     if (slopes[j * n + i] > 16) continue
     if (targets.some((t) => Math.hypot(t.x - x, t.y - y) < 9)) continue
+    if (nearWater(x, y, 2.5)) continue
     targets.push({ id: `t${targets.length + 1}`, x: r1(x), y: r1(y), kind: kinds[targets.length] })
   }
 
-  return { seed, n, ox, oy, heights, slopes, minH, maxH, targets }
+  const slopeAtXY = (x, y) => slopes[clamp(Math.round((y - oy) / RES), 0, n - 1) * n + clamp(Math.round((x - ox) / RES), 0, n - 1)]
+  const dry = (x, y, minLander, maxSlope) =>
+    Math.abs(x) < half - 5 && Math.abs(y) < half - 5 && Math.hypot(x - LANDER.x, y - LANDER.y) > minLander && slopeAtXY(x, y) <= maxSlope && !nearWater(x, y, 2)
+
+  // v4: groves of crystal spires (the first one close to the lander, so it shows early).
+  const spires = []
+  if (PROTOCOL >= 4) {
+    for (let g = 0; g < 4; g++) {
+      let c = null
+      for (let tries = 0; tries < 200 && !c; tries++) {
+        const a = rand() * Math.PI * 2
+        const d = g === 0 ? 11 + rand() * 4 : 18 + rand() * 30
+        const x = Math.cos(a) * d
+        const y = Math.sin(a) * d
+        if (dry(x, y, 9, 20) && targets.every((t) => Math.hypot(t.x - x, t.y - y) > 5)) c = [x, y]
+      }
+      if (!c) continue
+      const count = 3 + Math.floor(rand() * 3)
+      for (let k = 0, tries = 0; k < count && tries < 80; tries++) {
+        const a = rand() * Math.PI * 2
+        const d = k === 0 ? 0 : 1.6 + rand() * 3.6
+        const x = c[0] + Math.cos(a) * d
+        const y = c[1] + Math.sin(a) * d
+        if (!dry(x, y, 8, 22) || spires.some((q) => Math.hypot(q.x - x, q.y - y) < 2.2) || targets.some((t) => Math.hypot(t.x - x, t.y - y) < 2.5)) continue
+        spires.push({ id: `s${spires.length + 1}`, x: r1(x), y: r1(y), height: r1(2.2 + rand() * 2.2), radius: r2(0.28 + rand() * 0.17), standing: true })
+        k++
+      }
+    }
+  }
+
+  // v4: herds of grazers, and (v4b) the organic traces they leave behind.
+  const herds = []
+  if (PROTOCOL >= 4) {
+    for (let h = 0; h < 3; h++) {
+      let c = null
+      for (let tries = 0; tries < 300 && !c; tries++) {
+        const a = rand() * Math.PI * 2
+        const d = 26 + rand() * 20
+        const x = Math.cos(a) * d
+        const y = Math.sin(a) * d
+        if (dry(x, y, 14, 16) && !nearWater(x, y, 5) && herds.every((q) => Math.hypot(q.cx - x, q.cy - y) > 16)) c = [x, y]
+      }
+      if (!c) continue
+      herds.push({ cx: c[0], cy: c[1], count: 3 + Math.floor(rand() * 3) })
+      for (let tries = 0; tries < 60; tries++) {
+        const a = rand() * Math.PI * 2
+        const d = 2 + rand() * 3
+        const x = c[0] + Math.cos(a) * d
+        const y = c[1] + Math.sin(a) * d
+        if (!dry(x, y, 12, 16) || targets.some((t) => Math.hypot(t.x - x, t.y - y) < 4)) continue
+        targets.push({ id: `t${targets.length + 1}`, x: r1(x), y: r1(y), kind: 'trace' })
+        break
+      }
+    }
+  }
+
+  // Discs over each body of water: what water_zones is built from as rovers identify it.
+  const cover = water.map((w) => {
+    const out = []
+    const xs = w.outline.map((p) => p[0])
+    const ys = w.outline.map((p) => p[1])
+    for (let y = Math.min(...ys); y <= Math.max(...ys); y += COVER_SPACING) {
+      for (let x = Math.min(...xs); x <= Math.max(...xs); x += COVER_SPACING) {
+        if (pointInPoly(x, y, w.outline)) out.push({ x: r1(x), y: r1(y), r: COVER_RADIUS, seen: false })
+      }
+    }
+    let acc = 99
+    for (let k = 0; k < w.outline.length; k++) {
+      const [ax, ay] = w.outline[k]
+      const [bx, by] = w.outline[(k + 1) % w.outline.length]
+      acc += Math.hypot(bx - ax, by - ay)
+      if (acc < 2.8) continue
+      acc = 0
+      if (out.some((c) => Math.hypot(c.x - ax, c.y - ay) < 1.6)) continue
+      out.push({ x: r1(ax), y: r1(ay), r: r1(COVER_RADIUS * 0.75), seen: false })
+    }
+    return out
+  })
+
+  return { seed, n, ox, oy, heights, slopes, minH, maxH, targets, water, waterId, cover, spires, herds }
+}
+
+// Carves the lakes and the river; returns [{ id, kind, level, outline }].
+function carveWater(rand, heights, n, ox, oy) {
+  const half = MAP_SIZE / 2
+  const orig = Float32Array.from(heights)
+  const hAt = (x, y) => orig[clamp(Math.round((y - oy) / RES), 0, n - 1) * n + clamp(Math.round((x - ox) / RES), 0, n - 1)]
+  const out = []
+  const used = []
+  const pickDir = () => {
+    for (let tries = 0; tries < 100; tries++) {
+      const a = rand() * Math.PI * 2
+      if (used.every((b) => Math.abs(wrapAngle(a - b)) > 1.4)) {
+        used.push(a)
+        return a
+      }
+    }
+    return rand() * Math.PI * 2
+  }
+  const each = (x0, x1, y0, y1, fn) => {
+    for (let j = Math.max(0, Math.floor((y0 - oy) / RES)); j <= Math.min(n - 1, Math.ceil((y1 - oy) / RES)); j++) {
+      for (let i = Math.max(0, Math.floor((x0 - ox) / RES)); i <= Math.min(n - 1, Math.ceil((x1 - ox) / RES)); i++) fn(i, j, ox + i * RES, oy + j * RES, j * n + i)
+    }
+  }
+  // Lakes: a wobbly outline, a bowl under it and a beach that rises back to the terrain.
+  const lakes = [
+    [19 + rand() * 4, 6 + rand() * 2],
+    [33 + rand() * 8, 6.5 + rand() * 3],
+  ]
+  for (const [dist, R] of lakes) {
+    const a = pickDir()
+    const lim = half - R * 1.5 - 6
+    const cx = clamp(Math.cos(a) * dist, -lim, lim)
+    const cy = clamp(Math.sin(a) * dist, -lim, lim)
+    const p1 = rand() * 6.28
+    const p2 = rand() * 6.28
+    const a1 = 0.14 + rand() * 0.1
+    const a2 = 0.06 + rand() * 0.06
+    const rAt = (th) => R * (1 + a1 * Math.sin(3 * th + p1) + a2 * Math.sin(5 * th + p2))
+    const outline = []
+    let ring = 0
+    for (let k = 0; k < 44; k++) {
+      const th = (k / 44) * Math.PI * 2
+      const r = rAt(th)
+      outline.push([r1(cx + Math.cos(th) * r), r1(cy + Math.sin(th) * r)])
+      ring += hAt(cx + Math.cos(th) * r * 1.2, cy + Math.sin(th) * r * 1.2)
+    }
+    const level = r2(ring / 44 - 0.1)
+    const ext = R * 1.4 * 1.7
+    each(cx - ext, cx + ext, cy - ext, cy + ext, (i, j, x, y, k) => {
+      const q = Math.hypot(x - cx, y - cy) / rAt(Math.atan2(y - cy, x - cx))
+      if (pointInPoly(x, y, outline)) heights[k] = Math.min(heights[k], level - 0.2 - 1.5 * (1 - Math.min(1, q) ** 2))
+      else if (q < 1.6) {
+        const qq = Math.max(1, q)
+        heights[k] = Math.max(level + 0.05, lerp(level + 0.08 + 0.5 * (qq - 1), heights[k], smoothstep(1, 1.6, qq)))
+      }
+    })
+    out.push({ id: `w${out.length + 1}`, kind: 'lake', level, outline })
+  }
+  // A short river: a bending channel with banks.
+  {
+    const a = pickDir()
+    const d = 30 + rand() * 8
+    let x = Math.cos(a) * d
+    let y = Math.sin(a) * d
+    let heading = a + Math.PI / 2 + (rand() - 0.5)
+    const pts = [[x, y]]
+    for (let k = 0; k < 5; k++) {
+      heading += (rand() - 0.5) * 0.7
+      x = clamp(x + Math.cos(heading) * 6.5, -half + 8, half - 8)
+      y = clamp(y + Math.sin(heading) * 6.5, -half + 8, half - 8)
+      pts.push([x, y])
+    }
+    // Resample the centre line every metre, with a width that tapers at both ends.
+    const line = []
+    for (let k = 0; k < pts.length - 1; k++) {
+      const steps = Math.ceil(Math.hypot(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1]))
+      for (let q = 0; q < steps; q++) line.push([lerp(pts[k][0], pts[k + 1][0], q / steps), lerp(pts[k][1], pts[k + 1][1], q / steps)])
+    }
+    line.push(pts[pts.length - 1])
+    const W = 1.5 + rand() * 0.4
+    const width = (t) => W * (0.55 + 0.45 * Math.sin(Math.PI * clamp(t, 0, 1)))
+    const left = []
+    const right = []
+    let sum = 0
+    line.forEach(([px, py], k) => {
+      const [ax, ay] = line[Math.max(0, k - 1)]
+      const [bx, by] = line[Math.min(line.length - 1, k + 1)]
+      const len = Math.hypot(bx - ax, by - ay) || 1
+      const nx = -(by - ay) / len
+      const ny = (bx - ax) / len
+      const w = width(k / (line.length - 1))
+      if (k % 2 === 0 || k === line.length - 1) {
+        left.push([r1(px + nx * w), r1(py + ny * w)])
+        right.push([r1(px - nx * w), r1(py - ny * w)])
+      }
+      sum += hAt(px, py)
+    })
+    const outline = [...left, ...right.reverse()]
+    const level = r2(sum / line.length - 0.15)
+    const xs = line.map((p) => p[0])
+    const ys = line.map((p) => p[1])
+    each(Math.min(...xs) - W - 3, Math.max(...xs) + W + 3, Math.min(...ys) - W - 3, Math.max(...ys) + W + 3, (i, j, px, py, k) => {
+      let best = Infinity
+      let bt = 0
+      for (let q = 0; q < line.length - 1; q++) {
+        const dd = segDist(px, py, line[q][0], line[q][1], line[q + 1][0], line[q + 1][1])
+        if (dd < best) {
+          best = dd
+          bt = q / (line.length - 1)
+        }
+      }
+      const w = width(bt)
+      if (pointInPoly(px, py, outline)) heights[k] = Math.min(heights[k], level - 0.2 - 0.6 * (1 - Math.min(1, best / w) ** 2))
+      else if (best < w + 2.5) heights[k] = Math.max(level + 0.05, lerp(level + 0.08 + 0.4 * (best - w), heights[k], smoothstep(w, w + 2.5, best)))
+    })
+    out.push({ id: `w${out.length + 1}`, kind: 'river', level, outline })
+  }
+  return out
 }
 
 function computeSlopes(heights, n, res) {
@@ -384,7 +672,24 @@ function newSim(seed) {
     nextRequest: 1,
     firstQuestionAt: wallNow() + FIRST_QUESTION_S,
     firstAsked: false,
+    // v4
+    waterSeen: new Uint8Array(n * n), // water cells inside identified zones (count as explored)
+    waterSeenCount: 0,
+    waterZones: [], // [x, y, r] the fleet has identified
+    identified: new Set(), // water body indices
+    spireSeen: new Set(),
+    lifeforms: [],
+    herds: [],
+    nextLife: 1,
+    tracks: [],
+    nextTrack: 1,
+    lifeConfirmed: new Set(), // lifeform ids the fleet has confirmed
+    firstLifeAsked: false,
+    nextSpire: world.spires.length + 1,
+    featuresVersion: 0, // bumped when a spire falls or appears: the next tick resends `features`
+    featuresSent: 0,
   }
+  for (const h of world.herds) spawnHerd(h.cx, h.cy, h.count)
   for (let r = 0; r < NUM_ROVERS; r++) {
     const a = (r / NUM_ROVERS) * Math.PI * 2 + Math.PI / 6
     const x = LANDER.x + Math.cos(a) * 3.4
@@ -421,6 +726,14 @@ function newSim(seed) {
       hold: false, // told to hold (operator, or "wait" as an answer)
       holdUntil: null,
       slowUntil: -999,
+      // v4
+      trackId: null,
+      observeMode: null, // 'follow' | 'watch'
+      observeUntil: 0,
+      observeReplanT: 0,
+      // v4b
+      samples: [],
+      sampling: null, // { target, instrument, progress, total }
     })
   }
   addEvent(null, 'info', `Survey started. ${NUM_ROVERS} rover${NUM_ROVERS === 1 ? '' : 's'} deployed from the lander.`)
@@ -488,6 +801,7 @@ function sense(rover) {
       if (!inMap(i, j)) continue
       const k = idx(i, j)
       if (sim.known[k]) continue
+      if (world.waterId[k] >= 0) continue // v4: no LiDAR returns from liquid
       sim.known[k] = 1
       sim.knownCount++
       const h = r2(world.heights[k] + gaussian(sim.rand) * 0.015)
@@ -495,6 +809,10 @@ function sense(rover) {
       sim.mslope[k] = world.slopes[k]
       sim.pendingCells.push([i, j, h, r1(world.slopes[k])])
     }
+  }
+  if (PROTOCOL >= 4) {
+    senseSpires(rover)
+    senseWater(rover)
   }
   for (const t of world.targets) {
     if (sim.discovered.has(t.id)) continue
@@ -505,19 +823,140 @@ function sense(rover) {
   }
 }
 
+// v4: spires are LiDAR obstacles. Their footprint goes into the shared map as steep
+// ground (the height stays the ground's, so the crystal is not buried in a terrain spike).
+function markFootprint(cells, x0, y0, x1, y1, r) {
+  const R = Math.ceil((Math.hypot(x1 - x0, y1 - y0) / 2 + r + 0.4) / RES)
+  const ci = toI((x0 + x1) / 2)
+  const cj = toJ((y0 + y1) / 2)
+  for (let dj = -R; dj <= R; dj++) {
+    for (let di = -R; di <= R; di++) {
+      const i = ci + di
+      const j = cj + dj
+      if (!inMap(i, j)) continue
+      const d = segDist(world.ox + i * RES, world.oy + j * RES, x0, y0, x1, y1)
+      if (d > r + 0.15) continue
+      const k = idx(i, j)
+      if (world.waterId[k] >= 0) continue
+      if (!sim.known[k]) {
+        sim.known[k] = 1
+        sim.knownCount++
+        sim.measured[k] = r2(world.heights[k])
+      }
+      sim.mslope[k] = Math.max(sim.mslope[k], 46 - d * 6)
+      cells.push([i, j, sim.measured[k], r1(sim.mslope[k])])
+    }
+  }
+}
+
+function spireSegment(sp) {
+  if (sp.standing) return [sp.x, sp.y, sp.x, sp.y]
+  return [sp.x0 ?? sp.x, sp.y0 ?? sp.y, sp.x1 ?? sp.x, sp.y1 ?? sp.y]
+}
+
+function senseSpires(rover) {
+  const range = lidarRange()
+  for (const sp of world.spires) {
+    if (sp.fallT && sim.t < sp.fallT) continue // still falling
+    const [x0, y0, x1, y1] = spireSegment(sp)
+    const key = `${sp.id}:${sp.standing ? 'up' : 'down'}`
+    if (sim.spireSeen.has(key) || segDist(rover.x, rover.y, x0, y0, x1, y1) > range) continue
+    sim.spireSeen.add(key)
+    markFootprint(sim.pendingCells, x0, y0, x1, y1, sp.radius)
+    if (!sp.standing) {
+      const dist = Math.round(segDist(rover.x, rover.y, x0, y0, x1, y1))
+      const blocking = rover.path.length && pathNear(rover, (x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + 1)
+      const changed = replanAround((x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + 1.2)
+      rover.reactedAt = sim.t
+      addEvent(
+        rover.id,
+        'warn',
+        blocking || changed.includes(rover)
+          ? `LiDAR: a ${r1(Math.hypot(x1 - x0, y1 - y0))} m spire now lies across the route ${dist} m ahead. Marked it impassable and replanned.`
+          : `LiDAR: a fallen spire ${dist} m away, ${r1(Math.hypot(x1 - x0, y1 - y0))} m long. Marked it on the shared map.`,
+        [(x0 + x1) / 2, (y0 + y1) / 2],
+      )
+    }
+  }
+}
+
+// v4: a rover close to a LiDAR hole looks at it (camera, or the rules: flat edges all at
+// one height) and works out it is liquid. The identified area grows as rovers see more.
+function senseWater(rover) {
+  world.water.forEach((w, wi) => {
+    const cover = world.cover[wi]
+    if (!sim.identified.has(wi)) {
+      if (distToPoly(rover.x, rover.y, w.outline) > IDENTIFY_RANGE && !pointInPoly(rover.x, rover.y, w.outline)) return
+      sim.identified.add(wi)
+      revealCover(wi, rover, SENSOR_RADIUS)
+      const xs = w.outline.map((p) => p[0])
+      const ys = w.outline.map((p) => p[1])
+      const across = Math.round(Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)))
+      const near = cover.filter((c) => c.seen).sort((a, b) => Math.hypot(a.x - rover.x, a.y - rover.y) - Math.hypot(b.x - rover.x, b.y - rover.y))[0]
+      const at = near ? [near.x, near.y] : [rover.x, rover.y]
+      const what = w.kind === 'river' ? 'a stream' : 'a lake'
+      const g = gemmaCall('vision')
+      rover.reactedAt = sim.t
+      const changed = replanAround(at[0], at[1], 6)
+      if (g.ok) {
+        later(g.ms, () =>
+          addEvent(rover.id, 'discovery', `No LiDAR returns over a patch about ${across} m across, and the camera shows a flat, rippling surface: liquid water, ${what}. Marked impassable for the fleet.`, at, 'gemma'),
+        )
+      } else {
+        addEvent(rover.id, 'discovery', `No LiDAR returns over a patch about ${across} m across, edges all at the same height: treating it as liquid (${what}). Marked impassable.`, at)
+      }
+      if (changed.some((r) => r !== rover)) addEvent(null, 'info', `${changed.filter((r) => r !== rover).map((r) => r.id).join(' and ')} replanned around the water.`, at)
+      return
+    }
+    revealCover(wi, rover, SENSOR_RADIUS)
+  })
+}
+
+function revealCover(wi, rover, range) {
+  const w = world.water[wi]
+  for (const c of world.cover[wi]) {
+    if (c.seen || Math.hypot(c.x - rover.x, c.y - rover.y) > range) continue
+    c.seen = true
+    sim.waterZones.push([c.x, c.y, c.r])
+    // The water cells under the disc now count as explored.
+    const R = Math.ceil(c.r / RES)
+    for (let dj = -R; dj <= R; dj++) {
+      for (let di = -R; di <= R; di++) {
+        const i = toI(c.x) + di
+        const j = toJ(c.y) + dj
+        if (!inMap(i, j) || di * di + dj * dj > R * R) continue
+        const k = idx(i, j)
+        if (world.waterId[k] === wi && !sim.waterSeen[k]) {
+          sim.waterSeen[k] = 1
+          sim.waterSeenCount++
+        }
+      }
+    }
+  }
+  void w
+}
+
+const waterAt = (x, y) => {
+  const i = toI(x)
+  const j = toJ(y)
+  return inMap(i, j) ? world.waterId[idx(i, j)] : -1
+}
+
 function computeFrontiers() {
   const n = world.n
   const bucket = 6
   const buckets = new Map()
+  // Unknown but identified water is not unexplored: no frontier along a lake shore.
+  const open = (k) => !sim.known[k] && !sim.waterSeen[k]
   for (let j = 0; j < n; j++) {
     for (let i = 0; i < n; i++) {
       const k = j * n + i
       if (!sim.known[k]) continue
       const edge =
-        (i > 0 && !sim.known[k - 1]) ||
-        (i < n - 1 && !sim.known[k + 1]) ||
-        (j > 0 && !sim.known[k - n]) ||
-        (j < n - 1 && !sim.known[k + n])
+        (i > 0 && open(k - 1)) ||
+        (i < n - 1 && open(k + 1)) ||
+        (j > 0 && open(k - n)) ||
+        (j < n - 1 && open(k + n))
       if (!edge) continue
       const x = world.ox + i * RES
       const y = world.oy + j * RES
@@ -546,6 +985,15 @@ function knownObstacles(self) {
   for (const rk of sim.rocks) if (rk.seen) out.push([rk.x, rk.y, rk.r + 0.8])
   for (const z of sim.softZones) out.push([z[0], z[1], z[2] + 0.6])
   for (const r of sim.rovers) if (r !== self && r.state === 'fault') out.push([r.x, r.y, 1.7])
+  // v4: identified water, and spires the LiDAR has seen (fallen ones as a row of discs).
+  for (const z of sim.waterZones) out.push([z[0], z[1], z[2] + 0.3])
+  for (const sp of world.spires) {
+    if (!sim.spireSeen.has(`${sp.id}:${sp.standing ? 'up' : 'down'}`)) continue
+    const [x0, y0, x1, y1] = spireSegment(sp)
+    const len = Math.hypot(x1 - x0, y1 - y0)
+    const steps = Math.max(1, Math.ceil(len / 0.8))
+    for (let q = 0; q <= steps; q++) out.push([lerp(x0, x1, q / steps), lerp(y0, y1, q / steps), sp.radius + 0.7])
+  }
   return out
 }
 
@@ -701,9 +1149,27 @@ function routeMaxSlope(rover) {
 
 function chooseExplorationGoal(rover) {
   // An unclaimed discovered target nearby wins over plain exploration.
-  for (const t of sim.discovered.values()) {
-    if (t.status === 'sampled' || t.assigned) continue
-    if (Math.hypot(t.x - rover.x, t.y - rover.y) < 30 && rover.battery > 0.45) {
+  const free = PROTOCOL >= 4 ? TUBES - rover.samples.length : 1
+  if (free <= 0 && rover.samples.length) {
+    startReturn(rover, `All ${TUBES} tubes full. Heading to the lander to cache the samples.`)
+    return true
+  }
+  // v4b: traces (highest expected value) first, then the closest.
+  const open = [...sim.discovered.values()].filter((t) => t.status !== 'sampled' && !t.assigned && Math.hypot(t.x - rover.x, t.y - rover.y) < 30)
+  open.sort((a, b) => (b.kind === 'trace') - (a.kind === 'trace') || Math.hypot(a.x - rover.x, a.y - rover.y) - Math.hypot(b.x - rover.x, b.y - rover.y))
+  if (PROTOCOL >= 4 && open.length > 1 && rover.battery > 0.45 && free > 0 && sim.t - rover.lastGoalEventT > 20) {
+    const [a, b] = open
+    const g = gemmaCall('choice')
+    if (g.ok) {
+      const da = Math.round(Math.hypot(a.x - rover.x, a.y - rover.y))
+      const db = Math.round(Math.hypot(b.x - rover.x, b.y - rover.y))
+      later(g.ms, () =>
+        addEvent(rover.id, 'info', `Second opinion: sample the ${KIND_LABEL[a.kind]} ${a.id} (${da} m) before the ${KIND_LABEL[b.kind]} ${b.id} (${db} m). ${free} free tube${free === 1 ? '' : 's'}, battery ${Math.round(rover.battery * 100)}%.`, null, 'gemma'),
+      )
+    }
+  }
+  for (const t of open) {
+    if (rover.battery > 0.45 && free > 0) {
       if (setGoal(rover, t.x, t.y, 'investigating', `Heading to the ${KIND_LABEL[t.kind]} found by ${t.found_by === rover.id ? 'this rover' : nameOf(t.found_by)}.`)) {
         t.assigned = rover.id
         rover.targetId = t.id
@@ -766,6 +1232,7 @@ function dockPoint(rover) {
 }
 
 function releaseTarget(rover) {
+  rover.sampling = null
   if (!rover.targetId) return
   const t = sim.discovered.get(rover.targetId)
   if (t && t.status !== 'sampled') {
@@ -833,10 +1300,153 @@ function drive(rover, dt, maxSpeed) {
     if (!rock.seen) markRocksSeen(rover, [rock])
     return false
   }
+  if (PROTOCOL >= 4) {
+    // Liquid stops the wheels at the shore: reveal what is in view and go around.
+    const wi = waterAt(nx, ny)
+    if (wi >= 0) {
+      rover.speed = 0
+      revealCover(wi, rover, SENSOR_RADIUS)
+      bumpReplan(rover)
+      return false
+    }
+    for (const sp of world.spires) {
+      if (sp.fallT && sim.t < sp.fallT) continue
+      const [x0, y0, x1, y1] = spireSegment(sp)
+      if (segDist(nx, ny, x0, y0, x1, y1) < sp.radius + 0.5) {
+        rover.speed = 0
+        sim.spireSeen.add(`${sp.id}:${sp.standing ? 'up' : 'down'}`)
+        bumpReplan(rover)
+        return false
+      }
+    }
+  }
   const lim = MAP_SIZE / 2 - 1
   rover.x = clamp(nx, -lim, lim)
   rover.y = clamp(ny, -lim, lim)
   return false
+}
+
+// Blocked by something the map did not show: plan again, or give the goal up.
+function bumpReplan(rover) {
+  if (sim.t - (rover.bumpT ?? -99) < 1.5) return
+  rover.bumpT = sim.t
+  if (rover.state === 'observing') {
+    rover.observeReplanT = 0
+    return
+  }
+  if (rover.goal && setGoal(rover, rover.goal[0], rover.goal[1], rover.state)) return
+  releaseTarget(rover)
+  Object.assign(rover, { goal: null, path: [], state: 'idle', timer: 0.5 })
+}
+
+function faceToward(rover, x, y, dt) {
+  const diff = wrapAngle(Math.atan2(y - rover.y, x - rover.x) - rover.yaw)
+  rover.yaw = wrapAngle(rover.yaw + clamp(diff, -1.1 * dt, 1.1 * dt))
+}
+
+// ---------------------------------------------------------------- v4: observing a lifeform
+
+function startObserve(rover, track, mode) {
+  releaseTarget(rover)
+  if (rover.trackId && rover.trackId !== track.id) {
+    const old = sim.tracks.find((q) => q.id === rover.trackId)
+    if (old && old.observer === rover.id) old.observer = null
+  }
+  Object.assign(rover, { state: 'observing', trackId: track.id, observeMode: mode, observeUntil: sim.t + OBSERVE_S, observeReplanT: 0, path: [], goal: null })
+  track.observer = rover.id
+}
+
+function endObserve(rover, why) {
+  const k = sim.tracks.find((q) => q.id === rover.trackId)
+  if (k && k.observer === rover.id) k.observer = null
+  const id = rover.trackId
+  Object.assign(rover, { trackId: null, observeMode: null, state: 'idle', timer: 1, path: [], goal: null })
+  rover.lastGoalEventT = sim.t
+  if (why === 'lost') addEvent(rover.id, 'info', `Lost sight of ${id}: no moving returns for ${TRACK_LOST_S} s. Back to exploring.`)
+  else if (why === 'battery') addEvent(rover.id, 'info', `Battery at ${Math.round(rover.battery * 100)}%. Stopped observing ${id} to save power.`)
+  else if (why === 'done') addEvent(rover.id, 'info', `Observed ${id} for ${OBSERVE_S} s: gait, size and grazing logged. Back to exploring.`)
+}
+
+function stepObserve(rover, dt) {
+  const k = sim.tracks.find((q) => q.id === rover.trackId)
+  const life = k && sim.lifeforms.find((l) => l.id === k.lifeId)
+  if (!k || !life || k.status === 'lost') return endObserve(rover, 'lost')
+  if (lowBattery(rover, 0.3)) {
+    endObserve(rover, 'battery')
+    return startReturn(rover)
+  }
+  if (sim.t > rover.observeUntil && !rover.request) return endObserve(rover, 'done')
+  const dx = rover.x - life.x
+  const dy = rover.y - life.y
+  const d = Math.hypot(dx, dy) || 1
+  const follow = rover.observeMode === 'follow' && !rover.request && !rover.hold
+  if (follow && (d > OBSERVE_DIST + 1.3 || d < OBSERVE_DIST - 1.6)) {
+    const tx = life.x + (dx / d) * OBSERVE_DIST
+    const ty = life.y + (dy / d) * OBSERVE_DIST
+    if (sim.t > rover.observeReplanT || !rover.path.length) {
+      rover.observeReplanT = sim.t + 2.5
+      const path = planPath(rover.x, rover.y, tx, ty, rover)
+      if (path) {
+        rover.path = path
+        rover.goal = [r1(tx), r1(ty)]
+        rover.replannedAt = sim.t
+      }
+    }
+    drive(rover, dt, 0.45)
+  } else {
+    rover.path = []
+    rover.goal = null
+    rover.speed = Math.max(0, rover.speed - dt * 1.5)
+    faceToward(rover, life.x, life.y, dt)
+  }
+}
+
+// ---------------------------------------------------------------- v4b: samples
+
+function scienceScore() {
+  let sum = 0
+  for (const t of sim.discovered.values()) if (t.cached && Number.isFinite(t.value)) sum += t.value
+  return sum
+}
+
+function finishSample(rover, t) {
+  const instrument = rover.sampling.instrument
+  rover.sampling = null
+  t.status = 'sampled'
+  t.instrument = instrument
+  t.carried_by = rover.id
+  t.cached = false
+  rover.samples.push(t.id)
+  const list = ANALYSES[t.kind] || ANALYSES.mineral
+  const [value, analysis] = list[Math.floor(sim.rand() * list.length)]
+  const g = gemmaCall('vision')
+  const tubes = rover.samples.length
+  later(g.ok ? g.ms : 250, () => {
+    t.value = value
+    t.analysis = analysis
+    addEvent(rover.id, 'discovery', `Analysed the ${INSTRUMENT_FOR[t.kind] || 'drill'} sample from the ${KIND_LABEL[t.kind]}: ${analysis}. Science value ${value}/10. Tube ${tubes} of ${TUBES}.`, [t.x, t.y], g.ok ? 'gemma' : null)
+  })
+  rover.targetId = null
+  rover.goal = null
+  rover.state = 'idle'
+  rover.timer = 1
+  if (rover.samples.length >= TUBES) startReturn(rover, `All ${TUBES} tubes full. Heading to the lander to cache the samples.`)
+}
+
+function deliverSamples(rover) {
+  if (!rover.samples.length) return 0
+  const n = rover.samples.length
+  for (const id of rover.samples) {
+    const t = sim.discovered.get(id)
+    if (t) {
+      t.cached = true
+      t.carried_by = null
+    }
+  }
+  rover.samples = []
+  const cached = [...sim.discovered.values()].filter((t) => t.cached).length
+  addEvent(rover.id, 'discovery', `Cached ${n} sample${n === 1 ? '' : 's'} at the lander (${cached} in the cache). Fleet science score ${scienceScore()}.`, [LANDER.x, LANDER.y])
+  return n
 }
 
 function stepRover(rover, dt) {
@@ -888,7 +1498,7 @@ function stepRover(rover, dt) {
       rover.speed = 0
       if (rover.hold) break
       rover.timer -= dt
-      if (rover.battery < 0.3) {
+      if (lowBattery(rover, 0.3)) {
         startReturn(rover) // nothing left to explore nearby, so do not idle on a flat battery
         break
       }
@@ -896,7 +1506,7 @@ function stepRover(rover, dt) {
       break
     }
     case 'exploring': {
-      if (rover.battery < 0.28) {
+      if (lowBattery(rover, 0.28)) {
         startReturn(rover)
         break
       }
@@ -923,7 +1533,7 @@ function stepRover(rover, dt) {
         rover.timer = 0.5
         break
       }
-      if (rover.battery < 0.22) {
+      if (lowBattery(rover, 0.22)) {
         startReturn(rover)
         break
       }
@@ -934,6 +1544,19 @@ function stepRover(rover, dt) {
       }
       rover.path = []
       rover.speed = Math.max(0, rover.speed - dt * 2)
+      if (PROTOCOL >= 4) {
+        if (t.status === 'found' || !rover.sampling) {
+          t.status = 'investigating'
+          const instrument = INSTRUMENT_FOR[t.kind] || 'drill'
+          rover.sampling = { target: t.id, instrument, progress: 0, total: SAMPLE_S[instrument], elapsed: 0 }
+          const verb = { drill: 'Drilling a core', scoop: 'Scooping ice', sniffer: 'Sampling the gas', swab: 'Swabbing the trace' }[instrument]
+          addEvent(rover.id, 'info', `Arrived at the ${KIND_LABEL[t.kind]}. ${verb} (${SAMPLE_S[instrument]} s), tube ${rover.samples.length + 1} of ${TUBES}.`)
+        }
+        rover.sampling.elapsed += dt
+        rover.sampling.progress = clamp(rover.sampling.elapsed / rover.sampling.total, 0, 1)
+        if (rover.sampling.progress >= 1) finishSample(rover, t)
+        break
+      }
       if (t.status === 'found') {
         t.status = 'investigating'
         rover.timer = 12
@@ -954,9 +1577,16 @@ function stepRover(rover, dt) {
     case 'returning': {
       const [dx, dy] = dockPoint(rover)
       if (Math.hypot(dx - rover.x, dy - rover.y) < 1.1) {
-        rover.state = 'charging'
         rover.path = []
         rover.goal = null
+        const delivered = deliverSamples(rover)
+        if (delivered && rover.battery >= 0.7) {
+          rover.state = 'idle'
+          rover.timer = 1.5
+          addEvent(rover.id, 'info', `Tubes empty, battery ${Math.round(rover.battery * 100)}%. Back to exploring.`)
+          break
+        }
+        rover.state = 'charging'
         addEvent(rover.id, 'info', 'Docked at the lander. Charging.')
         break
       }
@@ -972,6 +1602,10 @@ function stepRover(rover, dt) {
         rover.state = 'idle'
         rover.timer = 0.5
       }
+      break
+    }
+    case 'observing': {
+      stepObserve(rover, dt)
       break
     }
     case 'recovering': {
@@ -991,6 +1625,209 @@ function stepRover(rover, dt) {
       break
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Lifeforms (v4): herds of grazers wander, graze, avoid water and keep clear of rovers.
+
+function lifeOk(x, y) {
+  const lim = MAP_SIZE / 2 - 4
+  if (Math.abs(x) > lim || Math.abs(y) > lim) return false
+  if (Math.hypot(x - LANDER.x, y - LANDER.y) < 9) return false
+  if (waterAt(x, y) >= 0) return false
+  return slopeAt(x, y) < 24
+}
+
+function spawnHerd(cx, cy, count) {
+  const herd = { id: sim.herds.length + 1, cx, cy, heading: sim.rand() * Math.PI * 2, speed: 0.14 + sim.rand() * 0.1, pause: 0, seenT: -999, confirmT: -999 }
+  sim.herds.push(herd)
+  for (let k = 0; k < count && sim.lifeforms.length < MAX_LIFEFORMS; k++) {
+    const a = (k / count) * Math.PI * 2 + sim.rand()
+    const d = 0.8 + sim.rand() * 1.8
+    sim.lifeforms.push({
+      id: `l${sim.nextLife++}`,
+      kind: 'grazer',
+      x: cx + Math.cos(a) * d,
+      y: cy + Math.sin(a) * d,
+      yaw: sim.rand() * Math.PI * 2,
+      vx: 0,
+      vy: 0,
+      size: r2(0.95 + sim.rand() * 0.4),
+      herd,
+      oa: a,
+      od: d,
+    })
+  }
+  return herd
+}
+
+function moveHerd(herd, cx, cy) {
+  const dx = cx - herd.cx
+  const dy = cy - herd.cy
+  herd.cx = cx
+  herd.cy = cy
+  for (const l of sim.lifeforms) {
+    if (l.herd !== herd) continue
+    l.x += dx
+    l.y += dy
+  }
+}
+
+function stepLifeforms(dt) {
+  // A herd being watched mostly grazes (so a watching rover keeps it in view).
+  const watched = new Set()
+  for (const r of sim.rovers) {
+    if (r.state !== 'observing') continue
+    const k = sim.tracks.find((q) => q.id === r.trackId)
+    const l = k && sim.lifeforms.find((q) => q.id === k.lifeId)
+    if (l) watched.add(l.herd)
+  }
+  for (const h of sim.herds) {
+    if (h.pause > 0) {
+      h.pause -= dt
+      continue
+    }
+    const calm = watched.has(h)
+    if (sim.rand() < dt / (calm ? 12 : 35)) h.pause = 5 + sim.rand() * 8 // stop to graze
+    h.heading += gaussian(sim.rand) * 0.35 * dt
+    const sp = h.speed * (calm ? 0.35 : 1)
+    const nx = h.cx + Math.cos(h.heading) * sp * dt
+    const ny = h.cy + Math.sin(h.heading) * sp * dt
+    const ahead = [h.cx + Math.cos(h.heading) * 3, h.cy + Math.sin(h.heading) * 3]
+    if (!lifeOk(nx, ny) || !lifeOk(ahead[0], ahead[1])) h.heading += Math.PI * (0.4 + sim.rand() * 0.4)
+    else {
+      h.cx = nx
+      h.cy = ny
+    }
+  }
+  for (const l of sim.lifeforms) {
+    const h = l.herd
+    l.oa += dt * 0.05
+    let tx = h.cx + Math.cos(l.oa) * l.od
+    let ty = h.cy + Math.sin(l.oa) * l.od
+    // Keep clear of rovers (they are big and noisy), and of each other.
+    let fx = 0
+    let fy = 0
+    for (const r of sim.rovers) {
+      const d = Math.hypot(l.x - r.x, l.y - r.y)
+      if (d < 3.5 && d > 0.01) {
+        fx += ((l.x - r.x) / d) * (3.5 - d) * 1.6
+        fy += ((l.y - r.y) / d) * (3.5 - d) * 1.6
+      }
+    }
+    for (const o of sim.lifeforms) {
+      if (o === l) continue
+      const d = Math.hypot(l.x - o.x, l.y - o.y)
+      if (d < 1.3 && d > 0.01) {
+        fx += ((l.x - o.x) / d) * (1.3 - d)
+        fy += ((l.y - o.y) / d) * (1.3 - d)
+      }
+    }
+    let vx = (tx - l.x) * 0.35 + fx
+    let vy = (ty - l.y) * 0.35 + fy
+    const grazing = h.pause > 0 && Math.hypot(tx - l.x, ty - l.y) < 0.7 && !fx && !fy
+    const sp = Math.hypot(vx, vy)
+    const max = grazing ? 0 : 0.5
+    if (sp > max) {
+      vx = sp > 0 ? (vx / sp) * max : 0
+      vy = sp > 0 ? (vy / sp) * max : 0
+    }
+    const k = Math.min(1, dt * 1.5)
+    l.vx += (vx - l.vx) * k
+    l.vy += (vy - l.vy) * k
+    const nx = l.x + l.vx * dt
+    const ny = l.y + l.vy * dt
+    if (lifeOk(nx, ny) || !lifeOk(l.x, l.y)) {
+      l.x = nx
+      l.y = ny
+    } else {
+      l.vx *= -0.3
+      l.vy *= -0.3
+    }
+    if (Math.hypot(l.vx, l.vy) > 0.05) {
+      const diff = wrapAngle(Math.atan2(l.vy, l.vx) - l.yaw)
+      l.yaw = wrapAngle(l.yaw + clamp(diff, -1.5 * dt, 1.5 * dt))
+    }
+    void tx
+    void ty
+  }
+}
+
+// Tracks: a rover's LiDAR sees returns move between scans. The camera (Gemma) labels them.
+function stepTracks() {
+  const range = lidarRange()
+  for (const life of sim.lifeforms) {
+    let seer = null
+    let best = Infinity
+    for (const r of sim.rovers) {
+      if (r.state === 'charging') continue
+      const d = Math.hypot(life.x - r.x, life.y - r.y)
+      if (d <= range && d < best) {
+        best = d
+        seer = r
+      }
+    }
+    if (!seer) continue
+    const noise = () => gaussian(sim.rand) * 0.06
+    let k = sim.tracks.find((q) => q.lifeId === life.id)
+    if (k) {
+      Object.assign(k, { x: life.x + noise(), y: life.y + noise(), vx: life.vx, vy: life.vy, last_seen: sim.t, status: 'tracking' })
+      continue
+    }
+    k = { id: `k${sim.nextTrack++}`, lifeId: life.id, x: life.x, y: life.y, vx: life.vx, vy: life.vy, size: r1(life.size * (0.92 + sim.rand() * 0.12)), last_seen: sim.t, observer: null, label: 'moving object', status: 'tracking', confirmed: false }
+    sim.tracks.push(k)
+    const herd = life.herd
+    const dist = Math.round(best)
+    const dir = compass(life.x - seer.x, life.y - seer.y)
+    if (sim.t - herd.seenT > 25) {
+      herd.seenT = sim.t
+      addEvent(seer.id, 'warn', `LiDAR returns moving between scans ${dist} m ${dir}: something is moving on its own. Tracking it as ${k.id}.`, [life.x, life.y])
+    }
+    // The camera takes a look; without Gemma the rules settle on a gait after a while.
+    const g = gemmaCall('vision')
+    later(g.ok ? g.ms : 8000 / SIM_SPEED, () => {
+      k.label = g.ok ? `possible lifeform, six legs, about ${r1(life.size)} m` : `moving object, legged gait, about ${r1(life.size)} m`
+      k.confirmed = true
+      sim.lifeConfirmed.add(life.id)
+      if (sim.t - herd.confirmT > 30) {
+        herd.confirmT = sim.t
+        const n = sim.lifeforms.filter((l) => l.herd === herd).length
+        addEvent(
+          seer.id,
+          'discovery',
+          g.ok
+            ? `Camera: possible lifeform, six legs, about ${r1(life.size)} m long, grazing${n > 1 ? `, with ${n - 1} more like it nearby` : ''}. Tracking ${k.id}.`
+            : `Moving object with a legged gait, about ${r1(life.size)} m, ${n > 1 ? `${n} of them` : 'alone'}. Tracking ${k.id}.`,
+          [life.x, life.y],
+          g.ok ? 'gemma' : null,
+        )
+      }
+    })
+    // Should this rover stop and watch? Not if it is busy, low, or someone already watches the herd.
+    // (Asking is fine for a rover the operator put on hold; following on its own is not.)
+    const free = ['exploring', 'idle', 'investigating'].includes(seer.state) && !seer.sampling && !seer.request && seer.battery > 0.4
+    const watched = sim.rovers.some((r) => r.state === 'observing' && sim.tracks.some((q) => q.id === r.trackId && sim.lifeforms.find((l) => l.id === q.lifeId)?.herd === herd))
+    if (!free || watched || (seer.hold && (sim.firstLifeAsked || PROTOCOL < 3))) continue
+    if (!sim.firstLifeAsked && PROTOCOL >= 3) {
+      startObserve(seer, k, 'watch')
+      sim.firstLifeAsked = askAbout(seer, 'life', { dist, dir, at: [life.x, life.y] })
+    } else {
+      startObserve(seer, k, 'follow')
+      const g2 = gemmaCall('choice')
+      const at = [life.x, life.y]
+      const say = () =>
+        addEvent(seer.id, 'info', `Observing ${k.id} from ${OBSERVE_DIST} m for ${OBSERVE_S} s: it moves about ${r1(Math.max(0.1, Math.hypot(life.vx, life.vy)))} m/s and keeps to its herd. Following without getting closer.`, at, g2.ok ? 'gemma' : null)
+      if (g2.ok) later(g2.ms, say)
+      else say()
+    }
+  }
+  for (const k of sim.tracks) {
+    if (k.status === 'tracking' && sim.t - k.last_seen > TRACK_LOST_S) {
+      k.status = 'lost'
+      k.observer = null
+    }
+  }
+  sim.tracks = sim.tracks.filter((k) => k.status !== 'lost' || sim.t - k.last_seen < TRACK_DROP_S)
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,7 +2000,7 @@ function fleetEvents() {
     }
     sim.nextSlipT = sim.t + 60 + sim.rand() * 60
   }
-  const pct = (sim.knownCount / sim.known.length) * 100
+  const pct = ((sim.knownCount + sim.waterSeenCount) / sim.known.length) * 100
   while (sim.milestones.length && pct >= sim.milestones[0]) {
     addEvent(null, 'info', `${sim.milestones.shift()}% of the map explored.`)
   }
@@ -1179,6 +2016,16 @@ function lidarScan(rover, range) {
   const gz = groundSmooth(rover.x, rover.y)
   const oz = gz + MAST_H
   const near = sim.rocks.filter((rk) => sim.t >= rk.landT && Math.hypot(rk.x - rover.x, rk.y - rover.y) < range + rk.r)
+  const spires = []
+  if (PROTOCOL >= 4) {
+    for (const sp of world.spires) {
+      if (sp.fallT && sim.t < sp.fallT) continue
+      const seg = spireSegment(sp)
+      if (segDist(rover.x, rover.y, ...seg) > range + 0.5) continue
+      if (sp.g0 == null) sp.g0 = groundSmooth(sp.x, sp.y)
+      spires.push([sp, seg])
+    }
+  }
   const seen = new Set()
   const pts = []
   const step = 0.2
@@ -1210,7 +2057,25 @@ function lidarScan(rover, range) {
           pts.push(x, y, z)
           break
         }
+        let spire = false
+        for (const [sp, seg] of spires) {
+          if (sp.standing) {
+            const hz = z - sp.g0
+            if (hz < 0 || hz > sp.height) continue
+            const rr = sp.radius * (1 - (hz / sp.height) * 0.85)
+            if ((x - sp.x) ** 2 + (y - sp.y) ** 2 < rr * rr) spire = true
+          } else if (segDist(x, y, ...seg) < sp.radius && z < groundSmooth(x, y) + sp.radius * 2) spire = true
+          if (spire) break
+        }
+        if (spire) {
+          pts.push(x, y, z)
+          break
+        }
         const g = groundSmooth(x, y)
+        if (PROTOCOL >= 4) {
+          const wi = waterAt(x, y)
+          if (wi >= 0 && z <= world.water[wi].level) break // liquid: the beam never comes back
+        }
         if (z <= g) {
           pts.push(x, y, g)
           break
@@ -1324,6 +2189,8 @@ function publicHazard(h) {
     const r = sim.rovers.find((q) => q.id === h.rover)
     if (r) Object.assign(out, { x: r1(r.x), y: r1(r.y) })
   }
+  if (h.type === 'spire_fall') Object.assign(out, { spire: h.spire, x0: h.x0, y0: h.y0, x1: h.x1, y1: h.y1 })
+  if (h.type === 'lifeform') Object.assign(out, { x: h.x, y: h.y })
   return out
 }
 
@@ -1361,6 +2228,7 @@ function validSpot(x, y, r) {
   const lim = MAP_SIZE / 2 - r - 1
   if (Math.abs(x) > lim || Math.abs(y) > lim) return false
   if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + r + 0.8) return false
+  if (PROTOCOL >= 4 && world.water.some((w) => pointInPoly(x, y, w.outline) || distToPoly(x, y, w.outline) < r)) return false
   return !sim.hazards.some((h) => (h.type === 'rockfall' || h.type === 'sand') && Math.hypot(h.x - x, h.y - y) < h.radius + r)
 }
 
@@ -1379,8 +2247,239 @@ function routeCandidates(needRoute) {
   return [...drivers, ...ok.filter((r) => !drivers.includes(r))]
 }
 
-function createHazard(type, requested) {
-  if (!HAZARD_TYPES.includes(type)) throw new HazardError(`Unknown hazard type "${type}". Use rockfall, sand, dust_storm or rover_fault.`)
+// v4: where the user clicked. Throws the 400 answers from the protocol.
+function checkPoint(type, [x, y]) {
+  const half = MAP_SIZE / 2
+  const at = `(${r1(x)}, ${r1(y)})`
+  if (Math.abs(x) > half || Math.abs(y) > half) throw new HazardError(`${at} is off the map: it spans ${-half} to ${half} m on both axes.`)
+  if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + 0.5) throw new HazardError(`${at} is on the lander. Pick a spot at least ${LANDER.radius + 0.5} m from its centre.`)
+  for (const r of sim.rovers) {
+    const d = Math.hypot(r.x - x, r.y - y)
+    if (d < 2) throw new HazardError(`${at} is ${r1(d)} m from ${r.name}. Pick a spot at least 2 m from any rover.`)
+  }
+  const wi = waterAt(x, y)
+  if (wi >= 0 && type !== 'spire_fall') throw new HazardError(`${at} is in the ${world.water[wi].kind === 'river' ? 'stream' : 'lake'}. Pick dry ground.`)
+  const slope = Math.round(slopeAt(x, y))
+  if (type === 'sand' && slope > 20) throw new HazardError(`The ground at ${at} slopes ${slope} deg: too steep for soft sand to collect. Pick flatter ground (under 20 deg).`)
+  if (type === 'lifeform' && slope > 24) throw new HazardError(`The ground at ${at} slopes ${slope} deg: too steep for the creatures to graze there.`)
+  if (type === 'rockfall' || type === 'sand') {
+    const r = type === 'rockfall' ? 2.6 : 2.2
+    const clash = sim.hazards.find((h) => (h.type === 'rockfall' || h.type === 'sand') && Math.hypot(h.x - x, h.y - y) < h.radius + r)
+    if (clash) throw new HazardError(`${at} overlaps the ${clash.type === 'rockfall' ? 'rockfall' : 'soft sand'} already there. Pick a spot a few metres away.`)
+  }
+  return [x, y]
+}
+
+// The rover whose route passes closest to (x, y), within `within` metres: [rover, point on route].
+function routeNear(x, y, within, prefer = null) {
+  let best = null
+  for (const r of sim.rovers) {
+    if (r.state === 'fault' || !r.path.length || (prefer && r !== prefer)) continue
+    let px = r.x
+    let py = r.y
+    for (const [qx, qy] of r.path) {
+      const dx = qx - px
+      const dy = qy - py
+      const len2 = dx * dx + dy * dy || 1e-9
+      const t = clamp(((x - px) * dx + (y - py) * dy) / len2, 0, 1)
+      const cx = px + dx * t
+      const cy = py + dy * t
+      const d = Math.hypot(cx - x, cy - y)
+      if (d < within && (!best || d < best[2]) && Math.hypot(cx - r.x, cy - r.y) > 3) best = [r, [cx, cy], d]
+      px = qx
+      py = qy
+    }
+  }
+  return best
+}
+
+function makeRocks(h, spot, radius) {
+  h.rocks = []
+  const count = 5 + Math.floor(sim.rand() * 3)
+  const lim = MAP_SIZE / 2 - 0.8
+  for (let k = 0; k < count && h.rocks.length < count; k++) {
+    for (let tries = 0; tries < 20; tries++) {
+      const a = sim.rand() * Math.PI * 2
+      const d = k === 0 ? sim.rand() * 0.4 : 0.6 + sim.rand() * (radius - 0.9)
+      const r = 0.36 + sim.rand() * 0.42 + (k === 0 ? 0.2 : 0)
+      const x = spot[0] + Math.cos(a) * d
+      const y = spot[1] + Math.sin(a) * d
+      if (Math.abs(x) > lim || Math.abs(y) > lim) continue
+      if (h.rocks.some((q) => Math.hypot(q.x - x, q.y - y) < q.r + r - 0.1)) continue
+      if (sim.rovers.some((q) => Math.hypot(q.x - x, q.y - y) < r + 0.9)) continue
+      if (PROTOCOL >= 4 && waterAt(x, y) >= 0) continue
+      h.rocks.push({ x, y, z: groundSmooth(x, y) + r * 0.55, r, landT: sim.t + 0.6 + sim.rand() * 0.4, seen: false, hazard: h })
+      break
+    }
+  }
+  sim.rocks.push(...h.rocks)
+}
+
+// Rockfall or soft sand where the user clicked (snapped onto a rover route nearby).
+function placeAt(base, type, [x, y], requested) {
+  const radius = type === 'rockfall' ? 2.6 : r1(2.0 + sim.rand() * 0.4)
+  const prefer = requested != null ? pickRover(requested) : null
+  let spot = [x, y]
+  let rover = null
+  const near = routeNear(x, y, type === 'rockfall' ? 4 : radius + 1, prefer)
+  if (near) {
+    rover = near[0]
+    // Boulders go across the route itself, if that spot is free.
+    if (type === 'rockfall' && sim.rovers.every((r) => Math.hypot(r.x - near[1][0], r.y - near[1][1]) > radius + 0.8) && waterAt(near[1][0], near[1][1]) < 0) spot = near[1]
+  }
+  const h = { ...base, rover: rover?.id ?? prefer?.id ?? null, x: spot[0], y: spot[1], radius }
+  if (type === 'rockfall') {
+    makeRocks(h, spot, radius)
+    if (!h.rocks.length) throw new HazardError(`No room for boulders at (${r1(x)}, ${r1(y)}). Pick a more open spot.`)
+    addEvent(null, 'hazard', rover ? `Rockfall on ${rover.id}'s route.` : `Rockfall at (${r1(spot[0])}, ${r1(spot[1])}).`, spot)
+  } else {
+    h.known = false
+    addEvent(null, 'hazard', rover ? `Soft sand on ${rover.id}'s route. Its LiDAR cannot see it.` : `Soft sand at (${r1(spot[0])}, ${r1(spot[1])}). LiDAR cannot see it.`, spot)
+  }
+  sim.hazards.push(h)
+  sim.nextHazard++
+  return h
+}
+
+// v4: a spire topples (toward the clicked point, or across a rover's route).
+function createSpireFall(base, requested, at) {
+  const prefer = requested != null ? pickRover(requested) : null
+  if (prefer && prefer.state === 'fault' && !at) throw new HazardError(`${prefer.name} is parked with a motor fault. Pick another rover.`)
+  const okFall = (x0, y0, x1, y1, r) => {
+    const lim = MAP_SIZE / 2 - 0.5
+    if (Math.abs(x1) > lim || Math.abs(y1) > lim) return 'The spire would fall off the map.'
+    if (segDist(LANDER.x, LANDER.y, x0, y0, x1, y1) < LANDER.radius + 0.4) return 'The spire would fall onto the lander.'
+    const hit = sim.rovers.find((q) => segDist(q.x, q.y, x0, y0, x1, y1) < r + 1.1)
+    if (hit) return `The spire would fall onto ${hit.name}. Pick another spot.`
+    return null
+  }
+  let sp = null
+  let dir = null
+  let rover = prefer
+  if (at) {
+    const [x, y] = at
+    sp = world.spires.filter((q) => q.standing && Math.hypot(q.x - x, q.y - y) <= 6).sort((a, b) => Math.hypot(a.x - x, a.y - y) - Math.hypot(b.x - x, b.y - y))[0] || null
+    if (sp) {
+      const d = Math.hypot(x - sp.x, y - sp.y)
+      const a = d > 0.3 ? Math.atan2(y - sp.y, x - sp.x) : sim.rand() * Math.PI * 2
+      dir = [Math.cos(a), Math.sin(a)]
+    } else {
+      if (waterAt(x, y) >= 0) throw new HazardError(`(${r1(x)}, ${r1(y)}) is in the water and there is no spire within 6 m to topple. Pick dry ground.`)
+      sp = { id: `s${sim.nextSpire}`, x: r1(x), y: r1(y), height: r1(2.6 + sim.rand() * 1.4), radius: r2(0.3 + sim.rand() * 0.12), standing: true, fresh: true }
+      // Fall across the nearest rover's route if there is one in reach, else any free way.
+      const near = routeNear(x, y, sp.height + 1, prefer)
+      const tries = near ? [Math.atan2(near[1][1] - y, near[1][0] - x)] : []
+      for (let k = 0; k < 12; k++) tries.push((k / 12) * Math.PI * 2)
+      for (const a of tries) {
+        const tx = x + Math.cos(a) * sp.height
+        const ty = y + Math.sin(a) * sp.height
+        if (!okFall(x, y, tx, ty, sp.radius)) {
+          dir = [Math.cos(a), Math.sin(a)]
+          break
+        }
+      }
+      if (!dir) throw new HazardError(`No room for a spire to fall at (${r1(x)}, ${r1(y)}). Pick a more open spot.`)
+      if (near) rover = near[0]
+    }
+  } else {
+    const cands = prefer ? [prefer] : routeCandidates(true)
+    for (const cand of cands) {
+      for (const d of [5.5, 7, 8.5, 4.5]) {
+        if (d > remainingPath(cand) - 0.5) continue
+        const P = pointAhead(cand, d)
+        const Q = pointAhead(cand, d + 0.5)
+        const along = Math.atan2(Q[1] - P[1], Q[0] - P[0])
+        const stand = world.spires.find((q) => q.standing && Math.hypot(q.x - P[0], q.y - P[1]) < q.height - 0.6 && Math.hypot(q.x - P[0], q.y - P[1]) > 1.5)
+        if (stand) {
+          const a = Math.atan2(P[1] - stand.y, P[0] - stand.x)
+          if (!okFall(stand.x, stand.y, stand.x + Math.cos(a) * stand.height, stand.y + Math.sin(a) * stand.height, stand.radius)) {
+            sp = stand
+            dir = [Math.cos(a), Math.sin(a)]
+          }
+        } else {
+          const h = r1(2.8 + sim.rand() * 1.2)
+          const side = sim.rand() < 0.5 ? 1 : -1
+          const bx = P[0] + Math.cos(along + (side * Math.PI) / 2) * h * 0.55
+          const by = P[1] + Math.sin(along + (side * Math.PI) / 2) * h * 0.55
+          const a = along - (side * Math.PI) / 2
+          if (lifeOk(bx, by) && !okFall(bx, by, bx + Math.cos(a) * h, by + Math.sin(a) * h, 0.36)) {
+            sp = { id: `s${sim.nextSpire}`, x: r1(bx), y: r1(by), height: h, radius: r2(0.3 + sim.rand() * 0.12), standing: true, fresh: true }
+            dir = [Math.cos(a), Math.sin(a)]
+          }
+        }
+        if (sp) {
+          rover = cand
+          break
+        }
+      }
+      if (sp) break
+    }
+    if (!sp) throw new HazardError(prefer ? `No spot near ${prefer.name}'s route for a spire to fall across. Try again in a few seconds.` : 'No rover is driving a long enough route for a spire to fall across. Try again in a few seconds.')
+  }
+  const x1 = r1(sp.x + dir[0] * sp.height)
+  const y1 = r1(sp.y + dir[1] * sp.height)
+  const bad = okFall(sp.x, sp.y, x1, y1, sp.radius)
+  if (bad) throw new HazardError(bad)
+  if (sp.fresh) {
+    delete sp.fresh
+    world.spires.push(sp)
+    sim.nextSpire++
+  }
+  Object.assign(sp, { standing: false, x0: sp.x, y0: sp.y, x1, y1, fallT: sim.t + 1.5 })
+  sim.featuresVersion++ // like the real sim: the changed spires go out in the next tick
+  if (!rover) rover = sim.rovers.filter((r) => r.path.length && pathNear(r, (sp.x + x1) / 2, (sp.y + y1) / 2, sp.height / 2 + 1))[0] || null
+  const h = { ...base, type: 'spire_fall', rover: rover?.id ?? null, spire: sp.id, x0: sp.x, y0: sp.y, x1, y1 }
+  sim.hazards.push(h)
+  sim.nextHazard++
+  addEvent(null, 'hazard', rover ? `Spire ${sp.id} toppled across ${rover.id}'s route.` : `Spire ${sp.id} toppled.`, [(sp.x + x1) / 2, (sp.y + y1) / 2])
+  return h
+}
+
+// v4: a small herd wanders into view of a rover (a demo convenience: the rovers still
+// have to notice it themselves).
+function createLifeformHazard(base, requested, at) {
+  let rover = requested != null ? pickRover(requested) : null
+  if (!rover) {
+    if (at) rover = [...sim.rovers].sort((a, b) => Math.hypot(a.x - at[0], a.y - at[1]) - Math.hypot(b.x - at[0], b.y - at[1]))[0]
+    else rover = routeCandidates(false)[0] || sim.rovers[0]
+  }
+  let spot = at
+  if (!spot) {
+    for (const d of [10, 11, 9, 12, 8.5, 13]) {
+      for (const side of [0, 3, -3, 6, -6]) {
+        const P = pointAhead(rover, d)
+        const a = rover.yaw + Math.PI / 2
+        const x = P[0] + Math.cos(a) * side
+        const y = P[1] + Math.sin(a) * side
+        if (lifeOk(x, y) && sim.rovers.every((r) => Math.hypot(r.x - x, r.y - y) > 4)) {
+          spot = [x, y]
+          break
+        }
+      }
+      if (spot) break
+    }
+    if (!spot) throw new HazardError(`No room for a herd near ${rover.name} right now (water, steep ground or the map edge). Try another rover.`)
+  }
+  let herd
+  if (sim.herds.length < 6 && sim.lifeforms.length + 4 <= MAX_LIFEFORMS) herd = spawnHerd(spot[0], spot[1], 3 + Math.floor(sim.rand() * 2))
+  else {
+    // Move the herd nobody is watching that is farthest from every rover.
+    const watched = new Set(sim.tracks.filter((k) => k.observer).map((k) => sim.lifeforms.find((l) => l.id === k.lifeId)?.herd))
+    herd = [...sim.herds].filter((h) => !watched.has(h)).sort((a, b) => Math.min(...sim.rovers.map((r) => Math.hypot(r.x - b.cx, r.y - b.cy))) - Math.min(...sim.rovers.map((r) => Math.hypot(r.x - a.cx, r.y - a.cy))))[0] || sim.herds[0]
+    moveHerd(herd, spot[0], spot[1])
+  }
+  herd.heading = Math.atan2(rover.y - spot[1], rover.x - spot[0]) + gaussian(sim.rand) * 0.4
+  herd.pause = 0
+  const n = sim.lifeforms.filter((l) => l.herd === herd).length
+  const h = { ...base, type: 'lifeform', rover: rover.id, x: r1(spot[0]), y: r1(spot[1]), endT: sim.t + 40 }
+  sim.hazards.push(h)
+  sim.nextHazard++
+  addEvent(null, 'hazard', `A herd of ${n} creatures wandered in ${Math.round(Math.hypot(rover.x - spot[0], rover.y - spot[1]))} m ${compass(spot[0] - rover.x, spot[1] - rover.y)} of ${rover.id}.`, spot)
+  return h
+}
+
+function createHazard(type, requested, point = null) {
+  if (!HAZARD_TYPES.includes(type)) throw new HazardError(`Unknown hazard type "${type}". Use ${HAZARD_TYPES.slice(0, -1).join(', ')} or ${HAZARD_TYPES[HAZARD_TYPES.length - 1]}.`)
   const base = { id: `h${sim.nextHazard}`, type, t: sim.t, rover: null, active: true }
 
   if (type === 'dust_storm') {
@@ -1444,6 +2543,12 @@ function createHazard(type, requested) {
     return h
   }
 
+  // v4: point and click (older sims ignore x and y). Dust and faults never use the point.
+  const at = point && PROTOCOL >= 4 ? checkPoint(type, point) : null
+  if (type === 'spire_fall') return createSpireFall(base, requested, at)
+  if (type === 'lifeform') return createLifeformHazard(base, requested, at)
+  if (at) return placeAt(base, type, at, requested)
+
   // rockfall and sand go on a rover's route
   let candidates
   if (requested != null) {
@@ -1479,21 +2584,7 @@ function createHazard(type, requested) {
   }
   const h = { ...base, rover: rover.id, x: spot[0], y: spot[1], radius }
   if (type === 'rockfall') {
-    h.rocks = []
-    const count = 5 + Math.floor(sim.rand() * 3)
-    for (let k = 0; k < count && h.rocks.length < count; k++) {
-      for (let tries = 0; tries < 20; tries++) {
-        const a = sim.rand() * Math.PI * 2
-        const d = k === 0 ? sim.rand() * 0.4 : 0.6 + sim.rand() * (radius - 0.9)
-        const r = 0.36 + sim.rand() * 0.42 + (k === 0 ? 0.2 : 0)
-        const x = spot[0] + Math.cos(a) * d
-        const y = spot[1] + Math.sin(a) * d
-        if (h.rocks.some((q) => Math.hypot(q.x - x, q.y - y) < q.r + r - 0.1)) continue
-        h.rocks.push({ x, y, z: groundSmooth(x, y) + r * 0.55, r, landT: sim.t + 0.6 + sim.rand() * 0.4, seen: false, hazard: h })
-        break
-      }
-    }
-    sim.rocks.push(...h.rocks)
+    makeRocks(h, spot, radius)
     addEvent(null, 'hazard', `Rockfall on ${rover.id}'s route.`, spot)
   } else {
     h.known = false
@@ -1506,6 +2597,10 @@ function createHazard(type, requested) {
 
 function stepHazards(dt) {
   for (const h of sim.hazards) {
+    if (h.type === 'lifeform' && h.active && sim.t > h.endT) {
+      h.active = false
+      h.endedAt = sim.t
+    }
     if (!h.active || h.remaining == null) continue
     h.remaining -= dt
     if (h.remaining > 0) continue
@@ -1546,13 +2641,18 @@ const OPTION_SETS = {
     { id: 'wait', label: 'Wait here' },
   ],
 }
-const SAFE_DEFAULT = { rockfall: 'reroute', unknown: 'reroute', sand: 'back_out' }
+OPTION_SETS.life = [
+  { id: 'follow', label: 'Follow it' },
+  { id: 'observe_here', label: 'Observe from here' },
+  { id: 'keep_exploring', label: 'Keep exploring' },
+]
+const SAFE_DEFAULT = { rockfall: 'reroute', unknown: 'reroute', sand: 'back_out', life: 'observe_here' }
 
 // The rover (or Gemma looking at its camera) cannot interpret what it senses: it slows
 // (or holds, on soft ground) and asks. Returns false when it already has a question open.
 function askAbout(rover, kind, info) {
   if (PROTOCOL < 3 || rover.request || rover.state === 'fault') return false
-  const hold = kind === 'sand'
+  const hold = kind === 'sand' || kind === 'life'
   rover.request = { pending: true, hold } // act cautiously while the model looks at the image
   const g = gemmaCall('vision')
   later(g.ok ? g.ms : 120, () => {
@@ -1568,6 +2668,9 @@ function askAbout(rover, kind, info) {
     if (kind === 'rockfall') {
       question = `LiDAR shows ${info.n} objects up to ${info.tall} m tall, ${info.dist} m ahead, that were not on my map. ${g.ok ? `From the camera I can't tell rocks from a slope edge (${conf}% confidence).` : 'My rules cannot tell rocks from a slope edge.'} What should I do?`
       note = `Unsure about ${info.n} new objects ${info.dist} m ahead${g.ok ? ` (camera ${conf}% confident)` : ''}. Slowing to 0.15 m/s and asking the operator.`
+    } else if (kind === 'life') {
+      question = `Possible lifeform ${info.dist} m ${info.dir}. Follow it or keep exploring?`
+      note = `Something is moving ${info.dist} m ${info.dir}${g.ok ? `: the camera sees legs (${conf + 30}% confident)` : ''}. Watching it from here and asking the operator.`
     } else if (kind === 'sand') {
       question = `Wheel slip ${info.slip}% but LiDAR shows flat ground (height change under ${info.flat} m).${g.ok ? ` The camera can't tell what the surface is (${conf}% confidence).` : ''} Back out or push through slowly?`
       note = `Slip ${info.slip}% on ground that looks flat${g.ok ? ` (camera ${conf}% confident)` : ''}. Holding and asking the operator.`
@@ -1613,6 +2716,19 @@ function publicRequest(q) {
 function applyOption(rover, q, option) {
   if (!rover) return ''
   if (rover.state === 'fault') return 'Motors are down, so I will decide once they are back.'
+  if (q.kind === 'life') {
+    const k = sim.tracks.find((x) => x.id === rover.trackId)
+    if (option === 'keep_exploring' || !k || rover.state !== 'observing') {
+      if (rover.state === 'observing') endObserve(rover, null)
+      return option === 'keep_exploring' ? 'Leaving it be and carrying on exploring. The track stays on the shared map.' : 'It moved out of sight, so I am carrying on exploring.'
+    }
+    rover.observeMode = option === 'follow' ? 'follow' : 'watch'
+    rover.observeUntil = sim.t + OBSERVE_S
+    rover.hold = false // the operator just said what to do
+    rover.holdUntil = null
+    rover.observeReplanT = 0
+    return option === 'follow' ? `Following ${k.id} at ${OBSERVE_DIST} m, never closer, for up to ${OBSERVE_S} s.` : `Watching ${k.id} from here for up to ${OBSERVE_S} s.`
+  }
   if (option === 'reroute') {
     rover.hold = false
     const state = rover.state === 'investigating' ? 'investigating' : 'exploring'
@@ -1713,6 +2829,13 @@ function parseCommand(lower) {
   if (/\b(hold|stop|halt|freeze|wait|pause|stay)\b/.test(lower)) return { cmd: 'hold' }
   if (/\b(explore|survey|scout)\b/.test(lower)) return { cmd: 'resume' }
   return { cmd: 'unclear' }
+}
+
+// Time to head home: under the fixed floor, or not much more than the trip back needs
+// (on the 120 m map a far rover would otherwise run flat on the way).
+function lowBattery(rover, floor) {
+  const home = Math.hypot(rover.x - LANDER.x, rover.y - LANDER.y) * 1.3 * ENERGY_PER_M
+  return rover.battery < Math.max(floor, home + 0.08)
 }
 
 function batteryNeed(rover, gx, gy) {
@@ -1893,6 +3016,29 @@ function fleetSummary() {
     budget_ms: BUDGET_MS,
     cycle_ms: CYCLE_MS,
     soft_zones: sim.softZones.map((z) => [r1(z[0]), r1(z[1]), r1(z[2])]),
+    ...(PROTOCOL >= 4 && {
+      explored_pct: r1(((sim.knownCount + sim.waterSeenCount) / sim.known.length) * 100),
+      water_zones: sim.waterZones,
+      lifeforms_seen: sim.lifeConfirmed.size,
+      samples_cached: [...sim.discovered.values()].filter((t) => t.cached).length,
+      samples_carried: sim.rovers.reduce((n, r) => n + r.samples.length, 0),
+      science_score: scienceScore(),
+    }),
+  }
+}
+
+function publicLifeform(l) {
+  return { id: l.id, kind: l.kind, x: r2(l.x), y: r2(l.y), z: r2(groundSmooth(l.x, l.y) + 0.25 * l.size), yaw: r2(l.yaw), speed: r2(Math.hypot(l.vx, l.vy)), size: l.size }
+}
+
+function publicTrack(k) {
+  return { id: k.id, x: r2(k.x), y: r2(k.y), vx: r2(k.vx), vy: r2(k.vy), size: k.size, last_seen: r1(k.last_seen), observer: k.observer, label: k.label, status: k.status }
+}
+
+function featuresJson() {
+  return {
+    water: world.water.map((w) => ({ id: w.id, kind: w.kind, level: w.level, outline: w.outline })),
+    spires: world.spires.map((sp) => ({ id: sp.id, x: sp.x, y: sp.y, height: sp.height, radius: sp.radius, standing: sp.standing })),
   }
 }
 
@@ -1905,6 +3051,13 @@ function targetList() {
     status: t.status,
     found_by: t.found_by,
     found_t: t.found_t,
+    ...(PROTOCOL >= 4 && {
+      instrument: t.instrument ?? null,
+      value: t.value ?? null,
+      analysis: t.analysis ?? null,
+      carried_by: t.carried_by ?? null,
+      cached: !!t.cached,
+    }),
   }))
 }
 
@@ -1924,6 +3077,12 @@ function roverStates() {
     sensors: r.sensors,
     scan: r.scan,
     brain: brainSummary(r),
+    ...(PROTOCOL >= 4 && {
+      track_id: r.trackId,
+      samples: [...r.samples],
+      capacity: TUBES,
+      ...(r.sampling && { sampling: { target: r.sampling.target, instrument: r.sampling.instrument, progress: r2(r.sampling.progress) } }),
+    }),
   }))
 }
 
@@ -1946,6 +3105,7 @@ function initMessage() {
     hazards: sim.hazards.map(publicHazard),
     t: r1(sim.t),
     ...(PROTOCOL >= 3 && { planner: plannerJson(), chat: sim.chat.slice(-50), requests: sim.requests.map(publicRequest) }),
+    ...(PROTOCOL >= 4 && { features: featuresJson(), lifeforms: sim.lifeforms.map(publicLifeform), tracks: sim.tracks.map(publicTrack) }),
   }
 }
 
@@ -1972,9 +3132,11 @@ function tick() {
     sim.t += dt
     stepHazards(dt)
     for (const r of sim.rovers) stepRover(r, dt)
+    if (PROTOCOL >= 4) stepLifeforms(dt)
   }
   for (const r of sim.rovers) sense(r)
   updateSensors(dtTotal)
+  if (PROTOCOL >= 4) stepTracks()
   computeFrontiers()
   fleetEvents()
   stepRequests()
@@ -1989,7 +3151,10 @@ function tick() {
     fleet: fleetSummary(),
     hazards: sim.hazards.map(publicHazard),
     ...(PROTOCOL >= 3 && { planner: plannerJson(), chat: sim.pendingChat, requests: sim.requests.map(publicRequest) }),
+    ...(PROTOCOL >= 4 && { lifeforms: sim.lifeforms.map(publicLifeform), tracks: sim.tracks.map(publicTrack) }),
+    ...(PROTOCOL >= 4 && sim.featuresSent !== sim.featuresVersion && { features: featuresJson() }),
   }
+  sim.featuresSent = sim.featuresVersion
   sim.pendingCells = []
   sim.pendingEvents = []
   sim.pendingChat = []
@@ -2067,7 +3232,11 @@ const server = http.createServer((req, res) => {
         return sendJson(res, 400, { ok: false, error: 'Body must be JSON like {"type": "rockfall", "rover": "r2"}' })
       }
       try {
-        const h = createHazard(String(parsed?.type ?? ''), parsed?.rover == null || parsed.rover === '' ? null : parsed.rover)
+        const hasX = parsed?.x != null
+        const hasY = parsed?.y != null
+        if ((hasX || hasY) && !(Number.isFinite(parsed.x) && Number.isFinite(parsed.y))) throw new HazardError('Give both x and y as numbers (world metres), or neither.')
+        const point = hasX && hasY ? [parsed.x, parsed.y] : null
+        const h = createHazard(String(parsed?.type ?? ''), parsed?.rover == null || parsed.rover === '' ? null : parsed.rover, point)
         console.log(`[mock] hazard ${h.id} ${h.type}${h.rover ? ` on ${h.rover}` : ''}`)
         sendJson(res, 200, { ok: true, hazard: publicHazard(h) })
       } catch (err) {
@@ -2096,6 +3265,23 @@ const server = http.createServer((req, res) => {
       const rover = pool.find((r) => r.path.length) || pool[0]
       if (!rover || !askUnknown(rover)) throw new HttpError(400, 'No rover free to ask a question.')
       return { ok: true, rover: rover.id }
+    },
+    '/api/_mock/teleport': (b) => {
+      const rover = sim.rovers.find((r) => r.id === b?.rover)
+      if (!rover || !Number.isFinite(b?.x) || !Number.isFinite(b?.y)) throw new HttpError(400, 'Body: {"rover": "r1", "x": 10, "y": -5, "hold": false}')
+      if (Math.abs(b.x) > MAP_SIZE / 2 - 1 || Math.abs(b.y) > MAP_SIZE / 2 - 1 || waterAt(b.x, b.y) >= 0) throw new HttpError(400, 'That spot is off the map or in the water.')
+      if (rover.state === 'observing') endObserve(rover, null)
+      releaseTarget(rover)
+      Object.assign(rover, { x: b.x, y: b.y, path: [], goal: null, speed: 0, hold: !!b.hold, holdUntil: null, timer: 1.5 })
+      if (rover.state !== 'fault') rover.state = 'idle'
+      if (Number.isFinite(b.yaw)) rover.yaw = b.yaw
+      sense(rover)
+      return { ok: true }
+    },
+    '/api/_mock/rearm': (b) => {
+      // {"armed": true} (default): the next lifeform sighting asks the operator again.
+      sim.firstLifeAsked = b?.armed === false
+      return { ok: true, armed: !sim.firstLifeAsked }
     },
     '/api/_mock/battery': (b) => {
       const rover = sim.rovers.find((r) => r.id === b?.rover)

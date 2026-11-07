@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { Html } from '@react-three/drei'
 import * as THREE from 'three'
-import { simStore, useSim, roverPoses } from '../state/store.js'
+import { appStore, simStore, useSim, roverPoses } from '../state/store.js'
+import { placement } from '../lib/placement.js'
 import { forEachTrailPoint, sampleGround, sampleGroundNear, TRAIL_POINTS } from '../state/simState.js'
 import { FatPolyline } from './fatLine.js'
 import { glowTexture, warningTexture } from './textures.js'
@@ -103,10 +104,17 @@ function Rover({ meta, selected, onSelect }) {
   useEffect(() => () => (document.body.style.cursor = ''), [])
 
   // Click (not drag) on the rover or its label selects it: sensor panel and follow.
+  // While a hazard is being placed the 3D view handles clicks (a motor fault picks the
+  // rover under the cursor there), so the rover itself does nothing.
   const select = (e) => {
     e.stopPropagation()
-    if (e.delta > 6) return
+    if (e.delta > 6 || appStore.get().placing) return
     onSelect?.(meta.id)
+  }
+  const tagClick = () => {
+    const placing = appStore.get().placing
+    if (placing?.mode === 'rover') placement.commit?.({ rover: meta.id })
+    else if (!placing) onSelect?.(meta.id)
   }
 
   useFrame(({ clock, camera, size }, dt) => {
@@ -180,7 +188,7 @@ function Rover({ meta, selected, onSelect }) {
       onClick={select}
       onPointerOver={(e) => {
         e.stopPropagation()
-        document.body.style.cursor = 'pointer'
+        if (!appStore.get().placing) document.body.style.cursor = 'pointer'
       }}
       onPointerOut={() => (document.body.style.cursor = '')}
     >
@@ -196,7 +204,7 @@ function Rover({ meta, selected, onSelect }) {
       <sprite ref={sign} material={faultMats.sign} position={[0, 3.55, 0]} scale={1.15} visible={false} renderOrder={10} />
       {labelsReady && (
         <Html position={[0, 2.5, 0]} center zIndexRange={[12, 0]} style={{ pointerEvents: 'none' }}>
-          <button type="button" className="rover-tag" data-selected={selected || undefined} data-fault={faulted || undefined} data-ask={(asking && !faulted) || undefined} onClick={() => onSelect?.(meta.id)} title={`Show ${meta.name}'s sensors`}>
+          <button type="button" className="rover-tag" data-selected={selected || undefined} data-fault={faulted || undefined} data-ask={(asking && !faulted) || undefined} onClick={tagClick} title={`Show ${meta.name}'s sensors`}>
             <span className="dot" style={{ background: meta.color }} />
             {meta.name}
             {faulted && <span className="rover-tag-fault">Fault</span>}

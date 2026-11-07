@@ -28,6 +28,11 @@ from redshift.sim import Simulation  # noqa: E402
 
 JPEG = b"\xff\xd8\xff\xe0" + bytes(300) + b"\xff\xd9"      # stands in for a camera frame
 EM_DASH = chr(0x2014)
+MAP_SIZE = 80.0     # these scripted scenarios (seed 42, set times, quoted sensor numbers) were written for the 80 m map
+# ... and for the world before protocol v4: no water, spires or lifeforms, a 3 s sample and no tube limit
+# (test_v4.py covers those on the 120 m default map)
+LEGACY = dict(map_size=MAP_SIZE, water=False, spires=False, lifeforms=False, drill_s=3.0, scoop_s=3.0,
+              sniffer_s=3.0, swab_s=3.0, sample_capacity=99, num_boulders=12)
 PLANNER_KEYS = {"model", "state", "online", "calls", "ok", "fallbacks", "avg_ms", "p95_ms", "last_ms", "budget_ms",
                 "over_budget"}
 CHAT_KEYS = {"id", "t", "from", "to", "text", "kind", "source", "request_id"}
@@ -69,7 +74,10 @@ class LikeGemmaOnSlip(RecordingFake):
     """What gemma4:e2b really answered for wheel slip before the prompt fix: right class, unsafe action."""
 
     def _interpret(self, req):
-        return {"classification": "soft_ground", "reason": "Slip 82% while ground speed 0.11 m/s",
+        an = req.payload.get("anomaly", {})
+        slip = an.get("slip", 0.82)
+        slip = slip * 100.0 if slip <= 1.0 else slip
+        return {"classification": "soft_ground", "reason": f"Slip {slip:.0f}% while the wheels spin",
                 "action": "proceed_slowly", "confidence": 0.85}
 
 
@@ -81,6 +89,8 @@ def fake_planner(backend=None) -> GemmaPlanner:
 
 
 def make_sim(planner=None, seed=42, wait=True, frames=True, **cfg) -> Simulation:
+    for k, v in LEGACY.items():
+        cfg.setdefault(k, v)
     return Simulation(Config(seed=seed, plan_clock="model", **cfg), planner=planner,
                       frame_source=(lambda rid: JPEG) if frames else None, wait_for_gemma=wait)
 
@@ -540,7 +550,7 @@ def test_chat_and_answer_endpoints():
 
     p = fake_planner()
     old = server.state.runner
-    server.state.runner = server.SimRunner(Config(seed=42, plan_clock="model"), planner=p)   # not started
+    server.state.runner = server.SimRunner(Config(seed=42, plan_clock="model", **LEGACY), planner=p)   # not started
     try:
         sim = server.state.runner.sim
         sim.advisor.frame_source = None

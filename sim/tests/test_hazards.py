@@ -25,6 +25,10 @@ STORM_S = 40.0
 FAULT_S = 40.0
 SCRIPT = [("rockfall", 40.0, None), ("sand", 85.0, None), ("dust_storm", 150.0, None), ("rover_fault", 200.0, "r3")]
 END_T = 262.0
+MAP_SIZE = 80.0     # the scripted run (seed 42, set times) was written for the 80 m map and the world before
+# protocol v4 (no water, spires or lifeforms, a 3 s sample, no tube limit); test_v4.py covers those
+LEGACY = dict(map_size=MAP_SIZE, water=False, spires=False, lifeforms=False, drill_s=3.0, scoop_s=3.0,
+              sniffer_s=3.0, swab_s=3.0, sample_capacity=99, num_boulders=12)
 EM_DASH = chr(0x2014)
 
 _R = None
@@ -39,7 +43,7 @@ def run() -> Run:
     if _R is not None:
         return _R
     R = Run()
-    cfg = Config(seed=42, plan_clock="model", dust_storm_s=STORM_S, fault_s=FAULT_S)
+    cfg = Config(seed=42, plan_clock="model", dust_storm_s=STORM_S, fault_s=FAULT_S, **LEGACY)
     sim = Simulation(cfg)
     R.sim = sim
     R.hz = {}            # type -> hazard message at trigger
@@ -271,7 +275,7 @@ def test_brain_within_budget_with_hazards():
 
 # ---------------------------------------------------------------------- small extra sims
 def test_dusty_panels_slow_charging():
-    sim = Simulation(Config(seed=7, plan_clock="model", dust_storm_s=12.0))
+    sim = Simulation(Config(seed=7, plan_clock="model", dust_storm_s=12.0, **LEGACY))
     r = sim.rovers[0]
     r.battery = 0.3
     r.state = "charging"
@@ -286,7 +290,7 @@ def test_dusty_panels_slow_charging():
 
 
 def test_anomaly_hook_and_caution():
-    sim = Simulation(Config(seed=42, plan_clock="model"))
+    sim = Simulation(Config(seed=42, plan_clock="model", **LEGACY))
     sim.run_for(10.0)
     r = sim.rovers[1]
     got = []
@@ -301,7 +305,7 @@ def test_anomaly_hook_and_caution():
 
 
 def test_anytime_planning_splits_but_keeps_exploring():
-    sim = Simulation(Config(seed=42, plan_clock="model", brain_budget_ms=0.5))
+    sim = Simulation(Config(seed=42, plan_clock="model", brain_budget_ms=0.5, **LEGACY))
     sim.run_for(60.0)
     f = sim.fleet
     assert f.plan_slices > f.plan_calls, (f.plan_slices, f.plan_calls)
@@ -326,7 +330,7 @@ def test_hazard_endpoint():
         return 200, json.loads(json.dumps(out))
 
     old = server.state.runner
-    server.state.runner = server.SimRunner(Config(seed=42, plan_clock="model"))   # not started: no thread
+    server.state.runner = server.SimRunner(Config(seed=42, plan_clock="model", **LEGACY))   # not started: no thread
     try:
         code, body = call(b'{"type": "dust_storm"}')
         assert code == 200 and body["ok"] and body["hazard"]["type"] == "dust_storm" and body["hazard"]["active"]

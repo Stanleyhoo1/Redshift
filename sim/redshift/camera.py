@@ -73,7 +73,8 @@ CHASE_SMOOTH_S = 0.3          # chase camera heading follows the rover with this
 NEAR_CLIP = 0.05              # the model's znear is relative to its extent (several metres here)
 FAR_CLIP = 300.0
 
-_GEOM_GROUPS = (1, 1, 1, 1, 1, 0)   # terrain, rocks, targets, rovers, lander ring; not the walls (5)
+_GEOM_GROUPS = (1, 1, 1, 1, 1, 1)   # terrain, rocks and spires, targets and lifeforms, rovers, lander ring
+                                    # (the walls in group 4 have alpha 0 and are never drawn), liquid (5)
 
 
 class RenderUnavailable(RuntimeError):
@@ -517,7 +518,7 @@ DETECT_TOL = 0.22              # max per channel chroma difference from the mark
 DETECT_SPLIT = 0.7             # 0 = background colour, 1 = marker colour: a match must be beyond this
 DETECT_MIN_VALUE = 50          # ignore pixels darker than this (shadowed edges, dark sky)
 DETECT_DEPTH_GAP = 0.75        # split a colour blob where depth jumps by more than this (two markers)
-DETECT_MERGE_R = 1.0           # blobs closer than this (m) are one marker
+DETECT_MERGE_R = 1.5           # blobs closer than this (m) are one marker (markers are >= 2.5 m apart)
 MARKER_RADIUS = 0.28           # target capsule radius in world.py: its axis is this far behind the surface
 DETECT_HIDE_GROUPS = (3, 4)    # the fleet's own hardware (rovers, lander ring) is not drawn
 

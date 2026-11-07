@@ -12,6 +12,7 @@ import { reducedMotion } from './sceneConstants.js'
 export function Lander() {
   const lander = useSim((s) => s.lander)
   const labelsReady = useThree((s) => !!s.events.connected) // see Rovers.jsx
+  const cached = useSim((s) => (Number.isFinite(s.fleet.samples_cached) ? s.fleet.samples_cached : null)) // v4b
   const group = useRef()
   const beacon = useRef()
   const h = useRef(null)
@@ -62,7 +63,15 @@ export function Lander() {
       {/* Below the pad (on screen), so it does not collide with the tags of docked rovers above them. */}
       {labelsReady && (
         <Html position={[0, 0.3, R + 1.1]} center zIndexRange={[11, 0]} style={{ pointerEvents: 'none' }}>
-          <div className="lander-tag">Lander</div>
+          <div className="lander-tag">
+            Lander
+            {cached !== null && (
+              <span className="lander-cache" data-some={cached > 0 || undefined} title="Samples in the lander's cache">
+                <i aria-hidden="true" />
+                {cached} cached
+              </span>
+            )}
+          </div>
         </Html>
       )}
     </group>

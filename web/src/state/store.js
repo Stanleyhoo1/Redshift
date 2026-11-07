@@ -33,6 +33,10 @@ export const appStore = createStore({
   // v3: answers this client sent to clarification requests, by request id:
   // { state: 'pending' | 'sent' | 'error', option, error, status, at }
   answers: {},
+  // v4 point-and-click hazards: { type, mode: 'point' | 'rover' } while the user places one.
+  placing: null,
+  // v4b: a target the user picked (Samples tab or its pin): its value tag stays up.
+  pickedTarget: null,
 })
 
 export function dispatchSim(msg) {
@@ -46,6 +50,10 @@ export const useApp = (selector) => useSyncExternalStore(appStore.subscribe, () 
 // Displayed (interpolated) rover poses, written by the 3D rovers every frame and read
 // by the camera rig for follow mode. Plain mutable map, no React involved.
 export const roverPoses = new Map()
+
+// v4: displayed (interpolated) track positions, { x, y, z } in three.js coordinates,
+// written by the track markers and read by the observing rovers' lines of sight.
+export const trackPoses = new Map()
 
 // Where the HUD panels sit over the 3D view, in px relative to the view's top left:
 // { left, top, right, bottom } per panel, or null when the panel is not shown. Written

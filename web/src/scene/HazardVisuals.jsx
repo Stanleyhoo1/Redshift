@@ -2,29 +2,15 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js'
-import { appStore, nowSeconds, simStore, useSim } from '../state/store.js'
-import { sampleGround, sampleGroundNear, simTimeNow } from '../state/simState.js'
+import { nowSeconds, simStore, useSim } from '../state/store.js'
+import { simTimeNow } from '../state/simState.js'
+import { groundAt } from './ground.js'
 import { DUST, SAND } from '../lib/theme.js'
 import { FatPolyline } from './fatLine.js'
 import { glowTexture, hatchTexture } from './textures.js'
 import { reducedMotion } from './sceneConstants.js'
 
 // ---------------------------------------------------------------- shared helpers
-
-// Ground height for hazard decals: what the fleet measured, else the ground truth,
-// else the nearest known ground.
-function groundAt(x, y) {
-  const T = simStore.get().terrain
-  const g = sampleGround(T, x, y)
-  if (g !== null) return g
-  const tr = appStore.get().truth
-  if (tr && tr.heights) {
-    const i = Math.round((x - tr.ox) / tr.res)
-    const j = Math.round((y - tr.oy) / tr.res)
-    if (i >= 0 && j >= 0 && i < tr.nx && j < tr.ny) return tr.heights[j * tr.nx + i]
-  }
-  return sampleGroundNear(T, x, y, 8) ?? 0
-}
 
 function mulberry(seed) {
   let a = seed >>> 0

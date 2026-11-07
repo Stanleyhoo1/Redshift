@@ -393,8 +393,10 @@ async def reset(request: Request):
 
 @app.post("/api/hazard")
 async def hazard(request: Request):
-    """Change the world now: {"type": "rockfall" | "sand" | "dust_storm" | "rover_fault", "rover": "r2"}
-    (rover optional). The rovers are not told; they have to notice through their sensors."""
+    """Change the world now: {"type": "rockfall" | "sand" | "dust_storm" | "rover_fault" | "spire_fall" |
+    "lifeform", "rover": "r2", "x": 12.5, "y": -30.0} (rover, x and y optional; x and y place rockfall,
+    sand, spire_fall and lifeform at that point). The rovers are not told; they have to notice
+    through their sensors."""
     runner = state.runner
     if runner is None:
         return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
@@ -412,16 +414,24 @@ async def hazard(request: Request):
                                                    f"{', '.join(HAZARD_TYPES)})"}, status_code=400)
     if rover is not None and not isinstance(rover, str):
         return JSONResponse({"ok": False, "error": "rover must be a rover id like \"r2\""}, status_code=400)
+    x, y = data.get("x"), data.get("y")
+    if (x is None) != (y is None):
+        return JSONResponse({"ok": False, "error": "give both x and y (world metres), or neither"}, status_code=400)
+    if x is not None:
+        if isinstance(x, bool) or isinstance(y, bool) or not isinstance(x, (int, float)) or not isinstance(y, (int, float)) \
+                or not (math.isfinite(x) and math.isfinite(y)):
+            return JSONResponse({"ok": False, "error": "x and y must be numbers (world metres)"}, status_code=400)
 
     def trigger():
         with runner.locked() as sim:
-            return sim.hazards.trigger(kind, rover)
+            return sim.hazards.trigger(kind, rover, x, y)
 
     try:
         h = await asyncio.to_thread(trigger)
     except HazardError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-    _log(f"hazard {h['id']}: {h['type']}" + (f" on {h['rover']}" if h.get("rover") else ""))
+    _log(f"hazard {h['id']}: {h['type']}" + (f" on {h['rover']}" if h.get("rover") else "")
+         + (f" at ({x:g}, {y:g})" if x is not None else ""))
     return {"ok": True, "hazard": h}
 
 

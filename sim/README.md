@@ -2,10 +2,13 @@
 
 A fleet of rovers explores an unknown super-Earth at 2 g. Each rover only knows what its own
 sensors tell it. The rovers build a shared map from LiDAR, pick where to go next, learn how steep
-a slope they can really climb, find and sample science targets, and drive home to charge. They
-make every decision on their own; nothing is scripted. The world can also change while they work
-(rockfalls, soft sand, dust storms, motor faults) and they have to notice and cope. The web UI
-(in `../web`) shows the world filling in. The message format is in `../PROTOCOL.md`.
+a slope they can really climb, find science targets, take samples with the right instrument, carry
+them in a few sample tubes and cache them at the lander, and drive home to charge. They make every
+decision on their own; nothing is scripted. The planet has lakes and rivers (LiDAR gets no echo from
+liquid), tall alien crystal spires, and herds of slow six-legged grazers that the rovers watch from
+a safe distance. The world can also change while they work (rockfalls, soft sand, dust storms, motor
+faults, a spire falling across a route) and they have to notice and cope. The web UI (in `../web`)
+shows the world filling in. The message format is in `../PROTOCOL.md`.
 
 The brain has two tiers. Fast hand-written rules decide everything, 5 times a second, and keep the
 rovers safe. A small Gemma model running on your own machine gives advice beside them: which goal
@@ -17,13 +20,15 @@ messages mean. The rules check every piece of advice. See "Two-tier brain" below
 | File | What it does |
 |---|---|
 | `redshift/config.py` | All settings in one place. Reads the env vars below. |
-| `redshift/terrain.py` | Makes the ground: plains, hills, ridges, craters (each with a gentle way in), rocks, and 6 to 9 science targets in clusters. Same seed, same world. |
-| `redshift/world.py` | Builds the MuJoCo physics model: the ground as height-map tiles, rocks, the lander pad, target markers, hidden rockfall boulders, and the rovers (4 wheels, skid steering, front axle that rocks so all wheels touch, an IMU). |
-| `redshift/mapping.py` | The shared fleet map. Turns LiDAR hits into heights and slopes for each grid cell, notices when mapped ground changes, keeps a "soft ground" layer, and finds frontiers (edges of the known area). |
-| `redshift/planner.py` | A* path planning on the map. Steep cells, obstacles and soft ground are off limits. The search can stop when its time is up and carry on in the next cycle. |
-| `redshift/rover.py` | One rover's brain: sensors, driving, battery, and its state (exploring, investigating, returning, charging, recovering, idle, fault). |
-| `redshift/fleet.py` | Team decisions: who goes to which frontier, the shared slope limit, the target list, soft ground reports, who takes over from a broken rover, and the event log. |
-| `redshift/hazards.py` | Changes the world on request: rockfall, sand, dust storm, rover fault. Only the UI sees this list; the rovers must find out for themselves. |
+| `redshift/terrain.py` | Makes the ground: plains, hills, ridges, craters (each with a gentle way in), rocks, science targets in clusters, one or two lakes (often with a short river), alien spires, the home areas of the grazer herds, organic "trace" targets near them, and each target's science value and analysis. Feature counts grow with the map area. Same seed, same world. |
+| `redshift/world.py` | Builds the MuJoCo physics model: the ground as height-map tiles, rocks, the lander pad, target markers, liquid surfaces, spires, creatures, hidden rockfall boulders and spare spires, and the rovers (4 wheels, skid steering, front axle that rocks so all wheels touch, an IMU). |
+| `redshift/mapping.py` | The shared fleet map. Turns LiDAR hits into heights and slopes for each grid cell, notices when mapped ground changes, keeps layers for soft ground, identified water and "no echo here" evidence, and finds frontiers (edges of the known area). |
+| `redshift/planner.py` | A* path planning on the map. Steep cells, obstacles, soft ground and water are off limits. The search can stop when its time is up and carry on in the next cycle. |
+| `redshift/rover.py` | One rover's brain: sensors, driving, battery, samples, and its state (exploring, investigating, returning, charging, recovering, idle, fault, observing). |
+| `redshift/fleet.py` | Team decisions: who goes to which frontier, the shared slope limit, the target list and the sample cache, soft ground and water reports, who observes a lifeform, who takes over from a broken rover, and the event log. |
+| `redshift/tracker.py` | Motion tracker: LiDAR point clusters that move between sweeps become tracks (position, speed, size). |
+| `redshift/lifeforms.py` | The grazers: they wander, graze, keep together, avoid bad ground and shy away from rovers. The rovers never read this. |
+| `redshift/hazards.py` | Changes the world on request: rockfall, sand, dust storm, rover fault, spire fall, and (demo) a herd walking into view. Rockfall, sand, spire fall and lifeform can be put at a clicked point. Only the UI sees this list; the rovers must find out for themselves. |
 | `redshift/sim.py` | Runs it all: steps the physics, runs the rovers' decisions 5 times per sim second, and builds the messages for the UI. Also a command line runner that can script hazards. |
 | `redshift/camera.py` | Live pictures from each rover's mast camera (MuJoCo renders), for the UI and for Gemma. |
 | `redshift/gemma.py` | Talks to the local Gemma model (Ollama), or a fake model for demos and tests: prompts, answer checks, timeouts, a keyword parser for typed commands. |
@@ -31,11 +36,17 @@ messages mean. The rules check every piece of advice. See "Two-tier brain" below
 | `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
 | `scripts/climb_test.py` | Drives a rover up ramps of known angle to check how steep it can climb. |
 | `scripts/gemma_bench.py` | Measures Gemma's speed and answers against a real Ollama. |
-| `tests/test_smoke.py` | Runs 400 sim seconds with no hazards and checks the results and every message. |
+| `tests/test_smoke.py` | Runs 400 sim seconds on the default 120 m map with no hazards and checks the results and every message. |
 | `tests/test_hazards.py` | Runs every hazard in turn and checks how the rovers react, plus the v2 message fields and `/api/hazard`. |
 | `tests/test_camera.py` | Camera renders and the camera endpoint. |
 | `tests/test_gemma.py` | `gemma.py` against a stub Ollama server. |
 | `tests/test_brain.py` | Tier 2 with the fake model: goal switches, anomaly checks, questions, every chat command, Gemma offline, v3 messages, speed and budget. |
+| `tests/test_v4.py` | Water (a hole in the map, identified, avoided, the water sensor failsafe), spire fall and replan, motion tracks, observing a lifeform at a safe distance, the first-sighting question, point-and-click hazards and every 400, sampling, tubes and the cache, and the v4 message fields. |
+
+`test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
+numbers) written for the old 80 m world, so they run with `MAP_SIZE` 80 and the v4 features (water,
+spires, lifeforms, slower instruments, tube limit) switched off; `test_smoke.py` and `test_v4.py`
+run on the 120 m default.
 
 ## How to run
 
@@ -75,11 +86,19 @@ curl -X POST localhost:8000/api/hazard -d '{"type": "rockfall"}'
 curl -X POST localhost:8000/api/hazard -d '{"type": "sand", "rover": "r1"}'
 curl -X POST localhost:8000/api/hazard -d '{"type": "dust_storm"}'
 curl -X POST localhost:8000/api/hazard -d '{"type": "rover_fault", "rover": "r3"}'
+curl -X POST localhost:8000/api/hazard -d '{"type": "spire_fall"}'                 # across a rover's route
+curl -X POST localhost:8000/api/hazard -d '{"type": "lifeform", "rover": "r2"}'    # a herd walks into view
+curl -X POST localhost:8000/api/hazard -d '{"type": "rockfall", "x": 12.5, "y": -30}'   # at a clicked point
 ```
 
 The answer is `{"ok": true, "hazard": {...}}`, or HTTP 400 with a reason (unknown type, nowhere
 sensible to put it right now, or it would leave no working rover). Without `"rover"` the sim
 picks the exploring rover with the longest route ahead (or a random working one for a fault).
+With `"x"` and `"y"` (world metres), rockfall, sand, spire fall and lifeform go to that point (or
+as close as is safe). A rockfall lands across the route of a rover heading that way, or as a
+cluster there; a spire fall topples the nearest standing spire within 6 m toward the point, or
+drops a new spire there. 400 if the point is off the map, on the lander, within 2 m of a rover, or
+unsuitable (water, steep ground for sand, no safe room). Dust storm and rover fault ignore the point.
 
 Headless, as fast as possible, with a summary and the event log at the end. Hazards can be
 scripted as `TYPE@SECONDS[:ROVER]` (retried for up to 60 s if there is nowhere to put it yet):
@@ -88,6 +107,7 @@ scripted as `TYPE@SECONDS[:ROVER]` (retried for up to 60 s if there is nowhere t
 python -m redshift.sim --seconds 900 --seed 7
 python -m redshift.sim --seconds 400 --hazard rockfall@60 --hazard sand@120:r1 \
        --hazard dust_storm@200 --hazard rover_fault@260:r3 --ticks
+python -m redshift.sim --seconds 900 --hazard lifeform@60 --hazard spire_fall@150 --hazard rockfall@300:12,-30
 ```
 
 `--ticks` also builds the UI messages and reports their size. `--model-clock` makes runs repeat
@@ -99,7 +119,7 @@ GEMMA_FAKE=1 python -m redshift.sim --gemma --seconds 200 --hazard rockfall@60 \
        --say "30:rover 2, go check out the area north of the lander" --say "45:r1 go to 10, -5"
 ```
 
-Tests (about 2 minutes):
+Tests (about 4 minutes):
 
 ```bash
 python -m pytest -q tests/        # add -s to see the event log
@@ -114,7 +134,7 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `SEED` | 42 | terrain and target layout |
 | `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
 | `SIM_SPEED` | 3.0 | sim seconds per wall second |
-| `MAP_SIZE` | 80 | map width in metres |
+| `MAP_SIZE` | 120 | map width in metres (feature counts grow with the area; 80 gives the old layout) |
 | `GRAVITY_G` | 2.0 | gravity in Earth g |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer |
 | `BRAIN_BUDGET_MS` | 40 | compute budget per rover per decision cycle (ms) |
@@ -138,6 +158,11 @@ and up to 200 points of the latest LiDAR sweep (`scan`).
 
 - **LiDAR** on a 0.75 m mast: 1008 rays, 8 m range, 5 sweeps a second. Hits build the shared map.
   `lidar_range` is how far the rover believes it can see, `lidar_hits` the returns in the sweep.
+  Liquid gives no echo at all (the beam is absorbed or glances off), so a lake is a hole in the map.
+  Hits on creatures go to the motion tracker instead of the map (see "Lifeforms").
+- **Camera** on the mast (`camera.py`): the rules take a small picture to check a LiDAR hole for blue
+  liquid; Gemma gets the camera picture for anomalies and for anything that moves.
+- **Water sensor**: a wetness probe on the belly. Only matters if a rover ever drives into liquid.
 - **Spectrometer**: LiDAR hits on science targets within 8 m. `spectro` is the nearest one.
 - **IMU**: a MuJoCo `framequat` (attitude, like an AHRS chip) and `gyro` on the chassis, with a
   little noise. Pitch, roll, tilt, heading and yaw rate all come from it.
@@ -161,8 +186,87 @@ The hazard list (`hazards` in every message) is for the UI only. The rovers neve
 | Dust storm | 90 s. LiDAR range drops from 8 m to 3 m with some lost returns and noise. Dust also covers the lander's solar panels: charging runs at 30%. | Its own scans: no returns from beyond about 3 m for 3 sweeps in a row. Docked rovers see their battery filling slowly. | Becomes "unsure": slows to 0.3 m/s briefly, then drives at 0.4 m/s with gentle turns, stays on mapped ground (unknown ground costs much more to plan through), prefers near frontiers and makes no far trips to targets. A rover charging slowly raises its return margin from 15% to 25%. Each change is logged once, and again when it clears. |
 | Rover fault | One rover's motor controller drops out for 90 s. The brakes lock the wheels. State `fault`. | Motor feedback (controller status). | It tells the fleet: its frontier and any target it was going to sample are released at once, the others re-plan, and one may take over its area. Then "r3 rebooted. Back online." and it carries on. A request that would leave no working rover is refused. |
 
+| Spire fall | An alien spire topples across a rover's route 4 to 9 m ahead (about 1.5 s, rotating about its base), then lies there: a long, low obstacle. If no spire stands near the route, a spare one comes up beside it and falls. Never onto a rover or the lander, and nobody gets trapped. | LiDAR change detection, as for a rockfall. The changed cells form one narrow continuous strip, so it is called a long, low obstacle (a boulder row has gaps). | "r2 sees a new long, low obstacle across its path 7 m ahead (LiDAR: about 2.0 m long, 0.8 m tall, 3 map cells changed)", slows, replans ("rerouting around the fallen obstacle"). The UI gets `standing: false` for that spire in an updated `features` object in the next tick (and in every later `init`). |
+| Lifeform (demo) | Moves a herd of grazers 6 to 7 m in front of a rover (or to the clicked point), walking across its view. | The rovers must notice them themselves: moving LiDAR clusters (tracker). | See "Lifeforms". |
+
 Hazards stay until `/api/reset`. Exploration-complete and the auto reset keep working (a faulted
 rover is not parked, so there is no reset while one is down).
+
+## Water
+
+One or two lakes (and on most 120 m maps a short river flowing into one) are carved into gentle
+ground away from the lander. Each has a flat liquid surface at its `level` (`features.water` in
+`init` has the outlines). The basin has a shallow shelf at the shore and a guard ring of ground just
+above the level, and a lake or river is only kept if the ground the rovers could reach before is
+still reachable around it.
+
+1. **No echo.** Steep LiDAR rays straight ahead that should meet the ground inside the 8 m range
+   come back empty. The rover extends the ground line from the last returns in each ray column, so
+   a slope that falls away from the beam is not mistaken for a hole. These missing returns are
+   recorded as "no echo here" evidence in the map. A hole in two sweeps in a row is checked.
+2. **Look.** The rover slows to 0.3 m/s and takes a small camera picture. Blue liquid in the lower
+   part of the picture: "r2 LiDAR gets no returns 5 m ahead and the camera shows a liquid surface
+   (10% of the lower view is blue). Marking a lake and routing around it." The anomaly
+   (`no_returns`) also goes to Gemma with the picture, which can confirm "liquid". No blue: it is a
+   drop-off (a crater edge), logged once, and the rover keeps to mapped ground.
+3. **Avoid.** Identified water (`fleet.water_zones`) is impassable for every rover. As rovers drive
+   along the shore, more of the lake is added quietly. Unknown cells that are water, or that keep
+   giving no echo, no longer count as unexplored, so the rovers do not chase frontiers into a lake.
+4. **Failsafe.** If a rover still drives into liquid (its belly probe gets wet), it stops, marks the
+   water ahead for the fleet and backs out along its own tracks.
+
+Without a working camera (no OpenGL) the rules fall back to the hole's shape: a flat, level edge
+(height spread under 8 cm) is probably liquid.
+
+## Lifeforms
+
+Two or three herds of grazers (3 or 4 each, 1 to 1.5 m long, six legs, teal green) live in open
+ground. They wander at 0.2 to 0.5 m/s, graze, keep loosely together, avoid steep ground, water,
+rocks and spires, and walk away from any rover closer than about 3 m. `lifeforms` (truth) is in
+every message for rendering.
+
+- **Seeing them.** LiDAR hits on creatures go to a motion tracker instead of the terrain map. This
+  is a stated simplification: a real rover would split them off by comparing each scan with the
+  map. After that split the tracker only sees anonymous points: it clusters each sweep, matches
+  clusters to tracks, smooths position and speed, and only calls something a moving object after
+  several sweeps in which it moved more than 0.35 m. `tracks` in every message is what the fleet
+  believes.
+- **Curious but careful.** A new track: the nearest free rover with enough battery switches to
+  `observing` (one observer per herd, at most two at a time; the others keep exploring): "r3 sees
+  something moving 9 m north-west (LiDAR track k2, 0.3 m/s, about 1.2 m). Stopping to look." Gemma
+  gets the camera picture and the track numbers and says what it is ("possible lifeform, six legs,
+  about 1.2 m"). Then the rover approaches to about 6 m and follows at 0.35 m/s at most, turning to
+  keep the camera on it, never closer than 4 m (planetary protection: it backs off if a creature
+  comes toward it), never more than 25 m from where it started, and stops after 75 s or earlier for
+  battery, terrain, water or if it loses sight: "r3 observed the herd for 70 s: 3 individuals,
+  average speed 0.3 m/s. Resuming exploration." `fleet.lifeforms_seen` counts confirmed lifeforms
+  (by herd: the most individuals seen at the same time, so a creature that is lost and found again
+  is not counted twice).
+- **The operator decides the first time.** The first sighting after start or reset asks: "Possible
+  lifeform 8 m north (...). Follow it or keep exploring?" with Follow it / Observe from here (the
+  default: it never gets closer) / Keep exploring. Later sightings only ask when Gemma is unsure.
+  With tier 2 switched off the rules follow carefully.
+- Any other rover that finds a tracked creature within 3.5 m ahead stops and waits, and the planner
+  routes around tracks.
+
+## Samples
+
+Each rover has 3 sample tubes. Sampling uses the instrument for the target kind: mineral = drill
+(about 10 s), ice = scoop (8 s), vent = gas sniffer (6 s), trace = swab (6 s; organic traces near
+the herds, never the creatures). `sampling.progress` shows the instrument running. Then the rover
+analyses the sample on board: a short result and a science value from 1 to 10 (deterministic per
+seed; most finds are ordinary, two per map are jackpots, traces tend to score high): "r2 drilled a
+core from t3: olivine-rich basalt with water-bearing clays (value 8/10). 2 of 3 tubes used."
+
+- The spectrometer gives an estimate from afar ("estimated value 7/10"), so the rovers weigh value
+  against distance, battery and free tubes. With one tube left, finds estimated under 6/10 are
+  skipped (logged once: "r2 skips t5 (estimated value 3/10 and only 1 of 3 tubes left, keeping it
+  for a better find)").
+- Full tubes go to the lander cache on the next return, or on a dedicated trip if a find estimated
+  at 8/10 or more is waiting: "r2 cached 3 samples at the lander (fleet total 7, science score
+  41)." After a cache trip with charge left the rover heads straight back out.
+- Gemma's goal options quote value and tubes ("value 8/10 (estimate), 2 tubes free"), and the
+  operator's "sample t4" checks there is a free tube.
 
 **Uncertainty.** Anything perception did not expect (new obstacles on the path, sudden wheel slip,
 LiDAR returns collapsing) goes through one method, `Rover.on_anomaly(t, kind, details)`. It stores
@@ -170,8 +274,9 @@ the anomaly in `rover.anomaly` (and `rover.anomaly_log`), slows the rover at onc
 re-planning, and logs what was seen. Other code can listen by adding a function to
 `rover.anomaly_hooks`; it is called with `(rover, anomaly)`. The anomaly is a dict like
 `{"t": 61.4, "kind": "new_obstacle", "type": "new_obstacle", "at": [2.0, -28.0], "dist": 4.0, "cells": 5}`
-(`kind` is `new_obstacle`, `slip` or `low_visibility`; `type` uses the names `new_obstacle`,
-`wheel_slip`, `low_visibility`).
+(`kind` is `new_obstacle`, `slip`, `low_visibility` or `no_returns`; `type` uses the names
+`new_obstacle`, `wheel_slip`, `low_visibility`, `no_returns`). A new obstacle may carry
+`"shape": "long"` with its `length` and `height` (a fallen spire).
 
 ## Two-tier brain (rules + Gemma)
 
@@ -198,7 +303,10 @@ Where Gemma helps:
    `ask_operator`), or it is the first anomaly since start or reset, the rover asks in the chat with
    2 or 3 safe options and its camera picture, and creeps at 0.25 m/s along its safe route while it
    waits. No answer in 20 s: it takes the safest option and says so.
-4. **Typed commands.** Gemma (or the keyword parser if Gemma is offline) turns the operator's text
+4. **Lifeforms.** When a rover starts observing something that moves, Gemma gets the camera picture
+   and the track numbers and says whether it is a lifeform, with a short label and what to do
+   (approach to observe, observe from here, ignore). See "Lifeforms".
+5. **Typed commands.** Gemma (or the keyword parser if Gemma is offline) turns the operator's text
    into a command; the rules check it and run it or refuse with numbers ("r1: can't, battery 22%
    would not get me there and back"). One reply per command. Commands: go to x, y; explore a
    direction (for 3 minutes); sample a target; return home; hold; resume; avoid an area (a circle that
@@ -234,16 +342,25 @@ ahead. A rover that goes over budget several times in 10 s logs a warning and pl
 slices for a while. Each tick reports `brain` (last, average and peak ms over 10 s, and cycles
 over budget).
 
-Measured on the dev machine (2 shared CPUs, 3 rovers, 400 sim s, wall clock):
+Measured on the dev machine (2 shared CPUs, 3 rovers, 120 m map, 900 sim s, wall clock, with
+`--hazard lifeform@60 --hazard spire_fall@150 --hazard rockfall@300 --hazard sand@400
+--hazard dust_storm@500 --hazard rover_fault@650:r3 --ticks`):
 
-| Run | avg ms | p95 ms | max ms | over 40 ms |
-|---|---|---|---|---|
-| no hazards, seeds 42 / 7 / 123 | 1.2 to 1.5 | 2.4 to 3.8 | 6 to 30 | 0 |
-| all four hazards, seeds 42 / 7 / 123 | 1.1 to 1.3 | 2.2 to 3.6 | 8 to 30 | 0 |
+| Seed | avg ms | p95 ms | max ms | over 40 ms | sim speed | tick median / p95 / max |
+|---|---|---|---|---|---|---|
+| 42 | 1.7 to 1.9 | 4.1 to 4.9 | 18 to 45 | 1 of 13500 cycles | 9.4x | 17.2 / 18.8 / 32.9 KB |
+| 7 | 1.6 to 1.7 | 3.9 | 12 to 30 | 0 | 9.9x | 17.3 / 18.7 / 33.1 KB |
+| 123 | 1.7 | 3.9 to 4.3 | 30 to 32 | 0 | 9.5x | 16.8 / 20.0 / 30.8 KB |
 
-The whole sim still runs about 14 to 15 times faster than real time with 3 rovers, hazards and
-UI messages, and about 13 times with the fake Gemma attached. A tick message is about 12 to 13 KB
-(most of it the LiDAR points).
+A maximum of about 30 ms is the planner using its whole share of a cycle (0.75 x 40 ms). The
+reachability flood fill on the bigger grid is anytime too (at most 80 growth steps per cycle). The
+whole sim runs about 9.5 to 10 times faster than real time. A tick message is about 17 KB (most of
+it the LiDAR points; `lifeforms` and `tracks` add about 1 KB). An `init` carries the whole known map:
+about 1 MB once the 120 m map is explored (56,000 cells), about 150 to 250 KB early on.
+
+Full exploration of the 120 m map (seed 42, no hazards) finishes at about 1590 sim s (97% of the
+map, all 20 targets found, 17 samples cached, science score 91, no rover ran out of battery);
+at 900 s the hazard runs above had explored 65 to 82%.
 
 The budget is wall clock time, so on a busy machine a plan may be split at a different moment and
 two runs can drift apart. `--model-clock` (or `plan_clock="model"` in `Config`) counts A*
@@ -264,14 +381,16 @@ expansions instead (3 us each, measured here), which makes runs repeat exactly; 
   96%"). Every rover replans with the new limit straight away. The limit never drops below the
   steepest climb a rover has already managed. A stall caused by a rock or by losing grip does not
   count. The real limit at 2 g is about 20.5 deg (see `scripts/climb_test.py`).
-- **Science.** If a LiDAR ray hits a target within 8 m, the rover reports it. If it is free and has
-  the battery, it drives over, waits a few seconds to take a sample, and marks it sampled. Busy
-  rovers log the find and another rover can pick it up. Targets come in clusters, so frontiers near
-  a sampled target get a bonus.
+- **Science.** If a LiDAR ray hits a target within 8 m, the rover reports it with the
+  spectrometer's value estimate. If it is free, has the battery and a tube to spare, it drives over,
+  runs the instrument, analyses the sample and keeps it in a tube (see "Samples"). Busy rovers log
+  the find and another rover can pick it up. Targets come in clusters, so frontiers near a sampled
+  target get a bonus.
 - **Battery.** Driving uses power (more on slopes and in tight turns), and the electronics use a
   little all the time. Each rover keeps checking how much charge it needs to get home and goes
   back with a 15% margin (25% while the lander charges slowly). It charges on the lander pad, then
-  heads out again.
+  heads out again. The battery is sized for the map (1.5 times bigger on the 120 m map than on the
+  80 m one), so a trip to the far edge and back takes about the same share of a charge.
 - **Trouble.** If a rover stops moving it works out why: a rock (mark it and go round), a slope
   (learn), lost grip (back off and try another line), soft ground (back out and mark it), or a
   rover in the way (back off). If it tips over it rights itself. If steep ground boxes it in, it

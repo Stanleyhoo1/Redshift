@@ -1,10 +1,12 @@
 import { useSim } from '../state/store.js'
 import { degrees, fixed } from '../lib/format.js'
-import { GROUND_RAMP, KIND_STYLE, SIGNAL, SLOPE } from '../lib/theme.js'
+import { GROUND_RAMP, KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
 
-export function Legend({ slopeColors, frontiers }) {
+export function Legend({ slopeColors, frontiers, life = true }) {
   const limit = useSim((s) => s.limit)
   const map = useSim((s) => s.map)
+  const v4 = useSim((s) => s.v4)
+  const hasTrace = useSim((s) => s.v4 || s.targets.some((t) => t.kind === 'trace'))
   const lim = Number.isFinite(limit.current) ? limit.current : 30
   const caution = lim * 0.6
   return (
@@ -54,13 +56,39 @@ export function Legend({ slopeColors, frontiers }) {
           </li>
         )}
       </ul>
-      <ul className="legend-list legend-row">
-        {Object.entries(KIND_STYLE).map(([k, v]) => (
-          <li key={k}>
-            <i className="sw sw-diamond" style={{ '--c': v.color }} />
-            {v.label}
+      {v4 && (
+        <ul className="legend-list legend-row">
+          <li title="Liquid water the fleet has identified (LiDAR gets no returns from it)">
+            <i className="sw sw-water" style={{ '--c': WATER.mid, '--c2': WATER.deep }} />
+            Water
           </li>
-        ))}
+          <li title="Alien crystal spires: LiDAR obstacles">
+            <i className="sw sw-spire" style={{ '--c': SPIRE.body, '--g': SPIRE.glow }} />
+            Spire
+          </li>
+          {life && (
+            <>
+              <li title="A creature the fleet is tracking">
+                <i className="sw sw-life" style={{ '--c': LIFE }} />
+                Lifeform
+              </li>
+              <li title="A fleet track: what the rovers believe is moving there">
+                <i className="sw sw-track" style={{ '--c': LIFE }} />
+                Track
+              </li>
+            </>
+          )}
+        </ul>
+      )}
+      <ul className="legend-list legend-row">
+        {Object.entries(KIND_STYLE)
+          .filter(([k]) => k !== 'trace' || hasTrace)
+          .map(([k, v]) => (
+            <li key={k}>
+              <i className="sw sw-diamond" style={{ '--c': v.color }} />
+              {v.label}
+            </li>
+          ))}
       </ul>
     </div>
   )
