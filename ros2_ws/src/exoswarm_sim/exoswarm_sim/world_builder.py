@@ -13,7 +13,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import yaml
-from scipy import ndimage
 
 from .robot_models import ROVER_SPEC, rover_sdf, scout_sdf
 from .terrain_gen import generate_terrain
@@ -30,21 +29,26 @@ def robot_names(fleet: dict) -> list[str]:
            [f'scout_{k}' for k in range(int(fleet.get('drones', 0)))]
 
 
+def _periodic_noise(rng, n: int, beta: float = 2.2) -> np.ndarray:
+    """Seamlessly tileable fractal noise (spectral synthesis: periodic by construction)."""
+    fx = np.fft.fftfreq(n)[:, None]
+    fy = np.fft.fftfreq(n)[None, :]
+    f = np.sqrt(fx * fx + fy * fy)
+    f[0, 0] = 1.0
+    spec = (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))) / f ** (beta / 2)
+    spec[0, 0] = 0
+    out = np.real(np.fft.ifft2(spec))
+    return (out - out.min()) / (out.max() - out.min())
+
+
 def _write_textures(out: Path, seed: int):
     rng = np.random.default_rng(seed + 1000)
     n = 512
-    noise = np.zeros((n, n))
-    amp = 1.0
-    for k in range(5):
-        cells = 4 * 2 ** k
-        g = rng.standard_normal((cells, cells))
-        noise += amp * ndimage.zoom(g, n / cells, order=3, mode='wrap')[:n, :n]
-        amp *= 0.5
-    noise = (noise - noise.min()) / (noise.max() - noise.min())
+    noise = 0.7 * _periodic_noise(rng, n, 2.4) + 0.3 * _periodic_noise(rng, n, 1.2)
     base = np.array([52, 84, 156], np.float64)      # BGR rust regolith
-    img = base[None, None, :] * (0.75 + 0.45 * noise[..., None])
-    specks = rng.random((n, n)) < 0.004
-    img[specks] *= 0.55
+    img = base[None, None, :] * (0.72 + 0.5 * noise[..., None])
+    specks = rng.random((n, n)) < 0.003
+    img[specks] *= 0.6
     cv2.imwrite(str(out / 'regolith_diffuse.png'), np.clip(img, 0, 255).astype(np.uint8))
     normal = np.zeros((n, n, 3), np.uint8)
     normal[:] = (255, 128, 128)                    # BGR of a flat tangent-space normal (128,128,255)
@@ -146,8 +150,7 @@ def build_world(cfg: dict, out_dir) -> dict:
     robots_sdf = ''.join(rover_sdf(n, spawn[n]) if n.startswith('rover') else scout_sdf(n, spawn[n]) for n in names)
     rocks_sdf = ''.join(_rock_sdf(k, r, terr.height_at(r.x, r.y)) for k, r in enumerate(terr.rocks))
     crystals_sdf = ''.join(_crystal_sdf(k, x, y, terr.height_at(x, y)) for k, (x, y) in enumerate(terr.science))
-    pad_x, pad_y = terr.spawn_xy[0]
-    tex_size = 6.0
+    tex_size = 14.0
     world = f'''<?xml version="1.0"?>
 <sdf version="1.10">
 <world name="{WORLD_NAME}">
@@ -201,16 +204,6 @@ def build_world(cfg: dict, out_dir) -> dict:
           <size>{size_m} {size_m} {hmax:.4f}</size>
           <pos>0 0 0</pos>
         </heightmap></geometry>
-      </visual>
-    </link>
-  </model>
-  <model name="landing_pad">
-    <static>true</static>
-    <pose>{pad_x:.3f} {pad_y:.3f} {terr.height_at(pad_x, pad_y) + 0.01:.3f} 0 0 0</pose>
-    <link name="link">
-      <visual name="ring">
-        <geometry><cylinder><radius>2.6</radius><length>0.01</length></cylinder></geometry>
-        <material><ambient>0.6 0.3 0.1 1</ambient><diffuse>0.9 0.45 0.15 1</diffuse><emissive>0.4 0.15 0.02 1</emissive></material>
       </visual>
     </link>
   </model>

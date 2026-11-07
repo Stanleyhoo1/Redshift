@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from exoswarm_sim.scene_events import JOLT, rockslide_layout
+from exoswarm_sim.scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_layout
 
 
 def test_rockslide_lies_ahead_on_path_and_across_it():
@@ -36,5 +36,9 @@ def test_rockslide_short_path_extends_along_last_segment():
 
 
 def test_jolt_profile():
-    assert JOLT['duration_s'] > 0
-    assert JOLT['torque'][0] != 0 or JOLT['force'][1] != 0
+    # tuned: cut 21.4 deg -> ~33.8 deg peak, 5 deg past the 2.2 g tip alarm (28.8 deg)
+    assert jolt_cut_angle_deg(28.8) == pytest.approx(21.4, abs=0.1)
+    f, t = jolt_wrench_world(0.0, 2.2)
+    assert t[0] == pytest.approx(JOLT['torque_nm_at_2_2g'])
+    _, t1 = jolt_wrench_world(math.pi / 2, 1.0)
+    assert t1[1] == pytest.approx(JOLT['torque_nm_at_2_2g'] / 2.2) and abs(t1[0]) < 1e-9

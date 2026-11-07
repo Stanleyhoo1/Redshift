@@ -5,25 +5,28 @@ import math
 
 import numpy as np
 
-# Lateral "ground subsidence" jolt applied to the rover base link for `duration_s`
-# (body frame: +y = left). Tuned in Gazebo so peak roll lands in [32°, 45°] at 2.2 g and the rover
-# self-rights (see plan T12). The mock world uses `mock_roll_impulse_deg_s` instead.
+# "Ground subsidence" jolt: a roll torque on the rover base link, released by the *world* (not the
+# agent) once the true roll reaches a cut-off angle. Tuned in Gazebo at 2.2 g (plan T12):
+# peak roll ≈ 2·cut − 9°, rover self-rights for peaks up to ~50°. Torque scales with g so the
+# motion is gravity-invariant; the cut-off targets a peak `peak_over_alarm_deg` beyond the tip alarm.
 JOLT = {
-    'force': [0.0, 1400.0, 0.0],
-    'torque': [700.0, 0.0, 0.0],
-    'duration_s': 0.35,
-    'mock_roll_impulse_deg_s': 260.0,
+    'torque_nm_at_2_2g': 750.0,
+    'force': [0.0, 0.0, 0.0],
+    'peak_over_alarm_deg': 5.0,
+    'max_duration_s': 1.0,
 }
 
 
-def jolt_wrench_world(yaw: float, g_mult: float = 1.0):
-    """Rotate the body-frame jolt into the world frame; scales with weight so tilt is comparable."""
+def jolt_cut_angle_deg(tip_alarm_deg: float) -> float:
+    target_peak = tip_alarm_deg + JOLT['peak_over_alarm_deg']
+    return (target_peak + 9.0) / 2.0
+
+
+def jolt_wrench_world(yaw: float, g_mult: float = 2.2):
+    """Body-frame roll torque rotated into the world frame, scaled with weight."""
+    tq = JOLT['torque_nm_at_2_2g'] * g_mult / 2.2
     c, s = math.cos(yaw), math.sin(yaw)
-    k = max(1.0, g_mult) / 2.2
-    f, t = JOLT['force'], JOLT['torque']
-    force = [k * (c * f[0] - s * f[1]), k * (s * f[0] + c * f[1]), k * f[2]]
-    torque = [k * (c * t[0] - s * t[1]), k * (s * t[0] + c * t[1]), k * t[2]]
-    return force, torque
+    return [0.0, 0.0, 0.0], [c * tq, s * tq, 0.0]
 
 
 def _point_along(path: np.ndarray, pose, ahead_m: float):
