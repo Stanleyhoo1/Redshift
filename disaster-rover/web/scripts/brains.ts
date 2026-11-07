@@ -15,7 +15,10 @@ export interface RunnerBrain {
 
 export async function makeBrain(kind: string, args: Record<string, string>, _sim: Sim): Promise<RunnerBrain> {
   if (kind === 'wander') return new WanderBrain();
-  if (kind === 'local') return new LocalBrain();
+  if (kind === 'local') {
+    const b = new LocalBrain(); b.noProbes = args['no-probes'] === 'true';
+    return Object.assign(b, { stats: () => ({ probeWarnings: b.probeWarnings }) });
+  }
   if (kind === 'ros') { const b = new RosBrain(); await b.connect(args.url ?? 'ws://localhost:9090'); return b; }
   throw new Error(`unknown brain ${kind}`);
 }

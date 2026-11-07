@@ -12,8 +12,11 @@
 
 - M6: earthquake (IMU residual -> hold still in the open / flee structures; rubble + cracks via LiDAR), tornado (funnel sightings + wind/pressure -> track, closest-approach prediction, refuges off its 60 s track, wind reflex), meteors (impact flashes -> drifting impact zone; incoming-streak dodge reflex). Local TS, 8 seeds: quake 8/8, tornado 8/8, meteor 6/8, all five at once 5/8. ROS 2 brain seed 4: quake, tornado, meteor all survived, 0 missed frames. Browser smoke test with every chaos button: no console errors.
 
+- M7: probes. Placement = coverage gain + warning value (early-warning distance ahead of a sensed hazard, flood gauge near water, watching structures), >= 26 m spacing, paced over the mission, damped while fleeing. Each probe is a sensor station: 1 Hz samples (water, temperature, elevation) every 5 m within 22 m feed the belief grid, reveal fog of war, act as flood gauges for the stage estimate, and raise "PROBE n early warning" lines + agent events when a cell turns wet or hot. 8 seeds: flood 9.5, fire 10.8, meteor 9.9 early warnings per run on average. Ablation (`--no-probes`, 6 seeds): same survival, 0 warnings; cost is survey time (quake 25.5 % vs 32.6 % surveyed).
+- Water reflex now drives back to the last spot the depth gauge read dry (elevation search was fooled by the water surface). 8 seeds: flood 8/8, flood+fire 8/8, fire 5/8, meteor 6/8.
+
 ## Next
-- M7 probes.
+- M8 Gemma 4 mission_agent + rule set.
 
 ## Blockers
 - (resolved) Pushing was blocked earlier; The repo `redshift` is not under `kayaclaridge-sys`; the only match is `Stanleyhoo1/Redshift` (you have WRITE access, found via `gh api user/repos`). Cloning and the local branch `naturaldisasterdemo` worked, but `git push -u origin naturaldisasterdemo` was refused by the Claude Code permission guard ("create public surface" on a repo owned by another account). All milestone commits are on the local `naturaldisasterdemo` branch in `~/redshift`. The owner pushed the branch; pushes to `naturaldisasterdemo` now go after each milestone.

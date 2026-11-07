@@ -58,3 +58,10 @@
 - Brain: meteor dodge never heads into water/obstacles/steep ground, and water deeper than 0.35 m beats a dodge. Tilt reflex checks for water before reversing. Refuges near the projected tornado track are penalised. Probe placement is damped by the flee score.
 - Unseen cells within 6 m of seen water cost 5 (not 0.6) to plan through: a fleeing rover in smoke drove into an unseen river strip. Side effect: survey coverage with no disaster dropped a little (~27 % -> ~23 % in 180 s on 8 seeds).
 - Known limits: dense meteor showers can still score a direct hit (the streak warning is ~3 s and the rover turns at 1.6 rad/s); being caught between a fire and the river remains the most common wildfire failure.
+
+## Probes (M7)
+- A probe early warning fires only when a probe sample shows a CHANGE the brain didn't already know: a cell seen dry turning wet, or seen cool turning hot. Samples repeat every frame between 1 Hz updates and river cells are always wet, so "value above threshold" alone would spam.
+- Throttled to one warning per probe per hazard kind per 10 s.
+- Probes standing in water double as flood gauges (their DSM sample is the water surface).
+- Survival is unchanged with/without probes: they are an early-warning network for people (the mission), not a survival aid for the rover. Their cost is time spent driving to good spots instead of exploring.
+- Water reflex escape = back to last dry fix. Near fire, shallow water tolerance is 0.28 m (hard limit 0.5), escape planning avoids > 0.22 m.

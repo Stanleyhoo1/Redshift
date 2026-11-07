@@ -26,7 +26,10 @@ export interface Readings {
   waterNear: { dist: number; bearing: number } | null;
   /** brain-side estimate of the water surface elevation (flood stage), NaN if no water seen */
   stageObs: number;
+  /** probe early warnings this frame */
+  probeAlerts: ProbeAlert[];
 }
+export interface ProbeAlert { id: number; kind: 'water' | 'heat'; x: number; y: number; value: number }
 
 /** Slow state carried between frames by perception. */
 export class PerceptionState {
@@ -136,7 +139,7 @@ export function perceive(b: Belief, f: SensorFrame, ps: PerceptionState): Readin
     }
   }
   // depth estimate for seen water cells: surface (stage) minus the dry ground we saw earlier
-  const stageObs = stageSamples.length ? median(stageSamples) : (depth > 0.05 && !isNaN(b.elev[here]) ? b.elev[here] : NaN);
+  let stageObs = stageSamples.length ? median(stageSamples) : (depth > 0.05 && !isNaN(b.elev[here]) ? b.elev[here] : NaN);
   if (!isNaN(stageObs)) {
     for (let i = 0; i < b.water.length; i++) if (b.waterT[i] === t && b.water[i] > 0 && !isNaN(b.dryElev[i])) b.water[i] = Math.max(b.water[i], stageObs - b.dryElev[i]);
   }
@@ -176,12 +179,19 @@ export function perceive(b: Belief, f: SensorFrame, ps: PerceptionState): Readin
   }
 
   // ---------- probes: each one is a remote sensor station ----------
+  //     early warning = a probe sees a cell CHANGE into a hazard (dry -> wet, cool -> hot) before the rover does
+  const probeAlerts: ProbeAlert[] = [];
+  const probeStage: number[] = [];
   for (const pr of status.probes) {
     if (!pr.alive) continue;
     const sm = pr.samples;
     for (let k = 0; k + 4 < sm.length; k += 5) {
       const px = sm[k], py = sm[k + 1]; if (!b.inside(px, py)) continue;
       const i = b.idx(px, py);
+      const wasDry = b.water[i] === 0, wasCool = !isNaN(b.heat[i]) && b.heat[i] < 60;
+      if (sm[k + 2] > 0.05 && wasDry) probeAlerts.push({ id: pr.id, kind: 'water', x: px, y: py, value: sm[k + 2] });
+      if (sm[k + 3] > 100 && wasCool) probeAlerts.push({ id: pr.id, kind: 'heat', x: px, y: py, value: sm[k + 3] });
+      if (sm[k + 2] > 0.05) probeStage.push(sm[k + 4]);
       b.see(i, t);
       b.water[i] = sm[k + 2]; b.waterT[i] = t;
       b.heat[i] = sm[k + 3]; b.heatT[i] = t;
@@ -189,6 +199,9 @@ export function perceive(b: Belief, f: SensorFrame, ps: PerceptionState): Readin
       if (sm[k + 2] < 0.03) b.dryElev[i] = sm[k + 4];
     }
   }
+
+  // probes standing in water are flood gauges: their surface elevation is the stage
+  if (isNaN(stageObs) && probeStage.length) stageObs = median(probeStage);
 
   // ---------- IMU shake: median of sample-to-sample accel jumps (rover motion is smooth, seismic is not) ----------
   // residual = measured accel minus what our own motion + gravity explains; seismic shaking is what's left
@@ -213,7 +226,7 @@ export function perceive(b: Belief, f: SensorFrame, ps: PerceptionState): Readin
     t, dt, x, y, yaw, v: f.odom.twist.twist.linear.x, w: f.odom.twist.twist.angular.z, roll, pitch,
     tiltDeg: Math.max(Math.abs(roll), Math.abs(pitch)) * 180 / Math.PI,
     status, depth, tempC, windX: wx, windY: wy, windSpeed: ws, pressure: pr, pressureDrop: ps.pressureBase - pr, shake,
-    lidarFront: front, returnFrac, smoke, scanR: sc.ranges, scanA0: yaw + sc.angle_min, scanInc: sc.angle_increment, scanMax: sc.range_max, thermalMax, hotSectors, streaks, flashes, funnel, waterNear, stageObs,
+    lidarFront: front, returnFrac, smoke, scanR: sc.ranges, scanA0: yaw + sc.angle_min, scanInc: sc.angle_increment, scanMax: sc.range_max, thermalMax, hotSectors, streaks, flashes, funnel, waterNear, stageObs, probeAlerts,
   };
 }
 export { clamp01 };

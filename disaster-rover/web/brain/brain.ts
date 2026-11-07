@@ -35,6 +35,10 @@ export class LocalBrain implements Brain {
   badUntil = new Float32Array(CFG.G * CFG.G);
   /** events for the agent (new hazard, hazard on path, low battery, probe placed) */
   events: BrainEvent[] = [];
+  /** ablation switch: never place probes (to measure what the probe network adds) */
+  noProbes = false;
+  probeWarnings = 0;
+  private probeAlertT = new Map<string, number>();
   private reflexPos = { x: 0, y: 0, t: 0 };
   private lastMap = -1; private lastLog = -1; private lastLogKey = '';
   private stuckSince = -1; private recoverUntil = -1; private recoverW = 1;
@@ -46,6 +50,17 @@ export class LocalBrain implements Brain {
     const t = rd.t;
     if (!this.home) this.home = { x: rd.x, y: rd.y };
     this.pred.observe(rd, this.ps);
+    // probe early warnings (the probe network saw a hazard arrive before the rover could)
+    let probeLog: string | null = null;
+    for (const a of rd.probeAlerts) {
+      const key = `${a.id}:${a.kind}`;
+      if (t - (this.probeAlertT.get(key) ?? -1e9) < 10) continue;
+      this.probeAlertT.set(key, t); this.probeWarnings++;
+      const d = Math.hypot(a.x - rd.x, a.y - rd.y);
+      const txt = `PROBE ${a.id} early warning: ${a.kind === 'heat' ? `${a.value.toFixed(0)}°C` : `water ${a.value.toFixed(2)} m`} at (${a.x.toFixed(0)},${a.y.toFixed(0)}), ${d.toFixed(0)} m ${compass(Math.atan2(a.y - rd.y, a.x - rd.x))} of rover`;
+      probeLog = probeLog ? probeLog + '\n' + txt : txt;
+      this.events.push({ kind: 'probe_warning', text: txt });
+    }
     if (!rd.status.alive) return { cmd_vel: zeroTwist(), drop_probe: null, decision_log: null };
 
     // ---- map + predictions + candidate spots, 2 Hz ----
@@ -71,6 +86,7 @@ export class LocalBrain implements Brain {
     // ---- utility selection ----
     const placed = 6 - rd.status.probes_left;
     this.scores = score(ctx, P, rd, this.goal, placed);
+    if (this.noProbes) this.scores.place_probe = 0;
     const prev = this.behaviour;
     const nb = select(this.scores, this.behaviour, this.since, t);
     if (nb !== this.behaviour) { this.behaviour = nb; this.since = t; this.target = null; this.path = null; }
@@ -146,6 +162,7 @@ export class LocalBrain implements Brain {
     if (reflexStarted) log = `REFLEX ${reflex!.text} (overrides ${this.behaviour})`;
     else if (key !== this.lastLogKey || t - this.lastLog > 4 || drop) log = this.logLine(rd, prev, drop);
     if (log) { this.lastLog = t; this.lastLogKey = key; }
+    if (probeLog) log = log ? probeLog + '\n' + log : probeLog;
     return { cmd_vel: cmd, drop_probe: drop ? { x: rd.x, y: rd.y, z: 0 } : null, decision_log: log };
   }
 

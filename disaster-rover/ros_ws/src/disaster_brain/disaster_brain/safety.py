@@ -58,8 +58,11 @@ class Safety:
     def __init__(self):
         self.low_conf_since = -1.0
         self.last_rescan = -1e9
+        self.last_dry = None
 
     def check(self, rd, b, P):
+        if rd.depth < 0.03:
+            self.last_dry = (rd.x, rd.y)
         # 1. incoming meteor
         worst = None
         for s in rd.streaks:
@@ -73,14 +76,19 @@ class Safety:
                         text='Camera: meteor streak, impact %.1f m %s in %.1f s → DODGE %s' % (d, compass(math.atan2(wy - rd.y, wx - rd.x)), ttl, compass(away)))
         # 2. water
         heat_near = rd.temp_c > 40 or any(s[1] < 14 for s in rd.hot_sectors)
-        if rd.depth > (0.36 if heat_near else CFG['reflexWater']):
-            h = self.escape_search(rd, b, 0.3) if heat_near else self._best_dry_heading(rd, b)
+        if rd.depth > (0.28 if heat_near else CFG['reflexWater']):
+            ld = self.last_dry
+            dd = math.hypot(ld[0] - rd.x, ld[1] - rd.y) if ld else 99.0
+            if ld and 0.3 < dd < 15:
+                h = math.atan2(ld[1] - rd.y, ld[0] - rd.x)
+            else:
+                h = self.escape_search(rd, b, 0.22) if heat_near else self._best_dry_heading(rd, b)
             return dict(name='water', cmd=escape_heading(rd, h, 2.2),
                         text='Water depth %.2f m > %s m limit → climb out %s' % (rd.depth, CFG['reflexWater'], compass(h)))
         # 3. heat
         close = [s for s in rd.hot_sectors if s[1] < 9]
         if rd.temp_c > CFG['reflexTemp'] or close:
-            h = self.escape_search(rd, b, 0.38)
+            h = self.escape_search(rd, b, 0.22)
             if rd.temp_c > CFG['reflexTemp']:
                 why = 'Body temp %.0f°C > %.0f°C' % (rd.temp_c, CFG['reflexTemp'])
             else:

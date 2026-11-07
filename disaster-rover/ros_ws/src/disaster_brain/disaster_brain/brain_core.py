@@ -55,6 +55,8 @@ class BrainCore:
         self._batt_event = False
         self._path_event = -1e9
         self._grid = None
+        self.probe_warnings = 0
+        self._probe_alert_t = {}
 
     # ------------------------------------------------------------------ tick
     def tick(self, f):
@@ -65,6 +67,19 @@ class BrainCore:
         if self.home is None:
             self.home = (rd.x, rd.y)
         self.pred.observe(rd, self.ps)
+        probe_log = None
+        for a in rd.probe_alerts:
+            key = '%s:%s' % (a['id'], a['kind'])
+            if t - self._probe_alert_t.get(key, -1e9) < 10:
+                continue
+            self._probe_alert_t[key] = t
+            self.probe_warnings += 1
+            d = math.hypot(a['x'] - rd.x, a['y'] - rd.y)
+            val = ('%.0f°C' % a['value']) if a['kind'] == 'heat' else ('water %.2f m' % a['value'])
+            txt = 'PROBE %d early warning: %s at (%.0f,%.0f), %.0f m %s of rover' % (
+                a['id'], val, a['x'], a['y'], d, compass(math.atan2(a['y'] - rd.y, a['x'] - rd.x)))
+            probe_log = txt if probe_log is None else probe_log + '\n' + txt
+            self.events.append(dict(kind='probe_warning', text=txt))
         if not rd.status['alive']:
             return dict(cmd_vel=_zero(), drop_probe=None, decision_log=None)
 
@@ -185,6 +200,8 @@ class BrainCore:
         if log:
             self._last_log = t
             self._last_log_key = key
+        if probe_log:
+            log = probe_log + '\n' + log if log else probe_log
         return dict(cmd_vel=cmd, drop_probe=dict(x=rd.x, y=rd.y, z=0.0) if drop else None, decision_log=log)
 
     # ------------------------------------------------------------------ helpers

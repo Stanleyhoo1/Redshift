@@ -62,7 +62,11 @@ export class Safety {
    * SAFETY REFLEXES: hard limits that override every behaviour, instantly.
    * Ordered by how fast each hazard kills.
    */
+  /** last place our own depth gauge read dry: the surest way out of water is back the way we came */
+  lastDry: { x: number; y: number } | null = null;
+
   check(rd: Readings, b: Belief, P: Predictions): Reflex | null {
+    if (rd.depth < 0.03) this.lastDry = { x: rd.x, y: rd.y };
     // 1. incoming meteor whose impact point is near us
     let worst: { d: number; ttl: number; x: number; y: number; size: number } | null = null;
     for (const s of rd.streaks) {
@@ -76,14 +80,15 @@ export class Safety {
     // 2. standing in water deeper than the reflex limit (hard limit 0.5 m)
     // with fire close, shallow water (well under the 0.5 m limit) is an acceptable refuge
     const heatNear = rd.tempC > 40 || rd.hotSectors.some(s => s.dist < 14);
-    if (rd.depth > (heatNear ? 0.36 : CFG.reflexWater)) {
-      const h = heatNear ? this.escapeSearch(rd, b, 0.3) : this.bestDryHeading(rd, b);
+    if (rd.depth > (heatNear ? 0.28 : CFG.reflexWater)) {
+      const ld = this.lastDry, back = ld && Math.hypot(ld.x - rd.x, ld.y - rd.y) < 15 && Math.hypot(ld.x - rd.x, ld.y - rd.y) > 0.3;
+      const h = back ? Math.atan2(ld!.y - rd.y, ld!.x - rd.x) : heatNear ? this.escapeSearch(rd, b, 0.22) : this.bestDryHeading(rd, b);
       return { name: 'water', cmd: escapeHeading(rd, h, 2.2), text: `Water depth ${rd.depth.toFixed(2)} m > ${CFG.reflexWater} m limit → climb out ${compass(h)}` };
     }
     // 3. heat: onboard thermometer or a >100 °C hotspot very close
     const close = rd.hotSectors.filter(s => s.dist < 9);
     if (rd.tempC > CFG.reflexTemp || close.length) {
-      const h = this.escapeSearch(rd, b, 0.38);
+      const h = this.escapeSearch(rd, b, 0.22);
       const near = close.length ? close.reduce((a, c) => (c.dist < a.dist ? c : a)) : null;
       return { name: 'heat', cmd: escapeHeading(rd, h), text: `${rd.tempC > CFG.reflexTemp ? `Body temp ${rd.tempC.toFixed(0)}°C > ${CFG.reflexTemp}°C` : `Thermal ${near!.temp.toFixed(0)}°C at ${near!.dist.toFixed(1)} m ${compass(near!.bearing)}`} → ESCAPE ${compass(h)}` };
     }

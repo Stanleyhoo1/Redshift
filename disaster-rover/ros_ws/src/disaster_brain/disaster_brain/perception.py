@@ -43,7 +43,7 @@ class Readings:
     """Everything derived from ONE sensor frame. No ground truth anywhere in here."""
     __slots__ = ('t', 'dt', 'x', 'y', 'yaw', 'v', 'w', 'roll', 'pitch', 'tilt_deg', 'status', 'depth', 'temp_c',
                  'wind_x', 'wind_y', 'wind_speed', 'pressure', 'pressure_drop', 'shake', 'lidar_front', 'return_frac',
-                 'smoke', 'scan_r', 'scan_a0', 'scan_inc', 'scan_max', 'thermal_max', 'hot_sectors', 'streaks', 'flashes', 'funnel', 'water_near', 'stage_obs')
+                 'smoke', 'scan_r', 'scan_a0', 'scan_inc', 'scan_max', 'thermal_max', 'hot_sectors', 'streaks', 'flashes', 'funnel', 'water_near', 'stage_obs', 'probe_alerts')
 
 
 def _mark_hot(b, px, py, T, t):
@@ -258,6 +258,7 @@ def perceive(b, f, ps):
             streaks.append(d)
 
     # ---------- probes ----------
+    probe_alerts, probe_stage = [], []
     for pr in status['probes']:
         if not pr['alive']:
             continue
@@ -267,6 +268,14 @@ def perceive(b, f, ps):
             if not b.inside(px, py):
                 continue
             i = b.idx(px, py)
+            was_dry = b.water[i] == 0
+            was_cool = (not math.isnan(b.heat[i])) and b.heat[i] < 60
+            if sm[k + 2] > 0.05 and was_dry:
+                probe_alerts.append(dict(id=pr['id'], kind='water', x=px, y=py, value=sm[k + 2]))
+            if sm[k + 3] > 100 and was_cool:
+                probe_alerts.append(dict(id=pr['id'], kind='heat', x=px, y=py, value=sm[k + 3]))
+            if sm[k + 2] > 0.05:
+                probe_stage.append(sm[k + 4])
             last_seen[i] = t
             b.water[i] = sm[k + 2]
             b.water_t[i] = t
@@ -275,6 +284,9 @@ def perceive(b, f, ps):
             b.elev[i] = sm[k + 4]
             if sm[k + 2] < 0.03:
                 b.dry_elev[i] = sm[k + 4]
+
+    if math.isnan(stage_obs) and probe_stage:
+        stage_obs = _median(probe_stage)
 
     # ---------- IMU shake residual ----------
     la = f['imu']['linear_acceleration']
@@ -311,4 +323,5 @@ def perceive(b, f, ps):
     rd.scan_a0, rd.scan_inc, rd.scan_max = yaw + sc['angle_min'], sc['angle_increment'], rmax
     rd.thermal_max, rd.hot_sectors = thermal_max, hot_sectors
     rd.streaks, rd.flashes, rd.funnel, rd.water_near, rd.stage_obs = streaks, flashes, funnel, water_near, stage_obs
+    rd.probe_alerts = probe_alerts
     return rd

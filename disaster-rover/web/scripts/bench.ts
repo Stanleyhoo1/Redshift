@@ -15,6 +15,7 @@ const jobs = +(a.jobs ?? (a.brain === 'ros' ? 1 : 8));
 const extra = ['--duration', a.duration ?? '180', '--intensity', a.intensity ?? '0.6', '--brain', a.brain ?? 'local'];
 if (a.agent === 'true') extra.push('--agent');
 if (a.random === 'true') extra.push('--random');
+if (a['no-probes'] === 'true') extra.push('--no-probes');
 
 type Row = Record<string, any>;
 const queue: { sc: string; seed: number }[] = [];
@@ -38,14 +39,14 @@ await Promise.all(Array.from({ length: jobs }, async () => {
   }
 }));
 process.stderr.write('\n');
-console.log(`\n| scenario | survived | probes placed (avg) | area surveyed (avg %) | hazard coverage (avg %) | failures |`);
-console.log(`|---|---|---|---|---|---|`);
+console.log(`\n| scenario | survived | probes placed (avg) | area surveyed (avg %) | hazard coverage (avg %) | probe early warnings (avg) | failures |`);
+console.log(`|---|---|---|---|---|---|---|`);
 for (const sc of scenarios) {
   const rs = rows.filter(r => r.scenario === sc).sort((x, y) => x.seed - y.seed);
   const ok = rs.filter(r => r.survived).length;
   const avg = (k: string) => (rs.reduce((s, r) => s + (r[k] ?? 0), 0) / rs.length).toFixed(1);
   const fails = rs.filter(r => !r.survived).map(r => `s${r.seed}: ${r.cause}`).join('; ');
-  console.log(`| ${sc} | ${ok}/${rs.length} | ${avg('probesPlaced')} | ${avg('surveyedPct')} | ${avg('hazardCoveragePct')} | ${fails || '-'} |`);
+  console.log(`| ${sc} | ${ok}/${rs.length} | ${avg('probesPlaced')} | ${avg('surveyedPct')} | ${avg('hazardCoveragePct')} | ${avg('probeWarnings')} | ${fails || '-'} |`);
 }
 if (a.out) { mkdirSync(dirname(a.out), { recursive: true }); writeFileSync(a.out, JSON.stringify(rows, null, 1)); }
 process.exit(0);
