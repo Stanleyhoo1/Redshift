@@ -290,7 +290,15 @@ export class LocalBrain implements Brain {
       behaviour: this.behaviour, reflex: this.reflex?.text ?? null, scores: this.scores, confidence: this.confidence,
       goal: this.goal ? this.goal.text : 'none', goalPt: this.goal && this.goal.call.name !== 'hold_position' && this.goal.call.name !== 'retreat_to_high_ground' ? { x: this.goal.x, y: this.goal.y } : null,
       path: this.path?.path ?? null, view: this.b,
+      hazards: this.sensedHazards(),
     };
+  }
+  /** hazard kinds the brain currently senses (for the HUD) */
+  sensedHazards(): string[] {
+    const P = this.pred.p, out: string[] = [];
+    if (P.flood.active) out.push('flood'); if (P.fire.active) out.push('fire'); if (P.quake.recent) out.push('quake');
+    if (P.tornado.active) out.push('tornado'); if (P.meteor.active) out.push('meteor');
+    return out;
   }
 }
 export { CH };

@@ -19,6 +19,8 @@
 
 - M9 (in progress): 3D overlay shows behaviour, scores, confidence, active reflex, mission goal and Gemma's latest verdict (or "Agent offline, utility fallback"). README written. Utility-only survival over 10 seeds x 6 scenarios: 49/60 (`results/utility-10seeds.md`). Heat escape slows near water / steeply downhill.
 
+- Visual pass: flood Start bug fixed, new water/terrain/models/effects, redesigned UI (see NOTES).
+
 ## Next
 - Utility + agent comparison (3 seeds x 6 scenarios, latency-faithful, sequential, ~4 min per run) is running in the background into `results/agent-runs.jsonl`; fill README "AGENT_TABLE" when done.
 

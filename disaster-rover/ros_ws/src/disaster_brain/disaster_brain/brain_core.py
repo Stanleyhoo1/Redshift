@@ -363,7 +363,10 @@ class BrainCore:
                     water=q(b.channels[0]), heat=q(b.channels[1]), rubble=q(b.channels[2]), wind=q(b.channels[3]))
 
     def info(self):
+        P = self.pred.p
         return dict(behaviour=self.behaviour, reflex=self.reflex['text'] if self.reflex else None, scores=self.scores,
                     confidence=round(self.confidence, 2), goal=self.goal['text'] if self.goal else 'none',
                     goalPt=dict(x=self.goal['x'], y=self.goal['y']) if (self.goal and self.goal['call']['name'] not in ('hold_position', 'retreat_to_high_ground')) else None,
-                    path=[dict(x=p[0], y=p[1]) for p in self.path['path']] if self.path else None)
+                    path=[dict(x=p[0], y=p[1]) for p in self.path['path']] if self.path else None,
+                    hazards=[k for k, on in (('flood', P['flood']['active']), ('fire', P['fire']['active']), ('quake', P['quake']['recent']),
+                                             ('tornado', P['tornado']['active']), ('meteor', P['meteor']['active'])) if on])

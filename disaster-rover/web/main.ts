@@ -35,9 +35,11 @@ function newRun() {
   agent.reset();
   view.load(sim); running = false; acc = 0; ui.clearLogs();
 }
-ui.onStart = () => { if (sim.done || sim.t > 0) newRun(); running = true; };
-ui.onPause = () => { running = !running; };
-ui.onReset = () => newRun();
+// Start ALWAYS begins a fresh run with the current disaster / seed settings
+// (it used to reuse the page-load sim, so disasters ticked before the first Start were silently ignored).
+ui.onStart = () => { newRun(); running = true; ui.setRunning(true); };
+ui.onPause = () => { if (sim.t === 0 && !running) return; running = !running; ui.setRunning(running); };
+ui.onReset = () => { newRun(); ui.setRunning(false); };
 ui.onTrigger = k => { sim.trigger(k); };
 let connectToken = 0;
 ui.onBrainChange = async m => {
@@ -117,8 +119,8 @@ function loop(now: number) {
   }
   const info = brainInfo();
   view.toggles = ui.toggles();
-  view.render(info?.view ?? null, info?.path ?? null, info?.goalPt ?? null);
-  ui.update(sim, info);
+  view.render(info?.view ?? null, info?.path ?? null, info?.goalPt ?? null, info?.behaviour ?? 'explore');
+  ui.update(sim, info, mode);
   if ((statusAcc += dt) > 0.5) { statusAcc = 0; agentStatus(); }
   requestAnimationFrame(loop);
 }

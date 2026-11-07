@@ -74,3 +74,10 @@
 - Headless agent runs are latency-faithful: sim time is not allowed to run ahead of wall time while a request is in flight, so the rover keeps driving on the utility brain for exactly as long as Gemma really takes.
 - Observed LLM mistakes the rule set catches: re-proposing a probe 3-5 m from one just placed; placing a probe on a riverside spot the brain predicts will flood within 30 s.
 - `pkill -f <pattern>` inside a command that also contains the pattern kills its own shell (exit 144). Stop and start ROS in separate commands.
+
+## Visual pass + flood fix (after M9 part 1)
+- Bug: pressing Start the first time reused the sim built at page load, so disasters ticked before the first Start were ignored. A flood "never happened" in the browser while headless runs were fine. Start now always builds a fresh run from the current settings; Pause/Resume is separate.
+- Water: per-vertex `aDepth` = surface - ground, negative on dry vertices bordering water; the fragment shader discards depth <= 0, so the shoreline is the smooth depth = 0 contour instead of a 2 m staircase. Floodwater (wet, not river) is tinted mud; thin foam line at the edge; animated ripple normals; rain + darker sky while a flood is active.
+- Terrain is now a 1 m mesh (201 x 201) with colour noise, rock on slopes, sandy banks and a soft fog-of-war edge (3x3 blur).
+- Models are procedural (no assets): rocker-bogie rover (6 wheels, spinning LiDAR, pan/tilt mast camera, probe rack showing probes left, behaviour-coloured beacon); tripod probes with blinking beacon + expanding sensing pulse; conifers and broadleaf trees; houses with window textures and pitched roofs; three-shell tornado; meteors with trails; craters that glow while fresh; fire as flame wall + embers + fire light.
+- UI: HUD (time, brain, brain-sensed hazards, behaviour), score bars, stat tiles, toasts for world events and probe warnings, colour-coded logs, framed onboard-camera inset.

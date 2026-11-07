@@ -130,7 +130,7 @@ All numbers were measured on the dev machine: **Intel Core Ultra 5 125U (14 thre
 | Utility brain, local TS (Node / browser) | CPU, 1 core | tick average 1.5–5 ms at 10 Hz |
 | Gemma 4 E2B (`gemma4:e2b`, Q4_K_M, 4.6 B params) via Ollama 0.40 | CPU | first call **~21 s** (cold). Warm calls **4–7 s**, median **5.5 s** (~510 prompt tokens with the prompt prefix cached, ~45 output tokens). Called on events, else at most every 30 s; timeout 60 s |
 
-**Edge budget statement.** The whole stack (sim excluded) fits a laptop-class CPU with no GPU: the brain uses about 3 % of one core on average; Gemma uses all cores for ~5 s about twice a minute. If Gemma is slow, offline or erroring, the utility brain carries on alone and the UI shows **"Agent offline, utility fallback"**.
+**Edge budget statement.** The whole stack (sim excluded) fits a laptop-class CPU with no GPU: the brain uses roughly 3–7 % of one core (more during a large wildfire); Gemma uses the CPU for ~4–7 s per call, with calls every ~10–30 s depending on how many events occur. If Gemma is slow, offline or erroring, the utility brain carries on alone and the UI shows **"Agent offline, utility fallback"**.
 
 ---
 

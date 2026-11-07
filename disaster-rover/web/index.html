@@ -4,74 +4,103 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Disaster Rover</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./ui/style.css" />
 </head>
 <body>
   <aside id="left" class="panel">
-    <h1>Disaster Rover</h1>
-    <section>
+    <header class="brand">
+      <svg viewBox="0 0 32 32" class="logo"><rect x="5" y="11" width="22" height="9" rx="2"/><circle cx="9" cy="23" r="3"/><circle cx="16" cy="23" r="3"/><circle cx="23" cy="23" r="3"/><path d="M20 11V5h3"/><circle cx="23" cy="5" r="1.6"/></svg>
+      <div><h1>Disaster Rover</h1><div class="sub">autonomous survey &amp; early warning</div></div>
+    </header>
+
+    <section class="card">
       <h2>Disasters</h2>
       <div id="disasters"></div>
-      <label class="row"><input type="checkbox" id="random" /> Random timing</label>
+      <label class="toggle"><input type="checkbox" id="random" /><span></span> Random timing</label>
     </section>
-    <section>
+
+    <section class="card">
       <h2>Mission</h2>
-      <label class="row">Seed <input type="number" id="seed" value="3" min="1" max="99999" /></label>
-      <label class="row">Duration (s) <input type="number" id="duration" value="180" min="30" max="1200" /></label>
-      <label class="row">Speed <select id="speed"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
-      <div class="row btns"><button id="start">Start</button><button id="pause">Pause</button><button id="reset">Reset</button></div>
+      <div class="fields">
+        <label>Seed <input type="number" id="seed" value="3" min="1" max="99999" /></label>
+        <label>Duration <input type="number" id="duration" value="180" min="30" max="1200" /></label>
+        <label>Speed <select id="speed"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+      </div>
+      <div class="btns">
+        <button id="start" class="primary">▶ Start</button>
+        <button id="pause">❚❚ Pause</button>
+        <button id="reset">↺ Reset</button>
+      </div>
     </section>
-    <section>
+
+    <section class="card chaos">
       <h2>Chaos panel <small>trigger now</small></h2>
-      <div id="chaos" class="btns wrap"></div>
+      <div id="chaos" class="chaos-grid"></div>
     </section>
-    <section>
+
+    <section class="card">
       <h2>Brain</h2>
-      <div class="row seg" id="brainSel">
-        <label><input type="radio" name="brain" value="ros" /> ROS 2</label>
-        <label><input type="radio" name="brain" value="local" checked /> Local TS</label>
-        <label><input type="radio" name="brain" value="manual" /> Manual (WASD)</label>
+      <div class="seg" id="brainSel">
+        <label><input type="radio" name="brain" value="ros" /><span>ROS 2</span></label>
+        <label><input type="radio" name="brain" value="local" checked /><span>Local TS</span></label>
+        <label><input type="radio" name="brain" value="manual" /><span>Manual</span></label>
       </div>
       <div id="rosStatus" class="status">rosbridge: not connected</div>
-      <label class="row"><input type="text" id="rosUrl" value="ws://localhost:9090" /></label>
-      <label class="row"><input type="checkbox" id="agent" /> Agent: Gemma 4 mission commander</label>
-      <div id="agentStatus" class="status">Agent off, utility only</div>
+      <input type="text" id="rosUrl" value="ws://localhost:9090" class="wide" />
+      <label class="toggle"><input type="checkbox" id="agent" /><span></span> Gemma 4 mission commander</label>
+      <div id="agentStatus" class="status">Agent off: utility brain only</div>
     </section>
-    <section>
+
+    <section class="card">
       <h2>View</h2>
-      <label class="row"><input type="checkbox" id="tLidar" checked /> LiDAR rays</label>
-      <label class="row"><input type="checkbox" id="tHaz" /> Hazard overlay (brain belief)</label>
-      <label class="row"><input type="checkbox" id="tFog" checked /> Fog of war</label>
-      <label class="row"><input type="checkbox" id="tPath" checked /> Planned path</label>
-      <label class="row"><input type="checkbox" id="tCam" checked /> Onboard camera</label>
+      <label class="toggle"><input type="checkbox" id="tLidar" checked /><span></span> LiDAR rays</label>
+      <label class="toggle"><input type="checkbox" id="tHaz" /><span></span> Hazard overlay (brain belief)</label>
+      <label class="toggle"><input type="checkbox" id="tFog" checked /><span></span> Fog of war</label>
+      <label class="toggle"><input type="checkbox" id="tPath" checked /><span></span> Planned path</label>
+      <label class="toggle"><input type="checkbox" id="tCam" checked /><span></span> Onboard camera</label>
     </section>
   </aside>
+
   <main id="view">
     <canvas id="c"></canvas>
-    <div id="banner" class="hidden"></div>
+    <div id="hud">
+      <div class="hud-l"><span id="hudTime" class="mono">0.0 s</span><span id="hudBrain" class="chip">LOCAL TS</span></div>
+      <div id="hudHaz" class="hud-c"></div>
+      <div class="hud-r"><span id="hudBeh" class="chip beh">IDLE</span></div>
+    </div>
     <div id="overlay"></div>
-    <div id="hint">drag: orbit · wheel: zoom · WASD: drive (manual) · P: drop probe</div>
+    <div id="toasts"></div>
+    <div id="banner" class="hidden"></div>
+    <div id="pip"><span>ONBOARD CAMERA</span><i class="rec"></i></div>
+    <div id="hint">drag orbit · wheel zoom · WASD drive (manual) · P drop probe</div>
   </main>
+
   <aside id="right" class="panel">
-    <section>
+    <section class="card">
       <h2>Rover</h2>
-      <div id="status" class="grid2"></div>
+      <div id="status"></div>
     </section>
-    <section>
-      <h2>Brain's hazard map <small>(what the rover knows)</small></h2>
-      <canvas id="minimap" width="220" height="220"></canvas>
+    <section class="card">
+      <h2>Behaviour scores <small>utility selection</small></h2>
+      <div id="scores"></div>
+    </section>
+    <section class="card">
+      <h2>Hazard map <small>what the rover knows</small></h2>
+      <canvas id="minimap" width="300" height="300"></canvas>
       <div class="legend"><span class="sw" style="background:#3a7bd5"></span>water <span class="sw" style="background:#ff5a1f"></span>heat <span class="sw" style="background:#b58b5a"></span>rubble <span class="sw" style="background:#b04dff"></span>wind <span class="sw" style="background:#ffd23f"></span>predicted 30 s</div>
     </section>
-    <section>
-      <h2>Agent</h2>
+    <section class="card">
+      <h2>Gemma 4 commander</h2>
       <div id="agentPanel" class="log small"></div>
     </section>
-    <section class="grow">
+    <section class="card grow">
       <h2>Decision log</h2>
       <div id="log" class="log"></div>
     </section>
-    <section>
-      <h2>World events <small>(ground truth, not visible to brain)</small></h2>
+    <section class="card">
+      <h2>World events <small>ground truth · hidden from the brain</small></h2>
       <div id="events" class="log small"></div>
     </section>
   </aside>
