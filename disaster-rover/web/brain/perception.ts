@@ -46,7 +46,8 @@ const median = (a: number[]) => { if (!a.length) return 0; const s = [...a].sort
 
 export function perceive(b: Belief, f: SensorFrame, ps: PerceptionState): Readings {
   const status: RoverStatus = JSON.parse(f.rover_status.data);
-  const t = f.scan.header.stamp.sec + f.scan.header.stamp.nanosec * 1e-9;
+  // frame time = /rover_status time (it closes the frame; topics can arrive out of order over rosbridge)
+  const t = status.t;
   const dt = ps.lastT < 0 ? 0.1 : t - ps.lastT; ps.lastT = t;
   const p = f.odom.pose.pose.position, yaw = quatToYaw(f.odom.pose.pose.orientation);
   const [roll, pitch] = quatToRollPitch(f.imu.orientation);

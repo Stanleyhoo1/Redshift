@@ -27,3 +27,13 @@
 - Slope risk is dilated by one cell and blocks planning above ~20°; the rover rolls at 34°. Tilt reflex at 22° backs straight down and marks the cell ahead impassable.
 - A reflex that produces no motion for 1.5 s (wedged) switches to a turn/push wiggle.
 - Sim fixes found by testing: hard river-bank clamp created cliffs (now a 0.34 gradient ramp); rover could spawn touching a building; collision now only checks the leading edge so side contact slides instead of wedging.
+
+## ROS 2 (M4)
+- Python brain uses numpy (installed with ROS Jazzy via apt as `python3-numpy`; no pip). Pure-Python loops over 10k cells (distance transforms, dilations) were ~0.5 s per map update; vectorised it is 2.5 ms median / ~35 ms p95 per tick.
+- Distance fields in Python are an iterative 8-neighbour min-plus capped at 40 cells (80 m); beyond that 999. Every consumer clamps below 50 m, so results match the TS chamfer.
+- Frame time is the `/rover_status` time (JSON `t`): it is published last and closes the frame; topics can arrive slightly out of order through rosbridge.
+- Brain node is event-driven (one tick per `/rover_status`), not timer-driven. That makes a lockstep headless test possible (publish frame -> wait for its `/cmd_vel`) and costs nothing in the real-time browser.
+- Extra topics beyond the spec: `/elevation`, `/camera/water`, `/camera/detections`, `/pressure` (sensor inputs), `/brain_info`, `/hazard_map`, `/brain_summary`, `/agent_proposal`, `/agent_status`, `/agent_enable` (UI + agent plumbing).
+- Bug found by the ROS test: a Float32MultiArray with a 0-size dimension produced stride 0/0 = NaN -> JSON null -> rosbridge rejected the message.
+- Browser uses roslib; headless uses a 40-line rosbridge client over Node 22's built-in WebSocket (no extra deps).
+- A `/cmd_vel` older than 1 s is not trusted (rover stops); if the socket drops mid-run the app switches to the local brain.

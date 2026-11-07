@@ -27,7 +27,7 @@ export interface Probe { id: number; x: number; y: number; alive: boolean; t: nu
 const fma = (labels: [string, number][], data: number[]): Float32MultiArray => {
   const dim: { label: string; size: number; stride: number }[] = [];
   let stride = labels.reduce((a, l) => a * l[1], 1);
-  for (const [label, size] of labels) { dim.push({ label, size, stride }); stride = stride / size; }
+  for (const [label, size] of labels) { dim.push({ label, size, stride }); stride = size ? stride / size : 0; }
   return { layout: { dim, data_offset: 0 }, data };
 };
 
