@@ -64,6 +64,11 @@ class Simulation:
 
         self.map = FleetMap(cfg)
         self.fleet = Fleet(cfg, self.map, self.terrain.targets)
+        self.flora = None               # v7 alien flora (truth contacts, rover identification)
+        if cfg.flora:
+            from .v7_flora import FloraSystem
+            self.flora = FloraSystem(self)
+            self.fleet.flora = self.flora
         self.hazards = None
         self.rovers = [Rover(self, k, rid, f"Rover {k + 1}", color, docks[k])
                        for k, (rid, _x, _y, _yaw, color) in enumerate(spawns)]
@@ -126,6 +131,8 @@ class Simulation:
         if d.time < t_start + 0.5 * self.agent_dt or not np.isfinite(d.qpos).all() or not np.isfinite(d.qvel).all():
             self._recover_physics(t_start)
         self._check_rovers_in_world()
+        if self.flora is not None:
+            self.flora.truth_step()
         t = float(d.time)
         hz.step(t)
         c1 = time.perf_counter()
@@ -273,10 +280,13 @@ class Simulation:
     def features_msg(self) -> dict:
         """Ground truth of the static features (protocol v4): water outlines and spires."""
         standing = self.hazards.spire_standing
-        return {"water": [w.to_msg() for w in self.terrain.water],
+        out = {"water": [w.to_msg() for w in self.terrain.water],
                 "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
                             "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
                            for sp in self.hazards.all_spires()]}
+        if self.flora is not None:
+            out["flora"] = self.flora.features()
+        return out
 
     def close(self) -> None:
         """Stop tier 2's worker thread (the shared Gemma planner itself keeps running)."""

@@ -181,6 +181,10 @@ class Terrain:
         self.targets = self._make_targets(rng)
         self._add_traces(frng)
         self._assign_values(frng)
+        self.flora = []                    # v7 alien flora (own stream, placed last)
+        if getattr(cfg, "flora", False):
+            from . import v7_flora
+            self.flora = v7_flora.place(cfg, self)
 
     # ------------------------------------------------------------------ heights
     def _make_heights(self, rng: np.random.Generator) -> np.ndarray:
