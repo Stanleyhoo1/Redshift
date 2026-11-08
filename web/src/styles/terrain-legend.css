@@ -29,13 +29,15 @@
   box-shadow: 0 0 5px var(--c);
 }
 
+/* A clump of three bulbs, like the bush map marker. */
 .sw-t-bush {
-  width: 9px;
-  height: 9px;
-  margin: 0 1.5px;
-  border-radius: 50%;
-  background: var(--c);
-  box-shadow: 0 0 6px var(--c);
+  width: 12px;
+  height: 12px;
+  background:
+    radial-gradient(circle at 50% 30%, var(--c) 0 24%, transparent 28%),
+    radial-gradient(circle at 27% 70%, var(--c) 0 24%, transparent 28%),
+    radial-gradient(circle at 73% 70%, var(--c) 0 24%, transparent 28%);
+  filter: drop-shadow(0 0 3px var(--c));
 }
 
 .sw-t-keep {

@@ -25,6 +25,24 @@ const _s = new THREE.Vector3()
 const _q = new THREE.Quaternion()
 const _c = new THREE.Color()
 
+// The caps glow in their own colour (the instance colour squared, so the glow stays saturated),
+// brighter at the rim, so a violet or teal cap stands out on dark ground from afar but still
+// shades as a dome up close.
+function glowCaps(shader) {
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <emissivemap_fragment>',
+    `#include <emissivemap_fragment>
+  {
+    float rim = 1.0 - abs(dot(normalize(normal), normalize(vViewPosition)));
+#if defined( USE_COLOR ) || defined( USE_COLOR_ALPHA )
+    totalEmissiveRadiance = vColor.rgb * vColor.rgb * (0.7 + 1.2 * rim * rim * rim);
+#else
+    totalEmissiveRadiance = vec3(0.0);
+#endif
+  }`,
+  )
+}
+
 function Ring({ x, y, r }) {
   const geo = useMemo(() => {
     const pts = []
@@ -98,7 +116,7 @@ export function Flora({ reality }) {
     cap.current.instanceMatrix.needsUpdate = true
     if (cap.current.instanceColor) cap.current.instanceColor.needsUpdate = true
     bulb.current.instanceMatrix.needsUpdate = true
-    if (bulbMat.current) bulbMat.current.emissiveIntensity = reducedMotion ? 1.2 : 1.0 + 0.5 * Math.sin(clock.elapsedTime * 1.6)
+    if (bulbMat.current) bulbMat.current.emissiveIntensity = reducedMotion ? 1.7 : 1.5 + 0.5 * Math.sin(clock.elapsedTime * 1.6)
   })
 
   if (!list.length) return null
@@ -108,10 +126,10 @@ export function Flora({ reality }) {
         <meshStandardMaterial color="#d8d2c4" roughness={0.8} />
       </instancedMesh>
       <instancedMesh ref={cap} args={[geos.cap, undefined, MAX]} frustumCulled={false}>
-        <meshStandardMaterial color="#ffffff" emissive="#5a3a8a" emissiveIntensity={0.35} roughness={0.6} side={THREE.DoubleSide} />
+        <meshStandardMaterial color="#ffffff" emissive="#ffffff" roughness={0.6} side={THREE.DoubleSide} onBeforeCompile={glowCaps} customProgramCacheKey={() => 'redshift-flora-cap-1'} />
       </instancedMesh>
       <instancedMesh ref={bulb} args={[geos.bulb, undefined, MAX * BULBS]} frustumCulled={false}>
-        <meshStandardMaterial ref={bulbMat} color="#b8ff48" emissive="#9cff2a" emissiveIntensity={1.2} roughness={0.4} />
+        <meshStandardMaterial ref={bulbMat} color="#b8ff48" emissive="#9cff2a" emissiveIntensity={1.7} roughness={0.4} />
       </instancedMesh>
       {Array.isArray(zones) && zones.filter((z) => Array.isArray(z) && z.length >= 3 && z.every(Number.isFinite)).map((z, i) => (
         <Ring key={i} x={z[0]} y={z[1]} r={z[2]} />
