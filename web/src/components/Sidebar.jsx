@@ -274,7 +274,7 @@ export function Sidebar({ follow, selected, onSelect, onFocusEvent, inert = fals
         <p className="subtitle">Autonomous super-Earth survey</p>
         <WorldFacts />
       </header>
-      <FoldSection id="side.mission" title="Mission" summary={sum.mission} className="side-fold">
+      <FoldSection id="side.mission" title="Mission" summary={sum.mission} className="side-fold" defaultOpen={typeof window === 'undefined' || window.innerHeight > 800}>
         <FleetStats />
       </FoldSection>
       <FoldSection id="side.rovers" title="Rovers" summary={sum.rovers} className="side-fold">
