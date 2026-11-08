@@ -29,7 +29,7 @@ function goalText(rover, targets, lander, tracks) {
     if (rover.state === 'returning' && lander && Math.hypot(rover.goal[0] - lander.x, rover.goal[1] - lander.y) < lander.radius + 3) {
       return `To the lander, ${d} m away`
     }
-    return `Exploring, ${d} m to go`
+    return `Heading to its goal, ${d} m away`
   }
   if (rover.state === 'recovering') return 'Backing off, replanning'
   if (rover.state === 'returning') return 'Heading back to the lander'
