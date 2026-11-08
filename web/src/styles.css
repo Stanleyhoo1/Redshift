@@ -4762,3 +4762,48 @@ kbd {
 .rover-tag-samp b {
   font-weight: 700;
 }
+
+/* The "Waiting for the simulation" card centres in the map area right of the controls column,
+   so the controls never cover its left edge. */
+@media (min-width: 861px) {
+  .waiting {
+    padding-left: calc(232px + 32px);
+  }
+}
+
+/* Event log: Gemma's quoted reasoning on its own clamped line, and the "show where" icon in
+   the row's top-right corner instead of trailing alone on a line of its own. */
+.ev-why {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-top: 2px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 1.38;
+}
+
+.ev-btn {
+  position: relative;
+  padding-right: 28px;
+}
+
+.ev-btn .ev-goto {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  margin: 0;
+  opacity: 0.55;
+}
+
+.ev-btn:hover .ev-goto,
+.ev-btn:focus-visible .ev-goto {
+  opacity: 1;
+}
+
+@media (max-height: 820px) {
+  .ev {
+    font-size: 13.5px;
+  }
+}
