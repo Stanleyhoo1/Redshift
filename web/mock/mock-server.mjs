@@ -189,6 +189,7 @@ const SETTING_FIELDS = [
   { key: 'water', type: 'bool', label: 'Water', group: 'features', help: 'Lakes and a river. Liquid gives no LiDAR echo, so rovers must work it out.' },
   { key: 'spires', type: 'bool', label: 'Crystal spires', group: 'features', help: 'Tall alien crystals that block routes and can topple across one.' },
   { key: 'lifeforms', type: 'bool', label: 'Lifeforms', group: 'features', help: 'Herds of grazers. Rovers watch from 4 m or more and never touch them.' },
+  { key: 'life_variety', type: 'bool', label: 'More lifeforms', group: 'features', help: 'Skitterers, drifters, crawlers and burrowers join the grazers.' },
   { key: 'mesas', type: 'bool', label: 'Mesas', group: 'features', help: 'Flat-topped hills with cliff walls no rover can climb.' },
   { key: 'canyon', type: 'bool', label: 'Canyon', group: 'features', help: 'A winding trench with two ramps, the only ways across.' },
   { key: 'dunes', type: 'bool', label: 'Dunes', group: 'features', help: 'Rippled loose sand where the wheels slip.' },
@@ -234,6 +235,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   water: true,
   spires: true,
   lifeforms: true,
+  life_variety: envOn('LIFE_VARIETY'),
   ...Object.fromEntries(FEATURE_KEYS.map((k) => [k, envOn(k.toUpperCase())])),
   wear: ['off', 'normal', 'harsh'].includes(WEAR_ENV) ? WEAR_ENV : 'normal',
   sim_speed: clampTo('sim_speed', envNum('SIM_SPEED', 3)),
@@ -1827,7 +1829,15 @@ function lifeOk(x, y) {
   return slopeAt(x, y) < 24
 }
 
+// v7 "More lifeforms": with life_variety on, groups take turns over the kinds (the real sim picks
+// them by biome). Swarms are bigger, crawlers come alone or in pairs.
+const MOCK_KINDS = ['grazer', 'drifter', 'skitterer', 'crawler', 'burrower']
+const KIND_COUNT = { skitterer: (n) => n + 5, crawler: (n) => Math.min(2, n), drifter: (n) => n, burrower: (n) => n + 1, grazer: (n) => n }
+const KIND_SIZE = { skitterer: [0.4, 0.15], drifter: [0.7, 0.4], crawler: [1.6, 0.4], burrower: [0.5, 0.2] }
+
 function spawnHerd(cx, cy, count) {
+  const kind = settings.life_variety ? MOCK_KINDS[sim.herds.length % MOCK_KINDS.length] : 'grazer'
+  count = KIND_COUNT[kind](count)
   const herd = { id: sim.herds.length + 1, cx, cy, heading: sim.rand() * Math.PI * 2, speed: 0.14 + sim.rand() * 0.1, pause: 0, seenT: -999, confirmT: -999 }
   sim.herds.push(herd)
   for (let k = 0; k < count && sim.lifeforms.length < MAX_LIFEFORMS; k++) {
@@ -1835,13 +1845,13 @@ function spawnHerd(cx, cy, count) {
     const d = 0.8 + sim.rand() * 1.8
     sim.lifeforms.push({
       id: `l${sim.nextLife++}`,
-      kind: 'grazer',
+      kind,
       x: cx + Math.cos(a) * d,
       y: cy + Math.sin(a) * d,
       yaw: sim.rand() * Math.PI * 2,
       vx: 0,
       vy: 0,
-      size: r2(0.95 + sim.rand() * 0.4),
+      size: kind === 'grazer' ? r2(0.95 + sim.rand() * 0.4) : r2(KIND_SIZE[kind][0] + sim.rand() * KIND_SIZE[kind][1]),
       herd,
       oa: a,
       od: d,
@@ -4255,7 +4265,15 @@ function fleetSummary() {
 }
 
 function publicLifeform(l) {
-  return { id: l.id, kind: l.kind, x: r2(l.x), y: r2(l.y), z: r2(groundSmooth(l.x, l.y) + 0.25 * l.size), yaw: r2(l.yaw), speed: r2(Math.hypot(l.vx, l.vy)), size: l.size }
+  const g = groundSmooth(l.x, l.y)
+  if (l.kind === 'drifter') return { id: l.id, kind: l.kind, x: r2(l.x), y: r2(l.y), z: r2(g + 1.5 + 2 * ((l.size - 0.7) / 0.4) + 0.15 * Math.sin(sim.t * 0.8 + l.oa)), yaw: r2(l.yaw), speed: r2(Math.hypot(l.vx, l.vy)), size: l.size }
+  if (l.kind === 'burrower') {
+    // up for about 5 s in every 15 s, each on its own beat
+    const ph = (sim.t + l.od * 7) % 15
+    const up = ph < 0.6 ? ph / 0.6 : ph < 5 ? 1 : ph < 5.6 ? 1 - (ph - 5) / 0.6 : 0
+    return { id: l.id, kind: l.kind, x: r2(l.x), y: r2(l.y), z: r2(g - 1.0 * (1 - up)), yaw: r2(l.yaw), speed: r2(Math.hypot(l.vx, l.vy)), size: l.size, up: r2(up) }
+  }
+  return { id: l.id, kind: l.kind, x: r2(l.x), y: r2(l.y), z: r2(g + 0.25 * l.size), yaw: r2(l.yaw), speed: r2(Math.hypot(l.vx, l.vy)), size: l.size }
 }
 
 function publicTrack(k) {

@@ -189,6 +189,9 @@ class Terrain:
         self.truth_heights = self.with_spires(self.truth_nospire, self.spires)
         self.reach = self.reachable(cfg.target_path_slope_deg)    # every target reachable without steeper ground
         self.herds = self._make_herds(frng) if cfg.lifeforms else []
+        if self.herds and getattr(cfg, "life_variety", False):
+            from . import v7_life
+            v7_life.vary(self, cfg)                        # v7: kinds by biome, a couple more groups (own stream)
         self.targets = self._make_targets(rng)
         self._add_traces(frng)
         self._assign_values(frng)

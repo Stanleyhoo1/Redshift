@@ -24,11 +24,12 @@ from redshift import config as C  # noqa: E402
 from redshift.config import PRESETS, SETTINGS, SETTINGS_BY_KEY, Config  # noqa: E402
 
 EM_DASH = chr(0x2014)
-V7_FLAGS = ("mesas", "canyon", "dunes", "boulder_fields", "pits", "geysers", "ice_sheets", "ground_detail", "flora")
+V7_FLAGS = ("mesas", "canyon", "dunes", "boulder_fields", "pits", "geysers", "ice_sheets", "ground_detail", "flora",
+            "biomes", "life_variety")
 V7_ENV = {f: f.upper() for f in V7_FLAGS}              # MESAS, CANYON, ..., FLORA
-SETTING_KEYS = ("gravity_g", "seed", "num_rovers", "map_size", "water", "spires", "lifeforms", "mesas", "canyon",
-                "dunes", "boulder_fields", "pits", "geysers", "ice_sheets", "flora", "ground_detail", "wear",
-                "sim_speed")
+SETTING_KEYS = ("gravity_g", "seed", "num_rovers", "map_size", "water", "spires", "lifeforms", "life_variety", "mesas",
+                "canyon", "dunes", "boulder_fields", "pits", "geysers", "ice_sheets", "flora", "ground_detail", "biomes",
+                "wear", "sim_speed")
 SMALL = dict(map_size=60.0, water=False, spires=False, lifeforms=False, plan_clock="model")   # quick worlds
 JPEG = b"\xff\xd8\xff\xe0" + bytes(300) + b"\xff\xd9"      # stands in for a camera frame
 

@@ -9,6 +9,7 @@ import { FatPolyline } from './fatLine.js'
 import { glowTexture } from './textures.js'
 import { groundAt, hashStr } from './ground.js'
 import { reducedMotion } from './sceneConstants.js'
+import { LifeKinds } from './LifeKinds.jsx'
 
 // Lifeforms (PROTOCOL.md version 4). `lifeforms` is the ground truth, `tracks` is what the
 // fleet believes. A creature shows when a fleet track is near it (the rovers have noticed
@@ -280,6 +281,17 @@ function Creatures({ reality }) {
     sets.memory.n = 0
     const a = 1 - Math.exp(-Math.min(dt, 0.1) * 5)
     for (const life of s.lifeforms) {
+      if (life.kind && life.kind !== 'grazer') {
+        // v7 kinds are drawn by LifeKinds.jsx; remember the kind behind a track so a lost
+        // track does not leave a grazer-shaped "last seen" copy.
+        for (const k of s.tracks) {
+          if (k.status === 'tracking' && Math.hypot(k.x - life.x, k.y - life.y) < TRACK_NEAR) {
+            memoryFor(mem.current, k.id).kind = life.kind
+            break
+          }
+        }
+        continue
+      }
       let tracked = null
       for (const k of s.tracks) {
         if (k.status === 'tracking' && Math.abs(k.x - life.x) < TRACK_NEAR && Math.abs(k.y - life.y) < TRACK_NEAR && Math.hypot(k.x - life.x, k.y - life.y) < TRACK_NEAR) {
@@ -328,6 +340,7 @@ function Creatures({ reality }) {
       }
       if (back) continue
       let m = mem.current.get(k.id)
+      if (m && m.kind && m.kind !== 'grazer') continue
       if (!m) {
         // Lost before this client saw it live (a late joiner): the track's own estimate.
         m = memoryFor(mem.current, k.id)
@@ -586,6 +599,7 @@ export function Life({ reality }) {
   return (
     <group>
       <Creatures reality={reality} />
+      <LifeKinds reality={reality} />
       <Tracks />
       {meta.map((m) => (
         <LineOfSight key={`${gen}:${m.id}`} meta={m} />
