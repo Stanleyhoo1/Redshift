@@ -80,13 +80,22 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   size, speed, the world features and wear, all drawn from `GET /api/config`. Launch sends only what
   changed. An older sim gets a seed-only form that resets.
 - Planet view (version 7, web only): `G` or View: Planet in the controls (the row above
-  Graphics) lifts the camera off the map, fades, and shows the whole planet, drawn from the
-  world's seed: dusty plains, darker maria, craters, polar ice and a glow of thick air on
-  the limb, under the same low sun as the sector, with the landing site in daylight. The
-  legend gives the planet's name, its radius (gravity x 6371 km, assuming Earth's density)
-  and the site's latitude and longitude (from the seed). A cyan ring marks the landing
-  sector (a symbol: the sector is far too small to see at this scale), with a live card:
-  sector size, explored share, gravity, sim time and every rover's state. Drag to turn the
+  Graphics) lifts the camera off the map, fades, and shows the whole planet under the same
+  low sun as the sector, with the landing site in daylight and a glow of thick air on the
+  limb. Like the sector, it starts blank: the fleet has not surveyed the planet, so it is a
+  dark grey ball with faint latitude and longitude lines every 15 degrees. The landing
+  sector shows the fleet's own map, live: a square patch at the site, map north to the
+  planet's north, empty right after launch and filling in as the rovers map the ground
+  (mapped ground in the map legend's colours with shaded relief, the fleet's water, ice,
+  plant and soft sand zones on top). It is enlarged to about 14 degrees across, since the
+  real sector is far too small to see from orbit. It repaints at most twice a second, and
+  only when the map changed (once a second on Graphics Low). Reality (`R`) also works on the
+  planet: it fades in the true planet, drawn from the world's seed (dusty plains, darker
+  maria, craters, polar ice), and the patch keeps showing the fleet's map. The legend gives
+  the planet's name, its radius (gravity x 6371 km, assuming Earth's density) and the
+  site's latitude and longitude (from the seed). A cyan ring frames the landing sector, with
+  a live card: sector size, explored share, gravity, sim time and every rover's state.
+  Drag to turn the
   planet, scroll to zoom, `0` frames the site again. Left alone for a few seconds it sways
   slowly, about 20 degrees towards the sun over a minute and back, so the site and its card
   stay in view. Reset sim on the planet glides to the new world's site. Clicking the ring,
