@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .config import REACH_SLOPE, TARGET_PATH_SLOPE, Config  # noqa: F401 (the 2 g values, still importable here)
+from . import v7_landforms
 
 KINDS = ("mineral", "ice", "vent")            # kinds placed in clusters; "trace" is placed near herds
 ALL_KINDS = ("mineral", "ice", "vent", "trace")
@@ -164,6 +165,10 @@ class Terrain:
         self._placed = []                  # (x, y, radius) of mounds and craters
         self._ridges = []                  # ridge spines (p0, p1)
         self.heights = self._make_heights(rng)
+        self.landform_mask = None                         # v7 landforms: cells nothing else may use
+        self.landforms = None
+        if v7_landforms.any_on(cfg):
+            self.heights = v7_landforms.apply(self, self.heights)
         self.wet = np.zeros(self.heights.shape, bool)     # under liquid
         self.wet_id = np.zeros(self.heights.shape, np.int8)   # 1 + index into self.water, 0 = dry
         self.water: list = []
@@ -173,6 +178,7 @@ class Terrain:
         self.max_h = float(self.heights.max())
         self.slope = slope_deg(self.heights, self.res)
         self.rocks = self._make_rocks(rng)
+        self.bfield = v7_landforms.make_boulder_fields(self) if cfg.boulder_fields else []
         self.truth_nospire = self._with_rocks()           # terrain and rocks
         self.spires = self._make_spires(frng) if cfg.spires else []
         self.truth_heights = self.with_spires(self.truth_nospire, self.spires)
@@ -363,6 +369,8 @@ class Terrain:
             x, y = rng.uniform(-half + 2, half - 2, 2)
             if math.hypot(x, y) < cfg.lander_flat_radius + 3.0:
                 continue
+            if self.landform_mask is not None and not v7_landforms.spot_clear(self, x, y, 0.5):
+                continue
             size = rng.uniform(0.3, 1.0)
             sx = size / 2 * rng.uniform(0.8, 1.2)
             sy = size / 2 * rng.uniform(0.7, 1.1)
@@ -398,6 +406,10 @@ class Terrain:
             if not self.reach[tj, ti]:
                 return False
             if any(math.hypot(x - r.x, y - r.y) < r.sx + r.sy + 1.5 for r in self.rocks):
+                return False
+            if self.bfield and any(math.hypot(x - r.x, y - r.y) < r.sx + r.sy + 1.5 for r in self.bfield):
+                return False
+            if not v7_landforms.spot_clear(self, x, y, 1.5):
                 return False
             if self.wet_near(x, y, 2.5) or any(math.hypot(x - sp.x, y - sp.y) < 3.0 for sp in self.spires):
                 return False
@@ -437,7 +449,7 @@ class Terrain:
 
     def _with_rocks(self) -> np.ndarray:
         H = self.heights.copy()
-        for r in self.rocks:
+        for r in (self.rocks + self.bfield if self.bfield else self.rocks):
             ext = max(r.sx, r.sy)
             i0, j0 = self.ij(r.x - ext, r.y - ext)
             i1, j1 = self.ij(r.x + ext, r.y + ext)
@@ -472,6 +484,8 @@ class Terrain:
     def _clear_of_features(self, x: float, y: float, margin: float) -> bool:
         """Away from mounds and craters (their footprint) and ridge spines (about 7 m wide)."""
         if any(math.hypot(x - px, y - py) < 0.75 * pr + margin for px, py, pr in self._placed):
+            return False
+        if not v7_landforms.spot_clear(self, x, y, margin + 6.0):
             return False
         for a, b in self._ridges:
             d, _ = _seg_dist(np.array([x]), np.array([y]), a, b)
@@ -678,6 +692,8 @@ class Terrain:
             if math.hypot(x, y) < cfg.lander_flat_radius + 9.0 or self.wet_near(x, y, 3.0):
                 continue
             if self.max_slope_near(x, y, 1.0) > 14.0:
+                continue
+            if not v7_landforms.spot_clear(self, x, y, 3.0):
                 continue
             i, j = self.ij(x, y)
             k = int(round(3.0 / self.res))
