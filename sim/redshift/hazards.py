@@ -346,7 +346,7 @@ class HazardManager:
         """Ground a rover can really drive on (true terrain, spires and boulders already down, no water)."""
         from .terrain import slope_deg
         H = self.truth_heights(self.sim.terrain.truth_heights)
-        lim = min(self.sim.fleet.slope_limit, 20.0)
+        lim = min(self.sim.fleet.slope_limit, self.cfg.passable_slope_deg)
         return (slope_deg(H, self.cfg.res) <= lim) & ~self.sim.terrain.wet
 
     def _still_connected(self, ok: np.ndarray, rover, spots, sizes) -> bool:

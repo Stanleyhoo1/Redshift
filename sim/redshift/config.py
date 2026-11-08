@@ -27,6 +27,25 @@ def _env_bool(name: str, default: bool) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+# ====================================================================== gravity (v7)
+# The slope thresholds below were tuned for 2 g. With a launch gravity they follow the rover's predicted
+# climb limit instead, chosen so that each one is exactly its old value at 2 g.
+ROVER_AXLE_MASS = 0.5        # world.py: the front axle bar (kg)
+CLIMB_CAP_DEG = 30.0         # above this, grip and tipping limit the climb (climb_test at 1 g: 28 deg ok, tips at 32)
+TOW_FACTOR = 0.8             # a tow train keeps this share of the two rovers' motor limit
+TARGET_PATH_SLOPE = 15.0     # terrain.py: every target reachable from the lander without steeper ground
+REACH_SLOPE = 18.0           # terrain.py: flood fill slope of the "no traps" checks for lakes and rivers
+PASSABLE_SLOPE = 20.0        # hazards.py: steepest ground a placed hazard counts as drivable
+SAND_SPIN_LOAD = 0.2         # rover.py: wheel load (share of the torque cap) that tells sand from free spin
+
+
+def motor_climb_deg(gravity_g: float, mass: float, motor_torque: float, wheel_radius: float) -> float:
+    """Steepest slope (deg) four wheel motors can hold `mass` on: asin(4 T / r / (m g)); 90 when they
+    could lift it straight up."""
+    ratio = 4.0 * motor_torque / wheel_radius / (mass * 9.81 * gravity_g)
+    return math.degrees(math.asin(min(1.0, ratio)))
+
+
 ROVER_COLORS = ["#ff7a45", "#36cfc9", "#9254de", "#fadb14", "#73d13d", "#f759ab", "#40a9ff", "#ffc069"]
 
 
@@ -297,6 +316,49 @@ class Config:
     def lidar_el(self) -> tuple:
         return tuple(math.radians(e) for e in self.lidar_el_deg)
 
+    # ---- v7: thresholds derived from gravity (each exactly its old value at 2 g) ----
+    @property
+    def rover_mass(self) -> float:
+        """One rover (kg): chassis, four wheels and the axle bar, as world.py builds it."""
+        return self.chassis_mass + 4.0 * self.wheel_mass + ROVER_AXLE_MASS
+
+    @property
+    def climb_limit_deg(self) -> float:
+        """Predicted climb limit: the motor torque limit, capped where grip takes over."""
+        return min(CLIMB_CAP_DEG, motor_climb_deg(self.gravity_g, self.rover_mass, self.motor_torque,
+                                                  self.wheel_radius))
+
+    @property
+    def tow_limit_deg(self) -> float:
+        """Predicted steepest slope one rover can tow another up (two rovers' mass on four motors):
+        0.8 * asin(4 T / r / ((m1 + m2) g)), the asin capped at the single-rover grip limit (a tow train never
+        climbs steeper than one rover). The one tow limit: the setup screen and GET /api/config show it, and
+        the canyon ramps and tow paths of later v7 steps use it instead of their own copy of the formula."""
+        two = motor_climb_deg(self.gravity_g, 2.0 * self.rover_mass, self.motor_torque, self.wheel_radius)
+        return TOW_FACTOR * min(CLIMB_CAP_DEG, two)
+
+    @property
+    def target_path_slope_deg(self) -> float:
+        return min(TARGET_PATH_SLOPE, self.climb_limit_deg - 2.0)
+
+    @property
+    def reach_slope_deg(self) -> float:
+        return min(REACH_SLOPE, self.climb_limit_deg - 1.0)
+
+    @property
+    def passable_slope_deg(self) -> float:
+        return min(PASSABLE_SLOPE, self.climb_limit_deg - 1.0)
+
+    @property
+    def slope_floor_deg(self) -> float:
+        """The learned fleet slope limit never drops below this."""
+        return min(self.slope_limit_floor_deg, self.climb_limit_deg - 2.0)
+
+    @property
+    def sand_spin_load(self) -> float:
+        """Wheel load that marks sand: sinkage drag grows with weight, so lighter gravity needs less."""
+        return SAND_SPIN_LOAD * min(1.0, self.gravity_g / 2.0)
+
     def with_seed(self, seed: int) -> "Config":
         return replace(self, seed=int(seed))
 
@@ -383,3 +445,17 @@ class Config:
 
 # declared type of each Config field ("float", "int", ...): from_settings stores floats as floats
 _FIELD_TYPES = {f.name: f.type for f in fields(Config)}
+
+
+def physics_table(cfg: Config) -> list:
+    """Predicted climb and tow limits for this config's rover at every launch gravity step (GET /api/config
+    `physics`): [{gravity_g, climb_deg, tow_deg, grip_limited}, ...]."""
+    s = SETTINGS_BY_KEY["gravity_g"]
+    rows = []
+    for k in range(int(round((s.max - s.min) / s.step)) + 1):
+        g = round(s.min + k * s.step, 1)
+        c = replace(cfg, gravity_g=g)
+        motor = motor_climb_deg(g, c.rover_mass, c.motor_torque, c.wheel_radius)
+        rows.append({"gravity_g": g, "climb_deg": round(c.climb_limit_deg, 1), "tow_deg": round(c.tow_limit_deg, 1),
+                     "grip_limited": motor > CLIMB_CAP_DEG})
+    return rows

@@ -329,7 +329,7 @@ class Rover:
         if self.fleet.soft_zones and self.fleet.soft_zone_at(self.x, self.y, margin=1.5) is not None:
             thr = 0.75 * thr
         suspect = (driving and not turning and self.tilt < 14.0 and self.v_wheel > cfg.slip_min_wheel_speed
-                   and self.slip > thr and n_spin >= 2 and self.spin_load > 0.2)
+                   and self.slip > thr and n_spin >= 2 and self.spin_load > cfg.sand_spin_load)
         if suspect:
             if self.slip_since is None:
                 self.slip_since = t

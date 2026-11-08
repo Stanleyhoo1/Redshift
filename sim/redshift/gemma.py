@@ -198,6 +198,30 @@ SYSTEM_ANSWER = (
     'Reply with JSON only: {"text": "your answer"}'
 )
 
+
+def _system_base(gravity_g: float = 2.0) -> str:
+    """SYSTEM_BASE for one world's gravity (v7: the planner is shared across resets, so each request carries
+    its own). Exactly SYSTEM_BASE at 2 g; at 1 g and below the world is "an unknown planet"."""
+    gv = float(gravity_g)
+    if round(gv, 1) == 2.0:
+        return SYSTEM_BASE
+    world = "super-Earth" if gv > 1.0 else "planet"
+    return SYSTEM_BASE.replace("super-Earth (gravity 2 g,", f"{world} (gravity {round(gv, 2):g} g,", 1)
+
+
+def _with_gravity(system: str, gravity_g: float) -> str:
+    """A system prompt built on SYSTEM_BASE, restated for this gravity (unchanged at 2 g)."""
+    if round(float(gravity_g), 1) == 2.0 or not system.startswith(SYSTEM_BASE):
+        return system
+    return _system_base(gravity_g) + system[len(SYSTEM_BASE):]
+
+
+def _world_word(system: str, gravity_g: float) -> str:
+    """SYSTEM_COMMAND and SYSTEM_ANSWER name the world without its gravity ("a super-Earth"): at 1 g and below
+    it is "a planet", as in _system_base. No number: a command is parsed from the operator's words and an
+    answer may only quote its fact lines. Unchanged above 1 g, so the 2 g text stays byte for byte."""
+    return system if float(gravity_g) > 1.0 else system.replace("a super-Earth", "a planet", 1)
+
 EM_DASH = chr(0x2014)     # banned in all project text; replaced if the model writes one
 
 
@@ -300,6 +324,7 @@ class Request:
     timeout_s: float | None = None   # per request limit (answers: the latency budget); default GEMMA_TIMEOUT_S
     allowed_ids: tuple = ()          # answer: ids (r2, t4, ...) the reply may mention
     submitted: float = field(default_factory=time.perf_counter)
+    gravity_g: float = 2.0           # v7: the world's gravity, stated in the system prompt
 
     @property
     def key(self) -> tuple:
@@ -599,7 +624,7 @@ def colour_name(c) -> str | None:
 
 # ====================================================================== requests
 def make_choice_request(ticket: int, rover_id: str, t: float, perception: dict, candidates: list,
-                        default: str | None = None) -> Request:
+                        default: str | None = None, *, gravity_g: float = 2.0) -> Request:
     """Raises ValueError on bad input (the planner turns that into a fallback, it never raises)."""
     if not isinstance(candidates, (list, tuple)) or not candidates:
         raise ValueError("no candidates")
@@ -621,12 +646,13 @@ def make_choice_request(ticket: int, rover_id: str, t: float, perception: dict, 
     readings = render_readings(payload["sensors"])
     return Request(ticket=ticket, kind="choice", rover_id=str(rover_id), t=float(t), payload=payload,
                    inputs=input_numbers(payload) + input_numbers(readings), ids=tuple(ids),
-                   default=str(default) if default is not None else ids[0])
+                   default=str(default) if default is not None else ids[0], gravity_g=float(gravity_g))
 
 
 def make_interpretation_request(ticket: int, rover_id: str, t: float, perception: dict, anomaly: dict,
                                 image_jpeg: bytes | None, options: list,
-                                default: str | None = None, classes: list | None = None) -> Request:
+                                default: str | None = None, classes: list | None = None, *,
+                                gravity_g: float = 2.0) -> Request:
     opts = []
     for o in (options or ()):
         o = str(o)
@@ -653,11 +679,12 @@ def make_interpretation_request(ticket: int, rover_id: str, t: float, perception
     rendered = render_readings(payload["sensors"]) + " " + render_readings(payload["anomaly"])
     return Request(ticket=ticket, kind="interpretation", rover_id=str(rover_id), t=float(t), payload=payload,
                    inputs=input_numbers(payload) + input_numbers(rendered), options=tuple(opts), classes=cls,
-                   image_b64=img, default=default)
+                   image_b64=img, default=default, gravity_g=float(gravity_g))
 
 
 def make_description_request(ticket: int, rover_id: str, t: float, perception: dict, observation: dict,
-                             image_jpeg: bytes | None, default: str = "observe") -> Request:
+                             image_jpeg: bytes | None, default: str = "observe", *,
+                             gravity_g: float = 2.0) -> Request:
     """Something moving: what is it? observation: track numbers (distance, speed, size, ...)."""
     if default not in DESCRIBE_ACTIONS:
         raise ValueError(f"default {default!r} not in {DESCRIBE_ACTIONS}")
@@ -670,7 +697,7 @@ def make_description_request(ticket: int, rover_id: str, t: float, perception: d
     rendered = render_readings(payload["sensors"]) + " " + render_readings(payload["observation"])
     return Request(ticket=ticket, kind="describe", rover_id=str(rover_id), t=float(t), payload=payload,
                    inputs=input_numbers(payload) + input_numbers(rendered), options=DESCRIBE_ACTIONS,
-                   classes=DESCRIBE_CLASSES, image_b64=img, default=default)
+                   classes=DESCRIBE_CLASSES, image_b64=img, default=default, gravity_g=float(gravity_g))
 
 
 def _fleet_context(ctx: dict) -> dict:
@@ -717,7 +744,8 @@ def _fleet_context(ctx: dict) -> dict:
     return out
 
 
-def make_command_request(ticket: int, t: float, text: str, fleet_context: dict) -> Request:
+def make_command_request(ticket: int, t: float, text: str, fleet_context: dict, *,
+                         gravity_g: float = 2.0) -> Request:
     text = " ".join(str(text or "").split())[:MAX_TEXT]
     ctx = _fleet_context(fleet_context)
     rover_ids = tuple(r["id"] for r in ctx["rovers"])
@@ -728,14 +756,14 @@ def make_command_request(ticket: int, t: float, text: str, fleet_context: dict) 
     payload = {"message": text, "fleet": ctx}
     return Request(ticket=ticket, kind="command", rover_id="operator", t=float(t), payload=payload,
                    inputs=coords, ids=rover_ids, text=text, target_ids=target_ids, coords=coords, parsed=parsed,
-                   num_predict=COMMAND_NUM_PREDICT)
+                   num_predict=COMMAND_NUM_PREDICT, gravity_g=float(gravity_g))
 
 
 _ID_RE = re.compile(r"\b([rtkqwsh])(\d+)\b")
 
 
 def make_answer_request(ticket: int, speaker: str, t: float, question: str, topic: str, facts: list,
-                        default: str, timeout_s: float | None = None) -> Request:
+                        default: str, timeout_s: float | None = None, *, gravity_g: float = 2.0) -> Request:
     """An operator question to answer from fact lines (answers.fact_lines). speaker: a rover id, or
     "fleet". default: the rule-based answer, returned in a fallback."""
     q = " ".join(str(question or "").split())[:MAX_TEXT]
@@ -751,7 +779,7 @@ def make_answer_request(ticket: int, speaker: str, t: float, question: str, topi
     return Request(ticket=ticket, kind="answer", rover_id=str(speaker), t=float(t), payload=payload,
                    inputs=[v for ln in lines for _, v in numbers_in_text(_strip_thousands(ln))], text=q,
                    default=str(default or ""), num_predict=ANSWER_NUM_PREDICT, timeout_s=timeout_s,
-                   allowed_ids=tuple(sorted(ids)))
+                   allowed_ids=tuple(sorted(ids)), gravity_g=float(gravity_g))
 
 
 def _answer_prompt(req: Request) -> str:
@@ -804,15 +832,16 @@ def _command_prompt(req: Request) -> str:
 def build_prompt(req: Request) -> tuple:
     """(system prompt, user text). Kept small: under about 400 tokens without the image."""
     if req.kind == "command":
-        return SYSTEM_COMMAND, _command_prompt(req)
+        return _world_word(SYSTEM_COMMAND, req.gravity_g), _command_prompt(req)
     if req.kind == "answer":
-        return SYSTEM_ANSWER, _answer_prompt(req)
+        return _world_word(SYSTEM_ANSWER, req.gravity_g), _answer_prompt(req)
     p = req.payload
     head = f"Rover {p['rover']} readings: {render_readings(p['sensors']) or 'none'}"
     if req.kind == "choice":
         cands = "\n".join(f"{c['id']} ({c['kind']}): {c['summary']}" for c in p["candidates"])
-        return SYSTEM_CHOICE, (f"{head}\nCandidates:\n{cands}\n"
-                               "Pick one candidate id. Quote at least one reading above with its number and unit.")
+        return _with_gravity(SYSTEM_CHOICE, req.gravity_g), (
+            f"{head}\nCandidates:\n{cands}\n"
+            "Pick one candidate id. Quote at least one reading above with its number and unit.")
     if req.kind == "describe":
         ob = dict(p["observation"])
         lines = [head, f"Moving object (LiDAR track): {render_readings(ob) or 'no numbers'}",
@@ -820,7 +849,7 @@ def build_prompt(req: Request) -> tuple:
                  "Classes: " + ", ".join(p["classes"]),
                  "Actions: " + ", ".join(o for o in p["options"] if o != "ask_operator"),
                  "Describe it and pick one action. Quote at least one reading above with its number and unit."]
-        return SYSTEM_DESCRIBE, "\n".join(lines)
+        return _with_gravity(SYSTEM_DESCRIBE, req.gravity_g), "\n".join(lines)
     an = dict(p["anomaly"])
     typ = str(an.pop("type", "anomaly"))
     lines = [head, f"Anomaly: {typ}" + (f": {render_readings(an)}" if an else ""),
@@ -828,7 +857,7 @@ def build_prompt(req: Request) -> tuple:
              "Classes: " + ", ".join(p["classes"]),
              "Options: " + ", ".join(p["options"]),
              "Classify the cause and pick one option. Quote at least one reading above with its number and unit."]
-    return SYSTEM_INTERPRET, "\n".join(lines)
+    return _with_gravity(SYSTEM_INTERPRET, req.gravity_g), "\n".join(lines)
 
 
 def build_schema(req: Request) -> dict:
@@ -2283,13 +2312,14 @@ class GemmaPlanner:
 
     # ---------------------------------------------------------------- submit / poll
     def submit_choice(self, rover_id: str, t: float, perception: dict, candidates: list,
-                      default: str | None = None) -> int:
+                      default: str | None = None, *, gravity_g: float = 2.0) -> int:
         """Ask Gemma to pick one candidate. candidates: [{"id", "kind", "summary"}], kind in
         CANDIDATE_KINDS. default: the rules' own pick (default: the first candidate), returned
-        as Result.choice in a fallback. Returns a ticket for poll(). Never blocks, never raises."""
+        as Result.choice in a fallback. gravity_g: the world's gravity, stated in the prompt (v7).
+        Returns a ticket for poll(). Never blocks, never raises."""
         ticket = next(self._tickets)
         try:
-            req = make_choice_request(ticket, rover_id, t, perception, candidates, default)
+            req = make_choice_request(ticket, rover_id, t, perception, candidates, default, gravity_g=gravity_g)
         except Exception as e:                # noqa: BLE001
             ids = [c.get("id") for c in candidates or [] if isinstance(c, dict)]
             stub = Request(ticket, "choice", str(rover_id), float(t or 0.0), {}, [],
@@ -2299,16 +2329,17 @@ class GemmaPlanner:
 
     def submit_interpretation(self, rover_id: str, t: float, perception: dict, anomaly: dict,
                               image_jpeg: bytes | None, options: list, default: str | None = None,
-                              classes: list | None = None) -> int:
+                              classes: list | None = None, *, gravity_g: float = 2.0) -> int:
         """Ask Gemma what an anomaly is. anomaly: {"type": "wheel_slip" | "new_obstacle" |
         "low_visibility" | ..., plus any numbers}. image_jpeg: a small fpv JPEG (320 x 240 is
         plenty) or None. options: actions from ACTIONS (ask_operator is always added). default:
         the action used in a fallback (default proceed_slowly, else wait, else the first option).
+        gravity_g: the world's gravity, stated in the prompt (v7).
         Returns a ticket for poll(). Never blocks, never raises."""
         ticket = next(self._tickets)
         try:
             req = make_interpretation_request(ticket, rover_id, t, perception, anomaly, image_jpeg, options,
-                                              default, classes)
+                                              default, classes, gravity_g=gravity_g)
         except Exception as e:                # noqa: BLE001
             opts = [o for o in (options or []) if o in ACTIONS]
             dflt = default if default in ACTIONS else next(
@@ -2318,26 +2349,29 @@ class GemmaPlanner:
         return self._enqueue(req)
 
     def submit_description(self, rover_id: str, t: float, perception: dict, observation: dict,
-                           image_jpeg: bytes | None, default: str = "observe") -> int:
+                           image_jpeg: bytes | None, default: str = "observe", *, gravity_g: float = 2.0) -> int:
         """Ask Gemma what a moving LiDAR track is (lifeform or not, short label, action). observation:
-        {"distance": m, "speed": m/s, "size": m, ...}. Returns a ticket. Never blocks, never raises."""
+        {"distance": m, "speed": m/s, "size": m, ...}. gravity_g: the world's gravity, stated in the
+        prompt (v7). Returns a ticket. Never blocks, never raises."""
         ticket = next(self._tickets)
         try:
-            req = make_description_request(ticket, rover_id, t, perception, observation, image_jpeg, default)
+            req = make_description_request(ticket, rover_id, t, perception, observation, image_jpeg, default,
+                                           gravity_g=gravity_g)
         except Exception as e:                # noqa: BLE001
             stub = Request(ticket, "describe", str(rover_id), float(t or 0.0), {}, [], default="observe")
             return self._resolve_now(stub, f"bad input: {e}")
         return self._enqueue(req)
 
-    def submit_command(self, t: float, text: str, fleet_context: dict) -> int:
+    def submit_command(self, t: float, text: str, fleet_context: dict, *, gravity_g: float = 2.0) -> int:
         """Turn an operator message into a command. fleet_context: {"rovers": [{"id", "name",
         "color", "x", "y", "state", "battery"}], "targets": [{"id", "kind", "x", "y", "status"}],
         "lander": [x, y]}. The result's command is Gemma's (ok=True) or the regex parser's
         (ok=False, source="fallback"); either way use Result.command and show Result.ack, or
-        Result.question when the command is "unclear". Never blocks, never raises."""
+        Result.question when the command is "unclear". gravity_g: the world's gravity (v7); at 1 g
+        and below the prompt says "a planet", not "a super-Earth". Never blocks, never raises."""
         ticket = next(self._tickets)
         try:
-            req = make_command_request(ticket, t, text, fleet_context)
+            req = make_command_request(ticket, t, text, fleet_context, gravity_g=gravity_g)
         except Exception as e:                # noqa: BLE001
             stub = Request(ticket, "command", "operator", float(t or 0.0), {}, [], text=str(text)[:MAX_TEXT],
                            parsed=_unclear(_HELP))
@@ -2347,14 +2381,16 @@ class GemmaPlanner:
         return self._enqueue(req)
 
     def submit_answer(self, speaker: str, t: float, question: str, topic: str, facts: list,
-                      default: str, timeout_s: float | None = None) -> int:
+                      default: str, timeout_s: float | None = None, *, gravity_g: float = 2.0) -> int:
         """Ask Gemma to answer an operator question from fact lines (answers.fact_lines). speaker: a
         rover id or "fleet". default: the rule-based answer (Result.answer in a fallback). timeout_s:
-        latency limit for this call (default the budget, GEMMA_BUDGET_MS). Never blocks, never raises."""
+        latency limit for this call (default the budget, GEMMA_BUDGET_MS). gravity_g: the world's
+        gravity (v7); at 1 g and below the prompt says "a planet", not "a super-Earth". Never blocks,
+        never raises."""
         ticket = next(self._tickets)
         lim = timeout_s if timeout_s is not None else self.cfg.budget_ms / 1000.0
         try:
-            req = make_answer_request(ticket, speaker, t, question, topic, facts, default, lim)
+            req = make_answer_request(ticket, speaker, t, question, topic, facts, default, lim, gravity_g=gravity_g)
         except Exception as e:                # noqa: BLE001
             stub = Request(ticket, "answer", str(speaker), float(t or 0.0), {}, [], default=str(default or ""),
                            text=str(question)[:MAX_TEXT])
