@@ -24,7 +24,7 @@ import re
 from .gemma import TOPICS
 from .memory import BANDS, compass
 from .terrain import KIND_LABEL
-PER_ROVER_TOPICS = ("battery", "location", "why", "status")   # "everyone, report battery": each rover replies
+PER_ROVER_TOPICS = ("battery", "location", "why", "status", "history")   # "everyone, report battery": each rover replies
 MAX_ANSWER_CHARS = 360
 KIND_SHORT = {"mineral": "mineral", "ice": "ice", "vent": "vent", "trace": "organic trace"}
 INSTRUMENT = {"drill": "drill", "scoop": "scoop", "sniffer": "gas sniffer", "swab": "swab"}
@@ -418,6 +418,7 @@ def fact_lines(sheet: dict, topic: str) -> list:
     c = _fleet_clauses(sheet) if fleet else _rover_clauses(sheet)
     order = {
         "status": ["doing", "battery", "problem", "where", "progress", "recent"],
+        "history": ["progress", "targets", "samples", "hazards", "life", "water", "doing"],
         "exploration": ["mapped", "driven", "where"],
         "finds": ["targets", "samples", "life", "water"],
         "samples": ["samples", "tubes", "targets"],
@@ -558,6 +559,24 @@ def rule_answer(sheet: dict, topic: str) -> str:
 
 def _rover_answer(s: dict, topic: str) -> str:
     c = _rover_clauses(s)
+    if topic == "history":
+        parts = [c["progress"] + (f", {s['areas']}" if s.get("areas") else "")]
+        finds = c["targets"]
+        if s["n_samples"]:
+            finds += f", and sampled {s['n_samples']}"
+        parts.append(finds)
+        extra = []
+        if s["n_hazards"]:
+            extra.append(f"handled {s['n_hazards']} hazard{'s' if s['n_hazards'] != 1 else ''}")
+        if s["n_herds"]:
+            extra.append(f"watched {s['n_herds']} herd{'s' if s['n_herds'] != 1 else ''} of lifeforms")
+        if s["water"]:
+            x, y, _d, _k = _water_groups(s["water"])[0]
+            extra.append(f"found water near {_xy(x, y)}")
+        if extra:
+            parts.append("I also " + _list(extra))
+        parts.append("Now " + c["doing"])
+        return _sentences(*parts)
     if topic == "status":
         tail = c["problem"] if s.get("problem") else ("all systems normal" if s["n_hazards"] == 0 else
                                                       f"all systems normal now ({s['n_hazards']} hazards handled so far)")
@@ -616,6 +635,9 @@ def _rover_answer(s: dict, topic: str) -> str:
 def _fleet_answer(s: dict, topic: str) -> str:
     c = _fleet_clauses(s)
     rov = s["rovers"]
+    if topic == "history":
+        return _sentences(c["mapped"], c["targets"], c["samples"] if s["sampled"] else "",
+                          c["hazards"] if s["n_hazards"] else "", c["life"] if s["lifeforms"] else "")
     if topic == "status":
         brief = "; ".join(f"{r['id']} {r['state']} ({r['battery']}%)" for r in rov)
         tail = c["problem"] if any(r.get("problem") for r in rov) else ""

@@ -351,3 +351,42 @@ def test_no_em_dash_in_v5_code():
     for name in ("answers.py", "memory.py", "visuals.py", "gemma.py", "advisor.py", "camera.py", "world.py"):
         assert EM_DASH not in (ROOT / "redshift" / name).read_text(encoding="utf-8"), name
     assert EM_DASH not in Path(__file__).read_text(encoding="utf-8")
+
+
+# ====================================================================== addressee, history, holding while asking
+def test_ui_addressee_wins_unless_the_text_names_someone(world):
+    sim, _p, _ticks = world
+    who = sim.advisor._who
+    assert who("all", "r1", "what have you done so far") == "r1"      # model guessed "all": the UI pick wins
+    assert who("r2", "r1", "what have you done so far") == "r1"       # model guessed a rover nobody named
+    assert who("all", "r1", "everyone, report battery") == "all"      # the text names everyone
+    assert who("r1", "r1", "rover 2, where are you?") == "r2"         # the text names another rover
+    assert who("all", None, "what have you done?") == "all"           # no UI pick: the model decides
+    assert who(None, None, "status") is None
+
+
+def test_history_questions_get_the_rovers_own_log(world):
+    sim, _p, _ticks = world
+    assert g.question_topic("what have you done so far") == "history"
+    assert g.question_topic("give me a recap") == "history"
+    assert g.question_topic("what have you found so far?") == "finds"
+    r1 = next(r for r in sim.rovers if r.id == "r1")
+    rules = rule_answer(rover_sheet(r1), "history")
+    assert "mapped" in rules and "r2" not in rules and "r3" not in rules
+    cid, rep = ask(sim, "what have you done so far", rover="r1")
+    assert [m["from"] for m in rep] == ["r1"] and rep[0]["kind"] == "reply"
+    assert "r2 " not in rep[0]["text"] and "r3 " not in rep[0]["text"]
+
+
+def test_rover_stays_put_while_waiting_for_an_answer(world):
+    sim, _p, _ticks = world
+    r = next(r for r in sim.rovers if r.state in ("exploring", "investigating") and not r._may_move_while_asking(sim.t))
+    x0, y0 = r.x, r.y
+    r.question_hold = True
+    try:
+        sim.run_for(4.0)
+        moved = math.hypot(r.x - x0, r.y - y0)
+        if not r._may_move_while_asking(sim.t):
+            assert moved < 0.15, moved
+    finally:
+        r.question_hold = False

@@ -312,8 +312,10 @@ Where Gemma helps:
    ones are refused, for example "proceed slowly" on soft ground (`Safety rule wins: ...`).
 3. **Questions to the operator.** If Gemma is unsure (confidence under 0.75, or it says
    `ask_operator`), or it is the first anomaly since start or reset, the rover asks in the chat with
-   2 or 3 safe options and its camera picture, and creeps at 0.25 m/s along its safe route while it
-   waits. No answer in 20 s: it takes the safest option and says so.
+   2 or 3 safe options and its camera picture, and holds position while it waits (it only moves if
+   staying is the danger: backing out of soft ground or liquid, heading home on a low battery, or
+   making room for a creature that came too close). No answer in 20 s: it takes the safest option and
+   says so.
 4. **Lifeforms.** When a rover starts observing something that moves, Gemma gets the camera picture
    and the track numbers and says whether it is a lifeform, with a short label and what to do
    (approach to observe, observe from here, ignore). See "Lifeforms".

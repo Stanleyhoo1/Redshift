@@ -231,6 +231,7 @@ class Rover:
         self.pause_dust = False            # the wait ends early when visibility comes back
         self.crawl_until = -1e9            # creep at crawl_v until then (a question is open)
         self.crawl_v = 0.25
+        self.question_hold = False         # a question to the operator is open: stay put (safety moves allowed)
 
         # water, lifeforms and samples (protocol v4 / v4b)
         self.hole_prev = None              # (x, y) of a hole candidate in the previous sweep
@@ -1955,6 +1956,18 @@ class Rover:
             self._count_replan = True
         self.fleet.log(t, "info", msg, self.id, at=(x, y))
 
+    def _may_move_while_asking(self, t: float) -> bool:
+        """A rover waiting for the operator stays put, unless staying would be the danger: backing out of
+        soft ground or liquid, heading home on a low battery, or making room for a creature that came
+        closer than the planetary protection distance."""
+        if self.state == "recovering":
+            return True
+        if self.state == "returning" and self.return_reason in ("battery", "range"):
+            return True
+        if self.fleet.tracker.tracks and self.fleet.tracker.near(self.x, self.y, self.cfg.observe_min_dist, t):
+            return True
+        return False
+
     def _hold_if_blocked(self) -> None:
         """The new plan is not ready yet: if the old path runs into something close, wait."""
         if self.block_info is not None and self.block_info[2] < 3.5:
@@ -2028,6 +2041,8 @@ class Rover:
             v = min(v, self.crawl_v)         # a question to the operator is open: creep along the safe route
         if t < self.pause_until:
             v, w = 0.0, 0.0                  # waiting (Gemma or the operator said wait)
+        if self.question_hold and not self._may_move_while_asking(t):
+            v, w = 0.0, 0.0                  # asked the operator what to do: stay put until the answer
         if self.hold_for_plan:
             v, w = 0.0, 0.0                  # something blocks the path just ahead; wait for the new plan
         if self.state == "observing":

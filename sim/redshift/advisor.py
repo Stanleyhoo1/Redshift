@@ -45,7 +45,7 @@ from collections import OrderedDict
 
 from .answers import PER_ROVER_TOPICS, fact_lines, fleet_sheet, rover_sheet, rule_answer
 from .fleet import OVERLAP_RADIUS, compass
-from .gemma import GemmaConfig, GemmaPlanner, parse_command, wants_each
+from .gemma import GemmaConfig, GemmaPlanner, _fleet_context, _resolve_rover, parse_command, wants_each
 from .planner import PENDING
 from .terrain import KIND_LABEL
 
@@ -712,13 +712,13 @@ class Advisor:
              "image": f"/api/camera/{rover.id}.jpg?view=fpv", "kind": kind, "job": job}
         self.requests[qid] = q
         self.last_question[rover.id] = t
-        rover.crawl_until, rover.crawl_v = math.inf, CRAWL_V
+        rover.question_hold = True        # stay put until the operator answers (safety moves still allowed)
         src = "gemma" if res is not None else "rules"
         self.say(rover.id, t, f"{rover.id}: {q['question']}", "question", source=src, request_id=qid)
         if res is None:
             why = "first anomaly since landing" if job["first"] else "not sure what it sees"
-            self._log(t, "warn", f"{rover.id} {ANOMALY_NAME[kind]}: {why}, asking the operator. Creeping at "
-                                 f"{CRAWL_V:.2f} m/s meanwhile.", rover.id, at=job["at"])
+            self._log(t, "warn", f"{rover.id} {ANOMALY_NAME[kind]}: {why}, asking the operator. Holding position "
+                                 f"meanwhile.", rover.id, at=job["at"])
 
     def _close(self, qid: str, status: str, t: float):
         q = self.requests.pop(qid)
@@ -728,6 +728,7 @@ class Advisor:
         rover = self._rover(q["rover"])
         if rover is not None:
             rover.crawl_until = t
+            rover.question_hold = any(o["rover"] == rover.id for o in self.requests.values())
         return q, rover
 
     def answer(self, qid: str, option: str) -> str:
@@ -852,6 +853,7 @@ class Advisor:
              "image": f"/api/camera/{rover.id}.jpg?view=fpv", "kind": "lifeform", "job": job}
         self.requests[qid] = q
         self.last_question[rover.id] = t
+        rover.question_hold = True        # watch from where it stands until the operator answers
         self.say(rover.id, t, f"{rover.id}: {question}", "question", source="gemma" if res is not None else "rules",
                  request_id=qid)
         if res is None:
@@ -917,7 +919,7 @@ class Advisor:
         cmd = dict(res.command or {"type": "unclear", "question": res.question or "Sorry?"})
         src = "gemma" if res.ok else "rules"
         typ = cmd["type"]
-        rid = cmd.get("rover") or c["hint"]
+        rid = self._who(cmd.get("rover"), c.get("hint"), c.get("text"))
         ids = [r.id for r in self.sim.rovers]
         if rid not in ids and rid != "all":
             rid = None
@@ -938,13 +940,29 @@ class Advisor:
         elif typ == "question":
             self._ask(cmd, c, t, res)
 
+    def _who(self, named, hint, text) -> str | None:
+        """Who a message is for. The text itself decides when it names a rover or everyone; otherwise
+        the rover picked in the UI (hint) does. Small models often answer "all" (or guess a rover) for
+        a message that names nobody, so the model's pick only counts when there is no hint."""
+        ids = [r.id for r in self.sim.rovers]
+        try:
+            ctx = _fleet_context(self.fleet_context())
+            said, _rest, _q = _resolve_rover(" ".join(str(text or "").lower().split()), ctx["rovers"])
+        except Exception:
+            said = None
+        if said in ids or said == "all":
+            return said
+        if hint in ids:
+            return hint
+        return named if (named in ids or named == "all") else None
+
     # ================================================================== 6. questions from the operator
     def _ask(self, cmd: dict, c: dict, t: float, res) -> None:
         """Answer an operator question: who answers (one rover, each rover, or the fleet), a fact sheet
         each, the rule answer at once, Gemma's reply when it comes (within the budget)."""
         ids = [r.id for r in self.sim.rovers]
         topic = cmd.get("topic") or "status"
-        named = cmd.get("rover")
+        named = self._who(cmd.get("rover"), c.get("hint"), c.get("text"))
         text = res.text or c.get("text") or ""
         if named in ids:
             speakers = [named]
