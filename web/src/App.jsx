@@ -14,6 +14,10 @@ import { SetupScreen } from './components/SetupScreen.jsx'
 import { startConnection, wsUrl } from './net/connection.js'
 import { appStore, simStore, useApp, useSim } from './state/store.js'
 import { stopPlacing } from './lib/placement.js'
+// v7 planet view (src/globe)
+import { GlobeFade } from './globe/GlobeFade.jsx'
+import { GlobeLegend } from './globe/GlobeLegend.jsx'
+import { globeShown, leaveGlobe, useViewMode } from './globe/viewMode.js'
 
 function Waiting() {
   const ready = useSim((s) => s.ready)
@@ -54,6 +58,7 @@ export default function App() {
   const roverMeta = useSim((s) => s.roverMeta)
   const followPaused = useApp((a) => a.followPaused)
   const modal = useApp((a) => a.modal)
+  const globe = useViewMode(globeShown) // v7: the planet is drawn instead of the sector
   const selectedRef = useRef(selected)
   selectedRef.current = selected
   const followRef = useRef(follow)
@@ -74,7 +79,9 @@ export default function App() {
   // (while the follow is paused, it resumes instead).
   const select = useCallback(
     (id) => {
-      if (id && selectedRef.current === id) {
+      // v7: picked while on the planet: fly back down and open it (never a toggle-close).
+      const fromGlobe = id ? leaveGlobe() : false
+      if (id && selectedRef.current === id && !fromGlobe) {
         if (appStore.get().followPaused && followRef.current === id) resumeFollow()
         else goOverview()
         return
@@ -88,6 +95,7 @@ export default function App() {
   // Follow buttons, 3D clicks and number keys only ever open (never toggle closed); on
   // the paused rover they resume following it.
   const show = useCallback((id) => {
+    leaveGlobe() // v7: rovers live on the sector; from the planet this flies back down first
     setSelected(id)
     setFollow(id)
     appStore.patch({ followPaused: false })
@@ -98,6 +106,7 @@ export default function App() {
   // follow (the rover stays selected) instead of dropping it.
   const focusEvent = useCallback((e) => {
     if (!e?.at) return
+    leaveGlobe() // v7: events happen on the sector
     if (followRef.current) appStore.patch({ followPaused: true })
     setFocus({ x: e.at[0], y: e.at[1], key: `${e.key}:${performance.now()}`, hazard: e.level === 'hazard' })
   }, [])
@@ -174,7 +183,9 @@ export default function App() {
         <Canvas flat linear dpr={[1, 1.5]} camera={{ position: [0, 68, 46], fov: 42, near: 0.5, far: 2000 }} gl={{ antialias: true, powerPreference: 'high-performance' }}>
           <Scene view={view} follow={follow} overview={overview} selected={selected} onSelect={show} focus={focus} />
         </Canvas>
-        <DustHaze />
+        {/* v7: the fade between the sector and the planet; no dust veil over the planet */}
+        <GlobeFade />
+        {!globe && <DustHaze />}
         <div className="vignette" aria-hidden="true" />
         <ViewControls view={view} setView={setView} follow={follow} onSelect={show} onOverview={goOverview} />
         <div className="hud-top">
@@ -186,8 +197,17 @@ export default function App() {
             <DustBanner />
           </div>
         </div>
-        {selected ? <SensorPanel roverId={selected} onClose={closePanel} /> : <Legend slopeColors={view.slope} frontiers={view.frontiers} life={view.life} />}
-        {paused && <FollowPill roverId={follow} onResume={resumeFollow} />}
+        {/* v7: on the planet its own legend shows; an open sensor panel stays mounted but
+            hidden, so it comes back as it was; no follow pill over the planet */}
+        {globe && <GlobeLegend />}
+        {selected ? (
+          <div className="globe-keep" hidden={globe}>
+            <SensorPanel roverId={selected} onClose={closePanel} />
+          </div>
+        ) : (
+          !globe && <Legend slopeColors={view.slope} frontiers={view.frontiers} life={view.life} />
+        )}
+        {paused && !globe && <FollowPill roverId={follow} onResume={resumeFollow} />}
         <Waiting />
       </main>
       <Sidebar follow={follow} selected={selected} onSelect={select} onFocusEvent={focusEvent} inert={behind} />

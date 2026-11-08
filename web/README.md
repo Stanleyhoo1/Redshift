@@ -72,9 +72,6 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   stats the science score. The Samples tab lists every sample, best first: kind, instrument,
   analysis, value, and who carries it or "cached at lander". Rows fly the camera there.
 - Event log rows with a target icon fly the camera to where it happened. Hazards are red.
-- Keys: `R` `F` `P` `S` `L` `B` toggle layers, `1` to `9` select a rover, `Esc` cancels
-  placement, closes the sensor panel (then returns to the overview), `0` for the overview,
-  `/` for the message box.
 - Reset sim asks for confirmation, then restarts the sim with a random seed and the same settings. New
   mission opens the setup screen.
 - Setup screen (version 7 sims): opens by itself while the sim waits for a launch (it cannot be closed
@@ -82,6 +79,27 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   as gravity grows, and a figure shows the predicted steepest climb and towing slope), seed, rovers, sector
   size, speed, the world features and wear, all drawn from `GET /api/config`. Launch sends only what
   changed. An older sim gets a seed-only form that resets.
+- Planet view (version 7, web only): `G` or View: Planet in the controls (the row above
+  Graphics) lifts the camera off the map, fades, and shows the whole planet, drawn from the
+  world's seed: dusty plains, darker maria, craters, polar ice and a glow of thick air on
+  the limb, under the same low sun as the sector, with the landing site in daylight. The
+  legend gives the planet's name, its radius (gravity x 6371 km, assuming Earth's density)
+  and the site's latitude and longitude (from the seed). A cyan ring marks the landing
+  sector (a symbol: the sector is far too small to see at this scale), with a live card:
+  sector size, explored share, gravity, sim time and every rover's state. Drag to turn the
+  planet, scroll to zoom, `0` frames the site again. Left alone for a few seconds it sways
+  slowly, about 20 degrees towards the sun over a minute and back, so the site and its card
+  stay in view. Reset sim on the planet glides to the new world's site. Clicking the ring,
+  Fly down to the sector, `G` or View: Sector dives back to the map, and so does anything
+  that acts on the sector: selecting a rover (cards, keys, the card's rover rows), clicking
+  an event, a hazard button, or a rover asking you to pick a place. Hazard placement never
+  carries over to the planet. An open sensor panel hides on the planet and comes back as
+  it was. With reduced motion the switch is instant and the planet stays still. Graphics
+  Low draws a simpler planet (fewer noise layers, one crater size, fewer stars).
+- Keys: `R` `F` `P` `S` `L` `B` toggle layers, `1` to `9` select a rover, `G` switches
+  between the sector and the planet, `Esc` cancels placement, closes the sensor panel (then
+  returns to the overview), `0` for the overview (on the planet: frames the site), `/` for
+  the message box.
 - Following: orbit (left drag) and zoom keep following the rover. A pan (right drag, or a
   modifier with the left button, or two fingers) or a click on an event that flies the
   camera elsewhere pauses the follow right where you put the camera: the rover stays
@@ -202,6 +220,21 @@ the sim with `AUTO_LAUNCH=0`) drives the setup screen (also that neither Tab nor
 forced screen), launches and saves 5 screenshots.
 `scripts/screenshot.mjs` launches a sim that waits in its setup phase (`POST /api/launch {}`) before its
 shots, so it works with the sim's default `AUTO_LAUNCH=0`; a running sim or an older one is left alone.
+Version 7 planet view: `node scripts/v7-globe-check.mjs http://localhost:5182 <outDir>` (the
+mock on 8102 started with `MOCK_FIRST_QUESTION_S=99999`, vite on 5182 with
+`SIM_URL=http://localhost:8102`; `ONLY=toggle-key,marker-click` runs a few) switches both
+ways and checks the fade, the card, the legend, the kept sensor panel, orbit, scroll, `0`,
+the idle sway over more than a minute, Reset sim on the planet, Graphics Low, reduced
+motion, every way back to the sector, and click-to-place after a trip to the planet, and
+saves screenshots; it fails on any console error or warning. Run it once more with
+`WIDTH=1280 HEIGHT=720 ONLY=hud-fit,toggle-key` to check that the controls still end above
+the map legend on a short screen. The pure parts (planet numbers and the idle sway, the
+view state machine, the star, planet and marker materials) have Node tests, and one test
+fails if a file outside `src/globe` imports drei's `Html` directly (sector labels must use
+`src/globe/PlaneHtml.jsx`, which hides them on the planet): `node --test test/*.test.mjs`.
+With `?debug`, `window.__redshift` also has `setView('globe' | 'plane', instant)`,
+`globeState()` and `globeSiteScreen()`, and `state()` reports `view`, `viewRender` and
+`viewPhase`.
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

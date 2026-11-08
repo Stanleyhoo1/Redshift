@@ -5,6 +5,7 @@ import { fixed, shortName } from '../lib/format.js'
 import { HAZARD_TYPES } from '../lib/theme.js'
 import { PLACE_TEXT, placement, startPlacing, stopPlacing } from '../lib/placement.js'
 import { useHudRect } from '../lib/useHudRect.js'
+import { leaveGlobe } from '../globe/viewMode.js'
 
 const COOLDOWN_OK = 4000
 const COOLDOWN_ERR = 1200
@@ -145,6 +146,7 @@ export function HazardPanel() {
   }, [])
 
   const press = (h) => {
+    leaveGlobe() // v7: hazards act on the sector, so the planet view flies back down first
     if (placing?.type === h.type) return stopPlacing() // second click cancels
     if (!v4 || !h.place) {
       stopPlacing()
