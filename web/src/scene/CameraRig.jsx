@@ -7,6 +7,7 @@ import { sampleGroundNear } from '../state/simState.js'
 import { hasPlaces } from '../lib/answers.js'
 import { groundAt } from './ground.js'
 import { viewMode } from '../globe/viewMode.js'
+import { RETURN_OUT, RISE_RATE, settleControls, topDownPose } from '../globe/planeTransition.js'
 
 const _d = new THREE.Vector3()
 const _o = new THREE.Vector3()
@@ -305,9 +306,12 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
     const v = viewMode.get()
     c.enabled = v.view === 'plane' && v.render === 'plane'
     if (v.view === 'globe' || v.render === 'globe') {
+      if (v.render === 'plane') rise(c, s, dt)
+      else if (s.saved) s.saved.away = true
       s.hasLast = false
       return
     }
+    if (s.saved) comeBack(c, s)
     // Anything that moved the orbit target since our last frame was the user panning
     // (OrbitControls updates before this frame; rotate and zoom leave the target alone).
     const moved = s.hasLast ? c.target.distanceTo(s.last) : 0
@@ -500,6 +504,49 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
     if (c._panOffset?.isVector3) c._panOffset.set(0, 0, 0)
     s.fly = { target: pose.target, position: pose.position, rate: 1.6, kind: 'fit' }
     s.mode = 'fly'
+  }
+
+  // v7: on the way to the planet the camera eases up to straight above the middle of the
+  // map (the fade then takes over). Remembers the view it left in s.saved.
+  function rise(c, s, dt) {
+    if (!s.saved) {
+      settleControls(c)
+      s.saved = { target: c.target.clone(), position: camera.position.clone(), mode: s.mode, fly: s.mode === 'fly' ? s.fly : null, away: false }
+      const p = topDownPose(map, camera.fov)
+      s.top = { target: new THREE.Vector3(...p.target), position: new THREE.Vector3(...p.position) }
+    }
+    applyShift(s, camera, size, freeRect(size), dt)
+    const a = 1 - Math.exp(-Math.min(dt, 0.1) * RISE_RATE)
+    c.target.lerp(s.top.target, a)
+    camera.position.lerp(s.top.position, a)
+    camera.lookAt(c.target)
+  }
+
+  // v7: back on the sector. After the planet was drawn (the fade hid the jump), start
+  // further out along the old viewing angle and glide in; after a turn-back, glide from
+  // where the camera is. Then carry on as before: the overview, the follow (easing back to
+  // its distance), or a flight to the view or the fly-to that was under way. A rover
+  // picked or an event clicked meanwhile takes over in step() as usual.
+  function comeBack(c, s) {
+    const sv = s.saved
+    s.saved = null
+    s.top = null
+    settleControls(c)
+    if (sv.away) {
+      _o.copy(sv.position).sub(sv.target)
+      const len = Math.min(_o.length() * RETURN_OUT, c.maxDistance * 0.98)
+      c.target.copy(sv.target)
+      camera.position.copy(sv.target).addScaledVector(_o.normalize(), len)
+      camera.lookAt(c.target)
+    }
+    if (sv.mode === 'auto') s.mode = 'auto'
+    else if (sv.mode === 'follow') {
+      s.mode = 'follow'
+      s.zooming = true
+    } else {
+      s.mode = 'fly'
+      s.fly = sv.fly || { target: sv.target.clone(), position: sv.position.clone(), rate: 2.2, kind: 'view' }
+    }
   }
 
   const span = map ? Math.max(map.width, map.depth) : 80
