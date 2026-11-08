@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
-import { Html } from '@react-three/drei'
+import { Html } from '../globe/PlaneHtml.jsx'
 import * as THREE from 'three'
 import { useSim } from '../state/store.js'
 import { groundAt } from './ground.js'
