@@ -112,7 +112,7 @@ def post_answer(sim, body: dict):
 def world():
     """No lifeforms (a survey with nothing moving), the keyword parser (no Gemma), two bodies of water: a
     pond (one 2 m zone) and a lake (two overlapping 3 m zones, about 9 m across) on opposite sides."""
-    sim = Simulation(Config(seed=42, plan_clock="model", lifeforms=False))
+    sim = Simulation(Config(seed=42, plan_clock="model", lifeforms=False, autonomy_mode="supervised"))
     sim.run_for(40.0)
     f = sim.fleet
     px, py = spot(sim, 0.0, 0.0, 9.0, 16.0)
@@ -443,7 +443,8 @@ def test_requests_never_expire_by_default(monkeypatch):
     for timeout in (0.0, 5.0):
         p = GemmaPlanner(GemmaConfig(fake=True, check_every_s=3600.0, timeout_s=2.0), backend=FakeBackend(0.0))
         assert p.wait_ready(2.0)
-        sim = Simulation(Config(seed=42, operator_timeout_s=timeout, **legacy), planner=p, wait_for_gemma=True)
+        sim = Simulation(Config(seed=42, operator_timeout_s=timeout, autonomy_mode="supervised", **legacy), planner=p,
+                         wait_for_gemma=True)
         now = [1000.0]
         sim.advisor.clock = lambda: now[0]
         try:

@@ -14,6 +14,7 @@ services:
       GEMMA_FAKE: ${GEMMA_FAKE:-0}
       OPERATOR_TIMEOUT_S: ${OPERATOR_TIMEOUT_S:-0}
       CAMERA_SHADOWS: ${CAMERA_SHADOWS:-1}
+      AUTONOMY_MODE: ${AUTONOMY_MODE:-autonomous}
     # Lets the container reach Ollama running on your machine (Docker Desktop and plain Docker on Linux/WSL).
     extra_hosts:
       - "host.docker.internal:host-gateway"

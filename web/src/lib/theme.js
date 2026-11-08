@@ -22,6 +22,13 @@ export const STATE_STYLE = {
   idle: { label: 'Idle', color: '#8d99aa' },
   fault: { label: 'Fault', color: '#ff3b5c' },
   observing: { label: 'Observing', color: '#c8f25a' },
+  // v9: health, rescue and repair
+  disabled: { label: 'Disabled', color: '#ff4d4d', alert: true },
+  rescuing: { label: 'Rescuing', color: '#ffb547' },
+  towing: { label: 'Towing', color: '#ffb547' },
+  towed: { label: 'In tow', color: '#f0a05a' },
+  repairing: { label: 'Repairing', color: '#5fd4c8' },
+  wrecked: { label: 'Wrecked', color: '#8a93a3', wreck: true },
 }
 
 // Environment changes injected into the sim (PROTOCOL.md version 2). Crimson, so a
@@ -32,12 +39,15 @@ export const DUST = '#b98a5c'
 // `place`: how the button works with a version 4 sim. 'point' = click the map (x, y),
 // 'rover' = click a rover, null = one click. `radius` sizes the ghost marker (metres).
 // `v4`: only offered when the sim speaks version 4. `discovery`: styled as a find, not a hazard.
+// `v9`: only offered when the sim speaks version 9 (rover health). Damage picks a rover, then
+// a severity (and optionally a part) in a small popover.
 export const HAZARD_TYPES = [
-  { type: 'rockfall', label: 'Rockfall', place: 'point', radius: 2.8, hint: 'Boulders land on a rover route. LiDAR sees them, the planner steers around.' },
+  { type: 'rockfall', label: 'Rockfall', place: 'point', radius: 2.8, onRover: true, hint: 'Boulders land on a rover route. LiDAR sees them, the planner steers around.' },
   { type: 'sand', label: 'Soft sand', place: 'point', radius: 2.3, hint: 'Hidden soft ground on a route. Only wheel slip gives it away.' },
-  { type: 'spire_fall', label: 'Falling spire', place: 'point', radius: 0.8, v4: true, hint: 'A crystal spire topples across a route. LiDAR sees it, the planner steers around.' },
+  { type: 'spire_fall', label: 'Falling spire', place: 'point', radius: 0.8, v4: true, onRover: true, hint: 'A crystal spire topples across a route. LiDAR sees it, the planner steers around.' },
   { type: 'dust_storm', label: 'Dust storm', place: null, hint: 'LiDAR range collapses to a few metres for a while. Rovers slow down.' },
   { type: 'rover_fault', label: 'Motor fault', place: 'rover', hint: 'One rover loses its motors and reboots. The fleet routes around it.' },
+  { type: 'damage', label: 'Damage', place: 'rover', v9: true, hint: 'Damage a rover (light, heavy, disable or wreck). Watch its diagnosis, and the rescue if it cannot drive.' },
   { type: 'lifeform', label: 'Lifeform', place: 'point', radius: 3.2, v4: true, discovery: true, hint: 'A small herd of creatures wanders in. The rovers still have to notice them.' },
 ]
 
@@ -93,3 +103,34 @@ export const REGOLITH = {
 
 export const stateStyle = (s) => STATE_STYLE[s] || { label: s ? s[0].toUpperCase() + s.slice(1) : 'Unknown', color: '#8d99aa' }
 export const kindStyle = (k) => KIND_STYLE[k] || { label: k || 'Target', long: k || 'target', color: '#e6edf5' }
+
+// ---------------------------------------------------------------- version 9: rover health
+
+// Health status colours (the hp bar), and part levels (the part indicators).
+export const HEALTH = { ok: '#62d6a8', damaged: '#f3b24a', immobile: '#ff4d4d', wrecked: '#8a93a3' }
+export const healthColor = (status, hp) => HEALTH[status] || (!Number.isFinite(hp) ? '#8d99aa' : hp >= 85 ? HEALTH.ok : hp >= 40 ? HEALTH.damaged : HEALTH.immobile)
+export const partLevel = (v) => (!Number.isFinite(v) ? 'none' : v >= 70 ? 'ok' : v >= 30 ? 'warn' : v > 0 ? 'bad' : 'dead')
+export const PARTS = [
+  { key: 'drive_l', label: 'Left drive', short: 'L drive' },
+  { key: 'drive_r', label: 'Right drive', short: 'R drive' },
+  { key: 'lidar', label: 'LiDAR', short: 'LiDAR' },
+  { key: 'camera', label: 'Camera', short: 'Camera' },
+  { key: 'power', label: 'Power', short: 'Power' },
+  { key: 'comms', label: 'Comms', short: 'Comms' },
+]
+export const partLabel = (k) => PARTS.find((p) => p.key === k)?.label || (k ? k[0].toUpperCase() + k.slice(1).replace(/_/g, ' ') : 'Part')
+// Spare kinds at the lander (fleet `spares`).
+export const SPARES = [
+  { key: 'drive', label: 'Drive motor' },
+  { key: 'lidar', label: 'LiDAR' },
+  { key: 'camera', label: 'Camera' },
+  { key: 'power', label: 'Power pack' },
+]
+// "tip_over" -> "tip over"; the sim's own words otherwise.
+export const causeText = (c) => (c ? c.replace(/_/g, ' ') : 'unknown')
+export const SEVERITIES = [
+  { key: 'small', label: 'Small', hint: 'Flat 20 points off one part' },
+  { key: 'huge', label: 'Huge', hint: 'Flat 60 points off one part (a drive or power this low can strand it)' },
+  { key: 'disable', label: 'Disable', hint: 'It can no longer drive: distress, a helper, a diagnosis' },
+  { key: 'wreck', label: 'Wreck', hint: 'Beyond field repair: tow home or salvage' },
+]

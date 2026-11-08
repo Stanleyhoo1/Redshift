@@ -27,7 +27,7 @@ SCRIPT = [("rockfall", 40.0, None), ("sand", 85.0, None), ("dust_storm", 150.0, 
 END_T = 262.0
 MAP_SIZE = 80.0     # the scripted run (seed 42, set times) was written for the 80 m map and the world before
 # protocol v4 (no water, spires or lifeforms, a 3 s sample, no tube limit); test_v4.py covers those
-LEGACY = dict(map_size=MAP_SIZE, water=False, spires=False, lifeforms=False, drill_s=3.0, scoop_s=3.0,
+LEGACY = dict(map_size=MAP_SIZE, water=False, spires=False, lifeforms=False, curiosity=False, drill_s=3.0, scoop_s=3.0,
               sniffer_s=3.0, swab_s=3.0, sample_capacity=99, num_boulders=12)
 EM_DASH = chr(0x2014)
 

@@ -362,6 +362,137 @@ Sim notes (clarifications):
 - The rover state stays `"exploring"` during a survey (goal null). Chat for a place command: one `ack` (or `refuse`, `question`), an `info` on arrival, and with investigate the survey `info`; all carry `reply_to` the command, and `request_id` when they follow a `choose_place` answer.
 - "go to the lander" without investigate means return home (the closest free rover when none is named).
 
+## Version 7 additions (exploring an area, curiosity, chat memory, following lifeforms)
+
+All optional for clients.
+
+### Rover addition: `focus` (present only while a rover concentrates on an area)
+
+```json
+"focus": {"x": 12.0, "y": -30.0, "r": 15.0, "reason": "operator", "label": "the pond's shore", "ends_in": 64.0}
+```
+
+- While focused, the rover explores the unknown ground within `r` of the centre first (frontiers inside the circle win, then the nearest edge of the circle), and stays until `ends_in` (sim seconds) runs out or nothing unknown is left nearby. Then it reports in chat (`kind: "info"`) what it mapped and found there and goes back to normal exploration.
+- `reason: "operator"`: "explore around the lake", "go to the vent and look around", "explore there", "explore north of the lander", and "investigate ..." (survey first, then the focus). About 120 sim s. A plain "go to" still just goes.
+- `reason: "interest"`: the rover's own curiosity. When it finds something new (a science target, water, a cluster of spires, a herd it finished watching, or ground that looks different), it sticks around for about 60 sim s to look for more, and says so in the event log ("r2 found water here. Sticking around for about 60 s to look for more."). Never while returning, on low battery, during an operator focus, or where another rover already has a focus.
+
+### Chat memory
+
+The sim keeps a short conversation context: the last 8 or so messages, plus the places, targets, candidates and rovers most recently mentioned by the operator or the rovers. References resolve against it: "go back there", "what did you find there?", "the second one", "do that again", "same for rover 3", "that lake", "the vent you mentioned". Unclear references get a short question or a `choose_place` request as usual. Answers and acks may mention what was resolved ("Back to the pond's shore at (15.7, 1.7), 22 m.").
+
+### Lifeform sightings
+
+When a rover sees a herd it has not asked about before, it starts following at the observation standoff (never closer than the planetary protection distance) at once, because the creatures may wander off, and asks the operator in the same moment (request `kind: "lifeform"`, options: keep following, observe from here, keep exploring). It keeps following until the operator answers (no expiry by default). Each herd is asked about once. Safety still wins: low battery, hazards and water end the follow, and the rover says so.
+
+Sim notes (clarifications):
+- `focus.ends_in` counts from when the rover reaches the circle (within `r` plus about 4 m); until then it shows the full duration. An area the rover cannot get into within about 180 sim s is given up (reported).
+- An operator focus reports in chat with `reply_to` the command (and `request_id` after a `choose_place` answer). An interest focus reports in the event log only: it is the rover's own initiative, so the chat stays the operator's conversation.
+- Lifeform option ids stay `follow`, `observe_here`, `keep_exploring` (labels "Keep following", "Observe from here", "Keep exploring"); `default` stays `observe_here`. When the follow ends for safety before an answer, the request is closed (it leaves `requests`, `POST /api/answer` gets 409) with a chat `info` carrying its `request_id`.
+- Any rover waiting for the operator (any request kind) keeps its normal battery check; when it must go home it closes its open requests the same way ("Battery 21%, I can't wait any longer: heading back to the lander. ..."), drops a focus or a follow, and leaves at once. A rover held on the lander pad keeps charging.
+
+## Version 8 additions (autonomy mode, unexplored gaps and priorities, re-survey, area questions, object detection, faster camera)
+
+All optional for clients.
+
+### Autonomy mode
+
+- Fleet field `mode`: `"autonomous"` (default, env `AUTONOMY_MODE`) or `"supervised"`. `POST /api/mode` with `{"mode": "supervised"}` returns `{"ok": true, "mode": "supervised"}`; 400 for any other value. Chat also works ("switch to supervised mode", "you decide from now on").
+- **autonomous:** the rovers never wait for the operator on their own decisions. Where they would ask (an anomaly they cannot identify, a lifeform sighting, several places matching an operator command), Gemma decides (the rules when Gemma is offline; below 0.5 confidence the safest option). Each decision is logged as an event with a `decision` object and said in chat (`kind: "info"`). Operator commands still override at any time.
+- **supervised:** every such decision becomes a request to the operator: every anomaly (not only the first or uncertain ones), every lifeform sighting, every ambiguous place. Gemma's pick is shown as a suggestion (option field `"suggested": true`, and the question says "Gemma suggests: go around (0.82)"). Requests wait (version 6 rules).
+- Switching to autonomous with requests open: each rover decides them at once and logs the decision.
+- Event addition `decision` (optional): `{"question": "New rocks 4 m ahead, 0.6 m tall", "options": ["reroute", "proceed_slowly", "wait"], "choice": "reroute", "by": "gemma", "confidence": 0.82, "why": "LiDAR 0.6 m tall, 3 cells changed: rocks"}`.
+
+### Unexplored gaps and fleet priorities
+
+- New place kind for commands: unexplored gaps ("holes", "gaps", "blank spots", "dark patches", "unexplored areas", "unmapped pockets"): connected areas of unknown ground of at least about 4 m2 with known ground around most of their edge, ranked by size and distance. "explore one of those holes" sends the closest free rover to the best one (autonomous) or opens a `choose_place` request with every gap marked (supervised, when there are several).
+- Fleet field `priority` (present while set): `{"kind": "gaps", "label": "the unexplored gaps inside the map", "count": 4, "since": 1834.0, "places": [{"x": 12.0, "y": -8.0, "r": 3.5}]}` (`places`: the gaps still left, for the map, gaps priority only). Set by "prioritize the gaps", "focus on the unexplored holes first", "prioritize the north", "prioritize water", "prioritize sampling". Every rover's goal choice weights the priority strongly until nothing is left or the operator says "back to normal" or "cancel the priority". The ack states the plan ("Prioritizing 4 unexplored gaps: r1 takes the one at (12, -8), r2 the one at (-30, 4)."). Clearing it is announced in chat.
+
+### Re-survey
+
+- Focus addition `mode`: `"explore"` (unknown ground first) or `"resurvey"`. An operator focus on an area that is already mostly mapped becomes a re-survey: the rover drives a loop through the circle for the full time, rescanning with LiDAR, camera and spectrometer and stopping for anything interesting (targets the spectrometer missed, creatures, changes), then reports what changed or what it found ("No changes since it was mapped" is a valid report). Curiosity focuses still skip mapped areas.
+
+### Area questions
+
+- "what did we find there?", "anything near the lake?", "what's at the vent?": the answer covers the referenced place only (within about 15 m): targets, samples, water, spires, herds and hazards there, from fleet knowledge. "We" questions about a place answer for the fleet at that place.
+
+Sim notes (clarifications for the four parts above):
+- `decision.by` is `"gemma"` or `"rules"` (also when a safety rule overrides Gemma's pick; `why` says so); `confidence` is null for the rules. The same decision by the same rover within 30 sim s is logged again but said in chat once. An autonomous place decision is said in the command's `ack` ("I know 2 bodies of water; going for the lake ... (Gemma picked it, 0.80)."), so a command still gets one reply.
+- Supervised: a suggestion appears once Gemma has answered (none while Gemma is offline). A rover already waiting on a question decides a new one itself and logs it. "you decide" with questions open decides those now and stays supervised; with none open it switches to autonomous. Requests settled by a decision close like answered ones (`POST /api/answer` then gets 409).
+- Gaps count (places, `priority.count`) only when a reachable frontier touches them; exploring one is an operator focus around it. Priority `kind`: `"gaps"`, `"direction"` (plus `"direction": "north"`), `"water"` (no water known yet: low ground first, the label says so), `"sampling"` (free rovers start on found targets and fetch them from up to 90 m). A rover with its own operator task finishes it first; curiosity pauses while a priority is set.
+- Re-survey when less than 15% of the circle is unknown, or when an operator focus finds nothing to explore within 10 s of arriving. `focus.mode` is on every focus.
+
+### Object detection (camera perception)
+
+- Each rover runs an onboard detector on its own camera frames (RGB and depth pixels only, never ground truth). Classes: `rock`, `boulder`, `spire`, `creature`, `water`, `mineral`, `ice`, `vent`, `trace`, `rover`, `lander`.
+- Rover addition `vision` (latest detection for that rover):
+  `{"frame": 1234, "t": 512.3, "view": "fpv", "ms": 14.2, "objects": [{"label": "creature", "conf": 0.83, "box": [0.41, 0.38, 0.58, 0.62], "dist": 6.2, "bearing": 12.0}]}`
+  `box` is normalised `[x0, y0, x1, y1]` (0 to 1, origin top left). `dist` in metres from depth. `bearing` in degrees, positive to the left of the camera axis.
+- `GET /api/camera/{rover_id}.jpg` adds headers `X-Frame` (frame number), `X-Frame-Age-Ms`, and `X-Detections` (compact JSON of the objects detected in exactly that frame, same shape as `vision.objects`). Clients read them with `fetch`.
+- Decisions use detections and log them: water confirmation, creature confirmation for LiDAR tracks, the class of a new obstacle, and targets spotted by camera before the spectrometer reaches them ("Camera: possible vent 12 m ahead (0.71). Going to check it.").
+- `GET /api/vision/stats` (optional): detector precision and recall per class against ground truth, measured in the sim for transparency (the rovers never see the truth).
+
+### Faster camera
+
+- The server renders the requested views continuously in the background and keeps the newest frame; `GET /api/camera/{rover_id}.jpg` answers at once with the newest frame for that view and size (`X-Frame-Age-Ms` says how old it is). Views nobody has asked for in the last few seconds stop rendering.
+
+Clarifications (sim implementation notes):
+- Only the onboard `fpv` camera runs the detector: for `view=chase` (not a rover camera) `X-Detections` is `[]`. The first request for a new view and size waits for its first frame (as before); later ones answer at once. `X-Frame` numbers increase across all frames the server renders (streams, detector frames, Gemma's frames), so a client can tell a repeated frame from a new one. The three headers are listed in `Access-Control-Expose-Headers`.
+- Rover `vision` is absent until the rover's first detection. It comes from the newest of: the rover's own small detector render (about 1 per second, 256 x 192, no shadows), the streamed fpv view the UI is polling, or the frame Gemma looked at; `vision.frame` equals `X-Frame` when it came from that frame. Weak detections (confidence below 0.3) are dropped; decisions use about 0.5 and up.
+- `GET /api/vision/stats` answers `{"ok": true, "frames", "conf_min", "match", "classes": {label: {"tp", "fp", "fn", "precision", "recall"}}, "overall", "ms": {"avg", "p95"}, "confusion", "camera": {...}}`, measured on one detector frame in five since the sim started (`precision` / `recall` are `null` until there is data).
+
+## Version 9 additions (rover health and damage, distress, rescue, towing, salvage, repair)
+
+All optional for clients.
+
+### Rover addition: `health` (every tick)
+
+```json
+"health": {"hp": 64, "status": "damaged",
+           "parts": {"drive_l": 100, "drive_r": 35, "lidar": 90, "camera": 70, "power": 100, "comms": 100},
+           "diagnosis": "Right drive motor at 35%: pulls left, top speed 0.4 m/s.",
+           "last_hit": {"t": 812.4, "cause": "boulder", "shock_g": 7.4}}
+```
+
+- `parts` are 0 to 100 (100 = like new). `hp` is the overall figure the UI shows (worst parts weigh most).
+- `status`: `"ok" | "damaged" | "immobile" | "wrecked"`. Immobile: cannot drive (both drive sides too weak, or power gone) but can be repaired or towed. Wrecked: beyond field repair; it can only be towed home for a lander repair or salvaged for parts.
+- `diagnosis`: the rover's own plain-language reading of its state, from its sensors (motor current against wheel speed, IMU shocks, LiDAR return counts, camera noise, battery behaviour), never from ground truth.
+- Damage changes behaviour through the sensors and the physics: a weak drive side makes the rover pull to one side and lowers its top speed and climbing ability (its own slope limit drops); a damaged LiDAR loses range and rays; a damaged camera gets noisy and the detector's confidence drops; damaged power drains the battery faster; damaged comms shortens how far its messages reach.
+
+### Damage sources
+
+Damage comes from what happens in the physics: hard contacts and shocks from rocks and boulders (including a rockfall landing on or next to a rover), a spire falling onto a rover, tipping over, driving into water, long stalls and hard pulling in soft sand (motor strain), dust on the camera and panels, and lifeforms: a herd wandering into a rover, or a territorial creature charging a rover that stays too close too long. Rovers see a charge coming (a fast LiDAR track heading at them, confirmed by the camera) and back away when they can. Each hit is an event with a `damage` object:
+
+```json
+"damage": {"rover": "r2", "part": "drive_r", "before": 100, "after": 35, "cause": "boulder", "shock_g": 7.4}
+```
+
+Demo control: `POST /api/hazard` with `{"type": "damage", "rover": "r2", "severity": "light" | "heavy" | "disable" | "wreck"}` (optional `"part"`). Damage is also reachable by clicking: a rockfall or falling spire placed on a rover hits it.
+
+### Distress, rescue, towing, salvage, repair
+
+- A rover that becomes immobile stops, logs its diagnosis, and sends a **distress signal** (event plus chat, kind `"info"`): "r2: immobile. Right drive at 0%, left at 20%. Requesting help at (14.2, -30.5)." If its comms are too damaged to reach the others, they notice it went silent (no heartbeat for about 15 s) and go to its last known position.
+- The best placed healthy rover becomes the **helper** (closest, enough battery for the trip and back, plus towing if needed) and says so. It drives to the disabled rover, then **diagnoses** it for about 20 s (camera and close inspection), and reports what it found. Some damage can be fixed in the field (a jammed wheel, a tripped motor controller, a dirty camera): the helper fixes it and both carry on.
+- Otherwise there are three options, decided by Gemma in autonomous mode or asked as a request of `kind: "rescue"` in supervised mode, with the rules marking which are safe:
+  - **tow**: the helper hitches up and tows the rover back to the lander slowly (stricter slope limit, extra battery) for repair. Only offered when a safe route exists and the helper's battery covers it.
+  - **salvage**: the helper takes the most useful working parts (adds them to the fleet's spares) and leaves the wreck.
+  - **leave**: the wreck stays where it is, marked on the map, and the fleet carries on without it.
+- Rescue request options carry the rules' verdict: `{"id": "tow", "label": "Tow it home (180 m)", "safe": true, "note": "Route at most 12 deg, helper battery after tow about 41%"}`; unsafe options have `"safe": false` and the reason in `note` (the UI locks them). The request may carry `about` (the disabled rover's id).
+- **Repair at the lander**: a rover at the lander gets repaired over time, using spare parts for broken components. A drive, LiDAR, camera or power part below 30% needs a spare; better parts are serviced without one.
+- Fleet additions: `spares` `{"drive": 2, "lidar": 1, "camera": 1, "power": 1}`; `rescues` `[{"rover": "r2", "helper": "r1", "phase": "en_route" | "diagnosing" | "repairing" | "towing" | "salvaging" | "done", "plan": "tow" | "salvage" | "leave" | null}]`; `wrecks` `[{"rover": "r2", "x": 14.2, "y": -30.5}]`.
+- New rover states: `"disabled"` (immobile, waiting for help), `"rescuing"` (helper on its way or working), `"towing"`, `"towed"`, `"repairing"` (at the lander), `"wrecked"` (left behind).
+- Rovers answer questions about their health ("rover 2, are you damaged?", "how is rover 3?") from `health`, and the operator can order a rescue ("rover 1, go help rover 2", "tow rover 2 home", "salvage rover 3", "leave it").
+
+Sim notes (clarifications):
+- `status` "immobile" can still need a tow (a burnt-out motor needs a spare at the lander); "wrecked" means immobile even after a field repair and badly hurt overall (hp under 30, or three or more parts under 10%). A rover pulls toward its weak drive side ("Right drive motor at 35%: pulls right, top speed 0.4 m/s."). A skid steer needs both sides: either drive side under 15%, or power under 10%, is immobile.
+- `damage` hazard: `light` takes 15 to 25 points off one part (the named one, or a random one); `heavy` takes a part (default a drive side) to 35 to 45% and never immobilises; `disable` without a part burns out the right drive (0%) and jams the left wheel (20%, fixable in the field, not enough on its own); with `drive_l` / `drive_r` / `power` that part is knocked out; with `lidar`, `camera` or `comms` that part drops to 10% and the right drive burns out too, so the rover is always immobile; `wreck` takes both drives and the power system out (beyond field repair, the sensors stay worth salvaging; with a part, that part is lost too). Extra severity `"jam"`: a jammed left wheel and a tripped right motor controller (immobile, fully fixable in the field, for demoing a field repair). The rover reacts at once (distress in the same call). The response adds `"health"` (the rover's health after the hit). 400 for an unknown severity or part, an unknown rover, a rover already wrecked or being towed, and `disable` / `jam` on a rover that is already immobile. The hazard entry is `{"id", "type": "damage", "t", "rover", "x", "y", "severity", "part", "active": false}`.
+- A rockfall or spire fall placed on or within 2 m of a rover is aimed at it (instead of the old 400); the lander is still refused. `lifeform` accepts `"charge": true` (demo): the herd's territorial member charges the rover a few seconds after it appears.
+- Rescue phases: hitching up is reported as `"towing"`, waiting for a free helper as `"en_route"` with `helper` null, waiting for the decision (or the operator) as `"diagnosing"`. Finished rescues stay in `rescues` with phase `"done"` for 60 s.
+- A `rescue` request's `rover` is the helper (it waits by the disabled rover); `about` is the disabled rover. Option ids are `tow`, `salvage`, `leave`, the safe ones first; `default` is the rules' first safe option. Answering an option with `safe: false` gets HTTP 400 and the request stays open.
+- Towing is physical (a MuJoCo `connect` constraint between the helper's rear hitch and the towed rover's front hitch, the towed rover's drives passive). If it gets stuck the towed rover follows the hitch kinematically instead; the event log says which ("on the tow bar" or "on the rigid bar").
+- Repair at the lander: a spare is fitted and tested in about 20 s; a rover whose broken part has no spare waits at the lander (state `"repairing"`, charging) until one is delivered. Salvaged parts count once the helper docks, or at once when it fits one to itself.
+- Radio range is about 220 m times `comms` (the whole 120 m map at 100%); a rover heard by neither the lander nor another rover for 15 s goes silent.
+- Chat: question topic `"health"`; the command parser adds `{"type": "rescue", "rover": helper or null, "target": rover or null, "plan": "help" | "tow" | "salvage" | "leave"}` (null target: the rover currently in trouble).
+
 ### `GET /api/camera/{rover_id}.jpg`
 
 Live image rendered by MuJoCo from the rover's point of view, at the current sim state.
@@ -395,4 +526,5 @@ Nothing required. The server must ignore any text the client sends.
 | `GEMMA_MODEL` | gemma4:e2b | preferred model; falls back to gemma4:e4b, then gemma3:4b if not installed |
 | `GEMMA_FAKE` | 0 | 1 = deterministic fake model (demo and tests without Ollama) |
 | `OPERATOR_TIMEOUT_S` | 0 | 0 = operator requests never expire (the rover waits); above 0 = wall seconds before the rover takes the safe default |
+| `AUTONOMY_MODE` | autonomous | `autonomous` (Gemma decides, logs every decision) or `supervised` (the operator is asked every decision) |
 | `AUTO_RESET_S` | 0 | off by default (the sim only resets on `POST /api/reset`); if set, after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` |

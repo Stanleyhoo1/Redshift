@@ -11,9 +11,17 @@ Sensors (all the rover knows about the world):
   position       ground truth, treated as GPS-like localisation (no SLAM)
 
   water sensor   a wetness probe on the chassis belly (only matters if the rover ever drives into liquid)
-  camera         mast camera (camera.py), used by the rules for a quick colour check of a LiDAR hole
+  camera         mast camera (camera.py), used by the rules for a quick colour check of a LiDAR hole, and
+                 its onboard object detector (vision.py, protocol v8): self.vision holds the latest
+                 detections; the decision cycle only reads them (water, creatures, new obstacles, targets)
 
-States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault, observing.
+States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault, observing, and
+protocol v9: disabled (immobile, waiting for help), rescuing (a helper on its way or working), towing, towed,
+repairing (at the lander) and wrecked (left behind). Health (health.py) changes how the rover drives through the
+physics (a weak drive side has less torque and top speed), its sensors (LiDAR range and rays, camera noise), its
+battery drain and its radio range; the rover adapts (lower top speed, its own lower slope limit, home for a repair
+when its health is low) and backs away from a creature that charges at it (a fast LiDAR track coming straight at
+it, confirmed by the camera when it sees one).
 
 LiDAR returns are split three ways: liquid gives no return at all (water shows up as a hole in the
 map); hits on creatures go to the fleet's motion tracker (tracker.py; a stated simplification, a real
@@ -33,8 +41,19 @@ re-planning) and logs what was seen. Other layers can subscribe with Rover.anoma
 
 Tier 2 (advisor.py: Gemma advice and operator commands) can only nudge the rover through a few
 fields: held (operator hold: parked in state idle), op_goal (operator go_to), dir_bias (operator
-"explore north"), sticky_goal (a frontier Gemma picked), pause_until and crawl_until / crawl_v
-(wait or creep while a question is open). The safety rules below still run first every cycle.
+"explore north"), sticky_goal (a frontier Gemma picked), focus (protocol v7: an area to explore),
+pause_until and crawl_until / crawl_v (wait or creep while a question is open). The safety rules below
+still run first every cycle.
+
+Protocol v7: a focus {"x", "y", "r", "reason", ...} makes the frontier choice (fleet.choose_goal) take the
+unknown ground inside that circle first, then the ground nearest its edge; the rover stays until the time is
+up (counted from when it reaches the circle) or nothing unknown is left nearby, then the advisor reports
+what it mapped and found there. reason "operator" comes from a command ("explore around the lake"),
+"interest" from the rover's own curiosity: when it finds something new (a science target, water, a
+cluster of spires, a herd it finished watching, ground that suddenly looks different) it sticks around for
+about a minute, with a cooldown, never while returning, on a low battery, during another focus or where
+another rover's focus already covers the spot. While a lifeform question is open the rover follows the
+herd at the observation standoff instead of holding still; hazards, water and a low battery end that.
 """
 from __future__ import annotations
 
@@ -46,20 +65,29 @@ import mujoco
 import numpy as np
 
 from .config import Config
+from .health import Health
 from .memory import RoverMemory
 from .planner import PENDING, downsample, path_length
 from .terrain import KIND_LABEL
+from .vision import VisionBrain
 from .world import GROUP_ROCK
 
 LIDAR_GROUPS = np.array([1, 1, 1, 0, 0, 1], np.uint8)   # terrain, rocks, targets and creatures, liquid; never
                                                          # rovers (3) or the walls (4)
 BUMPER_GROUPS = np.array([0, 1, 0, 0, 0, 0], np.uint8)  # rocks only
-DRIVING = ("exploring", "investigating", "returning", "observing")
-PARKED = ("idle", "charging", "fault")
+DRIVING = ("exploring", "investigating", "returning", "observing", "rescuing", "towing")
+PARKED = ("idle", "charging", "fault", "disabled", "towed", "wrecked", "repairing")
+HURT = ("disabled", "towed", "wrecked")    # protocol v9: out of action (rescue.py decides what happens to them)
+CHARGE_SPEED = 0.65    # protocol v9: a LiDAR track closing this fast (m/s; grazers walk at 0.5 at most) ...
+CHARGE_RANGE = 9.0     # ... from this close, heading straight at the rover, is a creature charging
+EVADE_S = 2.5          # back away for this long
+REPAIR_NOTE_S = 120.0  # a rover that needs a repair says so at most this often
 ANOMALY_KINDS = ("new_obstacle", "slip", "low_visibility", "no_returns")
 ANOMALY_TYPE = {"new_obstacle": "new_obstacle", "slip": "wheel_slip", "low_visibility": "low_visibility",
                 "no_returns": "no_returns"}
 CAUTION_S = {"new_obstacle": 3.0, "slip": 1.0, "low_visibility": 3.0, "no_returns": 4.0}   # cautious slowdown
+FOLLOW_HAZARD = {"new_obstacle": "new rocks on my path", "slip": "soft ground (my wheels slipped)",
+                 "low_visibility": "dust (my LiDAR range dropped)", "no_returns": "liquid ahead (no LiDAR returns)"}
 HOLE_MIN_RAYS = 7          # missing steep returns straight ahead before a hole counts
 HOLE_FRONT = math.radians(35.0)   # only straight ahead (inside the camera's view)
 LIQUID_MIN_PCT = 3.0       # blue liquid in at least this share of the lower camera image
@@ -69,6 +97,25 @@ VERB = {"drill": "drilled a core from", "scoop": "scooped ice from", "sniffer": 
 BRAKE_KV = 400.0       # wheel brake stiffness while the motor controller is down (normal servo: motor_kv)
 SURVEY_S = 30.0        # protocol v6: survey on arrival with "investigate" (sim s) ...
 SURVEY_W = 0.55        # ... turn command in place (rad/s), corrected so a full circle takes about 26 s
+FOCUS_CHECK_S = 2.0    # protocol v7: how often a focused rover counts the unknown ground left in its circle ...
+FOCUS_MIN_UNKNOWN = 12  # ... and fewer unexplored samples than this (3 m2) means the area is done
+INTEREST_DONE_SHARE = 0.08  # curiosity: done when less than this share of its circle is still unknown ...
+INTEREST_START_SHARE = 0.2  # ... and only starts when at least this share is unknown
+FOCUS_STALL_S = {"interest": 15.0, "operator": 30.0}   # nothing new mapped for this long: nothing more to find
+INTEREST_SPOT_M = 15.0  # curiosity: not again within this distance of an earlier interest spot ...
+INTEREST_SPOT_S = 600.0  # ... for this long (sim s)
+INTEREST_STALE_S = 120.0  # a find not acted on within this long (busy sampling, say) is let go
+SPIRE_CHECK_S = 2.0    # how often a rover looks for spires its LiDAR newly mapped
+SPIRE_CLUSTER_M = 10.0  # spires this close together are a cluster (2 or more)
+GROUND_MIN_CELLS = 40  # a sweep must map this many new samples to compare the ground ...
+GROUND_WARMUP = 25     # ... after this many such sweeps
+GROUND_ALPHA = 0.08    # running mean of the median slope and height of newly mapped ground
+GROUND_SLOPE_DEG = 8.0  # "different ground": median slope this much above the running mean (and 1.8 times it) ...
+GROUND_HEIGHT_M = 2.5  # ... or median height this far from it
+RESURVEY_SHARE = 0.15  # protocol v8: an operator focus on an area with less unknown than this share is a re-survey
+RESURVEY_EARLY_S = 10.0  # ... and so is one whose area turns out to be explored this soon after arriving
+RESURVEY_RING = (0.6, 0.8, 0.4)  # loop waypoints at these fractions of the circle's radius (first safe one wins)
+RESURVEY_POINTS = 8    # waypoints around the loop
 
 
 def wrap(a: float) -> float:
@@ -236,6 +283,11 @@ class Rover:
         self.crawl_until = -1e9            # creep at crawl_v until then (a question is open)
         self.crawl_v = 0.25
         self.question_hold = False         # a question to the operator is open: stay put (safety moves allowed)
+        self.focus = None                  # protocol v7: the area this rover concentrates on (see start_focus)
+        self.pending_interest = None       # curiosity: something new found, the focus starts at the next goal choice
+        self.interest_next = 0.0           # no interest focus before then (cooldown)
+        self._ground = None                # [median slope, median height, sweeps] of newly mapped ground
+        self._next_spire_check = 0.0
 
         # water, lifeforms and samples (protocol v4 / v4b)
         self.hole_prev = None              # (x, y) of a hole candidate in the previous sweep
@@ -268,8 +320,20 @@ class Rover:
 
         # mission memory: what it mapped, found, sampled and met (answers questions, protocol v5 stats)
         self.mem = RoverMemory(self)
+        self.health = Health(self)         # protocol v9: parts, status, self diagnosis
+        self._health_v = 0                 # health version last acted on (replan on a change)
+        self._drive_sig = (1.0, 1.0, None)  # drive factors and own slope limit last planned with
+        self.carried_spares: list = []     # salvaged parts on board: (spare kind, condition, from rover)
+        self.evade_until = -1e9            # backing away from a charging creature until then
+        self.evade_from = None
+        self.charge_note_t = -1e9
+        self.repair_go_t = -1e9
+        self.repair_t0 = 0.0
+        self.repair_note = None
+        self._drive_mode = None            # last actuator setup written by _apply (only rewritten on a change)
         self._count_replan = False
         self.vis_lost_t = None
+        self.vision = VisionBrain(self)    # protocol v8: onboard object detection (results from the camera thread)
 
         self.read_pose()
         self.last_xy = (self.x, self.y)
@@ -345,6 +409,10 @@ class Rover:
             self.slip_load += np.where(spin, self._hw_call(self.wheel_loads), 0.0)
         else:
             self.slip_since = None
+        if self.state in DRIVING:                       # protocol v9: motor strain (heat) per side
+            T = cfg.motor_torque
+            self.health.strain(t, 1.0 / cfg.agent_hz, (float(tau[:2].mean()) / T, float(tau[2:].mean()) / T),
+                               self.cmd_v > 0.1 or abs(self.cmd_w) > 0.3)
 
     def _slip_on_ground(self) -> bool:
         """Were the wheels that kept spinning actually on the ground? Sunk in sand they carry their share
@@ -384,6 +452,9 @@ class Rover:
         m, d = self.sim.model, self.sim.data
         hz = self.sim.hazards
         rng_max = hz.lidar_range() if hz is not None else cfg.lidar_range
+        he = self.health.effects()
+        if he["lidar_range"] < 1.0:                     # protocol v9: a damaged LiDAR sees less far
+            rng_max = min(rng_max, cfg.lidar_range * he["lidar_range"])
         pnt = d.site_xpos[self.site].copy()
         az = self.yaw + (np.arange(self.n_az) + self.rng.uniform()) * (2 * math.pi / self.n_az)
         el = self.el + self.rng.uniform(-0.6, 0.6, len(self.el)) * (math.pi / 180.0)
@@ -406,6 +477,8 @@ class Rover:
             hit &= self.rng.uniform(size=self.nray) >= drop
             dist = dist + self.rng.normal(0.0, sigma, self.nray)
             hit &= (dist > 0.05) & (dist <= rng_max)
+        if he["lidar_drop"] > 0.0:         # protocol v9: a damaged LiDAR loses rays
+            hit &= self.rng.uniform(size=self.nray) >= he["lidar_drop"]
         self.lidar_hits = int(hit.sum())
         returned = hit.copy()              # anything that echoed back (ground, rocks, markers, creatures)
         tmap = self.sim.world.target_geom_ids
@@ -438,9 +511,11 @@ class Rover:
             self.scan_pts = pts
             fm = self.fleet.map
             k0 = fm.known_count
-            self.scan_changes = fm.integrate(pts, t)
+            self.scan_changes = fm.integrate(pts, t, origin=(float(pnt[0]), float(pnt[1])))
             if fm.known_count > k0:
                 self.mem.on_mapped(fm, fm.last_new, fm.known_count - k0)
+                if self.cfg.curiosity:
+                    self._ground_novelty(t, fm, fm.last_new)
         else:
             self.scan_pts = np.zeros((0, 3))
             self.scan_changes = 0
@@ -561,20 +636,29 @@ class Rover:
     def _on_hole(self, t: float, at: tuple, rays: int, pts: np.ndarray, spread) -> None:
         """A hole ahead in two sweeps: slow down, look with the camera, and decide liquid or drop-off."""
         d = math.hypot(at[0] - self.x, at[1] - self.y)
-        pct = self.camera_liquid_pct()
+        cam = self.vision.water_near(at, t)          # protocol v8: the onboard detector saw water there
+        pct = None if cam is not None else self.camera_liquid_pct()
         details = {"at": at, "dist": round(d, 1), "rays": int(rays)}
+        if cam is not None:
+            details["camera_water"] = cam["conf"]
         if pct is not None:
             details["camera_liquid_pct"] = pct
         if spread is not None:
             details["edge_spread"] = round(spread, 2)
-        liquid = pct is not None and pct >= LIQUID_MIN_PCT
+        liquid = cam is not None or (pct is not None and pct >= LIQUID_MIN_PCT)
         flat_guess = pct is None and spread is not None and spread < 0.08
         f = self.fleet
         if liquid or flat_guess:
             self.on_anomaly(t, "no_returns", details, f"Slowing to {self.cfg.caution_v:.1f} m/s to look.")
             zx, zy, zr = self._fit_zone(pts)
+            new_body = f.water_zone_gap(zx, zy) > zr + 3.0      # not just more of a lake the fleet knows
             f.add_water_zone(t, self, zx, zy, zr)
-            if liquid:
+            if new_body:
+                self.note_interest(t, zx, zy, "water", "water", "the water")
+            if cam is not None:
+                msg = (f"{self.id} Camera: water ahead ({cam['conf']:.2f}) where LiDAR gets no returns {d:.0f} m "
+                       f"ahead. Confirmed liquid: marking a lake and routing around it.")
+            elif liquid:
                 msg = (f"{self.id} LiDAR gets no returns {d:.0f} m ahead and the camera shows a liquid surface "
                        f"({pct:.0f}% of the lower view is blue). Marking a lake and routing around it.")
             else:
@@ -616,6 +700,13 @@ class Rover:
         ax, ay = self.x + 1.5 * math.cos(self.yaw), self.y + 1.5 * math.sin(self.yaw)
         f.add_water_zone(t, self, ax, ay, 2.5)
         self.mem.on_hazard("wet", t, (self.x, self.y))
+        # protocol v9: water in the chassis shorts the power system and gets into the wheel motors (once a minute:
+        # backing out it may dip in again)
+        if depth >= 0.05 and t - getattr(self, "_wet_hit_t", -1e9) > 60.0:   # a dunk, not a wet belly at the shore
+            self._wet_hit_t = t
+            sev = min(20.0, 6.0 + 30.0 * depth)
+            self.health.hit(t, [("power", 1.0), ("drive_l", 0.35), ("drive_r", 0.35)], sev, "water",
+                            kinds={"drive_l": "broken", "drive_r": "broken"})
         f.log(t, "warn", f"{self.id} water sensor wet: chassis {depth:.2f} m under a liquid surface. Stopping, "
                          f"marking it for the fleet and backing out.", self.id, at=(self.x, self.y))
         if self.state != "recovering":
@@ -678,10 +769,10 @@ class Rover:
         """Infer LiDAR visibility from the rover's own returns: in dust, nothing comes back from
         beyond a few metres. Degraded = unsure: slow down, stay on mapped ground, stay close."""
         cfg = self.cfg
-        if len(self.far_hist) < self.far_hist.maxlen:
+        if len(self.far_hist) < self.far_hist.maxlen or self.state in HURT:
             return
         far_max, far_min = max(self.far_hist), min(self.far_hist)
-        nominal = cfg.lidar_range
+        nominal = cfg.lidar_range * self.health.effects()["lidar_range"]   # its own range (damage, protocol v9)
         if not self.degraded and far_max < 0.55 * nominal:
             self.degraded = True
             self.lidar_eff = round(far_max, 1)
@@ -738,6 +829,10 @@ class Rover:
                 hook(self, a)
             except Exception:              # a broken add-on must never stop the rover
                 pass
+        if self.obs is not None and self.obs.get("asking") is not None:
+            # following a herd while the operator decides (protocol v7): safety wins, the follow ends here
+            self.obs["hazard"] = FOLLOW_HAZARD[kind]
+            self.end_observing(t, "hazard")
         return a
 
     def _remember_anomaly(self, t: float, kind: str, d: dict, at) -> None:
@@ -757,6 +852,8 @@ class Rover:
             pct = d.get("camera_liquid_pct")
             seen = (f"the camera saw liquid ({pct:.0f}% of the lower view blue)" if pct is not None
                     else "the hole had a flat, level edge")
+            if d.get("camera_water") is not None:
+                seen = f"the camera's detector saw water ({d['camera_water']:.2f})"
             self.mem.on_hazard("water", t, at, f"no LiDAR returns {d.get('dist', 0.0):.0f} m ahead and {seen}")
 
     def _check_new_obstacles(self, t: float) -> None:
@@ -814,18 +911,26 @@ class Rover:
         """Battery fraction to drive dist metres: learned motor cost per metre plus 25%, and the
         electronics drain at a cautious average speed (turns and slopes slow us down)."""
         cfg = self.cfg
-        return dist * (1.25 * self.e_per_m + cfg.battery_base_drain / cfg.battery_capacity / (0.55 * cfg.v_max))
+        e = self.health.effects()
+        v = 0.55 * cfg.v_max * min(1.0, e["v_cap"] + 0.1)
+        return dist * (1.25 * self.e_per_m + e["drain"] * cfg.battery_base_drain / cfg.battery_capacity / v)
 
     def _battery(self, t: float, dt: float, energy_j: float) -> None:
         cfg = self.cfg
         parked = self.state == "idle" and math.hypot(self.x - self.dock[0], self.y - self.dock[1]) < 1.6
+        if self.state == "repairing":
+            return                                      # rescue.repair_step charges it
         if self.state == "charging" or parked:
             power = self.sim.hazards.charge_factor() if self.sim.hazards is not None else 1.0
             self.battery = min(1.0, self.battery + power * dt / cfg.charge_time_s)
             return
         cap = cfg.battery_capacity
-        motor = cfg.battery_motor_k * energy_j / cap
-        self.battery = max(0.0, self.battery - cfg.battery_base_drain / cap * dt - motor)
+        drain = self.health.effects()["drain"]          # protocol v9: a damaged power system drains faster
+        motor = cfg.battery_motor_k * energy_j / cap * (1.0 + 0.4 * (drain - 1.0))
+        base = cfg.battery_base_drain / cap * dt * drain
+        if self.state in HURT:
+            base *= 0.3                                 # out of action: hibernating, only the heaters and radio
+        self.battery = max(0.0, self.battery - base - motor)
         moved = math.hypot(self.x - self.last_xy[0], self.y - self.last_xy[1])
         self.e_acc_drain += motor
         self.e_acc_dist += moved
@@ -929,8 +1034,12 @@ class Rover:
         self._check_visibility(t)
         if self.scan_changes > 0:
             self._check_new_obstacles(t)
+        self.vision.tick(t)                # decisions from the latest camera detections (protocol v8)
         self.hold_for_plan = False
         self.block_info = None
+        if self._health_tick(t, dt):       # protocol v9: out of action, or being repaired at the lander
+            self._apply()
+            return
 
         # motor controller status (motor feedback)
         if self.motor_fault:
@@ -949,12 +1058,20 @@ class Rover:
             self.end_survey(t, self.state if self.state != "exploring" else "new command")
         if self.op_task is not None and self.op_goal is None:
             self.op_task = None                # the operator trip ended some other way (home, hold, resume)
+        if self.focus is not None:
+            self._focus_step(t)
+        if self.cfg.curiosity and t >= self._next_spire_check:
+            self._next_spire_check = t + SPIRE_CHECK_S
+            self._check_spires(t)
         if self.state in DRIVING and self._check_immersion(t):
             self._apply()
             return
 
         if self.state == "idle":
             self._set_cmd(0.0, 0.0)
+            if math.hypot(self.x - self.dock[0], self.y - self.dock[1]) > 1.6 and self._evade(t):
+                self._apply()                  # protocol v9: even a parked rover gets out of a charging creature's way
+                return
             if self.held:
                 away = math.hypot(self.x - self.dock[0], self.y - self.dock[1]) > 1.6
                 if away and self.battery > 0.0 and self._need_return(t):
@@ -964,6 +1081,8 @@ class Rover:
                                  f"to the lander.", "info")
                     self.state = "exploring"
                     self._go_home(t, "battery")
+                elif not away and self.battery < 0.9:
+                    self.state = "charging"    # held on the pad: keep charging (still held once full)
             elif self.battery > 0.3 and not self.fleet.complete and t >= self.next_goal_try:
                 self.state = "exploring"
             self._apply()
@@ -995,7 +1114,17 @@ class Rover:
             elif self._need_return(t):
                 self._go_home(t, "battery")
 
+        if self.state == "rescuing" and self._need_return(t):
+            self._say(t, f"{self.id}: battery {self.battery * 100:.0f}%, I have to leave the rescue and charge.")
+            self._go_home(t, "battery")
+        if self._evade(t):                 # protocol v9: a creature charging at us
+            self._apply()
+            return
         self._track(t)
+        if self.state == "towing":         # the rescue watches a tow's progress (no reversing with a load)
+            self.sim.rescue.drive(self, t) or self._drive(t)
+            self._apply()
+            return
         if self.slip_since is not None and t - self.slip_since >= self.cfg.slip_time_s:
             if self._slip_on_ground() and self.bumper() is None:
                 self._on_soft_ground(t)
@@ -1025,8 +1154,137 @@ class Rover:
             if self._observe(t):
                 self._apply()
                 return
+        elif self.state in ("rescuing", "towing"):
+            if self.sim.rescue.drive(self, t):       # protocol v9: the rescue sets the motors itself
+                self._apply()
+                return
         self._drive(t)
         self._apply()
+
+    # ================================================================== protocol v9: health
+    def _health_tick(self, t: float, dt: float) -> bool:
+        """Health bookkeeping once per cycle (cheap). Returns True when the rover is out of action or being
+        repaired, i.e. the rest of the decision cycle is skipped."""
+        h = self.health
+        hz = self.sim.hazards
+        h.dust(t, dt, hz is not None and hz.storm_active() and self.state not in ("charging", "repairing"))
+        if h.version != self._health_v:
+            self._health_v = h.version
+            e = h.effects()
+            sig = (e["drive_l"], e["drive_r"], e["slope_cap"])
+            if sig != self._drive_sig:
+                self._drive_sig = sig
+                self._replan_now(t)        # a weaker drive means another slope limit and speed
+                self.plan_t = -1e9
+            if not self.degraded:
+                self.lidar_eff = round(self.cfg.lidar_range * h.effects()["lidar_range"], 1)
+            if not h.mobile() and self.state not in HURT + ("repairing",):
+                self.sim.rescue.on_immobile(self, t)
+        st = self.state
+        if st in HURT:
+            self._set_cmd(0.0, 0.0)
+            self.goal, self.path = None, []
+            return True
+        if st == "repairing":
+            self.sim.rescue.repair_step(self, t, dt)
+            return self.state == "repairing"
+        if (st in ("exploring", "investigating", "observing") and h.needs_repair() and t - self.repair_go_t > 30.0
+                and not self.held):
+            self.repair_go_t = t
+            if self.obs is not None:
+                self.end_observing(t, "interrupted", quiet=True)
+            self.state = "exploring" if st == "observing" else st
+            self._go_home(t, "repair")
+        return False
+
+    def release_all(self, t: float, why: str, quiet: bool = False) -> None:
+        """Protocol v9: drop every task and claim (frontier, target, focus, survey, observation, operator trip, open
+        questions) so the fleet can take them over. why: "immobile" (out of action) or "rescue" (off to help)."""
+        if self.survey is not None:
+            self.end_survey(t, why)
+        if self.focus is not None:
+            self.end_focus(t, "battery" if why == "immobile" else "new command", quiet=True)
+        if self.obs is not None:
+            self.end_observing(t, "interrupted", quiet=True)
+        if why == "immobile":
+            self.fleet.rover_faulted(t, self)  # its frontier goes to the others (takeover note)
+        self._drop_target(t, None, retry_s=0.0)
+        self.op_goal = None
+        self.op_task = None
+        self.sticky_goal = None
+        self.dir_bias = None
+        self.pending_interest = None
+        self.goal, self.path = None, []
+        self.searches.clear()
+        self.pending_goal_key = None
+        self.rec_phase = None
+        self.dwell_until = None
+        self.pause_until = min(self.pause_until, t)
+        self.crawl_until = min(self.crawl_until, t)
+        self.vision.cam_goal = None
+        if why == "immobile":
+            self.held = False
+            if self.advisor is not None:
+                self.advisor.on_out_of_action(self, t)
+
+    def limit_now(self) -> float:
+        """The slope limit this rover plans with: the fleet's, its own (a damaged drive climbs less) and a
+        stricter one while towing (protocol v9)."""
+        lim = self.fleet.slope_limit
+        cap = self.health.effects()["slope_cap"]
+        if cap is not None:
+            lim = min(lim, cap)
+        if self.state == "towing":
+            from .rescue import TOW_SLOPE_MARGIN
+            lim = min(lim, self.fleet.slope_limit - TOW_SLOPE_MARGIN)
+        return lim
+
+    def _evade(self, t: float) -> bool:
+        """A creature charging: a LiDAR track closing fast and heading straight at us (the camera confirms it when
+        it sees one). Back away from it for a moment if the ground behind is safe. True while doing that."""
+        if self.state == "recovering" or (self.state not in DRIVING and self.state != "idle"):
+            return False
+        tr_ = self.fleet.tracker
+        if tr_.tracks and t >= self.evade_until - EVADE_S + 0.6:
+            for tr in tr_.near(self.x, self.y, CHARGE_RANGE, t):
+                sp = tr.speed
+                if sp < CHARGE_SPEED:
+                    continue
+                px, py = tr.predict(t)
+                dx, dy = self.x - px, self.y - py
+                d = math.hypot(dx, dy)
+                if d < 0.3:
+                    continue
+                closing = (tr.vx * dx + tr.vy * dy) / d
+                if closing < CHARGE_SPEED or closing < 0.85 * sp or d / closing > 4.0 or d > 6.5:
+                    continue                # not at us, or not soon (time to contact over 4 s)
+                self.evade_until = t + EVADE_S
+                self.evade_from = (px, py)
+                if t - self.charge_note_t > 8.0:
+                    self.charge_note_t = t
+                    cam = ""
+                    res = self.vision.fresh(t)
+                    if res is not None:
+                        seen = [o for o in res.objects if o["label"] == "creature"
+                                and math.hypot(o["x"] - px, o["y"] - py) < 2.5 + sp * 1.0]
+                        if seen:
+                            cam = f" Camera confirms a creature ({max(o['conf'] for o in seen):.2f})."
+                    self.fleet.log(t, "warn", f"{self.id} LiDAR track {tr.id} is coming straight at me ({closing:.1f} m/s, "
+                                              f"{d:.1f} m away).{cam} Backing away.", self.id, at=(px, py))
+                    self.mem.on_hazard("charge", t, (px, py), f"a creature charging at me ({closing:.1f} m/s)",
+                                       handled="backed away")
+                break
+        if t >= self.evade_until or self.evade_from is None:
+            return False
+        px, py = self.evade_from
+        bearing = wrap(math.atan2(py - self.y, px - self.x) - self.yaw)
+        v = -0.45 if abs(bearing) < math.pi / 2 else 0.5
+        sx = self.x + (1.2 if v > 0 else -1.2) * math.cos(self.yaw)
+        sy = self.y + (1.2 if v > 0 else -1.2) * math.sin(self.yaw)
+        if not self._safe_cell(sx, sy) or self.fleet.water_zone_at(sx, sy, margin=0.5) is not None:
+            v = 0.0                         # nowhere safe to go: brace
+        self._set_cmd(v, 0.0)
+        return True
 
     # ================================================================== state logic
     def _need_return(self, t: float) -> bool:
@@ -1047,11 +1305,22 @@ class Rover:
             self._say(t, f"{self.id}: {why}, giving up on ({gx:g}, {gy:g}) and returning to the lander.")
         self.op_goal = None
         self.sticky_goal = None
-        if reason in ("battery", "range"):
+        if reason in ("battery", "range", "repair"):
             self.pause_until = min(self.pause_until, t)     # no waiting around when the battery says go home
+            self.crawl_until = min(self.crawl_until, t)
+            self.pending_interest = None
         self._drop_target(t, "battery low" if reason in ("battery", "range") else None)
         self.state = "returning"
         self.return_reason = reason
+        if reason in ("battery", "range", "repair"):
+            # protocol v7: waiting for the operator never outlasts the battery; a survey, a focus and any open
+            # question end here, with a chat line saying why (protocol v9: nor a repair)
+            if self.survey is not None:
+                self.end_survey(t, "returning")
+            if self.focus is not None:
+                self.end_focus(t, "battery")
+            if self.advisor is not None:
+                self.advisor.on_battery_return(self, t)
         self.dock_near_since = None
         self.goal = self.dock
         self.path = []
@@ -1072,6 +1341,10 @@ class Rover:
                                       f"Heading toward the lander to find a way round.", self.id, at=here)
         elif reason == "cache":
             self.next_goal_try = t + 1.0
+        elif reason == "repair":
+            self.fleet.log(t, "warn", f"{self.id} health {self.health.hp()} ({self.health.short()}). Heading home for "
+                                      f"a repair at the lander.", self.id, at=here)
+            self._say(t, f"{self.id}: health {self.health.hp()} ({self.health.short()}), heading home for a repair.")
 
     def _drop_target(self, t: float, reason: str | None = None, retry_s: float = 20.0) -> None:
         if self.target_idx is not None:
@@ -1135,6 +1408,14 @@ class Rover:
             self.path = []
             self.goal = None
             self.fleet.cache_samples(t, self)
+            self.sim.rescue.deliver(self, t)             # protocol v9: salvaged parts become fleet spares
+            if self.return_reason == "repair" or self.health.status() != "ok":
+                self.state = "repairing"                 # protocol v9: repaired at the lander (charges too)
+                self.repair_t0 = t
+                self.repair_note = None
+                self.fleet.log(t, "info", f"{self.id} docked for a repair (health {self.health.hp()}: "
+                                          f"{self.health.short()}).", self.id, at=self.dock)
+                return True
             if self.return_reason == "cache" and self.battery >= 0.6 and not self.fleet.complete:
                 self.state = "exploring"
                 self.next_goal_try = t
@@ -1199,6 +1480,8 @@ class Rover:
         if self.op_goal is not None:
             self._op_drive(t)
             return
+        if self.vision.drive_check(t):     # protocol v8: checking something the camera saw beyond the spectrometer
+            return
         # an already found target that nobody is sampling?
         if t >= self.next_target_check:
             self.next_target_check = t + 3.0
@@ -1217,6 +1500,12 @@ class Rover:
                         return
             k, d = f.unclaimed_target(t, self)
             reach = 8.0 if self.degraded else 30.0     # no far investigations while unsure
+            if not self.degraded and f.priority is not None and f.priority["kind"] == "sampling":
+                reach = 90.0                           # protocol v8: "prioritize sampling"
+            fc = self.focus
+            if k is not None and fc is not None and fc.get("mode") == "resurvey" and math.hypot(
+                    f.targets[k].spec.x - fc["x"], f.targets[k].spec.y - fc["y"]) > fc["r"] + self.cfg.focus_margin:
+                k = None                               # a re-survey stops only for what is inside its circle
             b = self.dir_bias
             if k is not None and b is not None and t < b[2]:    # operator: "explore north"
                 ts_ = f.targets[k].spec
@@ -1230,6 +1519,9 @@ class Rover:
                 f.log(t, "info", f"{self.id} heading to sample {ts.spec.id} ({KIND_LABEL[ts.spec.kind]}, "
                                  f"found by {ts.found_by}), {d:.0f} m away.", self.id, at=(ts.spec.x, ts.spec.y))
                 return
+        if self.focus is not None and self.focus.get("mode") == "resurvey":
+            self._resurvey_drive(t)           # protocol v8: a loop through the circle, rescanning
+            return
         need = self.goal is None
         reached = False
         if not need:
@@ -1241,10 +1533,24 @@ class Rover:
                 need = True
         replan = self.goal is not None and self._need_replan(t)
         if need and t >= self.next_goal_try:
+            if self.pending_interest is not None and self.focus is None:
+                self._start_interest(t)       # curiosity: something new was found, look around it first
             res = f.choose_goal(t, self)
             if res is PENDING:
                 self._hold_if_blocked()       # out of compute: keep the current plan, finish next cycle
                 return
+            if res is None and self.focus is not None:
+                if self.goal_fail_reason == "battery":
+                    why = "battery"
+                else:                         # nothing unknown left nearby, or what is left cannot be reached
+                    fc = self.focus
+                    _kn, unk = self.fleet.map.area_cells(fc["x"], fc["y"], fc["r"] + self.cfg.focus_margin)
+                    why = "explored" if unk < FOCUS_MIN_UNKNOWN else "blocked"
+                self.end_focus(t, why)
+                if why in ("explored", "blocked"):
+                    self.goal, self.path = None, []
+                    self.next_goal_try = t
+                    return
             if res is None:
                 self._after_replan(t, None)
                 self.goal, self.path = None, []
@@ -1269,7 +1575,12 @@ class Rover:
             self.sticky_goal = None
             self.next_goal_eval = t + 15.0
             self._set_path(t, path)
-            self.mem.on_goal(t, "rules", f"best frontier for size and distance ({size} cells of unknown ground at its edge)")
+            if self.focus is not None:
+                self.mem.on_goal(t, self.focus["reason"], f"unknown ground around {self.focus['label']} ({size} cells "
+                                                          f"at its edge)")
+            else:
+                self.mem.on_goal(t, "rules", f"best frontier for size and distance ({size} cells of unknown ground "
+                                             f"at its edge)")
             f.takeover_note(t, self, goal)
             if self.advisor is not None:          # tier 2 may suggest another option; we drive this one now
                 self.advisor.on_goal_chosen(self, t, goal, path, size, reached)
@@ -1305,7 +1616,9 @@ class Rover:
             task, self.op_task = self.op_task, None
             if task is not None:               # a place the operator named (protocol v6)
                 if task.get("investigate"):
-                    self.start_survey(t, task)
+                    self.start_survey(t, task)     # protocol v7: the area focus follows the survey
+                elif task.get("focus") is not None:
+                    self._task_focus(t, task)      # protocol v7: "explore around the lake"
                 if self.advisor is not None:
                     self.advisor.on_place_arrived(self, task, t)
                 return
@@ -1354,14 +1667,22 @@ class Rover:
                     f"for a better find")
         return None
 
+    def on_rescue(self) -> bool:
+        """True while this rover is the helper of a rescue: the stranded rover comes first, no side trips."""
+        rm = getattr(self.fleet, "rescue", None)
+        return rm is not None and rm.by_helper(self.id) is not None
+
     def can_investigate(self, t: float, ts) -> bool:
-        if self.state != "exploring" or self.target_idx is not None:
+        if self.state != "exploring" or self.target_idx is not None or self.on_rescue():
             return False
         if self.tube_verdict(ts) is not None:
             return False
         d = math.hypot(ts.spec.x - self.x, ts.spec.y - self.y)
         if self.degraded and d > 8.0:
             return False
+        fc = self.focus
+        if fc is not None and math.hypot(ts.spec.x - fc["x"], ts.spec.y - fc["y"]) > fc["r"] + self.cfg.spectro_range:
+            return False                   # exploring an area: finds well outside it wait (logged for later)
         need = self.energy_for_distance(1.3 * d + 1.3 * math.hypot(ts.spec.x, ts.spec.y)) + self.battery_margin + 0.05
         return self.battery > need
 
@@ -1371,6 +1692,8 @@ class Rover:
                 "swab": cfg.swab_s}.get(inst, cfg.investigate_dwell_s)
 
     def start_investigation(self, t: float, tidx: int) -> None:
+        if self.on_rescue():
+            return                         # on a rescue: no side trips (the target stays for later)
         ts = self.fleet.targets[tidx]
         self.state = "investigating"
         self.target_idx = tidx
@@ -1555,7 +1878,8 @@ class Rover:
         "exploring"; goal and path are empty. Ends in end_survey (the advisor writes the report)."""
         self.survey = {"t0": t, "last_yaw": self.yaw, "turned": 0.0, "label": task.get("label", "the place"),
                        "cid": task.get("cid"), "qid": task.get("qid"), "at": task.get("at"), "tracks": {},
-                       "targets": {}, "mapped0": self.mem.mapped_cells, "observing": None}
+                       "targets": {}, "mapped0": self.mem.mapped_cells, "observing": None,
+                       "task": task if task.get("focus") is not None else None}
         self.goal, self.path = None, []
         self.sticky_goal = None
         self.fleet.log(t, "info", f"{self.id} surveying {self.survey['label']} for the operator: turning slowly "
@@ -1619,14 +1943,309 @@ class Rover:
                 sv["tracks"][tr.id] = {"id": tr.id, "dist": math.hypot(px - self.x, py - self.y),
                                        "dir": compass(px - self.x, py - self.y), "speed": tr.speed, "size": tr.size,
                                        "label": tr.label}
+        then = sv.get("task") is not None and why in ("done", "observing")
+        sv["then_focus"] = then
         if self.advisor is not None:
             self.advisor.survey_report(self, sv, t, why)
+        if then:
+            self._task_focus(t, sv["task"])        # protocol v7: "investigate X": survey first, then the focus
+
+    # ================================================================== exploring an area (protocol v7 focus)
+    def start_focus(self, t: float, x: float, y: float, r: float, reason: str, label: str, dur: float,
+                    cid=None, qid=None, what: str | None = None, kind: str | None = None,
+                    mode: str | None = None) -> dict:
+        """Concentrate on the unknown ground within r of (x, y) for about dur sim seconds once there (reason
+        "operator" or "interest"). The frontier choice does the rest (fleet.choose_goal); _focus_step ends it.
+        mode (protocol v8): "explore", or "resurvey" (a loop through the circle for the whole time, rescanning);
+        None: an operator focus on an area that is already mostly mapped is a re-survey."""
+        if self.focus is not None:
+            self.end_focus(t, "replaced", quiet=self.focus["reason"] == "interest")
+        if mode is None:
+            mode = "resurvey" if reason == "operator" and self.mostly_mapped(x, y, r) else "explore"
+        fc = {"x": float(x), "y": float(y), "r": float(r), "reason": reason, "label": label, "dur": float(dur),
+              "t0": t, "arrived": None, "until": None, "cid": cid, "qid": qid, "what": what, "kind": kind,
+              "mapped0": self.mem.mapped_cells, "next_check": t + FOCUS_CHECK_S,
+              "gain_t": t, "gain_cells": self.mem.mapped_cells, "mode": mode, "loop": None, "wp": 0, "laps": 0,
+              "odo0": None, "found0": None}
+        self.focus = fc
+        self._focus_arrival(t)
+        self.sticky_goal = None
+        if self.state == "exploring" and self.op_goal is None and self.survey is None:
+            self.goal, self.path = None, []        # pick a frontier in the circle now
+            self.next_goal_try = self.next_goal_eval = t
+        return fc
+
+    def mostly_mapped(self, x: float, y: float, r: float) -> bool:
+        """Is the circle already mapped but for a little unknown ground (protocol v8 re-survey)?"""
+        kn, unk = self.fleet.map.area_cells(x, y, r)
+        return unk < max(4 * FOCUS_MIN_UNKNOWN, RESURVEY_SHARE * (kn + unk))
+
+    def _task_focus(self, t: float, task: dict) -> None:
+        fs = task["focus"]
+        self.start_focus(t, fs["x"], fs["y"], fs["r"], "operator", fs["label"], self.cfg.focus_s,
+                         cid=task.get("cid"), qid=task.get("qid"))
+
+    def _focus_arrival(self, t: float) -> None:
+        fc = self.focus
+        if fc["arrived"] is None and math.hypot(self.x - fc["x"], self.y - fc["y"]) <= fc["r"] + self.cfg.focus_margin:
+            fc["arrived"] = t                    # the clock starts when the rover is there
+            fc["until"] = t + fc["dur"]
+            fc["mapped0"] = self.mem.mapped_cells
+            fc["odo0"] = self.odometer
+            fc["found0"] = self._found_in(fc)
+            near = fc["r"] + self.cfg.focus_margin
+            if self.goal is not None and math.hypot(self.goal[0] - fc["x"], self.goal[1] - fc["y"]) > near:
+                self.next_goal_eval = t          # a goal picked on the way in: choose one inside now
+
+    def _focus_step(self, t: float) -> None:
+        """Every cycle while focused (microseconds; the unknown ground is counted every FOCUS_CHECK_S)."""
+        fc = self.focus
+        self._focus_arrival(t)
+        if self.held or self.state in ("returning", "charging", "idle"):
+            self.end_focus(t, "held" if self.held else self.state)
+        elif fc["until"] is not None and t >= fc["until"]:
+            self.end_focus(t, "time")
+        elif fc["arrived"] is None and t - fc["t0"] > self.cfg.focus_travel_s:
+            self.end_focus(t, "unreached")
+        elif fc["reason"] == "interest" and self.op_goal is not None:
+            self.end_focus(t, "new command", quiet=True)
+        elif fc["arrived"] is not None and t >= fc["next_check"] and fc.get("mode") != "resurvey":
+            fc["next_check"] = t + FOCUS_CHECK_S
+            if self.mem.mapped_cells > fc["gain_cells"]:
+                fc["gain_t"], fc["gain_cells"] = t, self.mem.mapped_cells
+            kn, unk = self.fleet.map.area_cells(fc["x"], fc["y"], fc["r"] + self.cfg.focus_margin)
+            done = FOCUS_MIN_UNKNOWN if fc["reason"] == "operator" else max(FOCUS_MIN_UNKNOWN,
+                                                                             INTEREST_DONE_SHARE * (kn + unk))
+            stalled = self.state == "exploring" and t - fc["gain_t"] > FOCUS_STALL_S.get(fc["reason"], 30.0)
+            if unk < done and fc["reason"] == "operator" and t - fc["arrived"] < RESURVEY_EARLY_S:
+                self._to_resurvey(t)             # protocol v8: nothing left to explore there: re-survey it
+            elif unk < done or stalled:
+                self.end_focus(t, "explored" if unk < done else "blocked")
+
+    def end_focus(self, t: float, why: str, quiet: bool = False) -> None:
+        """why: "time", "explored" (nothing unknown left nearby), "blocked" (unknown ground left that the rover
+        cannot reach or stopped gaining), "battery", "unreached", "replaced", "new
+        command", "held" or the state that ended it. The advisor reports what was mapped and found there."""
+        fc, self.focus = self.focus, None
+        if fc is None:
+            return
+        if fc["reason"] == "interest":
+            self.interest_next = t + self.cfg.interest_cooldown_s
+        summary = self.focus_summary(fc, t)
+        summary["why"] = why
+        self.mem.on_focus(summary)
+        self.next_goal_eval = t
+        if self.advisor is not None:
+            self.advisor.focus_report(self, fc, summary, t, why, quiet)
+        elif not quiet:
+            self.fleet.log(t, "info", f"{self.id} done exploring around {fc['label']} ({summary['dur']:.0f} s).",
+                           self.id, at=(fc["x"], fc["y"]))
+
+    def focus_summary(self, fc: dict, t: float) -> dict:
+        """What this rover mapped and found while focused, from its own memory (grounded numbers only)."""
+        t0 = fc["t0"]
+        there = fc["arrived"] is not None
+        kn, unk = self.fleet.map.area_cells(fc["x"], fc["y"], fc["r"])
+        spires = [sid for sid, (ts, rid, _x, _y) in self.fleet.spires_seen.items() if ts >= t0 and rid == self.id]
+        return {"label": fc["label"], "reason": fc["reason"], "x": round(fc["x"], 1), "y": round(fc["y"], 1),
+                "r": round(fc["r"]), "t": round(t, 1), "there": there,
+                "dur": round(max(0.0, t - fc["arrived"]), 1) if there else 0.0,
+                "mapped": round((self.mem.mapped_cells - fc["mapped0"]) * self.cfg.res ** 2) if there else 0,
+                "pct": round(100.0 * kn / max(kn + unk, 1)),
+                "targets": [dict(d) for d in self.mem.targets if d["t"] >= t0],
+                "samples": [dict(d) for d in self.mem.samples if d["t"] >= t0],
+                "water": [dict(w) for w in self.mem.water if w["t"] >= t0],
+                "life": [dict(e) for e in self.mem.life if e["t"] >= t0],
+                "spires": spires, "what": fc.get("what"), "mode": fc.get("mode", "explore"),
+                "laps": int(fc.get("laps", 0)),
+                "driven": round(self.odometer - fc["odo0"]) if there and fc.get("odo0") is not None else 0,
+                "changes": self.fleet.map.changes_in(fc["x"], fc["y"], fc["r"], fc["arrived"]) if there else 0,
+                "new_found": sorted(self._found_in(fc) - (fc.get("found0") or set())) if there else [],
+                "hazards": [dict(h) for h in self.mem.hazards if h["t"] >= t0]}
+
+    def focus_msg(self) -> dict | None:
+        fc = self.focus
+        if fc is None:
+            return None
+        left = fc["dur"] if fc["until"] is None else max(0.0, fc["until"] - self.t_now)
+        return {"x": round(fc["x"], 1), "y": round(fc["y"], 1), "r": round(fc["r"], 1), "reason": fc["reason"],
+                "label": fc["label"], "ends_in": round(left, 1), "mode": fc.get("mode", "explore")}
+
+    # ================================================================== re-survey (protocol v8)
+    def _found_in(self, fc: dict) -> set:
+        """Ids of the targets the fleet knows inside the focus circle."""
+        r = fc["r"] + self.cfg.focus_margin
+        return {ts.spec.id for ts in self.fleet.targets
+                if ts.status is not None and math.hypot(ts.spec.x - fc["x"], ts.spec.y - fc["y"]) <= r}
+
+    def _to_resurvey(self, t: float) -> None:
+        fc = self.focus
+        fc["mode"], fc["loop"], fc["wp"] = "resurvey", None, 0
+        self.goal, self.path = None, []
+        self.fleet.log(t, "info", f"{self.id} {fc['label']} is already mapped: re-surveying it instead, a loop through "
+                                  f"it for the rest of the {fc['dur']:.0f} s.", self.id, at=(fc["x"], fc["y"]))
+
+    def _resurvey_loop(self, fc: dict) -> list:
+        """Up to RESURVEY_POINTS safe waypoints on a ring through the circle (mapped, passable, off the water),
+        starting with the one nearest the rover and going round."""
+        f = self.fleet
+        pts = []
+        for k in range(RESURVEY_POINTS):
+            a = 2.0 * math.pi * k / RESURVEY_POINTS
+            for frac in RESURVEY_RING:
+                rr = max(3.0, frac * fc["r"])
+                x, y = fc["x"] + rr * math.cos(a), fc["y"] + rr * math.sin(a)
+                if self._safe_cell(x, y) and f.water_zone_at(x, y, margin=1.5) is None and f.in_reach(x, y):
+                    pts.append((round(x, 1), round(y, 1)))
+                    break
+        if not pts:
+            return []
+        k0 = min(range(len(pts)), key=lambda k: math.hypot(pts[k][0] - self.x, pts[k][1] - self.y))
+        return pts[k0:] + pts[:k0]
+
+    def _resurvey_drive(self, t: float) -> None:
+        """Drive the loop through the circle again and again while the focus lasts; LiDAR, the spectrometer and
+        the tracker keep working as usual (a target found inside the circle is sampled, a creature is watched,
+        new rocks are rerouted around). A waypoint with no path is skipped."""
+        fc = self.focus
+        if fc["loop"] is None:
+            fc["loop"], fc["wp"] = self._resurvey_loop(fc), 0
+            if not fc["loop"]:
+                self.end_focus(t, "noloop")
+                self.goal, self.path = None, []
+                self.next_goal_try = t
+                return
+        loop = fc["loop"]
+        gx, gy = loop[fc["wp"] % len(loop)]
+        if math.hypot(gx - self.x, gy - self.y) < 1.5:
+            fc["wp"] += 1
+            if fc["wp"] % len(loop) == 0:
+                fc["laps"] += 1
+            self.goal, self.path = None, []
+            return
+        if self.goal != (gx, gy):
+            self.goal, self.path, self.goal_t = (gx, gy), [], t
+        if not self._need_replan(t):
+            return
+        path = self.fleet.plan(t, self, self.goal)
+        self._after_replan(t, path)
+        if path is PENDING:
+            self._hold_if_blocked()
+        elif path is None:
+            fc["wp"] += 1                      # no way to that waypoint now: the next one
+            self.goal, self.path = None, []
+        else:
+            self._set_path(t, path)
+
+    # ================================================================== curiosity (interest focus, protocol v7)
+    def note_interest(self, t: float, x: float, y: float, kind: str, what: str, label: str | None = None) -> bool:
+        """Something new was found at (x, y): stick around it at the next goal choice (if allowed then)."""
+        if not self.cfg.curiosity or self.pending_interest is not None or not self._interest_ok(t, x, y):
+            return False
+        self.pending_interest = {"t": t, "x": float(x), "y": float(y), "kind": kind, "what": what,
+                                 "label": label or f"the {kind}"}
+        return True
+
+    def _interest_ok(self, t: float, x: float, y: float) -> bool:
+        if t < self.interest_next or self.focus is not None or self.held or self.op_goal is not None:
+            return False
+        if self.state in ("returning", "charging", "fault", "idle") or self.degraded or self.survey is not None:
+            return False
+        if self.on_rescue() or self.state in ("rescuing", "towing", "disabled", "towed", "wrecked", "repairing"):
+            return False                   # a rescue comes first: no curious detours
+        if self.dir_bias is not None and t < self.dir_bias[2]:
+            return False                   # the operator asked for a direction: that comes first
+        if self.fleet.priority is not None:
+            return False                   # protocol v8: and so does a fleet priority
+        if self.battery < max(0.4, self.need_home + self.battery_margin + 0.15):
+            return False                   # low battery: no detours
+        f = self.fleet
+        for o in f.rovers:
+            fc = getattr(o, "focus", None)
+            if o is not self and fc is not None and math.hypot(x - fc["x"], y - fc["y"]) <= fc["r"]:
+                return False               # another rover already concentrates on that spot
+        return not any(math.hypot(x - sx, y - sy) < INTEREST_SPOT_M and t - st < INTEREST_SPOT_S
+                       for sx, sy, st in f.interest_spots)
+
+    def _start_interest(self, t: float) -> bool:
+        if self.on_rescue():
+            self.pending_interest = None
+            return False
+        pi, self.pending_interest = self.pending_interest, None
+        if pi is None or t - pi["t"] > INTEREST_STALE_S or not self._interest_ok(t, pi["x"], pi["y"]):
+            return False
+        r = self.cfg.interest_r
+        kn, unk = self.fleet.map.area_cells(pi["x"], pi["y"], r + self.cfg.focus_margin)
+        if unk < max(4 * FOCUS_MIN_UNKNOWN, INTEREST_START_SHARE * (kn + unk)):
+            return False                   # little left to look at there: no need to stay
+        f = self.fleet
+        f.interest_spots = [s for s in f.interest_spots if t - s[2] < INTEREST_SPOT_S] + [(pi["x"], pi["y"], t)]
+        self.start_focus(t, pi["x"], pi["y"], r, "interest", pi["label"], self.cfg.interest_s, what=pi["what"],
+                         kind=pi["kind"])
+        f.log(t, "info", f"{self.id} found {pi['what']} here. Sticking around for about {self.cfg.interest_s:.0f} s "
+                         f"to look for more.", self.id, at=(pi["x"], pi["y"]))
+        return True
+
+    def _ground_novelty(self, t: float, fm, new) -> None:
+        """Ground that differs from what this rover has been driving through: the median slope (roughness) or
+        height of the samples a sweep mapped first jumps away from their running mean. A few microseconds."""
+        if new is None or len(new) < GROUND_MIN_CELLS or self.state != "exploring":
+            return
+        ms = float(np.median(fm.slope.ravel()[new]))
+        mh = float(np.median(fm.h.ravel()[new]))
+        g = self._ground
+        if g is None:
+            self._ground = [ms, mh, 1]
+            return
+        rough = ms > g[0] + GROUND_SLOPE_DEG and ms > 1.8 * g[0]
+        step = abs(mh - g[1]) > GROUND_HEIGHT_M
+        if g[2] >= GROUND_WARMUP and (rough or step) and self.pending_interest is None and self.focus is None \
+                and t >= self.interest_next:
+            jj, ii = np.divmod(new, fm.nx)
+            cx, cy = fm.ox + float(ii.mean()) * fm.res, fm.oy + float(jj.mean()) * fm.res
+            if rough:
+                what = f"rougher ground (median slope {ms:.0f} deg after {g[0]:.0f} deg)"
+            else:
+                what = f"a sharp change in height ({mh - g[1]:+.1f} m)"
+            self.note_interest(t, cx, cy, "ground", what, "the rough ground" if rough else "the height change")
+        g[0] += GROUND_ALPHA * (ms - g[0])
+        g[1] += GROUND_ALPHA * (mh - g[1])
+        g[2] += 1
+
+    def _check_spires(self, t: float) -> None:
+        """Spires the LiDAR newly mapped near this rover (something tall at a spire site, as places.py sees
+        them); two or more within SPIRE_CLUSTER_M of each other are a cluster worth a closer look."""
+        hz = self.sim.hazards
+        if hz is None:
+            return
+        f, m = self.fleet, self.fleet.map
+        reach = self.lidar_eff + 2.0
+        new = []
+        for sp in hz.all_spires():
+            if sp.id in f.spires_seen or abs(sp.x - self.x) > reach or abs(sp.y - self.y) > reach:
+                continue
+            if not hz.spire_standing.get(sp.id, True):
+                continue
+            i, j = m.ij(sp.x, sp.y)
+            if np.isfinite(m.tall_t[max(j - 2, 0):j + 3, max(i - 2, 0):i + 3]).any():
+                f.spires_seen[sp.id] = (t, self.id, float(sp.x), float(sp.y))
+                new.append(sp)
+        for sp in new:
+            near = [(v[2], v[3]) for k, v in f.spires_seen.items()
+                    if hz.spire_standing.get(k, True) and math.hypot(v[2] - sp.x, v[3] - sp.y) < SPIRE_CLUSTER_M]
+            if len(near) >= 2:
+                cx, cy = sum(p[0] for p in near) / len(near), sum(p[1] for p in near) / len(near)
+                self.note_interest(t, cx, cy, "spires", f"a cluster of {len(near)} spires", "the spires")
+                break
 
     # ================================================================== lifeforms: observe from a safe distance
-    def can_observe(self, t: float, tr) -> bool:
-        """Free, healthy, enough battery, close enough: may switch to observing this track."""
-        if self.state != "exploring" or self.held or self.op_goal is not None or self.degraded:
+    def can_observe(self, t: float, tr, busy_ok: bool = False) -> bool:
+        """Free, healthy, enough battery, close enough: may switch to observing this track. busy_ok: an
+        injected demo herd may also interrupt a trip to a target (investigating)."""
+        if self.state not in (("exploring", "investigating") if busy_ok else ("exploring",)) or self.held or self.op_goal is not None or self.degraded:
             return False
+        if self.on_rescue():
+            return False                   # on a rescue: the stranded rover comes first
         if self.dir_bias is not None and t < self.dir_bias[2]:
             return False
         px, py = tr.predict(t)
@@ -1637,6 +2256,8 @@ class Rover:
         return self.battery >= max(0.4, home + self.battery_margin + 0.15)
 
     def start_observing(self, t: float, tr) -> None:
+        if self.on_rescue():
+            return                         # on a rescue: keep going to the stranded rover
         from .fleet import compass
         px, py = tr.predict(t)
         d = math.hypot(px - self.x, py - self.y)
@@ -1647,14 +2268,28 @@ class Rover:
         self.searches.clear()
         self.obs = {"track": tr.id, "t0": t, "x0": self.x, "y0": self.y, "mode": "look", "look_until": t + 1.5,
                     "seen": {tr.id}, "speeds": [], "next_plan": t, "goal": None, "life": False, "decided": False,
-                    "most": 1, "start": (px, py), "far": 0.0}
+                    "most": 1, "start": (px, py), "far": 0.0,
+                    "t_lim": t,          # the time limit counts from here (reset when the operator answers)
+                    "asking": None,      # protocol v7: id of the open lifeform request (following meanwhile)
+                    "retry_at": -1e9, "blocked_note": False}
         tr.observer = self.id
         self.mem.on_sighting(t)
         self.fleet.log(t, "discovery", f"{self.id} sees something moving {d:.0f} m {compass(px - self.x, py - self.y)} "
                                        f"(LiDAR track {tr.id}, {tr.speed:.1f} m/s, about {tr.size:.1f} m). Stopping to "
                                        f"look.", self.id, at=(px, py))
         if self.advisor is not None and self.advisor.on_sighting(self, tr, t):
-            self.obs["look_until"] = t + 12.0           # tier 2 decides (Gemma's look, maybe the operator)
+            if self.obs is not None and self.obs["mode"] == "look":
+                self.obs["look_until"] = t + 12.0       # tier 2 decides (Gemma's look, maybe the operator)
+
+    def follow_while_asking(self, t: float, qid: str) -> None:
+        """Protocol v7: a new herd and a question to the operator about it: follow at the observation standoff
+        now (the creatures may wander off) until the answer comes; the time limit waits for the answer."""
+        if self.obs is None:
+            return
+        self.obs["asking"] = qid
+        self.obs["mode"] = "follow"
+        self.obs["decided"] = True
+        self.obs["next_plan"] = t
 
     def set_obs_mode(self, t: float, mode: str) -> None:
         """mode: "follow" (approach to the standoff distance and follow), "here" (watch from where it
@@ -1667,6 +2302,7 @@ class Rover:
             return
         self.obs["mode"] = mode
         self.obs["next_plan"] = t
+        self.obs["retry_at"] = -1e9
 
     def _face(self, px: float, py: float) -> None:
         e = wrap(math.atan2(py - self.y, px - self.x) - self.yaw)
@@ -1721,14 +2357,15 @@ class Rover:
                 o["track"] = tr.id
                 px, py = tr.predict(t)
                 d = math.hypot(px - self.x, py - self.y)
-        if t - o["t0"] >= cfg.observe_max_s:
+        asking = o.get("asking") is not None       # protocol v7: following while the operator decides
+        if not asking and t - o["t_lim"] >= cfg.observe_max_s:
             self.end_observing(t, "time")
             return False
         if self._need_return(t):
             self.end_observing(t, "battery")
             self._go_home(t, "battery")
             return False
-        if math.hypot(self.x - o["x0"], self.y - o["y0"]) > cfg.observe_leash:
+        if math.hypot(self.x - o["x0"], self.y - o["y0"]) > cfg.observe_leash + (3.0 if asking else 0.0):
             self.end_observing(t, "leash")
             return False
         if o["mode"] == "look" and t >= o["look_until"]:
@@ -1760,10 +2397,16 @@ class Rover:
             self._face(px, py)
             return True
         # follow: approach to the standoff distance, replanning as it moves
+        if t < o["retry_at"]:              # following while asking, no safe spot closer just now: watch, retry
+            self.path, self.goal = [], None
+            self._face(px, py)
+            return True
         moved = o["goal"] is None or math.hypot(px - o["goal"][2], py - o["goal"][3]) > 1.5
         if t >= o["next_plan"] or moved or not self.path:
             g = self._standoff_goal(px, py, d)
             if g is None:
+                if asking:
+                    return self._follow_blocked(t, tr, px, py, d)
                 o["mode"] = "here"
                 f.log(t, "info", f"{self.id} can't get closer to track {tr.id}: no safe ground near it (steep, "
                                  f"soft or water). Observing from here, {d:.0f} m away.", self.id, at=(px, py))
@@ -1774,6 +2417,8 @@ class Rover:
                 return True
             o["next_plan"] = t + 2.0
             if path is None:
+                if asking:
+                    return self._follow_blocked(t, tr, px, py, d)
                 o["mode"] = "here"
                 f.log(t, "info", f"{self.id} no safe path closer to track {tr.id}. Observing from here, "
                                  f"{d:.0f} m away.", self.id, at=(px, py))
@@ -1782,6 +2427,20 @@ class Rover:
             self.goal = g
             self._set_path(t, path)
         return False
+
+    def _follow_blocked(self, t: float, tr, px: float, py: float, d: float) -> bool:
+        """Following while asking, but no safe spot closer within the leash (steep, soft, water, too far from
+        where it started): watch from here and try again in a few seconds (the herd may come back)."""
+        o = self.obs
+        o["retry_at"] = t + 3.0
+        if not o["blocked_note"]:
+            o["blocked_note"] = True
+            self.fleet.log(t, "info", f"{self.id} can't follow track {tr.id} closer right now (no safe ground within "
+                                      f"{self.cfg.observe_leash:.0f} m of where it first saw it). Watching from here, "
+                                      f"{d:.0f} m away, until the operator answers.", self.id, at=(px, py))
+        self.path, self.goal = [], None
+        self._face(px, py)
+        return True
 
     def end_observing(self, t: float, why: str, quiet: bool = False) -> None:
         o, f = self.obs, self.fleet
@@ -1813,6 +2472,11 @@ class Rover:
         self.goal, self.path = None, []
         self.next_goal_try = t
         self.next_goal_eval = t
+        if o.get("asking") is not None and self.advisor is not None:
+            self.advisor.on_follow_ended(self, o["asking"], why, t, o)     # closes the open question, says why
+        if life and dur >= 15.0 and why in ("time", "leash", "lost"):
+            self.note_interest(t, px, py, "herd", f"a herd of {n} lifeform{'s' if n > 1 else ''}" if n > 1 else
+                               "a lifeform", "the herd's grazing ground")    # curiosity: look around where they graze
         if quiet:
             return
         who = "the herd" if n > 1 else "the creature"
@@ -1820,6 +2484,7 @@ class Rover:
                 "leash": f"Not going more than {self.cfg.observe_leash:.0f} m from where it started. Resuming exploration.",
                 "battery": f"Battery {self.battery * 100:.0f}%, returning to the lander.",
                 "operator": "Resuming exploration (operator).",
+                "hazard": f"Stopped following: {o.get('hazard', 'a hazard')}.",
                 "not_life": "Not a lifeform. Resuming exploration."}.get(why, "Resuming exploration.")
         f.log(t, "discovery", f"{self.id} observed {who} for {dur:.0f} s: {n} individual{'s' if n > 1 else ''}, "
                               f"average speed {avg:.1f} m/s. {tail}", self.id, at=(px, py))
@@ -1893,7 +2558,16 @@ class Rover:
         ax = self.x + 0.7 * math.cos(self.yaw)
         ay = self.y + 0.7 * math.sin(self.yaw)
         # only blame the slope if gravity alone would eat most of the motors' torque at this pitch
-        gravity_share = self.grav_torque * math.sin(math.radians(max(p_med, 0.0))) / (4.0 * self.cfg.motor_torque)
+        he = self.health.effects()
+        avail = 2.0 * self.cfg.motor_torque * (he["drive_l"] + he["drive_r"])     # protocol v9: a weak side
+        gravity_share = self.grav_torque * math.sin(math.radians(max(p_med, 0.0))) / avail
+        if he["slope_cap"] is not None and p_med >= 0.8 * p_max and not turning and gravity_share >= 0.8:
+            # a damaged drive: its own limit, not evidence about the fleet's (it does not lower the fleet limit)
+            f.map.mark_blocked(ax, ay, 0.5)
+            f.log(t, "info", f"{self.id} stalled on a {p_med:.0f} deg slope with its damaged drive (own slope limit "
+                             f"{he['slope_cap']:.0f} deg). Backing off and replanning.", self.id, at=here)
+            self._start_recovery(t, None)
+            return
         if p_med >= 12.0 and p_med >= 0.8 * p_max and not turning and gravity_share >= 0.8:
             # nose up on a steady slope with full power and no progress: the slope beat the motors.
             # The tilt (pitch and roll together) is the slope the planner's map measures.
@@ -1969,6 +2643,9 @@ class Rover:
             elif t - self.flip_since > self.cfg.flip_time_s:
                 self.flip_since = None
                 tilt = self.tilt
+                # protocol v9: tipping over knocks the mast (LiDAR, camera) and the antenna and deck
+                self.health.hit(t, [("lidar", 1.0), ("camera", 0.8), ("comms", 0.6), ("power", 0.4)], 30.0,
+                                "rollover")
                 self._hw_call(self.sim.reset_rover_upright, self)
                 self.read_pose()
                 self.mem.on_hazard("tipped", t, (self.x, self.y), f"tipping over (IMU tilt {tilt:.0f} deg)")
@@ -1996,7 +2673,7 @@ class Rover:
             return True
         if f._cost is None or t - f._cost_t > 0.6:
             f.cost(t)                       # keep the shared cost grid fresh for everyone's checks
-        b = f.blocked_ahead(t, self, f.slope_limit + self.plan_relax)
+        b = f.blocked_ahead(t, self, self.limit_now() + self.plan_relax)
         if b is not None:
             self.block_info = b
             x, y, dist, why = b
@@ -2113,12 +2790,16 @@ class Rover:
         e = wrap(math.atan2(c[1] - self.y, c[0] - self.x) - self.yaw)
         v_max = cfg.degraded_v_max if self.degraded else cfg.v_max
         w_max = 0.5 * cfg.w_max if self.degraded else cfg.w_max      # turn gently too when it cannot see far
+        v_max = min(v_max, cfg.v_max * self.health.effects()["v_cap"])  # protocol v9: a damaged rover drives slower
+        if self.state == "towing":
+            from .rescue import TOW_V, TOW_W
+            v_max, w_max = min(v_max, TOW_V), min(w_max, TOW_W)
         # Skid steer on a slope: a tight arc leaves the inner wheels with almost no speed target, so
         # only the outer pair pushes and the rover bogs down. On sloped ground make big corrections in
         # place and keep arcs wide enough that all four wheels drive forward.
         sloped = self.tilt > 7.0
         if abs(e) > (0.6 if sloped else 0.85):
-            v = 0.0
+            v = 0.12 if self.state == "towing" else 0.0      # protocol v9: towing turns in wide arcs, never pivots
             w = math.copysign(w_max, e)
         else:
             v = v_max * max(0.0, math.cos(e)) ** 2
@@ -2200,7 +2881,8 @@ class Rover:
         r = cfg.wheel_radius
         T = cfg.motor_torque
         Tb = 3.0 * T
-        if self.motor_fault:                 # controller offline: the parking brakes lock the wheels
+        if self.motor_fault or self.state in ("disabled", "wrecked"):
+            # controller offline, or out of action (protocol v9): the parking brakes lock the wheels
             for a in self.acts:
                 d.ctrl[a] = 0.0
                 m.actuator_forcerange[a] = (-Tb, Tb)
@@ -2208,23 +2890,43 @@ class Rover:
                 m.actuator_biasprm[a][2] = -BRAKE_KV
             self._brakes_locked = True
             return
-        if self._brakes_locked:
+        if self.state == "towed":            # protocol v9: drive clutches open, the wheels roll freely
             for a in self.acts:
-                m.actuator_gainprm[a][0] = cfg.motor_kv
-                m.actuator_biasprm[a][2] = -cfg.motor_kv
+                d.ctrl[a] = 0.0
+                m.actuator_forcerange[a] = (0.0, 0.0)
+                m.actuator_gainprm[a][0] = 0.0
+                m.actuator_biasprm[a][2] = 0.0
+            self._brakes_locked = True       # the gains are written again when it drives
+            return
+        e = self.health.effects()
+        fl, fr = e["drive_l"], e["drive_r"]
+        if self._brakes_locked or self._drive_mode != (fl, fr):
+            # protocol v9: a damaged drive side has a weaker servo (it lags, so the rover pulls that way)
+            for k, a in enumerate(self.acts):
+                f = fl if k < 2 else fr
+                kv = cfg.motor_kv if f >= 1.0 else cfg.motor_kv * (0.4 + 0.6 * f)
+                m.actuator_gainprm[a][0] = kv
+                m.actuator_biasprm[a][2] = -kv
             self._brakes_locked = False
+            self._drive_mode = (fl, fr)
         wl = (self.cmd_v - self.cmd_w * cfg.track_eff) / r
         wr = (self.cmd_v + self.cmd_w * cfg.track_eff) / r
         for k, a in enumerate(self.acts):
             wt = wl if k < 2 else wr
+            f = fl if k < 2 else fr
+            Tk, Tbk = T, Tb
+            if f < 1.0:                      # ... less torque and a lower top wheel speed
+                wm = cfg.max_wheel_speed * f
+                wt = max(-wm, min(wm, wt))
+                Tk, Tbk = T * f, Tb * max(f, 0.25)
             d.ctrl[a] = wt
             # motors drive with up to T, brakes and back driving resist with up to 3T
             if wt > 0.05:
-                m.actuator_forcerange[a] = (-Tb, T)
+                m.actuator_forcerange[a] = (-Tbk, Tk)
             elif wt < -0.05:
-                m.actuator_forcerange[a] = (-T, Tb)
+                m.actuator_forcerange[a] = (-Tk, Tbk)
             else:
-                m.actuator_forcerange[a] = (-Tb, Tb)
+                m.actuator_forcerange[a] = (-Tbk, Tbk)
 
     # ================================================================== protocol
     def sensors_msg(self) -> dict:
@@ -2251,7 +2953,7 @@ class Rover:
 
     def to_msg(self) -> dict:
         pts = []
-        if self.path and self.state not in ("charging", "idle", "fault"):
+        if self.path and self.state not in PARKED:
             rest = self.path[max(self.wp, 0):]
             pts = downsample([(self.x, self.y)] + rest, 30)
         msg = {
@@ -2271,7 +2973,13 @@ class Rover:
             "samples": [self.fleet.targets[k].spec.id for k in self.samples],
             "capacity": self.capacity,
             "stats": self.mem.stats(self),
+            "health": self.health.msg(),   # protocol v9
         }
+        if self.focus is not None:
+            msg["focus"] = self.focus_msg()
+        vis = self.vision.msg()
+        if vis is not None:
+            msg["vision"] = vis            # protocol v8: latest detections of the onboard camera
         if self.sampling is not None:
             sm = self.sampling
             msg["sampling"] = {"target": self.fleet.targets[sm["tidx"]].spec.id, "instrument": sm["instrument"],

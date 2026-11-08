@@ -19,6 +19,9 @@ import { Spires, fallDebug } from './Spires.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
 import { PlaceCandidates } from './PlaceCandidates.jsx'
+import { FocusAreas } from './FocusAreas.jsx'
+import { PriorityPlaces } from './PriorityPlaces.jsx'
+import { Rescue } from './Rescue.jsx'
 import { CameraRig } from './CameraRig.jsx'
 import { Atmosphere } from './Atmosphere.jsx'
 import { Gravel } from './Gravel.jsx'
@@ -72,6 +75,11 @@ function DebugHook() {
           hazards: s.hazards,
           requests: s.requests,
           lander: s.lander,
+          events: s.events.slice(0, 80),
+          priority: s.priority,
+          rescues: s.rescues,
+          wrecks: s.wrecks,
+          spares: s.spares,
         }
       },
     }
@@ -96,8 +104,11 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <Spires reality={view.reality} />
       <Lander />
       {view.frontiers && <Frontiers />}
+      <FocusAreas />
+      <PriorityPlaces />
       <Targets />
       <Rovers showPaths={view.paths} selected={selected} onSelect={onSelect} />
+      <Rescue />
       {view.lidar && <Lidar />}
       {view.life && <Life reality={view.reality} />}
       {view.reality && <Reality />}

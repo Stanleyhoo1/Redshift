@@ -1,0 +1,887 @@
+/* Version 9: rover health and damage, distress, rescue, towing, salvage, repair. */
+
+:root {
+  --alert: #ff4d4d;
+  --help: #ffb547;
+  --repair: #5fd4c8;
+  --wreck: #8a93a3;
+}
+
+/* ---------------------------------------------------------------- hp bar and parts */
+
+.hb {
+  position: relative;
+  display: block;
+  flex: 1;
+  min-width: 28px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--line-2);
+  overflow: hidden;
+}
+
+.hb i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--hc);
+  transition: width 500ms ease, background-color 300ms;
+}
+
+.hb[data-status='immobile'] i {
+  animation: hb-alert 1.1s ease-in-out infinite;
+}
+
+@keyframes hb-alert {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.pdots {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.pdot {
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 15px;
+  border-radius: 4px;
+  color: rgba(98, 214, 168, 0.72);
+}
+
+.pdot[data-level='warn'] {
+  color: var(--amber);
+  background: rgba(243, 178, 74, 0.12);
+}
+
+.pdot[data-level='bad'],
+.pdot[data-level='dead'] {
+  color: #ff6b5b;
+  background: rgba(255, 77, 77, 0.16);
+}
+
+.pdot[data-level='dead'] {
+  color: var(--alert);
+  box-shadow: inset 0 0 0 1px rgba(255, 77, 77, 0.55);
+}
+
+.pdot[data-level='none'] {
+  color: var(--ink-3);
+  opacity: 0.5;
+}
+
+.pi,
+.dmg-icon,
+.hz-dmg-pi {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pi .pi-fill,
+.dmg-icon .pi-fill,
+.hz-dmg-pi .pi-fill {
+  fill: currentColor;
+}
+
+.pi .pi-bolt,
+.dmg-icon .pi-bolt,
+.hz-dmg-pi .pi-bolt {
+  fill: currentColor;
+  stroke: none;
+}
+
+/* ---------------------------------------------------------------- rover cards */
+
+.rover-health {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 0 19px;
+  min-width: 0;
+}
+
+.rover-hp {
+  flex: none;
+  min-width: 2.6em;
+  font-size: 12px;
+  font-weight: 620;
+  color: var(--hc);
+  text-align: right;
+}
+
+/* Compact cards get a third row for health (the tubes keep their place, see styles.css). */
+.rover-list[data-compact] .rover {
+  grid-template-areas:
+    'dot name pill tubes batt'
+    '. goal goal goal speed'
+    '. health health health health';
+}
+
+.rover-list[data-compact] .rover-health {
+  grid-area: health;
+  margin: 0;
+  gap: 7px;
+}
+
+.rover-list[data-compact] .pdot {
+  width: 16px;
+  height: 14px;
+}
+
+.rover[data-trouble='alert'] {
+  background: color-mix(in srgb, var(--alert) 9%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--alert) 50%, transparent);
+}
+
+.rover[data-trouble='wreck'] {
+  background: rgba(138, 147, 163, 0.06);
+}
+
+.rover[data-trouble='wreck'] .rover-dot {
+  background: color-mix(in srgb, var(--rover) 35%, #333);
+  box-shadow: none;
+}
+
+.rover[data-trouble='wreck'] .rover-name,
+.rover[data-trouble='wreck'] .rover-goal {
+  color: var(--ink-3);
+}
+
+.rover-goal[data-v9='disabled'] {
+  color: #ffb3ad;
+}
+
+.rover-goal[data-v9='rescuing'],
+.rover-goal[data-v9='towing'],
+.rover-goal[data-v9='towed'] {
+  color: #ffd79a;
+}
+
+.rover-goal[data-v9='repairing'] {
+  color: #a5ece4;
+}
+
+/* State pills: solid and blinking for a rover that cannot drive, greyed for a wreck. */
+.pill-alert {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #fff;
+  background: var(--alert);
+  border-color: var(--alert);
+  font-weight: 680;
+}
+
+.pill[data-wreck] {
+  color: #c5ccd8;
+  background: rgba(138, 147, 163, 0.16);
+  border-color: rgba(138, 147, 163, 0.5);
+  border-style: dashed;
+}
+
+/* ---------------------------------------------------------------- sensor panel */
+
+.hud-sensors[data-wreck] {
+  border-color: rgba(138, 147, 163, 0.5);
+}
+
+.sp-health {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.sp-health-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.hb-sp {
+  flex: 0 1 110px;
+  height: 6px;
+}
+
+.sp-health-hp {
+  flex: none;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.sp-health-hp b {
+  color: var(--hc);
+  font-weight: 680;
+}
+
+.sp-parts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin: 0 0 0 auto;
+  padding: 0;
+  list-style: none;
+  justify-content: flex-end;
+}
+
+.sp-parts li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px 1px 4px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.sp-parts li .pi {
+  color: rgba(98, 214, 168, 0.8);
+}
+
+.sp-parts li b {
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.sp-parts li[data-level='warn'] {
+  background: rgba(243, 178, 74, 0.13);
+}
+
+.sp-parts li[data-level='warn'] .pi,
+.sp-parts li[data-level='warn'] b {
+  color: var(--amber);
+}
+
+.sp-parts li[data-level='bad'],
+.sp-parts li[data-level='dead'] {
+  background: rgba(255, 77, 77, 0.16);
+}
+
+.sp-parts li[data-level='bad'] .pi,
+.sp-parts li[data-level='bad'] b,
+.sp-parts li[data-level='dead'] .pi,
+.sp-parts li[data-level='dead'] b {
+  color: #ff7d70;
+}
+
+.sp-health-diag {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+
+.sp-health-quote {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.sp-health-line {
+  color: #ffd79a;
+  font-weight: 620;
+}
+
+.sp-health[data-status='immobile'] .sp-health-line {
+  color: #ffb3ad;
+}
+
+.sp-health-hit {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+@media (max-width: 1240px) {
+  .sp-part-name {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------- event log */
+
+.ev[data-level='damage'] {
+  --tint: rgba(255, 140, 70, 0.1);
+  --flash: rgba(255, 140, 70, 0.34);
+  box-shadow: inset 2px 0 0 #ff8c46;
+}
+
+.dmg {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px 7px;
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.dmg-icon {
+  color: #ffb07a;
+}
+
+.dmg[data-level='bad'] .dmg-icon,
+.dmg[data-level='dead'] .dmg-icon {
+  color: #ff7d70;
+}
+
+.dmg-part {
+  font-weight: 620;
+  color: var(--ink);
+}
+
+.dmg-bar {
+  position: relative;
+  width: 52px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--line-2);
+  overflow: hidden;
+}
+
+.dmg-bar u {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(255, 140, 70, 0.35);
+}
+
+.dmg-bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: #62d6a8;
+}
+
+.dmg[data-level='warn'] .dmg-bar i {
+  background: var(--amber);
+}
+
+.dmg[data-level='bad'] .dmg-bar i,
+.dmg[data-level='dead'] .dmg-bar i {
+  background: var(--alert);
+}
+
+.dmg-nums {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dmg-nums svg {
+  width: 10px;
+  height: 8px;
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.dmg-nums b {
+  color: var(--ink);
+}
+
+.dmg-cause,
+.dmg-g {
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 11.5px;
+}
+
+.dmg-g {
+  color: #ffc49a;
+}
+
+.evf[data-dmg] {
+  --c: #ff8c46;
+}
+
+.evf[data-dmg][aria-pressed='true'] {
+  --c: #ff8c46;
+  background: rgba(255, 140, 70, 0.16);
+}
+
+.evf-dmg {
+  width: 9px;
+  height: 9px;
+  fill: #ffa36a;
+}
+
+/* ---------------------------------------------------------------- rescue requests */
+
+.rq-opts[data-rescue] {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 5px;
+}
+
+.rq-opts[data-rescue] .rq-opt {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  grid-template-areas:
+    'label rule sugg'
+    'note note note';
+  align-items: center;
+  justify-items: start;
+  gap: 2px 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.rq-opts[data-rescue] .rq-opt-label {
+  grid-area: label;
+}
+
+.rq-opts[data-rescue] .rq-sugg {
+  grid-area: sugg;
+  justify-self: end;
+}
+
+.rq-opts[data-rescue] .rq-safe {
+  grid-column: 1 / -1;
+}
+
+.rq-rule {
+  grid-area: rule;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 640;
+  color: var(--ok);
+}
+
+.rq-rule svg {
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.rq-rule[data-unsafe] {
+  color: var(--amber);
+}
+
+.rq-note {
+  grid-area: note;
+  font-size: 11.5px;
+  font-weight: 450;
+  line-height: 1.3;
+  color: var(--ink-3);
+  white-space: normal;
+}
+
+.rq-opt[data-unsafe] {
+  border-style: dashed;
+  border-color: rgba(243, 178, 74, 0.45);
+  background: rgba(243, 178, 74, 0.05);
+}
+
+.rq-opt[data-unsafe]:disabled {
+  opacity: 0.78;
+  cursor: not-allowed;
+}
+
+.rq-opt[data-unsafe] .rq-opt-label {
+  text-decoration: line-through;
+  text-decoration-color: rgba(243, 178, 74, 0.7);
+}
+
+.msg-opt[data-unsafe] {
+  border-style: dashed;
+  text-decoration: line-through;
+  text-decoration-color: rgba(243, 178, 74, 0.7);
+  cursor: not-allowed;
+}
+
+.msg-opt small.msg-unsafe {
+  color: var(--amber);
+  text-decoration: none;
+}
+
+/* ---------------------------------------------------------------- hazard bar: Damage */
+
+.hud-hazards[data-v9] {
+  width: min(960px, 100%);
+}
+
+.hz-btn[data-type='damage'] svg {
+  stroke-width: 1.4;
+}
+
+@media (max-width: 1440px) {
+  .hud-hazards[data-v9] .hz-buttons {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.hz-dmg {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px 10px 10px;
+  border: 1px solid color-mix(in srgb, var(--hazard) 45%, var(--line-2));
+  border-radius: 9px;
+  background: rgba(255, 59, 92, 0.06);
+  animation: hz-dmg-in 180ms ease-out;
+}
+
+@keyframes hz-dmg-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+.hz-dmg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+}
+
+.hz-dmg-head .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.hz-dmg-hp {
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+
+.hz-dmg-x {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin: -3px -4px -3px auto;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+
+.hz-dmg-x:hover {
+  border-color: var(--line-2);
+  color: var(--ink);
+}
+
+.hz-dmg-x svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+
+.hz-dmg-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.hz-dmg-row > .hz-label {
+  flex: none;
+  width: 58px;
+}
+
+.hz-dmg-parts {
+  flex-wrap: wrap;
+}
+
+.hz-dmg-parts button {
+  padding: 2px 7px;
+  font-size: 12.5px;
+}
+
+.hz-dmg-sev {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hz-sev {
+  min-width: 74px;
+  padding: 5px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 620;
+  cursor: pointer;
+}
+
+.hz-sev:hover:not(:disabled) {
+  background: rgba(255, 59, 92, 0.14);
+  border-color: color-mix(in srgb, var(--hazard) 60%, transparent);
+}
+
+.hz-sev:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.hz-sev[data-sev='small'],
+.hz-sev[data-sev='light'] {
+  border-color: rgba(243, 178, 74, 0.45);
+}
+
+.hz-sev[data-sev='huge'],
+.hz-sev[data-sev='heavy'] {
+  border-color: rgba(255, 140, 70, 0.55);
+}
+
+.hz-sev[data-sev='disable'] {
+  border-color: rgba(255, 77, 77, 0.6);
+}
+
+.hz-sev[data-sev='wreck'] {
+  border-color: rgba(255, 59, 92, 0.75);
+  background: rgba(255, 59, 92, 0.1);
+}
+
+.hz-dmg-err {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 560;
+  color: #ff9f94;
+}
+
+/* ---------------------------------------------------------------- map tags */
+
+.rover-tag[data-alert] {
+  border-color: var(--alert);
+  box-shadow: 0 0 0 2px rgba(255, 77, 77, 0.25);
+}
+
+.rover-tag[data-wreck] {
+  color: var(--ink-3);
+  border-style: dashed;
+}
+
+.rover-tag-chip {
+  margin-left: 2px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #1a1206;
+  background: var(--help);
+}
+
+.rover-tag-chip[data-kind='repair'] {
+  color: #06201d;
+  background: var(--repair);
+}
+
+.rover-tag-chip[data-kind='wreck'] {
+  color: #dde2ea;
+  background: #4a515d;
+}
+
+.rover-tag-chip[data-kind='help'] {
+  color: var(--help);
+  background: rgba(255, 181, 71, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(255, 181, 71, 0.55);
+}
+
+/* Over a rover that cannot drive: "Rover 2 needs help", then the rescue's progress. */
+.distress-tag {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 10px 5px;
+  border: 1px solid var(--alert);
+  border-radius: 9px;
+  background: rgba(30, 6, 8, 0.86);
+  color: #fff;
+  font-family: var(--font);
+  font-size: 12.5px;
+  line-height: 1.25;
+  white-space: nowrap;
+  user-select: none;
+  box-shadow: 0 0 18px rgba(255, 77, 77, 0.35);
+  /* Bottom edge a few px above the rover's name tag (both anchored at the same point). */
+  transform: translateY(calc(-50% - 17px));
+}
+
+.distress-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.distress-title b {
+  font-weight: 700;
+}
+
+.distress-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--alert);
+  animation: fault-blink 0.9s steps(2, jump-none) infinite;
+}
+
+.distress-sub {
+  font-size: 11.5px;
+  color: #ffc7c2;
+}
+
+.distress-prog {
+  position: relative;
+  width: 100%;
+  min-width: 120px;
+  height: 4px;
+  margin-top: 2px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+
+.distress-prog i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: var(--help);
+  transition: width 400ms linear;
+}
+
+.distress-prog[data-busy='true'] i {
+  animation: distress-busy 1.4s ease-in-out infinite;
+}
+
+@keyframes distress-busy {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+
+.distress-tag[data-kind='diag'],
+.distress-tag[data-kind='fix'],
+.distress-tag[data-kind='salvage'] {
+  border-color: var(--help);
+  background: rgba(24, 16, 4, 0.86);
+  box-shadow: none;
+}
+
+.distress-tag[data-kind='diag'] .distress-dot,
+.distress-tag[data-kind='fix'] .distress-dot,
+.distress-tag[data-kind='salvage'] .distress-dot {
+  background: var(--help);
+  animation: none;
+}
+
+.distress-tag[data-kind='diag'] .distress-sub,
+.distress-tag[data-kind='fix'] .distress-sub,
+.distress-tag[data-kind='salvage'] .distress-sub {
+  color: #ffdca8;
+}
+
+.wreck-tag {
+  padding: 1px 7px;
+  border: 1px dashed rgba(154, 164, 180, 0.6);
+  border-radius: 6px;
+  background: rgba(6, 9, 14, 0.75);
+  color: #b8c0cc;
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* Lander: spare parts and repairs. */
+.spares {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 7px;
+  border-left: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.spare {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--ink-2);
+  font-weight: 620;
+}
+
+.spare .pi {
+  width: 12px;
+  height: 12px;
+  color: var(--repair);
+}
+
+.spare[data-none] {
+  color: var(--ink-3);
+  opacity: 0.6;
+}
+
+.spare[data-none] .pi {
+  color: var(--ink-3);
+}
+
+.lander-repair {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(95, 212, 200, 0.16);
+  color: var(--repair);
+  font-weight: 650;
+  animation: blink 1.6s ease-in-out infinite;
+}
+
+.lander-repair svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hb[data-status='immobile'] i,
+  .distress-dot,
+  .distress-prog[data-busy='true'] i,
+  .lander-repair {
+    animation: none;
+  }
+}

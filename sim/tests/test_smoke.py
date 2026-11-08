@@ -37,8 +37,10 @@ TARGET_KEYS = {"id", "x", "y", "kind", "status", "found_by", "found_t", "instrum
 EVENT_KEYS = {"t", "rover", "level", "msg"}           # plus optional "at": [x, y] and "source" (v3)
 FLEET_KEYS = {"explored_pct", "slope_limit_deg", "slope_limit_initial_deg", "targets_found", "targets_total",
               "sim_speed", "budget_ms", "cycle_ms", "soft_zones", "water_zones", "lifeforms_seen", "samples_cached",
-              "samples_carried", "science_score"}
-STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle", "fault", "observing"}
+              "samples_carried", "science_score", "mode",           # mode: protocol v8 ("priority" only while set)
+              "spares", "rescues", "wrecks"}                        # protocol v9
+STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle", "fault", "observing",
+          "disabled", "rescuing", "towing", "towed", "repairing", "wrecked"}             # protocol v9
 LEVELS = {"info", "warn", "discovery", "hazard"}
 EM_DASH = chr(0x2014)   # banned everywhere in this project
 
@@ -104,7 +106,7 @@ def _check_cells(cells, nx, ny):
 
 def _check_events(events):
     for e in events:
-        assert EVENT_KEYS <= set(e) <= EVENT_KEYS | {"at", "source"}, e
+        assert EVENT_KEYS <= set(e) <= EVENT_KEYS | {"at", "source", "decision", "damage"}, e
         assert e.get("source", "rules") in ("rules", "gemma", "operator"), e
         assert e["level"] in LEVELS, e
         assert isinstance(e["msg"], str) and e["msg"], e
@@ -196,7 +198,17 @@ def test_messages_match_protocol():
         assert m["type"] == "tick" and math.isfinite(m["t"])
         assert len(m["rovers"]) == cfg.num_rovers
         for r in m["rovers"]:
-            assert ROVER_KEYS <= set(r) <= ROVER_KEYS | {"sampling", "stats"}, set(r) ^ ROVER_KEYS   # stats: v5
+            # stats: v5; focus: v7 (only while a rover concentrates on an area)
+            assert ROVER_KEYS <= set(r) <= ROVER_KEYS | {"sampling", "stats", "focus", "health", "vision"}, \
+                set(r) ^ ROVER_KEYS
+            if "health" in r:                                                     # protocol v9
+                hl = r["health"]
+                assert set(hl) == {"hp", "status", "parts", "diagnosis", "last_hit"}, hl
+                assert hl["status"] in ("ok", "damaged", "immobile", "wrecked") and 0 <= hl["hp"] <= 100
+                assert set(hl["parts"]) == {"drive_l", "drive_r", "lidar", "camera", "power", "comms"}
+            if "focus" in r:
+                assert set(r["focus"]) == {"x", "y", "r", "reason", "label", "ends_in", "mode"}, r["focus"]   # mode: v8
+                assert r["focus"]["reason"] in ("operator", "interest") and r["focus"]["ends_in"] >= 0.0
             assert r["state"] in STATES, r["state"]
             assert 0.0 <= r["battery"] <= 1.0
             assert r["goal"] is None or (len(r["goal"]) == 2 and all(math.isfinite(v) for v in r["goal"]))

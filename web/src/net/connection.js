@@ -1,4 +1,5 @@
 import { appStore, dispatchSim, simStore } from '../state/store.js'
+import { sanitizeDetections } from '../state/simState.js'
 
 export function wsUrl() {
   return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
@@ -116,12 +117,14 @@ export async function loadTruth(gen) {
 // POST /api/hazard (PROTOCOL.md, version 2; `at` = [x, y] for version 4 point and click).
 // Resolves with the server's hazard, or throws an Error carrying the server's own error
 // text (HTTP 400) when it refuses.
-export async function postHazard(type, rover, at = null) {
+// `extra`: more body fields, e.g. version 9 damage { severity, part } (null values dropped).
+export async function postHazard(type, rover, at = null, extra = null) {
   const body = rover ? { type, rover } : { type }
   if (at) {
     body.x = at[0]
     body.y = at[1]
   }
+  if (extra) for (const [k, v] of Object.entries(extra)) if (v != null) body[k] = v
   let res
   try {
     res = await fetch('/api/hazard', {
@@ -154,13 +157,26 @@ export function freshUrl(url) {
   return u.origin === location.origin ? u.pathname + u.search : u.href
 }
 
-// One frame from GET /api/camera/{id}.jpg. Resolves with a Blob, or throws an Error
-// whose `status` is the HTTP status (0 for a network failure).
-export function fetchCameraFrame(id, view, w, h, signal) {
-  return fetchImage(`/api/camera/${encodeURIComponent(id)}.jpg?view=${view}&w=${w}&h=${h}&_=${Date.now()}`, signal)
+// One frame from GET /api/camera/{id}.jpg. Resolves with { blob, frame, ageMs, dets }:
+// version 8 headers X-Frame (frame number), X-Frame-Age-Ms (how old the frame was when the
+// sim sent it) and X-Detections (the objects detected in exactly that frame); each null when
+// the sim does not send it. Throws an Error whose `status` is the HTTP status (0 for a
+// network failure).
+export async function fetchCameraFrame(id, view, w, h, signal) {
+  const res = await fetchImageResponse(`/api/camera/${encodeURIComponent(id)}.jpg?view=${view}&w=${w}&h=${h}&_=${Date.now()}`, signal)
+  const frame = Number.parseInt(res.headers.get('X-Frame') ?? '', 10)
+  const age = Number.parseFloat(res.headers.get('X-Frame-Age-Ms') ?? '')
+  const rawDets = res.headers.get('X-Detections')
+  let dets = null
+  if (rawDets != null) dets = sanitizeDetections(parseMessage(rawDets)) || []
+  return { blob: await res.blob(), frame: Number.isFinite(frame) ? frame : null, ageMs: Number.isFinite(age) && age >= 0 ? age : null, dets }
 }
 
 export async function fetchImage(url, signal) {
+  return (await fetchImageResponse(url, signal)).blob()
+}
+
+async function fetchImageResponse(url, signal) {
   let res
   try {
     res = await fetch(url, { cache: 'no-store', signal })
@@ -173,7 +189,7 @@ export async function fetchImage(url, signal) {
     const j = parseMessage(await res.text().catch(() => '')) || {}
     throw Object.assign(new Error(j.error || j.detail || `HTTP ${res.status}`), { status: res.status })
   }
-  return res.blob()
+  return res
 }
 
 // POST helper for the v3 endpoints. Resolves with the JSON body, or throws an Error with
@@ -207,6 +223,11 @@ export function postAnswer(id, option) {
   return postJson('/api/answer', { id, option }, (status) =>
     status === 409 ? 'Too late: this question already closed' : status === 404 ? 'The sim no longer has this question' : `Answer refused (HTTP ${status})`,
   )
+}
+
+// POST /api/mode (version 8): "autonomous" or "supervised". Resolves with the JSON body.
+export function postMode(mode) {
+  return postJson('/api/mode', { mode }, (status) => (status === 404 || status === 405 ? 'This sim has no autonomy modes' : `Mode change refused (HTTP ${status})`))
 }
 
 export async function resetSim(seed) {

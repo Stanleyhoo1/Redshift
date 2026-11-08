@@ -35,6 +35,23 @@ DEGRADED_DIST_K = 2.5       # a rover that cannot see far weighs distance this m
 DEGRADED_MAX_GOAL = 14.0    # and avoids frontiers farther than this (unless there is nothing closer)
 SEARCH_TTL = 3.0            # an unfinished plan older than this (sim s) is dropped and restarted
 DIR_BIAS = 30.0             # operator "explore <direction>": utility bonus for frontiers straight that way
+# protocol v7: a rover with a focus (an area to explore) strongly prefers unknown ground inside its circle ...
+FOCUS_IN = 60.0             # ... utility bonus for a frontier inside the circle
+FOCUS_EDGE_K = 4.0          # ... else this much less per metre beyond the circle's edge (the nearest edge wins)
+CLAIMED = 200.0             # ... and a frontier another rover is already heading for only if nothing else is left
+FOCUS_CLAIM_PENALTY = 15.0  # other rovers leave the unknown ground inside someone's focus circle to that rover
+HERD_DISMISSED_M = 15.0     # tracks this close to a herd the operator said to leave alone are not observed again ...
+HERD_DISMISSED_S = 600.0    # ... for this long (sim s)
+# protocol v8: a fleet priority ("prioritize the gaps", "the north", "water") weighs every rover's frontier choice
+PRIORITY_IN = 80.0          # utility bonus for a frontier the priority covers (more than 80 m of extra distance)
+PRIORITY_MINE = 40.0        # ... plus this for a frontier on the gap assigned to this rover
+PRIORITY_WATER_M = 12.0     # "prioritize water": frontiers this close to known water
+PRIORITY_DIR_COS = 0.64     # "prioritize the north": frontiers within about 50 deg of that bearing from the lander
+GAP_REFRESH_S = 3.0         # the unexplored gaps are found again at most this often (sim s), only while needed
+MODES = ("autonomous", "supervised")
+DIR_VEC = {"north": (0.0, 1.0), "south": (0.0, -1.0), "east": (1.0, 0.0), "west": (-1.0, 0.0),
+           "north-east": (0.7071, 0.7071), "north-west": (-0.7071, 0.7071),
+           "south-east": (0.7071, -0.7071), "south-west": (-0.7071, -0.7071)}
 
 
 def compass(dx: float, dy: float) -> str:
@@ -103,23 +120,42 @@ class Fleet:
         self.dropoffs: list = []           # [(x, y, t)] LiDAR holes the camera said were not liquid
         self.tracker = Tracker()           # moving LiDAR clusters (lifeforms)
         self.observed_areas: list = []     # [(x, y, t)] where an observation ended (no repeat for a while)
+        self.injected_herds: list = []     # [(x, y, rover id, until)] demo herds brought in (hazards.py): always observed
         self.lifeform_herds: list = []     # [(x, y, most individuals seen at once)] confirmed lifeforms
         self.lifeforms_seen = 0
         self.announced: list = []          # [(x, y, t)] sightings already logged without an observer
         self.samples_cached = 0
         self.science_score = 0
         self.skip_logged: set = set()      # (rover id, target index) trade-offs already logged
+        self.interest_spots: list = []     # [(x, y, t)] places a rover already stuck around out of curiosity (v7)
+        self.spires_seen: dict = {}        # spire id -> (t, rover id, x, y) when the fleet's LiDAR first saw it
+        self.dismissed_herds: list = []    # [(x, y, t)] herds the operator said to leave alone (keep exploring)
+        self.mode = cfg.autonomy_mode if cfg.autonomy_mode in MODES else "autonomous"   # protocol v8
+        self.priority = None               # protocol v8: the fleet priority (dict, see priority_msg), or None
+        self.gaps: list = []               # protocol v8: unexplored gaps (gaps.find_gaps), cached ...
+        self.gap_grid = None               # ... their label grid (frontier lookups) ...
+        self.gaps_t = -1e9                 # ... and when they were found
+        self.spares: dict = {}             # protocol v9: spare parts at the lander (rescue.py fills it)
+        self.wrecks: list = []             # protocol v9: rovers left behind {"rover", "x", "y"}
+        self.rescue = None                 # protocol v9: the sim's RescueManager
+        self.rescues_msg = lambda: []
 
     # ------------------------------------------------------------------ events
-    def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None) -> None:
+    def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None,
+            decision: dict | None = None, damage: dict | None = None) -> None:
         """source: "gemma" or "operator" when the decision came from tier 2 or a typed command
-        (protocol v3); None means the rules (the field is then left out)."""
+        (protocol v3); None means the rules (the field is then left out). decision (protocol v8): what a
+        rover decided on its own instead of asking the operator."""
         self.event_seq += 1
         e = {"t": round(float(t), 1), "rover": rover, "level": level, "msg": msg, "_seq": self.event_seq}
         if at is not None:
             e["at"] = [round(float(at[0]), 1), round(float(at[1]), 1)]
         if source is not None and source != "rules":
             e["source"] = source
+        if decision is not None:
+            e["decision"] = decision
+        if damage is not None:
+            e["damage"] = damage           # protocol v9: what a hit did to one part
         self.events.append(e)
         if len(self.events) > 400:
             del self.events[:100]
@@ -136,6 +172,10 @@ class Fleet:
             out["at"] = e["at"]
         if "source" in e:
             out["source"] = e["source"]
+        if "decision" in e:
+            out["decision"] = e["decision"]
+        if "damage" in e:
+            out["damage"] = e["damage"]
         return out
 
     # ------------------------------------------------------------------ periodic
@@ -153,6 +193,59 @@ class Fleet:
             for k in [k for k, exp in self.blacklist.items() if exp < t]:
                 del self.blacklist[k]
             self._check_complete(t)
+        if self.priority is not None and self.priority["kind"] == "gaps":
+            self.refresh_gaps(t)                      # protocol v8: only while the gaps are the priority
+
+    # ------------------------------------------------------------------ unexplored gaps and priorities (v8)
+    def refresh_gaps(self, t: float, max_age: float = GAP_REFRESH_S) -> list:
+        """The unexplored gaps inside the map (gaps.find_gaps, a few ms), cached for max_age sim seconds."""
+        if t - self.gaps_t >= max_age or t < self.gaps_t:
+            from .gaps import find_gaps
+            self.gaps, self.gap_grid = find_gaps(self.map, self.usable_frontiers(t))
+            self.gaps_t = t
+        return self.gaps
+
+    def explorable_gaps(self, t: float, max_age: float = GAP_REFRESH_S) -> list:
+        """Gaps with a reachable frontier on their edge (the others sit in steep ground nobody can drive to)."""
+        return [g for g in self.refresh_gaps(t, max_age) if g["frontiers"]]
+
+    def in_direction(self, x: float, y: float, direction: str) -> bool:
+        """Is (x, y) in that part of the map ("the north": within about 50 deg of north, seen from the lander)?"""
+        d = math.hypot(x, y)
+        ux, uy = DIR_VEC[direction]
+        return d >= 5.0 and (x * ux + y * uy) / d >= PRIORITY_DIR_COS
+
+    def priority_bonus(self, rover, x: float, y: float, idx: int) -> float:
+        """Utility bonus of a frontier under the fleet priority (protocol v8). Sampling works on the target
+        choice instead (rover._explore fetches found targets from further away)."""
+        p = self.priority
+        kind = p["kind"]
+        if kind == "gaps":
+            if self.gap_grid is None:
+                return 0.0
+            lab = int(self.gap_grid.ravel()[idx])
+            if not lab:
+                return 0.0
+            return PRIORITY_IN + (PRIORITY_MINE if lab == p.get("labs", {}).get(rover.id) else 0.0)
+        if kind == "direction":
+            return PRIORITY_IN if self.in_direction(x, y, p["direction"]) else 0.0
+        if kind == "water":
+            if self.water_zones:
+                return PRIORITY_IN if self.water_zone_gap(x, y) < PRIORITY_WATER_M else 0.0
+            lo = p.get("low_h")                       # no water known yet: low ground, where liquid collects
+            return 0.5 * PRIORITY_IN if lo is not None and float(self.map.h.ravel()[idx]) <= lo else 0.0
+        return 0.0
+
+    def priority_msg(self) -> dict | None:
+        p = self.priority
+        if p is None:
+            return None
+        out = {"kind": p["kind"], "label": p["label"], "count": int(p.get("count", 0)), "since": round(p["since"], 1)}
+        if p.get("direction"):
+            out["direction"] = p["direction"]
+        if p.get("places"):
+            out["places"] = p["places"]
+        return out
 
     def _update_reach(self, t: float, max_iters: int | None = 80) -> None:
         """Flood fill from the lander over every sample the planner may cross (known and gentle
@@ -225,8 +318,8 @@ class Fleet:
                 self.log(t, "info", "New frontier spotted. Resuming exploration.")
             return
         usable = self.usable_frontiers(t)
-        busy = any((r.state in ("exploring", "investigating") and r.goal is not None) or r.state in ("fault", "observing")
-                   for r in self.rovers)
+        busy = any((r.state in ("exploring", "investigating") and r.goal is not None) or r.state in (
+            "fault", "observing", "rescuing", "towing") for r in self.rovers)
         if usable or busy or t < 30.0:
             self.no_frontier_since = None
             return
@@ -263,12 +356,15 @@ class Fleet:
         self._cost = None
         self._costs.clear()
 
-    def plan(self, t: float, rover, goal: tuple, relax: float = 0.0, max_exp: int = 14000):
+    def plan(self, t: float, rover, goal: tuple, relax: float = 0.0, max_exp: int = 14000, limit: float | None = None):
         """Plan from the rover to goal (x, y). Returns a list of (x, y) waypoints, None if there is
         no path, or PENDING if the rover's compute budget for this cycle ran out first (the search
-        resumes on the next call with the same goal)."""
+        resumes on the next call with the same goal). The slope limit is the rover's own (protocol v9: the
+        fleet's, lower for a damaged drive or while towing), or `limit` when given."""
         g = self.map.ij(goal[0], goal[1])
-        key = (g, round(relax, 1))
+        if limit is None:
+            limit = rover.limit_now() if hasattr(rover, "limit_now") else self.slope_limit
+        key = (g, round(relax, 1), round(limit, 1))
         fail = rover.plan_fails.get(key)
         if fail is not None and t - fail[0] < 2.0 and math.hypot(rover.x - fail[1], rover.y - fail[2]) < 1.0:
             return None                     # same question, same answer a moment ago
@@ -277,11 +373,12 @@ class Fleet:
                                  or math.hypot(rover.x - srch.sx, rover.y - srch.sy) > 1.0):
             srch = None
         if srch is None:
-            lim = self.slope_limit + relax
+            lim = limit + relax
             unk = self.cfg.degraded_unknown_cost if rover.degraded else (0.6 if relax > 0 else 1.0)
             base = self.cost(t, lim, unk)
-            others = [(o.x, o.y, 1.3 if (o.speed < 0.05 or o.state in ("idle", "charging", "fault")) else 0.9)
-                      for o in self.rovers if o is not rover]
+            others = [(o.x, o.y, 1.3 if (o.speed < 0.05 or o.state in (
+                "idle", "charging", "fault", "disabled", "wrecked", "towed", "repairing")) else 0.9)
+                for o in self.rovers if o is not rover and o is not getattr(rover, "helper", None)]
             others += [(*tr.predict(t), 3.0) for tr in self.tracker.near(rover.x, rover.y, 25.0, t)]
             mult = add_avoid(base, self.map, others)
             srch = AStar(mult, self.map.ij(rover.x, rover.y), g, max_expansions=max_exp)
@@ -428,19 +525,33 @@ class Fleet:
         self.observed_areas = [a for a in self.observed_areas if t - a[2] < 300.0]
         observing = [r for r in self.rovers if r.state == "observing" and r.obs is not None]
         max_obs = 2 if len(self.rovers) >= 3 else 1     # the others keep exploring
+        self.dismissed_herds = [d for d in self.dismissed_herds if t - d[2] < HERD_DISMISSED_S]
+        self.injected_herds = [h for h in self.injected_herds if t < h[3]]
         for tr in tracker.confirmed():
             if tr.observer is not None or tr.ignored or tr.status == "lost" or t < tr.done_until:
                 continue
             px, py = tr.predict(t)
+            # a herd the operator just brought in (POST /api/hazard lifeform) always gets a reaction: it skips
+            # the observer cap and the "watched a moment ago" / "dismissed" bookkeeping of the old place
+            inj = next((h for h in self.injected_herds if math.hypot(px - h[0], py - h[1]) < 10.0), None)
+            if inj is None and any(math.hypot(px - dx, py - dy) < HERD_DISMISSED_M for dx, dy, _ in self.dismissed_herds):
+                tr.ignored = True           # the operator said to leave this herd alone (protocol v7)
+                continue
             if any(o2.observer is not None and math.hypot(o2.x - px, o2.y - py) < 12.0 for o2 in tracker.confirmed()):
                 continue                    # its herd is already being watched
-            if any(math.hypot(px - ax, py - ay) < 15.0 for ax, ay, _ in self.observed_areas):
+            if inj is None and any(math.hypot(px - ax, py - ay) < 15.0 for ax, ay, _ in self.observed_areas):
                 continue                    # that herd was watched a moment ago
-            cands = [r for r in self.rovers if r.can_observe(t, tr)] if len(observing) < max_obs else []
+            free = len(observing) < max_obs or inj is not None
+            cands = [r for r in self.rovers if r.can_observe(t, tr)] if free else []
+            if inj is not None and not cands:
+                cands = [r for r in self.rovers if r.id == inj[2] and r.can_observe(t, tr, busy_ok=True)]
             if cands:
-                r = min(cands, key=lambda r_: math.hypot(r_.x - px, r_.y - py))
+                tgt = next((r_ for r_ in cands if inj is not None and r_.id == inj[2]), None)
+                r = tgt or min(cands, key=lambda r_: math.hypot(r_.x - px, r_.y - py))
                 r.start_observing(t, tr)
                 observing.append(r)
+                if inj is not None:
+                    self.injected_herds = [h for h in self.injected_herds if h is not inj]
                 continue
             if tr in fresh and not any(math.hypot(px - ax, py - ay) < 15.0 and t - at < 120.0
                                        for ax, ay, at in self.announced):
@@ -513,7 +624,9 @@ class Fleet:
 
     # ------------------------------------------------------------------ goals
     def choose_goal(self, t: float, rover, max_tries: int = 6):
-        """Pick the best frontier cluster for this rover and plan to it. Returns (goal, path, size) or None."""
+        """Pick the best frontier cluster for this rover and plan to it. Returns (goal, path, size) or None.
+        A rover with a focus (protocol v7) takes unclaimed frontiers inside its circle first, then the ones
+        nearest the circle's edge; the others leave the ground inside someone's focus circle to that rover."""
         rover.goal_fail_reason = None
         if self.complete or not self.frontiers:
             return None
@@ -522,8 +635,14 @@ class Fleet:
         bias = getattr(rover, "dir_bias", None)      # operator: "explore north" (unit vector, until t)
         if bias is not None and t >= bias[2]:
             bias = None
+        fc = getattr(rover, "focus", None)
+        circles = [(o.focus["x"], o.focus["y"], o.focus["r"]) for o in self.rovers
+                   if o is not rover and getattr(o, "focus", None) is not None]
         reach = self.reach.ravel() if (self.reach is not None and self.in_reach(rover.x, rover.y)) else None
+        # protocol v8: the fleet priority, unless the operator gave this rover its own area or direction
+        pri = self.priority is not None and fc is None and bias is None
         skipped_battery = 0
+        claimed_keys: set = set()
         for (x, y, size, idx) in self.frontiers:
             key = self._bucket(x, y)
             if key in self.blacklist or rover.blacklist.get(key, -1.0) > t:
@@ -544,21 +663,43 @@ class Fleet:
             ang = abs(math.atan2(math.sin(math.atan2(y - rover.y, x - rover.x) - rover.yaw),
                                  math.cos(math.atan2(y - rover.y, x - rover.x) - rover.yaw)))
             u -= W_TURN * ang
+            claimed = False
             for o in self.rovers:
                 if o is rover:
                     continue
                 if o.goal is not None and o.state in ("exploring", "investigating") and \
                         math.hypot(x - o.goal[0], y - o.goal[1]) < OVERLAP_RADIUS:
                     u -= OVERLAP_PENALTY
+                    claimed = True
                 if math.hypot(x - o.x, y - o.y) < 6.0:
                     u -= NEAR_ROVER_PENALTY
             if any(math.hypot(x - sx, y - sy) < self.cfg.target_bonus_radius for sx, sy in self.sampled_points):
                 u += SAMPLE_BONUS
             if bias is not None:
                 u += DIR_BIAS * ((x - rover.x) * bias[0] + (y - rover.y) * bias[1]) / max(d, 1e-6)
+            if pri:
+                u += self.priority_bonus(rover, x, y, idx)
+            if fc is not None:
+                dc = math.hypot(x - fc["x"], y - fc["y"])
+                if claimed:
+                    u -= CLAIMED                # fleet claims still keep rovers from duplicating work
+                    claimed_keys.add(key)
+                elif dc <= fc["r"]:
+                    u += FOCUS_IN
+                else:
+                    u -= FOCUS_EDGE_K * (dc - fc["r"])
+            elif any(math.hypot(x - cx, y - cy) <= cr for cx, cy, cr in circles):
+                u -= FOCUS_CLAIM_PENALTY
             cands.append((u, x, y, size, key))
         if not cands and skipped_battery:
             rover.goal_fail_reason = "battery"
+        if fc is not None and fc.get("arrived") is not None:
+            # there: only unknown ground nearby counts; nothing left means the focus is done
+            near = fc["r"] + self.cfg.focus_margin
+            cands = [c for c in cands if c[4] not in claimed_keys and math.hypot(c[1] - fc["x"], c[2] - fc["y"]) <= near]
+            if not cands:
+                rover.goal_fail_reason = rover.goal_fail_reason or "focus_done"
+                return None
         cands.sort(key=lambda c: -c[0])
         cands = cands[:max_tries]
         rover.goal_options = list(cands)        # ranked options: tier 2 (Gemma) may pick another one
@@ -594,6 +735,9 @@ class Fleet:
         dirn = compass(ts.spec.x - rover.x, ts.spec.y - rover.y)
         at = (ts.spec.x, ts.spec.y)
         est = f"estimated value {ts.spec.est_value}/10"
+        if hasattr(rover, "note_interest"):     # protocol v7 curiosity: targets come in clusters, look around it
+            rover.note_interest(t, ts.spec.x, ts.spec.y, "target", f"a possible {label} ({ts.spec.id})",
+                                f"{ts.spec.id} ({label})")
         if rover.can_investigate(t, ts):
             ts.status = "investigating"
             ts.investigator = rover.id
@@ -611,6 +755,8 @@ class Fleet:
                 why = "LiDAR degraded, staying on mapped ground"
             elif rover.state == "fault":
                 why = "motors offline"
+            elif rover.state in ("disabled", "towed", "wrecked", "repairing", "rescuing", "towing"):
+                why = "out of action" if rover.state in ("disabled", "towed", "wrecked") else rover.state   # v9
             else:
                 why = "busy"
             self.log(t, "discovery", f"{rover.id} spectrometer flags a possible {label} ({ts.spec.id}) {dist:.0f} m "
@@ -740,6 +886,11 @@ class Fleet:
             "samples_cached": int(self.samples_cached),
             "samples_carried": int(sum(len(r.samples) for r in self.rovers)),
             "science_score": int(self.science_score),
+            "mode": self.mode,                              # protocol v8
+            **({"priority": self.priority_msg()} if self.priority is not None else {}),
+            "spares": dict(self.spares),                    # protocol v9
+            "rescues": self.rescues_msg(),
+            "wrecks": [dict(w) for w in self.wrecks],
         }
 
     def discovered_targets(self) -> list:

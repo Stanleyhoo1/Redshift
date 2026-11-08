@@ -22,4 +22,5 @@ export const PLACE_TEXT = {
   spire_fall: { what: 'a falling spire', label: 'Falling spire' },
   lifeform: { what: 'a herd of grazers', label: 'Herd of grazers' },
   rover_fault: { what: 'a motor fault', label: 'Motor fault' },
+  damage: { what: 'damage', label: 'Damage' },
 }

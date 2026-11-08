@@ -6,7 +6,7 @@ import { autoDefault, clearPlaceHover, hasPlaces, hoverKey, isWaiting, optionLab
 import { useNow } from '../lib/useNow.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { CAM_RETRY_DOWN, LidarRadar, cameraProblem } from './SensorPanel.jsx'
-import { SourceTag } from './Planner.jsx'
+import { GemmaStar, SourceTag } from './Planner.jsx'
 
 // Clarification requests (PROTOCOL.md version 3, `requests`): a rover that cannot
 // interpret what it senses asks the operator, and takes the safe default when nobody
@@ -40,6 +40,12 @@ function useCompact() {
 const ShieldIcon = () => (
   <svg viewBox="0 0 12 12" aria-hidden="true">
     <path d="M6 1 10.2 2.6v3c0 2.6-1.8 4.4-4.2 5.4C3.6 10 1.8 8.2 1.8 5.6v-3z" />
+  </svg>
+)
+const WarnIcon = () => (
+  <svg viewBox="0 0 12 12" aria-hidden="true">
+    <path d="M6 1.4 11 10.2H1z" />
+    <path d="M6 4.8v2.4M6 8.6v.1" />
   </svg>
 )
 const CheckIcon = () => (
@@ -314,8 +320,15 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
   const places = hasPlaces(q)
   const nums = places ? placeNumbers(q) : null
   const color = meta?.color || '#8d99aa'
+  // v7: a rover that sights a herd follows it at a safe distance while it asks.
+  const following = useSim((s) => q.kind === 'lifeform' && s.rovers[q.rover]?.state === 'observing')
+  // v9: a rescue decision (tow, salvage, leave) with the rules' safety notes.
+  const rescue = q.kind === 'rescue'
+  const about = rescue && q.about ? byId[q.about]?.name || q.about : null
   let hint
-  if (waiting && places) hint = `${name} holds position until you choose. Click a numbered marker on the map, a choice here, or reply in Comms ("the second one").`
+  if (rescue) hint = `${name} waits${about ? ` by ${about}` : ''} until you decide. Options the rules mark unsafe are locked.`
+  else if (following) hint = `Following at a safe distance while waiting for you${auto ? `. With no answer it takes the safe default: ${def.toLowerCase()}.` : '.'}`
+  else if (waiting && places) hint = `${name} holds position until you choose. Click a numbered marker on the map, a choice here, or reply in Comms ("the second one").`
   else if (waiting) hint = `${name} holds position until you answer.`
   else if (auto) hint = `Moving cautiously until you answer. With no answer it takes the safe default: ${def.toLowerCase()}.`
   else hint = 'Moving cautiously until you answer.'
@@ -328,7 +341,7 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
           <button type="button" className="rq-name" onClick={() => q.rover && onSelect?.(q.rover)} title={`Show ${name}'s sensors`}>
             {name}
           </button>
-          <span className="rq-asks">{kind ? 'asked' : 'asks you'}</span>
+          <span className="rq-asks">{kind ? 'asked' : rescue ? 'needs a decision' : 'asks you'}</span>
           {source && <SourceTag source={source} />}
           {!kind && left !== null && (
             <span className="rq-left" data-low={left <= 5 || undefined} aria-label={`${Math.ceil(left)} seconds left`}>
@@ -337,7 +350,7 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
             </span>
           )}
           {!kind && waiting && (
-            <span className="rq-wait" title="No time limit: the rover waits for your answer">
+            <span className="rq-wait" title={following ? 'No time limit: the rover keeps following until you answer' : 'No time limit: the rover waits for your answer'}>
               <i aria-hidden="true" />
               Waiting for you
             </span>
@@ -348,21 +361,25 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
           <Outcome kind={kind} q={q} name={name} answer={answer} ghost={ghost} />
         ) : (
           <>
-            <div className="rq-opts" role="group" aria-label="Answer">
+            <div className="rq-opts" role="group" aria-label="Answer" data-rescue={rescue || undefined}>
               {q.options.map((o) => {
                 const isDefault = o.id === auto
                 const n = nums?.[o.id]
+                const unsafe = o.safe === false
                 return (
                   <button
                     key={o.id}
                     type="button"
                     className="rq-opt"
                     data-default={isDefault || undefined}
+                    data-suggested={o.suggested || undefined}
                     data-place={n ? true : undefined}
+                    data-safe={o.safe === true || undefined}
+                    data-unsafe={unsafe || undefined}
                     aria-busy={(pending && answer.option === o.id) || undefined}
-                    disabled={pending}
+                    disabled={pending || unsafe}
                     onClick={() => sendAnswer(q.id, o.id)}
-                    title={n ? `${o.label} (marker ${n} on the map)` : undefined}
+                    title={unsafe ? `Not safe by the rules${o.note ? `: ${o.note}` : ''}` : n ? `${o.label} (marker ${n} on the map)${o.suggested ? ", Gemma's suggestion" : ''}` : o.suggested ? "Gemma's suggestion" : o.note || undefined}
                     {...placeChipProps(q, o, hover)}
                   >
                     {n ? (
@@ -375,12 +392,25 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
                     ) : (
                       <span className="rq-opt-label">{o.label}</span>
                     )}
+                    {o.suggested && (
+                      <span className="rq-sugg">
+                        <GemmaStar className="src-star" />
+                        Gemma suggests
+                      </span>
+                    )}
                     {isDefault && (
                       <span className="rq-safe">
                         <ShieldIcon />
                         safe default
                       </span>
                     )}
+                    {rescue && (o.safe === true || unsafe) && (
+                      <span className="rq-rule" data-unsafe={unsafe || undefined}>
+                        {unsafe ? <WarnIcon /> : <ShieldIcon />}
+                        {unsafe ? 'Not safe' : 'Safe'}
+                      </span>
+                    )}
+                    {o.note && <span className="rq-note">{o.note}</span>}
                   </button>
                 )
               })}

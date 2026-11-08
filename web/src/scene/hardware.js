@@ -30,6 +30,25 @@ export function hardwareMaterials() {
   return mats
 }
 
+// v9: the same materials darkened, scorched and dull, for a wrecked rover.
+let wreck = null
+export function wreckMaterials() {
+  if (wreck) return wreck
+  const M = hardwareMaterials()
+  wreck = {}
+  for (const [k, m] of Object.entries(M)) {
+    const c = m.clone()
+    c.color = m.color.clone().multiplyScalar(k === 'lamp' ? 0.12 : k === 'paint' ? 0.3 : 0.38)
+    if (c.isMeshStandardMaterial) {
+      c.roughness = Math.min(1, m.roughness + 0.3)
+      c.envMapIntensity = m.envMapIntensity * 0.35
+    }
+    c.userData = { ...m.userData }
+    wreck[k] = c
+  }
+  return wreck
+}
+
 // UVs in metres / scale from a box projection (dominant normal axis), so panel textures
 // tile at the same size on every part.
 export function boxUV(g, scale = 0.4) {

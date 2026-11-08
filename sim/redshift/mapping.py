@@ -51,6 +51,9 @@ NORET_HOLE = 3       # sweeps with a missing return before an unknown sample cou
 TALL_FOOT = 0.35     # hits this close to a sample centre count for its "tall stuff" check ...
 TALL_DZ = 0.6        # ... and a spread of hit heights this big there means something tall stands in it
 TALL_OLD_S = 5.0     # tall stuff seen in a sample longer ago than this is static, not a change
+CHANGE_MIN_RANGE = 3.0   # hits closer than this (m, horizontal) to the sensor never start a change: up close the
+                         # beams graze rock faces a far view only half saw (a refinement); new rocks and fallen
+                         # spires land 4 m or more ahead and are seen from there first (fill-in stays allowed)
 _NBR = [(dj, di) for dj in (-1, 0, 1) for di in (-1, 0, 1)]
 
 
@@ -113,8 +116,9 @@ class FleetMap:
         return 100.0 * self.known_count / float(self.nx * self.ny)
 
     # ------------------------------------------------------------------ integration
-    def integrate(self, pts: np.ndarray, t: float = 0.0) -> int:
-        """pts: (N, 3) world hit points on terrain or rocks (one LiDAR sweep).
+    def integrate(self, pts: np.ndarray, t: float = 0.0, origin=None) -> int:
+        """pts: (N, 3) world hit points on terrain or rocks (one LiDAR sweep). origin: (x, y) of the sensor,
+        if known (hits closer than CHANGE_MIN_RANGE to it never start a change).
         Returns the number of samples overwritten because the ground changed. self.last_new holds the
         flat indices of the samples this sweep hit for the first time (rover memory, answers.py)."""
         self.scan_seq += 1
@@ -128,6 +132,7 @@ class FleetMap:
         ok = (i >= 0) & (i < self.nx) & (j >= 0) & (j < self.ny)
         if not ok.any():
             return 0
+        far = None if origin is None else np.hypot(pts[ok, 0] - origin[0], pts[ok, 1] - origin[1]) >= CHANGE_MIN_RANGE
         i, j, fi, fj, z = i[ok], j[ok], fi[ok], fj[ok], pts[ok, 2]
         dx = ((fi - i) * self.res).astype(np.float32)
         dy = ((fj - j) * self.res).astype(np.float32)
@@ -158,10 +163,12 @@ class FleetMap:
             better &= ~(known_f & (jump > 1.5))
             big = better & known_f & (jump > CHANGE_SEED_DZ) & (self.chg_conf.ravel()[f] >= CHANGE_CONFIRMED) \
                 & (self.changed_t.ravel()[f] < t - CHANGE_COOLDOWN_S) & (self.tall_t.ravel()[f] >= t - TALL_OLD_S)
+            if far is not None:
+                big &= far[sel]
             if big.any():
                 self._stamp_changes(f[big], t)
         upd = sel[better]
-        top = self._changed(flat, z, dx, dy, off, f[better], t)
+        top = self._changed(flat, z, dx, dy, off, f[better], t, far)
         n_changed = 0 if top is None else len(top)
         if n_changed:
             upd = np.concatenate([upd, top])
@@ -180,7 +187,7 @@ class FleetMap:
         self._refit(int(jj.min()) - 2, int(jj.max()) + 2, int(ii.min()) - 2, int(ii.max()) + 2)
         return n_changed
 
-    def _changed(self, flat, z, dx, dy, off, updated, t: float):
+    def _changed(self, flat, z, dx, dy, off, updated, t: float, far=None):
         """Change detection (new obstacles) for known samples this sweep did not update anyway.
         Per sample it looks at the highest hit near the centre in this sweep; if that stands well
         above the stored surface in CHANGE_SCANS separate sweeps (and nothing in between says the
@@ -220,6 +227,8 @@ class FleetMap:
         # change in an area also needs a well established old surface: a sample seen once from afar
         # that turns out higher is a correction, not a change.
         up = (d > np.where(near, CHANGE_DZ, CHANGE_SEED_DZ)) & (d < 2.0) & (near | (conf[ft] >= CHANGE_CONFIRMED))
+        if far is not None:
+            up &= near | far[top]          # up close only fill-in around a change seen from further away
         if not up.any():
             return None
         fd, td = ft[up], top[up]
@@ -460,6 +469,31 @@ class FleetMap:
         height = float(hw[ch].max() - (np.median(base) if base.size else hw[ch].min()))
         long_ = length >= 1.8 and width <= 1.3 and length >= 2.2 * width and gap <= 0.8
         return {"shape": "long" if long_ else "rocks", "length": round(length, 1), "height": round(max(height, 0.0), 1)}
+
+    def area_cells(self, x: float, y: float, r: float) -> tuple:
+        """(mapped samples, still unexplored samples) within r of (x, y). Unexplored leaves out identified water,
+        seen holes and the map edge (none of it can be mapped). One small window (protocol v7 focus checks)."""
+        i, j = self.ij(x, y)
+        k = int(math.ceil(r / self.res))
+        j0, j1 = max(0, j - k), min(self.ny - 1, j + k)
+        i0, i1 = max(0, i - k), min(self.nx - 1, i + k)
+        win = (slice(j0, j1 + 1), slice(i0, i1 + 1))
+        inside = (self.xs[i0:i1 + 1][None, :] - x) ** 2 + (self.ys[j0:j1 + 1][:, None] - y) ** 2 <= r * r
+        kn = self.known[win] & inside
+        unk = inside & ~self.known[win] & ~self.water[win] & (self.noret[win] < NORET_HOLE) & ~self.blocked[win]
+        return int(kn.sum()), int(unk.sum())
+
+    def changes_in(self, x: float, y: float, r: float, since) -> int:
+        """Samples within r of (x, y) that change detection overwrote after `since` (protocol v8 re-survey)."""
+        if since is None:
+            return 0
+        i, j = self.ij(x, y)
+        k = int(math.ceil(r / self.res))
+        j0, j1 = max(0, j - k), min(self.ny - 1, j + k)
+        i0, i1 = max(0, i - k), min(self.nx - 1, i + k)
+        win = (slice(j0, j1 + 1), slice(i0, i1 + 1))
+        inside = (self.xs[i0:i1 + 1][None, :] - x) ** 2 + (self.ys[j0:j1 + 1][:, None] - y) ** 2 <= r * r
+        return int(((self.changed_t[win] >= since) & inside).sum())
 
     def traversable(self, limit_deg: float) -> np.ndarray:
         return self.known & (self.slope <= limit_deg) & ~self.blocked & ~self.soft & ~self.avoid & ~self.water

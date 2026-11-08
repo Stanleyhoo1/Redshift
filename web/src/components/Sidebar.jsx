@@ -7,6 +7,7 @@ import { EventLog } from './EventLog.jsx'
 import { CommsPanel } from './Comms.jsx'
 import { PlannerPill } from './Planner.jsx'
 import { SamplesPanel } from './Samples.jsx'
+import { ModeSwitch, PriorityChip } from './Autonomy.jsx'
 
 const WORD = 'Redshift'
 const INK = [232, 238, 245]
@@ -30,6 +31,13 @@ function Wordmark() {
       })}
     </h1>
   )
+}
+
+// v8: with autonomy modes the subtitle's place holds the Autonomous / Supervised switch
+// (in supervised mode "autonomous survey" would not be true).
+function Subtitle() {
+  const v8 = useSim((s) => typeof s.fleet.mode === 'string')
+  return v8 ? <ModeSwitch /> : <p className="subtitle">Autonomous super-Earth survey</p>
 }
 
 // With sample science (v4b) the stats grid shows the score, so sim time moves up here.
@@ -177,7 +185,8 @@ export function Sidebar({ follow, selected, onSelect, onFocusEvent }) {
           <Wordmark />
           <PlannerPill />
         </div>
-        <p className="subtitle">Autonomous super-Earth survey</p>
+        <Subtitle />
+        <PriorityChip />
         <WorldFacts />
       </header>
       <FleetStats />

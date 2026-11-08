@@ -4,7 +4,7 @@
 // The terrain arrays are mutated in place for speed. Everything else is replaced
 // immutably, so React selectors see a new object when (and only when) it changed.
 
-export const MAX_EVENTS = 200
+export const MAX_EVENTS = 1000 // v8: per-rover log filters need some depth; the list renders a capped window
 export const MAX_CHAT = 200
 export const TRAIL_POINTS = 200
 export const FAR_PAST = -1e6
@@ -39,6 +39,13 @@ export function emptyState() {
     tracks: [], // what the fleet believes it is tracking
     fallen: {}, // spire id -> { x0, y0, x1, y1, t, hazard }: every spire seen falling since the last init
     limit: { current: null, initial: null, prev: null, changedAt: null },
+    // v8 (null with older sims): fleet.priority, sanitized, same object while unchanged
+    priority: null,
+    // v9 (stay empty with older sims): rover health is on each rover (`health`)
+    v9: false, // the sim has sent health, spares, rescues or wrecks at least once
+    spares: null, // { drive: 2, lidar: 1, ... } or null
+    rescues: [], // [{ rover, helper, phase, plan, progress }]
+    wrecks: [], // [{ rover, x, y }]
     t: 0,
     terrain: null,
     eventSeq: 0,
@@ -240,20 +247,180 @@ function keyEvents(list, seq) {
   for (const e of Array.isArray(list) ? list : []) {
     if (!e || typeof e !== 'object') continue
     seq++
+    const damage = sanitizeDamage(e.damage)
     out.push({
       key: seq,
       t: num(e.t, 0),
-      rover: e.rover == null ? null : String(e.rover),
+      // v9: a damage event without a rover belongs to the rover it hit
+      rover: e.rover == null ? (damage?.rover ?? null) : String(e.rover),
       level: EVENT_LEVELS.has(e.level) ? e.level : 'info',
       msg: e.msg == null ? '' : String(e.msg),
       at: isXY(e.at) ? [e.at[0], e.at[1]] : null,
       source: EVENT_SOURCES.has(e.source) ? e.source : 'rules', // v3: missing means rules
+      decision: sanitizeDecision(e.decision), // v8: null when the event records no decision
+      damage, // v9: null when the event records no damage
     })
   }
   return { events: out, seq }
 }
 
 const EVENT_SOURCES = new Set(['rules', 'gemma', 'operator'])
+
+// ---------------------------------------------------------------- version 9
+
+export const PART_KEYS = ['drive_l', 'drive_r', 'lidar', 'camera', 'power', 'comms']
+const pct100 = (v) => (Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : null)
+
+// v9 event `damage`: { rover, part, before, after, cause, shock_g } (parts 0 to 100).
+export function sanitizeDamage(d) {
+  if (!isObj(d) || typeof d.part !== 'string' || !d.part) return null
+  return {
+    rover: d.rover == null ? null : String(d.rover),
+    part: d.part,
+    before: pct100(d.before),
+    after: pct100(d.after),
+    cause: typeof d.cause === 'string' && d.cause ? d.cause : null,
+    shock_g: num(d.shock_g, null),
+  }
+}
+
+const HEALTH_STATUS = new Set(['ok', 'damaged', 'immobile', 'wrecked'])
+
+// v9 rover `health`: { hp, status, parts: { drive_l, ... }, diagnosis, last_hit: { t, cause,
+// shock_g } }. Same object while unchanged.
+function sanitizeHealth(h, prev) {
+  if (!isObj(h)) return null
+  const parts = {}
+  if (isObj(h.parts)) for (const [k, v] of Object.entries(h.parts)) if (Number.isFinite(v)) parts[k] = Math.round(pct100(v))
+  const lh = isObj(h.last_hit) ? h.last_hit : null
+  const next = {
+    hp: pct100(h.hp) === null ? null : Math.round(pct100(h.hp)),
+    status: HEALTH_STATUS.has(h.status) ? h.status : null,
+    parts,
+    diagnosis: typeof h.diagnosis === 'string' && h.diagnosis.trim() ? h.diagnosis.trim() : null,
+    last_hit: lh ? { t: num(lh.t, null), cause: typeof lh.cause === 'string' && lh.cause ? lh.cause : null, shock_g: num(lh.shock_g, null) } : null,
+  }
+  return prev && JSON.stringify(prev) === JSON.stringify(next) ? prev : next
+}
+
+const RESCUE_PHASES = new Set(['en_route', 'diagnosing', 'repairing', 'towing', 'salvaging', 'done'])
+
+// v9 fleet `rescues`, `wrecks` and `spares`. Each keeps its identity while unchanged.
+function sanitizeRescues(list, prev) {
+  if (!Array.isArray(list)) return prev
+  const out = []
+  for (const r of list) {
+    if (!isObj(r) || r.rover == null) continue
+    const p = num(r.progress, null)
+    out.push({
+      rover: String(r.rover),
+      helper: r.helper == null || r.helper === '' ? null : String(r.helper),
+      phase: RESCUE_PHASES.has(r.phase) ? r.phase : 'en_route',
+      plan: typeof r.plan === 'string' && r.plan ? r.plan : null,
+      progress: p === null ? null : Math.max(0, Math.min(1, p > 1 ? p / 100 : p)), // not in the protocol; used when sent
+    })
+  }
+  return JSON.stringify(out) === JSON.stringify(prev) ? prev : out
+}
+
+function sanitizeWrecks(list, prev) {
+  if (!Array.isArray(list)) return prev
+  const out = list.filter((w) => isObj(w) && Number.isFinite(w.x) && Number.isFinite(w.y)).map((w) => ({ rover: w.rover == null ? null : String(w.rover), x: w.x, y: w.y }))
+  return JSON.stringify(out) === JSON.stringify(prev) ? prev : out
+}
+
+function sanitizeSpares(sp, prev) {
+  if (!isObj(sp)) return prev
+  const out = {}
+  for (const [k, v] of Object.entries(sp)) if (Number.isFinite(v)) out[k] = Math.max(0, Math.round(v))
+  return prev && JSON.stringify(prev) === JSON.stringify(out) ? prev : out
+}
+
+// v9 fleet fields, shared by init and tick. A tick's fleet without `rescues` or `wrecks`
+// means none (spares stay as last sent).
+function applyV9Fleet(s, prev, fleet, isTick) {
+  if (!isObj(fleet)) return
+  if ('spares' in fleet || 'rescues' in fleet || 'wrecks' in fleet) s.v9 = true
+  s.spares = sanitizeSpares(fleet.spares, prev.spares)
+  s.rescues = sanitizeRescues(fleet.rescues ?? (isTick && s.v9 ? [] : undefined), prev.rescues)
+  s.wrecks = sanitizeWrecks(fleet.wrecks ?? (isTick && s.v9 ? [] : undefined), prev.wrecks)
+}
+
+// v8 event `decision`: { question, options: [string], choice, by, confidence, why }. Options
+// may be ids ("proceed_slowly") or labels; objects with an id or label are accepted too.
+export function sanitizeDecision(d) {
+  if (!isObj(d)) return null
+  const word = (v) => (v == null ? null : isObj(v) ? String(v.label ?? v.id ?? '') || null : String(v) || null)
+  const options = (Array.isArray(d.options) ? d.options : []).map(word).filter(Boolean).slice(0, 12)
+  const choice = word(d.choice)
+  if (!choice && !options.length) return null
+  const conf = num(d.confidence, null)
+  return {
+    question: typeof d.question === 'string' && d.question.trim() ? d.question.trim() : null,
+    options,
+    choice,
+    by: typeof d.by === 'string' && d.by ? d.by.toLowerCase() : null,
+    confidence: conf === null ? null : Math.max(0, Math.min(1, conf > 1 ? conf / 100 : conf)),
+    why: typeof d.why === 'string' && d.why.trim() ? d.why.trim() : null,
+  }
+}
+
+// v8 fleet `priority`: { kind, label, count, since } while set, else null. Positions are not
+// in the protocol; if a sim sends them (`places`, `gaps` or `areas`: [x, y, r] or {x, y, r,
+// label}) the map draws them. Same object while unchanged.
+export function sanitizePriority(p, prev) {
+  if (!isObj(p)) return null
+  const raw = [p.places, p.gaps, p.areas].find(Array.isArray) || []
+  const places = []
+  for (const q of raw) {
+    const x = Array.isArray(q) ? q[0] : q?.x
+    const y = Array.isArray(q) ? q[1] : q?.y
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+    const r = Array.isArray(q) ? q[2] : (q.r ?? q.radius)
+    places.push({ x, y, r: Number.isFinite(r) && r > 0.2 ? r : 3, label: !Array.isArray(q) && typeof q.label === 'string' ? q.label : null })
+    if (places.length >= 24) break
+  }
+  const next = {
+    kind: typeof p.kind === 'string' && p.kind ? p.kind : null,
+    label: typeof p.label === 'string' && p.label.trim() ? p.label.trim() : null,
+    count: Number.isFinite(p.count) ? Math.max(0, Math.round(p.count)) : null,
+    since: num(p.since, null),
+    places,
+  }
+  return prev && JSON.stringify(prev) === JSON.stringify(next) ? prev : next
+}
+
+// v8 detections (rover `vision.objects`, camera header X-Detections): label, conf 0..1,
+// box [x0, y0, x1, y1] normalised (top left origin), dist m, bearing deg (left positive).
+export function sanitizeDetections(list) {
+  if (!Array.isArray(list)) return null
+  const out = []
+  for (const o of list) {
+    if (!isObj(o) || !Array.isArray(o.box) || o.box.length < 4) continue
+    let [x0, y0, x1, y1] = o.box
+    if (![x0, y0, x1, y1].every(Number.isFinite)) continue
+    if (x1 < x0) [x0, x1] = [x1, x0]
+    if (y1 < y0) [y0, y1] = [y1, y0]
+    const c = num(o.conf, null)
+    out.push({
+      label: typeof o.label === 'string' && o.label ? o.label.toLowerCase() : 'object',
+      conf: c === null ? null : Math.max(0, Math.min(1, c > 1 ? c / 100 : c)),
+      box: [Math.max(0, Math.min(1, x0)), Math.max(0, Math.min(1, y0)), Math.max(0, Math.min(1, x1)), Math.max(0, Math.min(1, y1))],
+      dist: num(o.dist, null),
+      bearing: num(o.bearing, null),
+    })
+    if (out.length >= 48) break
+  }
+  return out
+}
+
+function sanitizeVision(v, prev) {
+  if (!isObj(v)) return null
+  const objects = sanitizeDetections(v.objects) || []
+  const next = { frame: num(v.frame, null), t: num(v.t, null), view: typeof v.view === 'string' ? v.view : null, ms: num(v.ms, null), objects }
+  if (prev && prev.frame === next.frame && prev.t === next.t && next.frame !== null) return prev
+  return next
+}
 const CHAT_KINDS = new Set(['command', 'ack', 'refuse', 'question', 'answer', 'info', 'reply'])
 
 // v3 chat messages, keyed like events. Unknown kinds read as info.
@@ -322,6 +489,13 @@ export function sanitizeRequests(list, prev, now, simT, speed) {
       .map((o) => {
         if (typeof o === 'string') return { id: o, label: o }
         const out = { id: String(o.id), label: o.label == null ? String(o.id) : String(o.label) }
+        if (o.suggested === true) out.suggested = true // v8: Gemma's pick in supervised mode
+        // v9 rescue options: the rules' verdict (`safe`) and why (`note`; also read from
+        // `why`, `reason` or `safety`). An option with `unsafe: true` counts as not safe.
+        if (typeof o.safe === 'boolean') out.safe = o.safe
+        else if (o.unsafe === true) out.safe = false
+        const note = [o.note, o.why, o.reason, o.safety, o.detail].find((v) => typeof v === 'string' && v.trim())
+        if (note) out.note = note.trim()
         if (Number.isFinite(o.x) && Number.isFinite(o.y)) {
           out.x = o.x
           out.y = o.y
@@ -339,6 +513,8 @@ export function sanitizeRequests(list, prev, now, simT, speed) {
       rover: q.rover == null ? null : String(q.rover),
       // v6: "anomaly" | "lifeform" | "choose_place" (null from older sims)
       kind: typeof q.kind === 'string' && q.kind ? q.kind : null,
+      // v9 rescue: the rover the question is about (not in the protocol; read when sent)
+      about: [q.about, q.target, q.subject].find((v) => typeof v === 'string' && v) ?? null,
       t,
       question: q.question == null ? '' : String(q.question),
       options,
@@ -401,6 +577,9 @@ export function sanitizeHazards(list) {
       y0: num(h.y0, null),
       x1: num(h.x1, null),
       y1: num(h.y1, null),
+      // v9 damage (demo control)
+      severity: typeof h.severity === 'string' ? h.severity : null,
+      part: typeof h.part === 'string' ? h.part : null,
     })
   }
   return out
@@ -430,6 +609,29 @@ function sanitizeRover(r, prev) {
     sampling: isObj(r.sampling) && r.sampling.target != null ? { target: String(r.sampling.target), instrument: r.sampling.instrument == null ? null : String(r.sampling.instrument), progress: Math.max(0, Math.min(1, num(r.sampling.progress, 0))) } : null,
     // v5 running totals (null when the sim does not send them)
     stats: sanitizeStats(r.stats, prev?.stats),
+    // v7: the area the rover concentrates on (present only while it does), else null
+    focus: sanitizeFocus(r.focus),
+    // v8: the onboard detector's latest result, else null
+    vision: sanitizeVision(r.vision, prev?.vision),
+    // v9: parts, overall hp, status, the rover's own diagnosis and its last hit, else null
+    health: sanitizeHealth(r.health, prev?.health),
+  }
+}
+
+// v7 rover focus: { x, y, r, reason: 'operator' | 'interest', label, ends_in } or null.
+// `ends_in` is sim seconds left as of the tick (null when the sim gives none).
+function sanitizeFocus(f) {
+  if (!isObj(f) || !Number.isFinite(f.x) || !Number.isFinite(f.y)) return null
+  const r = num(f.r, 0)
+  return {
+    x: f.x,
+    y: f.y,
+    r: r > 0.5 ? r : 10,
+    reason: f.reason === 'interest' ? 'interest' : 'operator',
+    label: typeof f.label === 'string' && f.label.trim() ? f.label.trim() : null,
+    ends_in: Number.isFinite(f.ends_in) ? Math.max(0, f.ends_in) : null,
+    // v8: "explore" (unknown ground first) or "resurvey" (a loop through mapped ground)
+    mode: f.mode === 'resurvey' ? 'resurvey' : f.mode === 'explore' ? 'explore' : null,
   }
 }
 
@@ -544,6 +746,9 @@ export function applyInit(prev, msg, now) {
   s.initSeq = keyed.seq
   s.fleet = msg.fleet && typeof msg.fleet === 'object' ? { ...msg.fleet } : {}
   s.limit = limitFromFleet(s.fleet, s.limit, now, false)
+  s.priority = sanitizePriority(s.fleet.priority, null)
+  applyV9Fleet(s, s, s.fleet, false)
+  if (Object.values(s.rovers).some((r) => r.health)) s.v9 = true
   s.hazards = sanitizeHazards(msg.hazards)
   s.t = num(msg.t, s.events[0]?.t ?? 0)
   s.chatSeq = prev?.chatSeq ?? 0 // keys keep growing across inits
@@ -604,6 +809,7 @@ export function applyTick(prev, msg, now) {
     s.rovers = rovers
     s.roverMeta = meta
     s.trails = trails
+    if (!s.v9 && msg.rovers.some((r) => isObj(r?.health))) s.v9 = true
   }
 
   if (Array.isArray(msg.frontiers)) s.frontiers = msg.frontiers.filter(isXY)
@@ -621,6 +827,10 @@ export function applyTick(prev, msg, now) {
 
   if (msg.fleet && typeof msg.fleet === 'object') {
     s.fleet = { ...prev.fleet, ...msg.fleet }
+    // v8: `priority` is present only while set, so a tick without it clears it.
+    if (!('priority' in msg.fleet)) delete s.fleet.priority
+    s.priority = sanitizePriority(s.fleet.priority, prev.priority)
+    applyV9Fleet(s, prev, msg.fleet, true)
     s.limit = limitFromFleet(s.fleet, prev.limit, now, true)
     // v4: the identified water is resent every tick; keep the old array while it is the
     // same, so the water mask is only redrawn when the fleet identifies more.

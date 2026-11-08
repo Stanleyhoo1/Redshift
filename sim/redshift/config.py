@@ -50,7 +50,7 @@ class Config:
     water: bool = True             # lakes (and maybe a river), see terrain.py
     spires: bool = True            # alien crystal spires
     lifeforms: bool = True         # herds of grazers (lifeforms.py)
-    reserve_spires: int = 4        # hidden spare spire bodies for "drop a new spire here"
+    reserve_spires: int = 20       # hidden spare spire bodies for "drop a new spire here"
 
     # ---- physics ----
     timestep: float = 0.005
@@ -117,6 +117,18 @@ class Config:
     observe_v: float = 0.35            # top speed while observing (m/s)
     observe_leash: float = 25.0        # never further than this from where the observation started (m)
 
+    # ---- protocol v7: exploring an area (focus) and curiosity ----
+    focus_s: float = 120.0             # operator "explore around X": stay this long once there (sim s)
+    focus_r: float = 15.0              # ... exploring the unknown ground within this radius (m)
+    focus_margin: float = 4.0          # unknown ground this far outside the circle still counts as nearby (m)
+    focus_offset: float = 20.0         # "explore north of the lander": the circle's centre this far that way (m)
+    focus_travel_s: float = 180.0      # an area focus not reached in this long is given up (sim s)
+    curiosity: bool = True             # rovers stick around something new they found (interest focus)
+    field_patch: bool = True           # v9: a helper patches a stranded rover's drive enough to limp home
+    interest_s: float = 60.0           # ... for about this long (sim s)
+    interest_r: float = 10.0           # ... within this radius (m)
+    interest_cooldown_s: float = 150.0  # per rover, after an interest focus ends (sim s)
+
     # ---- edge compute budget (per rover per decision cycle, wall clock) ----
     brain_budget_ms: float = 40.0
     plan_share: float = 0.75        # share of the budget the planner may use in one cycle
@@ -125,7 +137,7 @@ class Config:
     exp_cost_us: float = 3.0        # measured cost of one A* expansion on the dev machine
 
     # ---- hazards (see hazards.py) ----
-    num_boulders: int = 24          # hidden boulder bodies allocated in the model for rockfalls (3 to 5 per rockfall)
+    num_boulders: int = 100         # hidden boulder bodies allocated in the model for rockfalls (3 to 5 per rockfall)
     sand_radius: float = 2.5
     sand_friction: float = 0.3      # wheel friction inside a sand patch (normal: wheel_friction)
     sand_wheel_damping: float = 0.3  # extra wheel joint damping inside a patch (rolling resistance)
@@ -157,6 +169,7 @@ class Config:
     operator_ask_first: bool = True      # always check the first anomaly after start or reset with the operator
     question_cooldown_s: float = 60.0    # per rover, sim seconds between two questions
     max_open_questions: int = 2          # fleet wide
+    autonomy_mode: str = "autonomous"    # protocol v8: "autonomous" (Gemma decides) or "supervised" (ask the operator)
 
     @property
     def nx(self) -> int:
@@ -202,5 +215,7 @@ class Config:
             operator_timeout_s=max(0.0, _env_float("OPERATOR_TIMEOUT_S", 0.0)),
             operator_ask_below=min(1.01, max(0.0, _env_float("OPERATOR_ASK_BELOW", 0.75))),
             operator_ask_first=_env_bool("OPERATOR_ASK_FIRST", True),
+            autonomy_mode="supervised" if os.environ.get("AUTONOMY_MODE", "").strip().lower() == "supervised"
+            else "autonomous",
         )
         return replace(base, **overrides) if overrides else base

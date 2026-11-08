@@ -152,7 +152,7 @@ def test_provisional_goal_then_gemma_switch():
     sw = gemma_events(sim, "switching to")
     assert sw, "Gemma never changed a goal"
     for e in sw:
-        assert re.match(rf"{e['rover']} switching to (frontier|sample) .+ \(Gemma, \d+\.\d s\): '.*\d+.*'$", e["msg"]), e
+        assert re.match(rf"{e['rover']} switching to (frontier|sample) .+ \(Gemma, \d+\.\d s\): .*\d+.*$", e["msg"]), e
         assert "at" in e
     # one event per switch, never more than the questions asked
     assert len(sw) <= len(seen)
@@ -231,7 +231,7 @@ def test_unsafe_gemma_action_never_beats_a_safety_reaction():
 # ====================================================================== 3. questions
 def test_first_anomaly_asks_the_operator_and_the_answer_is_applied():
     p = fake_planner()
-    sim = make_sim(p, operator_timeout_s=20.0)      # the countdown (the default since v6 is no expiry)
+    sim = make_sim(p, operator_timeout_s=20.0, autonomy_mode="supervised")   # countdown (the default is no expiry)
     try:
         sim.run_for(40.0)
         h = trigger(sim, "rockfall")
@@ -273,7 +273,7 @@ def test_first_anomaly_asks_the_operator_and_the_answer_is_applied():
 
 def test_question_expires_to_the_safe_default():
     p = fake_planner()
-    sim = make_sim(p, operator_timeout_s=20.0)      # OPERATOR_TIMEOUT_S above 0: the old countdown
+    sim = make_sim(p, operator_timeout_s=20.0, autonomy_mode="supervised")   # OPERATOR_TIMEOUT_S above 0: countdown
     now = [1000.0]
     sim.advisor.clock = lambda: now[0]
     try:
@@ -301,7 +301,7 @@ def test_rules_ask_on_their_own_when_gemma_is_offline():
     p = GemmaPlanner(GemmaConfig(url="http://127.0.0.1:9", fallback_urls=(), check_every_s=3600.0,
                                  check_timeout_s=0.3), start=False)
     p.check_now()
-    sim = make_sim(p)
+    sim = make_sim(p, autonomy_mode="supervised")    # v8: the default (autonomous) never asks
     try:
         sim.run_for(12.0)
         r = next(r for r in sim.rovers if r.state == "exploring")
@@ -461,7 +461,7 @@ def test_gemma_offline_never_blocks_and_rules_carry_on():
 
 def test_protocol_v3_fields():
     p = fake_planner()
-    sim = make_sim(p)
+    sim = make_sim(p, autonomy_mode="supervised")
     msgs = [sim.init_message()]
     try:
         for k in range(int(70 / 0.6)):
@@ -550,7 +550,8 @@ def test_chat_and_answer_endpoints():
 
     p = fake_planner()
     old = server.state.runner
-    server.state.runner = server.SimRunner(Config(seed=42, plan_clock="model", **LEGACY), planner=p)   # not started
+    server.state.runner = server.SimRunner(Config(seed=42, plan_clock="model", autonomy_mode="supervised", **LEGACY),
+                                           planner=p)   # not started
     try:
         sim = server.state.runner.sim
         sim.advisor.frame_source = None

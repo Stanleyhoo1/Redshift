@@ -121,6 +121,11 @@ class SimRunner:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="redshift-sim", daemon=True)
         self._thread.start()
+        try:                            # protocol v8: the rovers' onboard detectors (camera thread)
+            from . import camera
+            camera.start_vision(self)
+        except Exception as e:          # noqa: BLE001 (no camera here: the rovers run without detections)
+            _log(f"onboard object detection unavailable: {e}")
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -351,6 +356,12 @@ try:   # onboard camera renders (camera.py); the server runs without them if the
     app.include_router(camera_router)
 except Exception as _e:  # noqa: BLE001
     _log(f"camera endpoint unavailable: {_e}")
+try:   # protocol v8: GET /api/vision/stats (detector precision and recall against the sim's truth)
+    from .vision import router as vision_router
+    if vision_router is not None:
+        app.include_router(vision_router)
+except Exception as _e:  # noqa: BLE001
+    _log(f"vision stats endpoint unavailable: {_e}")
 
 
 @app.get("/")
@@ -422,9 +433,20 @@ async def hazard(request: Request):
                 or not (math.isfinite(x) and math.isfinite(y)):
             return JSONResponse({"ok": False, "error": "x and y must be numbers (world metres)"}, status_code=400)
 
+    severity, part, charge = data.get("severity"), data.get("part"), data.get("charge", False)
+    if kind == "damage":                       # protocol v9 demo control
+        if severity is not None and not isinstance(severity, str):
+            return JSONResponse({"ok": False, "error": "severity must be one of light, heavy, disable, wreck"},
+                                status_code=400)
+        if part is not None and not isinstance(part, str):
+            return JSONResponse({"ok": False, "error": "part must be one of drive_l, drive_r, lidar, camera, power, "
+                                                       "comms"}, status_code=400)
+    if not isinstance(charge, bool):
+        return JSONResponse({"ok": False, "error": "charge must be true or false"}, status_code=400)
+
     def trigger():
         with runner.locked() as sim:
-            return sim.hazards.trigger(kind, rover, x, y)
+            return sim.hazards.trigger(kind, rover, x, y, severity=severity, part=part, charge=charge)
 
     try:
         h = await asyncio.to_thread(trigger)
@@ -432,7 +454,11 @@ async def hazard(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     _log(f"hazard {h['id']}: {h['type']}" + (f" on {h['rover']}" if h.get("rover") else "")
          + (f" at ({x:g}, {y:g})" if x is not None else ""))
-    return {"ok": True, "hazard": h}
+    health = h.pop("health", None)
+    out = {"ok": True, "hazard": h}
+    if health is not None:
+        out["health"] = health                 # protocol v9: the damaged rover's health right after the hit
+    return out
 
 
 async def _json_body(request: Request):
@@ -493,8 +519,30 @@ async def answer(request: Request):
     if status == "closed":
         return JSONResponse({"ok": False, "error": f"request {data['id']} already expired or was answered"},
                             status_code=409)
+    if status == "unsafe":
+        return JSONResponse({"ok": False, "error": f"option {data['option']!r} is marked unsafe by the rules "
+                                                   f"(see its note); pick a safe one"}, status_code=400)
     return JSONResponse({"ok": False, "error": f"option {data['option']!r} is not one of this request's options"},
                         status_code=400)
+
+
+@app.post("/api/mode")
+async def mode(request: Request):
+    """Protocol v8: {"mode": "autonomous" | "supervised"}: who decides when a rover would ask."""
+    runner = state.runner
+    if runner is None:
+        return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    data = await _json_body(request)
+    if data is None or data.get("mode") not in ("autonomous", "supervised"):
+        return JSONResponse({"ok": False, "error": 'Body must be JSON like {"mode": "supervised"} (autonomous or '
+                                                   'supervised)'}, status_code=400)
+
+    def switch():
+        with runner.locked() as sim:
+            sim.advisor.set_mode(data["mode"])
+            return sim.fleet.mode
+
+    return {"ok": True, "mode": await asyncio.to_thread(switch)}
 
 
 @app.websocket("/ws")

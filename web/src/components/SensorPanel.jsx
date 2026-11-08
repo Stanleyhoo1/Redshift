@@ -1,14 +1,18 @@
-import { useEffect, useRef, useState } from 'react'
-import { appStore, simStore, useApp, useSim } from '../state/store.js'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { appStore, setShowBoxes, simStore, useApp, useSim } from '../state/store.js'
 import { sampleGround } from '../state/simState.js'
-import { fixed } from '../lib/format.js'
-import { HAZARD, SIGNAL, instrumentStyle, kindStyle } from '../lib/theme.js'
+import { fixed, mmss } from '../lib/format.js'
+import { HAZARD, PARTS, SIGNAL, causeText, healthColor, instrumentStyle, kindStyle, partLevel } from '../lib/theme.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { Battery, StatePill, brainLevel, fmtMs } from './RoverBits.jsx'
 import { InstrumentIcon, Tubes } from './SampleBits.jsx'
+import { focusStatus, focusTitle } from '../lib/focus.js'
 import { PlannerRow } from './Planner.jsx'
 import { reducedMotion } from '../scene/sceneConstants.js'
-import { RETRY_DOWN, cameraProblem, useCameraStream } from './useCameraStream.js'
+import { RETRY_DOWN, cameraProblem, closeImage, fmtRate, useCamRate, useCameraStream } from './useCameraStream.js'
+import { detColor, detPhrase, drawDetections } from '../lib/detections.js'
+import { HealthBar, PartIcon, statusWord } from './HealthBits.jsx'
+import { V9_STATES, rescueLine } from '../lib/rescue.js'
 import '../styles/interaction.css'
 
 export { cameraProblem }
@@ -17,7 +21,7 @@ export const CAM_RETRY_DOWN = RETRY_DOWN
 const num = (v) => typeof v === 'number' && Number.isFinite(v)
 const CAM_W = 320
 const CAM_H = 240
-const CAM_PERIOD = 250 // ms between frame starts: about 4 per second
+const CAM_GAP = 50 // ms between frame starts at the most: up to 20 a second
 
 // Small square button with corner arrows: opens a large view of a panel section.
 export function ExpandButton({ onClick, label, className = '' }) {
@@ -35,22 +39,109 @@ export const openSensorDetail = (rover, focus) => appStore.patch({ modal: { kind
 
 // ---------------------------------------------------------------- camera
 
-// Polls the camera while the panel is open (this rover only), about 4 frames a second.
-// Paused while a large viewer covers the panel, so only the visible view is fetched.
-// Clicking the picture (or the expand icon) opens the large camera viewer.
+// Streams the camera while the panel is open (this rover only), as fast as the sim serves
+// new frames (up to 20 a second). Paused while a large viewer covers the panel, so only the
+// visible view is fetched. Frames are drawn on a canvas (swapped whole, no flicker) with the
+// detector's boxes for exactly that frame (version 8 X-Detections) on top. Clicking the
+// picture (or the expand icon) opens the large camera viewer.
+export function BoxesButton({ className = '', hasDets = true }) {
+  const on = useApp((a) => a.boxes)
+  return (
+    <button
+      type="button"
+      className={`ix-boxes ${className}`}
+      aria-pressed={on}
+      data-none={!hasDets || undefined}
+      onClick={(e) => {
+        e.stopPropagation()
+        setShowBoxes(!on)
+      }}
+      title={hasDets ? (on ? 'Hide the detection boxes (what the rover thinks it sees)' : 'Show the detection boxes (what the rover thinks it sees)') : 'No detections from the sim for this picture'}
+      aria-label={on ? 'Hide detection boxes' : 'Show detection boxes'}
+    >
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M2.5 5.5v-3h3M10.5 2.5h3v3M13.5 10.5v3h-3M5.5 13.5h-3v-3" />
+        <rect x="5.6" y="5.6" width="4.8" height="4.8" rx="0.8" />
+      </svg>
+    </button>
+  )
+}
+
+function CamRate({ stats, active }) {
+  const r = useCamRate(stats, active)
+  const text = fmtRate(r)
+  if (!text) return null
+  return (
+    <span className="sp-cam-rate" title="Frames a second, and how old the newest frame is">
+      {text}
+    </span>
+  )
+}
+
 function CameraFeed({ roverId }) {
   const [view, setView] = useState('fpv')
   const covered = useApp((a) => !!a.modal)
-  const { frame, problem, waiting, retry } = useCameraStream({ roverId, view, w: CAM_W, h: CAM_H, period: CAM_PERIOD, enabled: !covered })
-  const live = frame && !problem
+  const boxes = useApp((a) => a.boxes)
+  const canvas = useRef(null)
+  const last = useRef(null) // the frame on screen; owns its decoded image
+  const boxesRef = useRef(boxes)
+  boxesRef.current = boxes
+  const [hasDets, setHasDets] = useState(true)
+
+  // Fills the canvas (object-fit: cover) at the screen's pixel density, boxes on top.
+  const draw = useCallback(() => {
+    const cv = canvas.current
+    const f = last.current
+    if (!cv || !f) return
+    const px = Math.min(2, window.devicePixelRatio || 1)
+    const W = Math.max(1, Math.round(cv.clientWidth * px))
+    const H = Math.max(1, Math.round(cv.clientHeight * px))
+    if (cv.width !== W) cv.width = W
+    if (cv.height !== H) cv.height = H
+    const ctx = cv.getContext('2d')
+    const k = Math.max(W / f.w, H / f.h)
+    const dw = f.w * k
+    const dh = f.h * k
+    const ox = (W - dw) / 2
+    const oy = (H - dh) / 2
+    ctx.drawImage(f.image, ox, oy, dw, dh)
+    if (boxesRef.current) drawDetections(ctx, f.dets, ox, oy, dw, dh, px, false, W, H)
+  }, [])
+  const onFrame = useCallback(
+    (f) => {
+      const old = last.current
+      last.current = f
+      draw()
+      if (old) closeImage(old.image)
+      const has = f.dets !== null
+      setHasDets((v) => (v === has ? v : has))
+    },
+    [draw],
+  )
+  useEffect(() => draw(), [boxes, draw])
+  useEffect(() => {
+    const cv = canvas.current
+    if (!cv) return
+    const ro = new ResizeObserver(() => draw())
+    ro.observe(cv)
+    return () => ro.disconnect()
+  }, [draw])
+  useEffect(
+    () => () => {
+      if (last.current) closeImage(last.current.image)
+      last.current = null
+    },
+    [],
+  )
+
+  const { hasFrame, problem, waiting, retry, stats } = useCameraStream({ roverId, view, w: CAM_W, h: CAM_H, minGap: CAM_GAP, enabled: !covered, onFrame })
+  const live = hasFrame && !problem
   const open = () => openCameraViewer(roverId, view)
   return (
     <figure className="sp-cam" data-state={live ? 'live' : problem ? 'off' : 'wait'}>
-      {frame && (
-        <button type="button" className="ix-cam-hit" onClick={open} title="Open the large camera view" aria-label="Open the large camera view">
-          <img src={frame} alt={`${view === 'fpv' ? 'Onboard' : 'Chase'} camera view`} width={CAM_W} height={CAM_H} />
-        </button>
-      )}
+      <button type="button" className="ix-cam-hit" onClick={open} title="Open the large camera view" aria-label="Open the large camera view" tabIndex={hasFrame ? 0 : -1} style={hasFrame ? undefined : { visibility: 'hidden' }}>
+        <canvas ref={canvas} className="sp-cam-canvas" role="img" aria-label={`${view === 'fpv' ? 'Onboard' : 'Chase'} camera view`} />
+      </button>
       {!live && (
         <div className="sp-cam-off">
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -67,12 +158,14 @@ function CameraFeed({ roverId }) {
           )}
         </div>
       )}
+      {live && !covered && <CamRate stats={stats} active={live && !covered} />}
       <figcaption className="sp-cam-bar">
         <span className="sp-cam-live" data-live={(live && !covered) || undefined}>
           <i aria-hidden="true" />
           {live ? (covered ? 'Paused' : 'Live') : 'Camera'}
         </span>
         <span className="ix-cam-tools">
+          {hasFrame && <BoxesButton className="ix-boxes-sm" hasDets={hasDets} />}
           <span className="seg seg-xs" role="group" aria-label="Camera view">
             <button type="button" aria-pressed={view === 'fpv'} onClick={() => setView('fpv')} title="Onboard camera on the mast">
               FPV
@@ -85,6 +178,92 @@ function CameraFeed({ roverId }) {
         </span>
       </figcaption>
     </figure>
+  )
+}
+
+// v8: the detector's latest result for this rover, one compact line: "Sees: creature 0.83 at
+// 6 m, rock 0.64 at 4 m". Hidden with an older sim (no `vision`).
+function SeesLine({ vision }) {
+  if (!vision) return null
+  const objs = vision.objects.slice().sort((a, b) => (b.conf ?? 0) - (a.conf ?? 0))
+  const shown = objs.slice(0, 4)
+  const more = objs.length - shown.length
+  return (
+    <div className="sp-sees" title={objs.length ? objs.map(detPhrase).join(', ') : undefined}>
+      <span className="sp-k">Sees</span>
+      <span className="sp-sees-list">
+        {shown.length ? (
+          shown.map((o, i) => (
+            <span key={i} className="sp-sees-item" style={{ '--c': detColor(o.label) }}>
+              <i aria-hidden="true" />
+              {detPhrase(o)}
+              {i < shown.length - 1 || more > 0 ? ',' : ''}
+            </span>
+          ))
+        ) : (
+          <span className="sp-dim">nothing detected</span>
+        )}
+        {more > 0 && <span className="sp-dim"> +{more} more</span>}
+      </span>
+      {Number.isFinite(vision.ms) && <span className="sp-sees-ms">detector {fmtMs(vision.ms)} ms</span>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------- v9: health
+
+// Parts with their percentage, the rover's own diagnosis and the last hit (cause, shock,
+// when). Hidden with an older sim (no `health`).
+function HealthSection({ rover }) {
+  const h = rover.health
+  const t = useSim((s) => s.t)
+  const rescues = useSim((s) => s.rescues)
+  const meta = useSim((s) => s.roverMeta)
+  const rovers = useSim((s) => s.rovers)
+  const asking = useSim((s) => s.requests.some((q) => q.kind === 'rescue' && (q.rover === rover.id || q.about === rover.id)))
+  if (!h) return null
+  const color = healthColor(h.status, h.hp)
+  const lh = h.last_hit
+  const ago = lh && Number.isFinite(lh.t) ? Math.max(0, t - lh.t) : null
+  const agoText = ago === null ? '' : ago < 90 ? `${Math.round(ago)} s ago` : `${Math.round(ago / 60)} min ago`
+  const name = (id) => meta.find((m) => m.id === id)?.name || id
+  const dist = (id) => (rovers[id] ? Math.hypot(rovers[id].x - rover.x, rovers[id].y - rover.y) : null)
+  const line = V9_STATES.has(rover.state) ? rescueLine(rover, rescues, name, dist, asking) : null
+  return (
+    <div className="sp-health" data-status={h.status || undefined} style={{ '--hc': color }}>
+      <div className="sp-health-top">
+        <span className="sp-k">Health</span>
+        <HealthBar health={h} className="hb-sp" />
+        <span className="sp-health-hp">
+          <b>{Number.isFinite(h.hp) ? `${h.hp}%` : '--'}</b> {statusWord(h.status)}
+        </span>
+        <ul className="sp-parts" aria-label="Parts">
+          {PARTS.map((p) => {
+            const v = h.parts[p.key]
+            return (
+              <li key={p.key} data-level={partLevel(v)} title={`${p.label}: ${Number.isFinite(v) ? `${v}%` : 'no reading'}`}>
+                <PartIcon part={p.key} />
+                <span className="sp-part-name">{p.short}</span>
+                <b>{Number.isFinite(v) ? v : '--'}</b>
+              </li>
+            )
+          })}
+        </ul>
+      </div>
+      <div className="sp-health-diag">
+        <span className="sp-health-quote" title={h.diagnosis || undefined}>
+          {line && <b className="sp-health-line">{line}. </b>}
+          {h.diagnosis || <span className="sp-dim">No diagnosis from the rover</span>}
+        </span>
+        {lh && (
+          <span className="sp-health-hit" title={Number.isFinite(lh.t) ? `At ${mmss(lh.t)} sim time` : undefined}>
+            Last hit: {causeText(lh.cause)}
+            {Number.isFinite(lh.shock_g) && lh.shock_g > 0 ? `, ${fixed(lh.shock_g, 1)} g` : ''}
+            {agoText ? `, ${agoText}` : ''}
+          </span>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -584,14 +763,21 @@ export function SensorPanel({ roverId, onClose }) {
   const radarSize = useRadarSize()
   if (!meta) return null
   return (
-    <section className="hud hud-sensors" ref={ref} style={{ '--rover': meta.color }} aria-label={`${meta.name} live sensors`} data-fault={rover?.state === 'fault' || undefined}>
+    <section className="hud hud-sensors" ref={ref} style={{ '--rover': meta.color }} aria-label={`${meta.name} live sensors`} data-fault={rover?.state === 'fault' || rover?.state === 'disabled' || undefined} data-wreck={rover?.state === 'wrecked' || undefined}>
       <header className="sp-head">
         <span className="rover-dot" aria-hidden="true" />
         <h2 className="sp-name">{meta.name}</h2>
         <StatePill rover={rover} hazards={hazards} />
         <Battery value={rover?.battery} charging={rover?.state === 'charging'} />
         {rover?.capacity && <Tubes samples={rover.samples} capacity={rover.capacity} targets={targets} />}
-        <span className="sp-title">Live sensors</span>
+        {rover?.focus && !V9_STATES.has(rover.state) ? (
+          <span className="sp-title sp-focus" data-reason={rover.focus.reason} title={focusTitle(rover.focus)}>
+            <i aria-hidden="true" />
+            <span>{focusStatus(rover.focus)}</span>
+          </span>
+        ) : (
+          <span className="sp-title">Live sensors</span>
+        )}
         <button type="button" className="sp-close" onClick={onClose} title="Close (Esc)" aria-label="Close the sensor panel">
           <svg viewBox="0 0 12 12" aria-hidden="true">
             <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
@@ -605,6 +791,8 @@ export function SensorPanel({ roverId, onClose }) {
             <RadarBlock key={`radar:${roverId}`} rover={rover} size={radarSize} />
             <Readouts rover={rover} limit={limit} />
           </div>
+          <SeesLine vision={rover.vision} />
+          <HealthSection rover={rover} />
           <div className="sp-brains ix-brains">
             <BrainRow brain={rover.brain} budget={budget} cycle={cycle} />
             {planner && <PlannerRow planner={planner} />}

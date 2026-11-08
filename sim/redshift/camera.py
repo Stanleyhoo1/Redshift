@@ -7,9 +7,22 @@ Two views, both MuJoCo free cameras computed from the rover pose, so the model n
 
 Threading: an OpenGL context belongs to the thread that made it, and FastAPI runs handlers on many
 threads, so ONE render thread owns the GL context and the MuJoCo render context (rebuilt when a
-reset brings a new model). Requests reach it through a queue and get a Future back; the async
-handler awaits it. The sim lock is held only while mjv_updateScene copies the state into the
-scene; rendering, reading pixels and JPEG encoding happen outside the lock.
+reset brings a new model). The sim lock is held only to copy qpos and the mocap poses into a private
+MjData (microseconds); kinematics, the scene update, rendering, reading pixels, haze, object
+detection and JPEG encoding all happen outside the lock.
+
+Speed (protocol v8, "Faster camera"), all without changing a pixel:
+  culling  MuJoCo draws every geom in the scene, three times with shadows (shadow map, base pass,
+           sun pass), and the 120 m map has 576 terrain tiles plus 240 bodies parked below it. The
+           renderer keeps a private copy of the model whose geom groups it rewrites per frame: only
+           geoms inside the camera frustum or inside the sun's shadow prism (casters that can shade
+           what the camera sees) are drawn. Checked pixel for pixel against the full scene.
+  streams  GET /api/camera answers at once with the newest frame of that view and size; the render
+           thread keeps rendering every view asked for in the last STREAM_IDLE_S seconds, timed so a
+           fresh frame is ready just before the client's next request (one render per request, at
+           most STREAM_MAX_FPS), and drops the rest.
+  vision   the same thread runs the onboard object detector (vision.py) on every streamed fpv frame
+           and on a small, cheap render per rover (VISION_HZ, no shadows), see "Object detection".
 
 Look (visuals.py): procedural regolith, hazy sky with a low sun, the sun's shadows and distance haze.
   shadows  the directional light's shadow box (SHADOW_CLIP_M around a point a little ahead of the
@@ -17,6 +30,8 @@ Look (visuals.py): procedural regolith, hazy sky with a low sun, the sun's shado
            camera looks (CAMERA_SHADOWS=0 switches them off: they cost the most on software GL).
   haze     exponential distance fog in the horizon colour, applied to the pixels from the depth buffer
            (MuJoCo's own fog would also fog the skybox, which then turns into one flat colour).
+  dust     during a dust storm the haze thickens into a brown dust veil (visibility about 20 m),
+           ramping in and out over DUST_RAMP_S, so the camera (and the detector) see less.
 The rules' quick colour check and spot_targets() render without shadows or haze (machine vision
 frames, cheaper, and on the sim thread). scripts/camera_bench.py measures the render time per frame.
 
@@ -31,17 +46,21 @@ Wiring (one line in server.py):
     from .camera import router as camera_router; app.include_router(camera_router)
 
 Python helpers (also used by the tests): render_frame(), render_rgb(), render_jpeg(),
-renderer_status(), and spot_targets() (camera based target detection, see its docstring; not wired
-into the rovers). spot_targets() renders in the calling thread with that thread's own GL context,
-because it is meant to run with the sim lock already held.
+renderer_status(), segment_ids() (offline ground truth for the detector's evaluation), and
+spot_targets() (the old marker colour spotting, see its docstring; not wired into the rovers).
+spot_targets() renders in the calling thread with that thread's own GL context, because it is meant
+to run with the sim lock already held. start_vision(runner) (server.py) starts the rovers' detectors.
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
 import contextlib
+import copy
 import importlib
 import io
+import itertools
+import json
 import math
 import os
 import queue
@@ -49,8 +68,9 @@ import sys
 import threading
 import time
 import warnings
+import weakref
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mujoco
 import numpy as np
@@ -86,9 +106,33 @@ SHADOW_CLIP_M = 14.0          # sun shadows are drawn within this many metres of
 SHADOW_AHEAD_M = 10.0         # ... this far ahead of the camera (beyond that the haze hides their absence)
 SHADOW_BACK_M = 40.0          # the sun's shadow camera sits this far up-sun of that point
 SHADOWS = os.environ.get("CAMERA_SHADOWS", "1").strip().lower() not in ("0", "off", "false", "no")
+DUST_RGB = (0.62, 0.47, 0.35)  # dust storm veil
+DUST_SCALE_M = 9.0             # dust thickens with distance on this scale (visibility about 20 m) ...
+DUST_MAX = 0.93                # ... up to this much
+DUST_SKY = 0.8                 # and veils the sky this much
+DUST_RAMP_S = 5.0              # sim seconds to thicken at the start of a storm and to clear at its end
 
-_GEOM_GROUPS = (1, 1, 1, 1, 1, 1)   # terrain, rocks and spires, targets and lifeforms, rovers, lander ring
-                                    # (the walls in group 4 have alpha 0 and are never drawn), liquid (5)
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+STREAM_IDLE_S = 4.0            # a view nobody asked for in this long stops rendering (protocol v8)
+STREAM_MAX = 6                 # views rendered in the background at once (the least recently asked goes)
+STREAM_MAX_FPS = max(1.0, _env_float("CAMERA_FPS", 12.0))   # never more often than this per view
+STREAM_LEAD_S = 0.03           # a frame should be ready this long before the client's next request
+STREAM_REFRESH_S = 1.0         # a frame nobody fetched yet is still re-rendered after this long
+VISION_HZ = max(0.0, _env_float("VISION_HZ", 1.0))           # detector renders per rover per wall second
+VISION_W, VISION_H = 256, 192  # the small, cheap detector render (no shadows)
+VISION_STATS_EVERY = 5         # one detector frame in this many is also checked against ground truth
+CULL_GROUP = 5                 # geom group that means "not drawn this frame" in the private render model
+
+_GEOM_GROUPS = (1, 1, 1, 1, 1, 0)   # terrain, rocks and spires, targets and lifeforms, rovers, lander ring
+                                    # and decoration; group 5 is "culled" in the render copy (liquid moves to 2)
+_FRAME_SEQ = itertools.count(1)     # frame numbers (X-Frame, vision.frame): one sequence for every renderer
 
 
 class RenderUnavailable(RuntimeError):
@@ -142,9 +186,10 @@ def _ground(sim, x: float, y: float):
         return None
 
 
-def _rover_pose(sim, rover):
-    """Chassis position, rotation matrix and heading straight from MjData (exact, not a tick old)."""
-    d = sim.data
+def _rover_pose(sim, rover, data=None):
+    """Chassis position, rotation matrix and heading straight from MjData (exact, not a tick old).
+    data: the renderer's private snapshot (default: the sim's own MjData)."""
+    d = sim.data if data is None else data
     pos = np.array(d.xpos[rover.body], dtype=np.float64)
     R = np.array(d.xmat[rover.body], dtype=np.float64).reshape(3, 3)
     if not (np.isfinite(pos).all() and np.isfinite(R).all()):
@@ -154,9 +199,10 @@ def _rover_pose(sim, rover):
     return pos, R, yaw
 
 
-def rig(view: str, sim, rover, heading=None) -> CamSpec:
-    """Camera for this view at the current state. heading overrides the chase camera azimuth (rad)."""
-    pos, R, yaw = _rover_pose(sim, rover)
+def rig(view: str, sim, rover, heading=None, data=None) -> CamSpec:
+    """Camera for this view at the current state. heading overrides the chase camera azimuth (rad).
+    data: a private MjData snapshot to read the rover pose from (default sim.data)."""
+    pos, R, yaw = _rover_pose(sim, rover, data)
     lidar_h = float(getattr(sim.cfg, "lidar_height", 0.75))
     if view == "fpv":
         local = np.array([FPV_FORWARD, 0.0, lidar_h + FPV_UP])
@@ -226,14 +272,42 @@ def _place_sun_shadow(scn: mujoco.MjvScene, spec: CamSpec) -> None:
             lt.pos[:] = focus - d * SHADOW_BACK_M
 
 
-def _drop_markers(scn: mujoco.MjvScene, markers: set) -> None:
-    """Leave the science target marker capsules out of a look frame (their natural decoration is drawn)."""
-    geom_t = int(mujoco.mjtObj.mjOBJ_GEOM)
-    for i in range(scn.ngeom):
-        sg = scn.geoms[i]
-        if sg.objtype == geom_t and sg.objid in markers:
-            sg.size[:] = 1e-5
-            sg.pos[2] -= 1000.0
+def _cull_mask(centres: np.ndarray, rbound: np.ndarray, spec: CamSpec, w: int, h: int,
+               shadows: bool) -> np.ndarray:
+    """Geoms that can change a pixel of this frame: bounding sphere inside the camera frustum, or (with
+    shadows) inside the sun's shadow prism, where it may cast a shadow onto what the camera sees.
+    MuJoCo draws directional shadows only for casters within shadowClip of the line through the light's
+    position (SHADOW_BACK_M up-sun of the shadow focus), so the prism is that square (its half diagonal,
+    to be safe) extended along the sun direction."""
+    f, right, up = spec.basis()
+    rel = centres - spec.eye
+    tv = math.tan(math.radians(spec.fovy) / 2.0)
+    th = tv * w / h
+    keep = rel @ f >= -rbound
+    for n in (th * f - right, th * f + right, tv * f - up, tv * f + up):     # inward side planes
+        keep &= rel @ (n / np.linalg.norm(n)) >= -rbound
+    if shadows:
+        from .visuals import TO_SUN
+        fh = np.array([f[0], f[1], 0.0])
+        nh = np.linalg.norm(fh)
+        fh = fh / nh if nh > 1e-6 else np.zeros(3)
+        r2 = centres - (spec.eye + fh * SHADOW_AHEAD_M - np.array([0.0, 0.0, 1.0]))
+        along = r2 @ TO_SUN
+        perp = np.linalg.norm(r2 - along[:, None] * TO_SUN[None, :], axis=1)
+        keep |= (perp <= SHADOW_CLIP_M * 1.415 + rbound) & (along <= SHADOW_BACK_M + rbound)
+    return keep
+
+
+def _dust_level(sim) -> float:
+    """How thick the dust storm veil is right now (0 = none, 1 = full), ramping in and out."""
+    hz = getattr(sim, "hazards", None)
+    st = getattr(hz, "storm", None) if hz is not None else None
+    if st is None or not getattr(st, "active", False):
+        return 0.0
+    t = float(sim.data.time)
+    a = (t - float(st.t)) / DUST_RAMP_S
+    b = (float(st.until) - t) / DUST_RAMP_S if getattr(st, "until", None) is not None else 1.0
+    return float(min(1.0, max(0.0, min(a, b))))
 
 
 def _vision_lighting(scn: mujoco.MjvScene) -> None:
@@ -272,28 +346,64 @@ def _ray_factor(h: int, w: int, fovy: float) -> np.ndarray:
     return k
 
 
-def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float) -> np.ndarray:
+def _blend(rgb: np.ndarray, f: np.ndarray, colour) -> np.ndarray:
+    """rgb * (1 - f) + colour * f per pixel, in 16 bit integers (f quantised to 1/256: at most half a
+    grey level off, about twice as fast as float32 on a full HD frame)."""
+    a = np.rint(f * 256.0).astype(np.uint16)
+    out = rgb.astype(np.uint16)
+    out *= (256 - a)[..., None]
+    out += a[..., None] * np.asarray([round(c * 255.0) for c in colour], np.uint16)
+    out += 128
+    out >>= 8
+    return out.astype(np.uint8)
+
+
+def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float, dust: float = 0.0) -> np.ndarray:
     """Distance haze of a dense atmosphere: blend toward the horizon colour with distance along the ray
-    (exponential, nothing within visuals.FOG_START_M), never on the sky (farther than SKY_DIST_M)."""
+    (exponential, nothing within visuals.FOG_START_M), never on the sky (farther than SKY_DIST_M).
+    dust > 0: a dust storm veil on top (thicker with distance, the sky veiled too)."""
     from .visuals import FOG_END_M, FOG_START_M, HORIZON_RGB, HAZE_MAX
     dist = dep * _ray_factor(dep.shape[0], dep.shape[1], fovy)
-    d = np.clip(dist - FOG_START_M, 0.0, None)
-    f = (1.0 - np.exp(d * (-3.0 / (FOG_END_M - FOG_START_M)))) * HAZE_MAX
-    f[dist > SKY_DIST_M] = 0.0
-    fog = np.asarray(HORIZON_RGB, np.float32) * 255.0
-    out = rgb.astype(np.float32)
-    out += (fog - out) * f[..., None]
-    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    sky = dist > SKY_DIST_M
+    f = dist - np.float32(FOG_START_M)
+    np.maximum(f, 0.0, out=f)
+    f *= np.float32(-3.0 / (FOG_END_M - FOG_START_M))
+    np.exp(f, out=f)
+    f *= np.float32(-HAZE_MAX)
+    f += np.float32(HAZE_MAX)
+    f[sky] = 0.0
+    out = _blend(rgb, f, HORIZON_RGB)
+    if dust > 0.0:
+        g = np.exp(dist * np.float32(-1.0 / DUST_SCALE_M))
+        g *= np.float32(-DUST_MAX * dust)
+        g += np.float32(DUST_MAX * dust)
+        g[sky] = DUST_SKY * dust
+        out = _blend(out, g, DUST_RGB)
+    return out
+
+
+def _sensor_noise(rgb: np.ndarray, sigma: float, seed: int) -> np.ndarray:
+    """Protocol v9: a damaged camera's picture: pixel noise (sigma in 0..255 units) and, when badly damaged, dead
+    rows. The onboard detector sees exactly this frame, so its confidence drops on its own."""
+    rng = np.random.default_rng(seed)
+    out = rgb.astype(np.int16) + rng.normal(0.0, sigma, rgb.shape).astype(np.int16)
+    if sigma > 25.0:
+        rows = rng.integers(0, rgb.shape[0], size=int(rgb.shape[0] * (sigma - 25.0) / 200.0) + 1)
+        out[rows] = out[rows] // 4
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def _linear_depth(raw: np.ndarray, near: float, far: float) -> np.ndarray:
-    """Depth buffer (reverse Z, as mujoco.Renderer reads it) to metres along the view axis."""
+    """Depth buffer (reverse Z, as mujoco.Renderer reads it) to metres along the view axis (float32 is
+    plenty here: within 1e-5 relative of a float64 decode out to the far plane)."""
     zfar, znear = np.float32(far), np.float32(near)
     c = -(zfar + znear) / (zfar - znear)
     d = -(np.float32(2) * zfar * znear) / (zfar - znear)
     c = np.float32(-0.5) * c - np.float32(0.5)
     d = np.float32(-0.5) * d
-    return (d / (raw.astype(np.float64) + c)).astype(np.float32)
+    out = raw + c
+    np.divide(d, out, out=out)
+    return out
 
 
 # ====================================================================== render thread
@@ -331,14 +441,27 @@ def _make_gl_context(w: int, h: int):
 
 
 class _Gfx:
-    """MuJoCo render state for one model: GPU context (textures, height fields), scene, options."""
+    """MuJoCo render state for one model: a private copy of the model (its geom groups are rewritten per
+    frame for culling; the sim's model is never touched) and of the state, the GPU context (textures,
+    height fields), the scene and its options."""
 
     def __init__(self, model: mujoco.MjModel):
-        self.model = model
-        self.con = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_100.value)
+        self.src = model                                  # the sim's model (a reset brings a new one)
+        self.model = m = copy.copy(model)
+        self.data = mujoco.MjData(m)
+        self.orig_group = np.array(m.geom_group, dtype=np.int32)
+        base = self.orig_group.copy()
+        base[base == CULL_GROUP] = 2                      # liquid: drawn with the targets in the copy
+        self.base_group = base
+        self.rbound = np.array(m.geom_rbound, dtype=np.float64)
+        self.never = (np.asarray(m.geom_rgba)[:, 3] <= 0.0) & (np.asarray(m.geom_matid) < 0)   # the walls
+        hf = np.flatnonzero(np.asarray(m.geom_type) == int(mujoco.mjtGeom.mjGEOM_HFIELD))
+        # bodies parked far below the map (spare rockfall boulders and spires) are never drawn
+        self.zmin = float(np.asarray(m.geom_pos)[hf, 2].min()) - 5.0 if len(hf) else -1e9
+        self.con = mujoco.MjrContext(m, mujoco.mjtFontScale.mjFONTSCALE_100.value)
         mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN.value, self.con)
         self.con.readDepthMap = mujoco.mjtDepthMap.mjDEPTH_ZEROFAR
-        self.scn = mujoco.MjvScene(model, maxgeom=int(model.ngeom) + 500)
+        self.scn = mujoco.MjvScene(m, maxgeom=int(m.ngeom) + 500)
         flags = self.scn.flags
         flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 1
         flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
@@ -348,23 +471,23 @@ class _Gfx:
         self.con.shadowClip = SHADOW_CLIP_M
         # science target marker capsules: what LiDAR, the spectrometer and machine vision see. Look frames
         # that draw the visual-only decoration (group 4) show the natural target instead (world.py)
-        self.markers = {g for g in range(model.ngeom)
-                        if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("target_")}
+        self.markers = np.array([g for g in range(m.ngeom)
+                                 if (mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("target_")],
+                                dtype=np.int64)
         self.cam = mujoco.MjvCamera()
-        self._opts: dict = {}
-        self.max_w = int(min(MAX_W, model.vis.global_.offwidth))
-        self.max_h = int(min(MAX_H, model.vis.global_.offheight))
+        self.opt = mujoco.MjvOption()
+        self.opt.geomgroup[:] = _GEOM_GROUPS
+        self.opt.sitegroup[:] = 0
+        self.max_w = int(min(MAX_W, m.vis.global_.offwidth))
+        self.max_h = int(min(MAX_H, m.vis.global_.offheight))
 
-    def option(self, hide_groups: tuple = ()) -> mujoco.MjvOption:
-        opt = self._opts.get(hide_groups)
-        if opt is None:
-            opt = mujoco.MjvOption()
-            opt.geomgroup[:] = _GEOM_GROUPS
-            for g in hide_groups:
-                opt.geomgroup[g] = 0
-            opt.sitegroup[:] = 0
-            self._opts[hide_groups] = opt
-        return opt
+    def snapshot(self, d) -> None:
+        """Copy the state the picture needs (sim lock held: microseconds)."""
+        self.data.qpos[:] = d.qpos
+        if self.model.nmocap:
+            self.data.mocap_pos[:] = d.mocap_pos
+            self.data.mocap_quat[:] = d.mocap_quat
+        self.data.time = d.time
 
     def free(self) -> None:
         if self.con is not None:
@@ -380,6 +503,10 @@ class Frame:
     t: float                        # sim time of the frame
     rover_pos: np.ndarray           # chassis centre at that time
     rover_yaw: float
+    frame: int = 0                  # frame number (one sequence for every renderer)
+    view: str = "fpv"
+    rover: str = ""
+    dust: float = 0.0               # dust storm veil in this frame (0 to 1)
 
 
 class GLRenderer:
@@ -393,6 +520,7 @@ class GLRenderer:
         self._chase: dict = {}                # (id(sim), rover id) -> (smoothed heading, wall time)
         self.backend: str | None = None
         self.frames = 0
+        self.last: dict | None = None         # what the last frame drew (segment_ids re-renders it)
 
     def ensure(self) -> None:
         if self._ctx is not None:
@@ -410,7 +538,7 @@ class GLRenderer:
         _log(f"OpenGL context ready ({self.backend}, thread {threading.current_thread().name})")
 
     def _gfx_for(self, model) -> _Gfx:
-        if self._gfx is not None and self._gfx.model is model:
+        if self._gfx is not None and self._gfx.src is model:
             return self._gfx
         self._ctx.make_current()
         if self._gfx is not None:
@@ -445,45 +573,60 @@ class GLRenderer:
         return h
 
     def frame(self, runner, sim, rover_id: str, view: str, w: int, h: int, *,
-              depth: bool = False, hide_groups: tuple = (), smooth: bool = True, look: bool = True) -> Frame:
-        """Render one view. runner given: hold runner.locked() for the scene update only.
+              depth: bool = False, hide_groups: tuple = (), smooth: bool = True, look: bool = True,
+              shadows: bool | None = None) -> Frame:
+        """Render one view. runner given: hold runner.locked() only to copy the state.
         runner None: the caller already holds the sim lock (or nothing else touches sim).
-        look False: no shadows and no distance haze (machine vision frames: cheaper)."""
+        look False: no shadows and no distance haze (machine vision frames: cheaper).
+        shadows False: a look frame without the sun's shadows (the detector's cheap frames)."""
         self.ensure()
         try:
-            return self._frame(runner, sim, rover_id, view, w, h, depth, tuple(hide_groups), smooth, look)
+            return self._frame(runner, sim, rover_id, view, w, h, depth, tuple(hide_groups), smooth, look, shadows)
         except (UnknownRover, ValueError):
             raise
         except Exception:
             self.release()           # GL trouble: start from a fresh context next time
             raise
 
-    def _frame(self, runner, sim, rover_id, view, w, h, depth, hide_groups, smooth, look=True) -> Frame:
+    def _frame(self, runner, sim, rover_id, view, w, h, depth, hide_groups, smooth, look=True,
+               shadows=None) -> Frame:
         for _attempt in range(3):
             g = self._gfx_for(sim.model)
             hold = runner.locked() if runner is not None else contextlib.nullcontext(sim)
             with hold as s:
-                if s.model is not g.model:      # a reset swapped the model in between: rebuild, retry
+                if s.model is not g.src:        # a reset swapped the model in between: rebuild, retry
                     sim = s
                     continue
                 rover = _find_rover(s, rover_id)
-                pos, _R, yaw = _rover_pose(s, rover)
-                heading = self._chase_heading(s, rover_id, yaw) if (view == "chase" and smooth) else None
-                spec = rig(view, s, rover, heading)
-                _apply_free_camera(g.cam, spec)
-                mujoco.mjv_updateScene(g.model, s.data, g.option(hide_groups), None, g.cam,
-                                       mujoco.mjtCatBit.mjCAT_ALL.value, g.scn)
+                g.snapshot(s.data)
                 t = float(s.data.time)
+                dust = _dust_level(s) if look else 0.0
+                hl = getattr(rover, "health", None)       # protocol v9: a damaged camera is noisy
+                noise = hl.effects()["camera_noise"] if (hl is not None and view == "fpv") else 0.0
             break
         else:
             raise RuntimeError("the model kept changing while rendering")
+        m, d = g.model, g.data
+        mujoco.mj_kinematics(m, d)
+        mujoco.mj_camlight(m, d)
+        pos, _R, yaw = _rover_pose(sim, rover, d)
+        heading = self._chase_heading(sim, rover_id, yaw) if (view == "chase" and smooth) else None
+        spec = rig(view, sim, rover, heading, data=d)
         w = max(MIN_SIDE, min(int(w), g.max_w))
         h = max(MIN_SIDE, min(int(h), g.max_h))
+        shadow_on = bool(look and SHADOWS and (shadows is None or shadows))
+        keep = _cull_mask(d.geom_xpos, g.rbound, spec, w, h, shadow_on)
+        keep &= (d.geom_xpos[:, 2] + g.rbound > g.zmin) & ~g.never
+        if hide_groups:
+            keep &= ~np.isin(g.orig_group, hide_groups)
+        if look and 4 not in hide_groups and len(g.markers):
+            keep[g.markers] = False
+        m.geom_group[:] = np.where(keep, g.base_group, CULL_GROUP)
+        _apply_free_camera(g.cam, spec)
+        mujoco.mjv_updateScene(m, d, g.opt, None, g.cam, mujoco.mjtCatBit.mjCAT_ALL.value, g.scn)
         _set_frustum(g.scn, spec)
-        g.scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 1 if (look and SHADOWS) else 0
-        if look and 4 not in hide_groups and g.markers:
-            _drop_markers(g.scn, g.markers)
-        if look and SHADOWS:
+        g.scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 1 if shadow_on else 0
+        if shadow_on:
             _place_sun_shadow(g.scn, spec)
         elif not look:
             _vision_lighting(g.scn)
@@ -494,15 +637,96 @@ class GLRenderer:
         raw = np.empty((h, w), dtype=np.float32) if (depth or look) else None
         mujoco.mjr_readPixels(rgb, raw, rect, g.con)
         self.frames += 1
+        num = next(_FRAME_SEQ)
+        self.last = {"w": w, "h": h, "spec": spec}
         rgb = rgb[::-1]                                     # OpenGL rows start at the bottom
         dep = _linear_depth(raw[::-1], spec.near, spec.far) if raw is not None else None
         if look:
-            rgb = _haze(rgb, dep, spec.fovy)
-        return Frame(np.ascontiguousarray(rgb), dep if depth else None, spec, t, pos, yaw)
+            rgb = _haze(rgb, dep, spec.fovy, dust)
+        if noise > 0.5:
+            rgb = _sensor_noise(rgb, noise, num)
+        return Frame(np.ascontiguousarray(rgb), dep if depth else None, spec, t, pos, yaw,
+                     frame=num, view=view, rover=rover_id, dust=dust)
+
+    def segment_ids(self) -> np.ndarray:
+        """Ground truth for evaluating the detector OFFLINE (never used for decisions): geom id per pixel
+        (-1 = sky or nothing) of the frame this renderer drew last, from the same state, camera and
+        culling. Uses the non-multisampled window buffer where there is one (OSMesa), so ids are not
+        blended at object edges."""
+        if self.last is None or self._gfx is None:
+            raise RuntimeError("no frame rendered yet")
+        g, w, h = self._gfx, self.last["w"], self.last["h"]
+        flags = g.scn.flags
+        keep = {k: int(flags[k]) for k in (mujoco.mjtRndFlag.mjRND_SEGMENT, mujoco.mjtRndFlag.mjRND_IDCOLOR,
+                                           mujoco.mjtRndFlag.mjRND_SHADOW, mujoco.mjtRndFlag.mjRND_SKYBOX)}
+        flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = 1
+        flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = 1
+        flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+        flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = 0
+        rect = mujoco.MjrRect(0, 0, w, h)
+        self._ctx.make_current()
+        window = bool(g.con.windowAvailable)
+        try:
+            if window:
+                mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_WINDOW.value, g.con)
+            mujoco.mjr_render(rect, g.scn, g.con)
+            px = np.empty((h, w, 3), dtype=np.uint8)
+            mujoco.mjr_readPixels(px, None, rect, g.con)
+        finally:
+            if window:
+                mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN.value, g.con)
+            for k, v in keep.items():
+                flags[k] = v
+        seg = px[::-1].astype(np.int64)
+        seg = seg[..., 0] + seg[..., 1] * 256 + seg[..., 2] * 65536          # scene geom index + 1, 0 = none
+        geom_t = int(mujoco.mjtObj.mjOBJ_GEOM)
+        lut = np.full(g.scn.ngeom + 1, -1, dtype=np.int64)
+        for i in range(g.scn.ngeom):
+            sg = g.scn.geoms[i]
+            if sg.segid >= 0 and sg.objtype == geom_t and sg.segid + 1 < len(lut):
+                lut[sg.segid + 1] = sg.objid
+        seg[(seg < 0) | (seg >= len(lut))] = 0
+        return lut[seg]
+
+
+@dataclass
+class _Stream:
+    """One view a client keeps asking for (protocol v8): rendered in the background, newest frame kept."""
+    runner: object
+    rover: str
+    view: str
+    w: int
+    h: int
+    last_req: float                       # wall (monotonic) time of the latest request
+    req_dt: float = 0.25                  # smoothed time between requests
+    cost: float = 0.1                     # smoothed render + encode time (s)
+    due: float = 0.0                      # next render may start then
+    started: float = -1e9                 # when the last render started
+    served: bool = True                   # the newest frame went out at least once
+    jpeg: bytes | None = None
+    num: int = 0                          # frame number
+    t: float = 0.0                        # sim time of the frame
+    wall: float = 0.0                     # when it was rendered (monotonic)
+    dets: str = "[]"                      # X-Detections of exactly this frame
+    error: str | None = None
+    err_unavailable: bool = False         # the error was "no OpenGL here"
+    first: Future = field(default_factory=Future)
+
+
+@dataclass
+class _VisionRun:
+    """The onboard detectors of one running sim (server.SimRunner): a small render per rover at VISION_HZ."""
+    runner: object
+    due: dict = field(default_factory=dict)       # rover id -> next detector render (monotonic)
+    count: int = 0
+
+
+_STOP, _WAKE = object(), object()
 
 
 class RenderThread:
-    """The HTTP camera's render thread: owns one GLRenderer and runs queued jobs one at a time."""
+    """The camera's render thread: owns one GLRenderer, runs queued jobs one at a time (they go first),
+    and in between renders the streamed views and the rovers' detector frames that are due."""
 
     def __init__(self):
         self._jobs: queue.Queue = queue.Queue()
@@ -510,6 +734,16 @@ class RenderThread:
         self._pending: dict = {}              # coalescing key -> Future (identical queued requests share one)
         self._thread: threading.Thread | None = None
         self.gl = GLRenderer()
+        self.streams: dict = {}               # (id(runner), rover, view, w, h) -> _Stream
+        self.vision: dict = {}                # id(runner) -> _VisionRun
+        self.stream_frames = 0
+        self.vision_frames = 0
+        self.vision_cost = 0.08               # smoothed time of one detector render + detection (s)
+
+    def _ensure_thread(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="redshift-camera", daemon=True)
+            self._thread.start()
 
     def submit(self, fn, *args, key=None) -> Future:
         """Run fn(gl, *args) on the render thread. Jobs with the same key, while still queued, share a result."""
@@ -524,9 +758,7 @@ class RenderThread:
             if key is not None:
                 self._pending[key] = fut
             self._jobs.put((fut, key, fn, args))
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._run, name="redshift-camera", daemon=True)
-                self._thread.start()
+            self._ensure_thread()
         return fut
 
     def call(self, fn, *args, timeout: float = RENDER_TIMEOUT_S):
@@ -535,30 +767,203 @@ class RenderThread:
             return fn(self.gl, *args)
         return self.submit(fn, *args).result(timeout)
 
+    # ---------------------------------------------------------------- background work
+    def stream(self, runner, rover: str, view: str, w: int, h: int) -> _Stream:
+        """A client asked for this view: register (or refresh) its stream and return it."""
+        now = time.monotonic()
+        key = (id(runner), rover, view, w, h)
+        with self._mu:
+            st = self.streams.get(key)
+            if st is not None and st.runner is not runner:
+                st = None
+            new = st is None
+            if new:
+                if len(self.streams) >= STREAM_MAX:
+                    old = min(self.streams, key=lambda k: self.streams[k].last_req)
+                    self.streams.pop(old)
+                st = self.streams[key] = _Stream(runner, rover, view, w, h, last_req=now, due=now)
+            else:
+                gap = now - st.last_req
+                if gap > 0.02:
+                    st.req_dt = gap if gap > 3.0 * st.req_dt else 0.7 * st.req_dt + 0.3 * gap
+                st.last_req = now
+                st.served = True
+                if st.jpeg is not None:     # the next frame should be ready just before the next request
+                    interval = min(1.0, max(1.0 / STREAM_MAX_FPS, st.req_dt))
+                    due = max(st.started + 1.0 / STREAM_MAX_FPS, now + interval - st.cost - STREAM_LEAD_S)
+                    if now - st.wall > interval:
+                        due = min(due, max(now, st.started + 1.0 / STREAM_MAX_FPS))   # stale already: now
+                    st.due = due
+            self._ensure_thread()
+        self._jobs.put(_WAKE)
+        return st
+
+    def status(self) -> dict:
+        """What the render thread is doing (GET /api/vision/stats, for transparency)."""
+        now = time.monotonic()
+        with self._mu:
+            streams = [{"rover": st.rover, "view": st.view, "w": st.w, "h": st.h,
+                        "requests_per_s": round(1.0 / max(st.req_dt, 1e-3), 1),
+                        "render_ms": round(st.cost * 1000.0), "frame": st.num,
+                        "age_ms": round((now - st.wall) * 1000.0) if st.jpeg is not None else None}
+                       for st in self.streams.values()]
+        return {"streams": streams, "stream_frames": self.stream_frames, "detector_frames": self.vision_frames,
+                "detector_hz_per_rover": VISION_HZ, "detector_size": [VISION_W, VISION_H]}
+
+    def start_vision(self, runner) -> None:
+        if VISION_HZ <= 0:
+            return
+        with self._mu:
+            self.vision[id(runner)] = _VisionRun(runner)
+            self._ensure_thread()
+        self._jobs.put(_WAKE)
+
+    def stop_vision(self, runner) -> None:
+        with self._mu:
+            self.vision.pop(id(runner), None)
+
+    def _next_task(self, now: float):
+        """(due time, kind, item) of the most urgent background task, or None. Drops idle streams and
+        stopped sims."""
+        best = None
+        with self._mu:
+            for key, st in list(self.streams.items()):
+                if now - st.last_req > STREAM_IDLE_S or _stopped(st.runner):
+                    self.streams.pop(key)
+                    continue
+                if st.error is not None:
+                    continue
+                due = st.due if st.served else max(st.due, st.wall + STREAM_REFRESH_S)
+                if best is None or due < best[0]:
+                    best = (due, "stream", st)
+            if best is not None and best[0] <= now:
+                return best                    # a view someone is watching goes before the detector renders
+            first_stream = best
+            for key, vr in list(self.vision.items()):
+                if _stopped(vr.runner):
+                    self.vision.pop(key)
+                    continue
+                sim = vr.runner.sim
+                for r in sim.rovers:
+                    due = vr.due.setdefault(r.id, now + 0.1 * len(vr.due))
+                    if best is None or due < best[0]:
+                        best = (due, "vision", (vr, r.id))
+        if best is not None and best[1] == "vision" and first_stream is not None \
+                and first_stream[0] < max(now, best[0]) + 1.2 * self.vision_cost:
+            return first_stream                # a detector render now would make that view's next frame late
+        return best
+
+    def _render_stream(self, st: _Stream) -> None:
+        from . import vision
+        t0 = time.monotonic()
+        st.started = t0
+        try:
+            detect = st.view == "fpv" and vision.ENABLED
+            fr = self.gl.frame(st.runner, st.runner.sim, st.rover, st.view, st.w, st.h, depth=detect)
+            dets = "[]"
+            if detect:
+                res = vision.detect_frame(fr, source="stream")
+                vision.publish(st.runner.sim, st.rover, res)
+                dets = res.header()
+            jpg = encode_jpeg(fr.rgb)
+        except BaseException as e:            # noqa: BLE001 (answered as 503 by the endpoint)
+            st.error = f"{type(e).__name__}: {e}" if not isinstance(e, RenderUnavailable) else str(e)
+            st.err_unavailable = isinstance(e, RenderUnavailable)
+            if not st.first.done():
+                st.first.set_exception(e)
+            return
+        now = time.monotonic()
+        with self._mu:
+            st.jpeg, st.num, st.t, st.wall, st.dets, st.served = jpg, fr.frame, fr.t, now, dets, False
+            st.cost = 0.7 * st.cost + 0.3 * (now - t0)
+            # the next one is timed by the next request (stream()); nobody fetching: refresh now and then
+            st.due = now + STREAM_REFRESH_S
+        self.stream_frames += 1
+        if not st.first.done():
+            st.first.set_result(True)
+
+    def _render_vision(self, vr: _VisionRun, rid: str) -> None:
+        from . import vision
+        now = time.monotonic()
+        period = 1.0 / VISION_HZ
+        vr.due[rid] = now + period
+        sim = vr.runner.sim
+        rover = next((r for r in sim.rovers if r.id == rid), None)
+        brain = getattr(rover, "vision", None)
+        last = getattr(brain, "latest", None)
+        if last is not None and last.source == "stream" and now - last.wall < 0.9 * period:
+            return                             # the streamed fpv view already gave this rover fresh detections
+        try:
+            fr = self.gl.frame(vr.runner, sim, rid, "fpv", VISION_W, VISION_H, depth=True, smooth=False,
+                               shadows=False)
+        except UnknownRover:
+            vr.due.pop(rid, None)
+            return
+        except RenderUnavailable:
+            vr.due[rid] = now + GL_RETRY_S
+            return
+        res = vision.detect_frame(fr, source="detector")
+        vision.publish(sim, rid, res)
+        self.vision_cost = 0.8 * self.vision_cost + 0.2 * (time.monotonic() - now)
+        vr.count += 1
+        self.vision_frames += 1
+        if VISION_STATS_EVERY and vr.count % VISION_STATS_EVERY == 0:
+            try:                               # transparency only: compare with the truth, never decide on it
+                vision.stats_for(sim).add(res, self.gl.segment_ids(), self.gl._gfx.model)
+            except Exception as e:             # noqa: BLE001
+                _log(f"vision stats failed: {type(e).__name__}: {e}")
+
     def _run(self) -> None:
         while True:
-            item = self._jobs.get()
-            if item is None:
+            now = time.monotonic()
+            task = self._next_task(now)
+            wait = 0.5 if task is None else min(0.5, max(0.0, task[0] - now))
+            try:
+                item = self._jobs.get(timeout=wait) if wait > 0 else self._jobs.get_nowait()
+            except queue.Empty:
+                item = None
+            if item is _STOP:
                 break
-            fut, key, fn, args = item
-            if key is not None:
-                with self._mu:
-                    if self._pending.get(key) is fut:
-                        del self._pending[key]
-            if not fut.set_running_or_notify_cancel():
+            if item is _WAKE:
+                continue
+            if item is not None:
+                fut, key, fn, args = item
+                if key is not None:
+                    with self._mu:
+                        if self._pending.get(key) is fut:
+                            del self._pending[key]
+                if not fut.set_running_or_notify_cancel():
+                    continue
+                try:
+                    fut.set_result(fn(self.gl, *args))
+                except BaseException as e:          # noqa: BLE001 (handed to whoever waits for it)
+                    fut.set_exception(e)
+                continue
+            if task is None or task[0] > time.monotonic():
                 continue
             try:
-                fut.set_result(fn(self.gl, *args))
-            except BaseException as e:          # noqa: BLE001 (handed to whoever waits for it)
-                fut.set_exception(e)
+                if task[1] == "stream":
+                    self._render_stream(task[2])
+                else:
+                    self._render_vision(*task[2])
+            except Exception as e:                  # noqa: BLE001 (background work must never kill the thread)
+                _log(f"background render failed: {type(e).__name__}: {e}")
+                if task[1] == "vision":
+                    task[2][0].due[task[2][1]] = time.monotonic() + 5.0
         self.gl.release()
 
     def shutdown(self, timeout: float = 2.0) -> None:
         t = self._thread
         if t is not None and t.is_alive():
-            self._jobs.put(None)
+            self._jobs.put(_STOP)
             t.join(timeout)
         self._thread = None
+
+
+def _stopped(runner) -> bool:
+    """A SimRunner that was stopped (reset or shutdown). Runners without the attribute count as running."""
+    ev = getattr(runner, "_stop", None)
+    return bool(ev is not None and ev.is_set())
 
 
 _RT = RenderThread()
@@ -590,7 +995,14 @@ def encode_jpeg(rgb: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
 
 
 def _jpeg_job(gl: GLRenderer, runner, sim, rover_id, view, w, h) -> bytes:
-    return encode_jpeg(gl.frame(runner, sim, rover_id, view, w, h).rgb)
+    """One-off JPEG. With a running sim (runner given) an fpv frame also goes through the rover's object
+    detector, so whoever asked (Gemma's anomaly check) and the rover's `vision` see the same frame."""
+    from . import vision
+    detect = runner is not None and view == "fpv" and vision.ENABLED
+    fr = gl.frame(runner, sim, rover_id, view, w, h, depth=detect)
+    if detect:
+        vision.publish(sim, rover_id, vision.detect_frame(fr, source="gemma"))
+    return encode_jpeg(fr.rgb)
 
 
 def render_frame(sim, rover_id: str, view: str = "fpv", w: int = DEFAULT_W, h: int = DEFAULT_H, *,
@@ -607,6 +1019,22 @@ def render_rgb(sim, rover_id: str, view: str = "fpv", w: int = DEFAULT_W, h: int
 
 def render_jpeg(sim, rover_id: str, view: str = "fpv", w: int = DEFAULT_W, h: int = DEFAULT_H, **kw) -> bytes:
     return encode_jpeg(render_rgb(sim, rover_id, view, w, h, **kw))
+
+
+def segment_ids(sim, rover_id: str, view: str = "fpv", w: int = DEFAULT_W, h: int = DEFAULT_H, *,
+                shadows: bool | None = None) -> tuple:
+    """OFFLINE evaluation only: (Frame with depth, geom id per pixel) of one look frame and its ground
+    truth segmentation, rendered from the same state on the render thread (caller owns the sim)."""
+    def job(gl: GLRenderer):
+        fr = gl.frame(None, sim, rover_id, view, w, h, depth=True, smooth=False, shadows=shadows)
+        return fr, gl.segment_ids()
+    return _RT.call(job)
+
+
+def start_vision(runner) -> None:
+    """Start the rovers' onboard detectors for a running sim (server.SimRunner.start). They render on the
+    camera thread, stop by themselves when the runner stops, and are skipped if rendering is unavailable."""
+    _RT.start_vision(runner)
 
 
 def renderer_status() -> dict:
@@ -815,9 +1243,15 @@ def _error(status: int, msg: str) -> JSONResponse:
     return JSONResponse({"ok": False, "error": msg}, status_code=status, headers={"Cache-Control": "no-store"})
 
 
+FRAME_HEADERS = "X-Frame, X-Frame-Age-Ms, X-Detections"
+
+
 @router.get("/api/camera/{rover_id}.jpg")
 async def camera_jpg(rover_id: str, view: str = "fpv", w: int = DEFAULT_W, h: int = DEFAULT_H):
-    """PROTOCOL.md: live JPEG from a rover's camera. 404 unknown rover, 503 if rendering is unavailable."""
+    """PROTOCOL.md: live JPEG from a rover's camera. 404 unknown rover, 503 if rendering is unavailable.
+    Protocol v8: answers at once with the newest frame of this view and size (rendered in the background
+    while someone keeps asking), with X-Frame, X-Frame-Age-Ms and X-Detections (fpv only; [] for chase,
+    which is not an onboard camera)."""
     from . import server   # lazy: server imports this module
 
     runner = server.state.runner
@@ -831,19 +1265,29 @@ async def camera_jpg(rover_id: str, view: str = "fpv", w: int = DEFAULT_W, h: in
     sim = runner.sim
     if rover_id not in {r.id for r in sim.rovers}:
         return _error(404, f"unknown rover {rover_id!r}")
+    st = _RT.stream(runner, rover_id, view, w, h)
     try:
-        fut = _RT.submit(_jpeg_job, runner, sim, rover_id, view, w, h, key=(id(runner), rover_id, view, w, h))
-        # shield: a timed out request must not cancel a frame that other requests may share
-        jpg = await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(fut)), RENDER_TIMEOUT_S)
+        if st.jpeg is None and st.error is None:
+            # shield: a timed out request must not cancel the stream's first frame
+            await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(st.first)), RENDER_TIMEOUT_S)
     except UnknownRover:
         return _error(404, f"unknown rover {rover_id!r}")
-    except RenderUnavailable as e:
-        return _error(503, f"rendering unavailable: {e}")
-    except RenderBusy as e:
-        return _error(503, str(e))
     except asyncio.TimeoutError:
         return _error(503, "camera render timed out")
-    except Exception as e:      # noqa: BLE001 (the camera must never take the server down)
-        _log(f"render failed: {type(e).__name__}: {e}")
-        return _error(503, f"render failed: {type(e).__name__}: {e}")
-    return Response(content=jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    except Exception:           # noqa: BLE001 (reported from st.error below)
+        pass
+    with _RT._mu:
+        jpg, num, wall, dets, err = st.jpeg, st.num, st.wall, st.dets, st.error
+        if err is not None:
+            _RT.streams.pop((id(runner), rover_id, view, w, h), None)     # the next request tries again
+    if jpg is None or err is not None:
+        if st.err_unavailable:
+            return _error(503, f"rendering unavailable: {err}")
+        if err is not None and err.startswith("UnknownRover"):
+            return _error(404, f"unknown rover {rover_id!r}")
+        _log(f"render failed: {err}")
+        return _error(503, f"render failed: {err}")
+    age = max(0.0, (time.monotonic() - wall) * 1000.0)
+    return Response(content=jpg, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Frame": str(num), "X-Frame-Age-Ms": f"{age:.0f}",
+                             "X-Detections": dets, "Access-Control-Expose-Headers": FRAME_HEADERS})

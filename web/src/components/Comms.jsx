@@ -53,6 +53,8 @@ function resolution(m, chat, answers, waited, byMsgId) {
 
 function InlineQuestion({ m, req, answer, res, now }) {
   const hover = usePlaceHover()
+  // v7: a rover that sighted a herd follows it while it waits for the answer.
+  const following = useSim((s) => req?.kind === 'lifeform' && s.rovers[req.rover]?.state === 'observing')
   if (!req) {
     return (
       <p className="msg-res" data-kind={res.kind}>
@@ -81,11 +83,13 @@ function InlineQuestion({ m, req, answer, res, now }) {
             type="button"
             className="msg-opt"
             data-default={o.id === auto || undefined}
+            data-suggested={o.suggested || undefined}
             data-place={nums[o.id] ? true : undefined}
-            disabled={pending}
+            data-unsafe={o.safe === false || undefined}
+            disabled={pending || o.safe === false}
             aria-busy={(pending && answer.option === o.id) || undefined}
             onClick={() => sendAnswer(req.id, o.id)}
-            title={o.id === auto ? 'The safe default: taken if nobody answers' : nums[o.id] ? `Marker ${nums[o.id]} on the map` : undefined}
+            title={o.safe === false ? `Not safe by the rules${o.note ? `: ${o.note}` : ''}` : o.note ? `${o.suggested ? "Gemma's suggestion. " : ''}${o.note}` : o.suggested ? "Gemma's suggestion" : o.id === auto ? 'The safe default: taken if nobody answers' : nums[o.id] ? `Marker ${nums[o.id]} on the map` : undefined}
             {...placeChipProps(req, o, hover)}
           >
             {nums[o.id] && (
@@ -94,6 +98,8 @@ function InlineQuestion({ m, req, answer, res, now }) {
               </b>
             )}
             {o.label}
+            {o.suggested && <small className="msg-sugg">Gemma suggests</small>}
+            {o.safe === false && <small className="msg-unsafe">not safe</small>}
             {o.id === auto && <small>safe default</small>}
           </button>
         ))}
@@ -105,6 +111,8 @@ function InlineQuestion({ m, req, answer, res, now }) {
           auto ? `${left} s left, then the safe default` : `${left} s left`
         ) : anyPlace ? (
           'Waiting for you: pick one here, click its marker on the map, or type "the second one"'
+        ) : following ? (
+          'Waiting for you: following at a safe distance meanwhile'
         ) : (
           'Waiting for you: the rover holds until you answer'
         )}

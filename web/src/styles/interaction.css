@@ -1251,3 +1251,40 @@
     animation: none;
   }
 }
+
+/* v8: the large camera's picture is a canvas (frames swapped whole); boxes on a second canvas */
+.cv-stage .cv-pic {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform-origin: 0 0;
+  will-change: transform;
+  pointer-events: none;
+}
+
+.cv-stage .cv-boxes {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  transition: opacity 120ms;
+}
+
+.ix-live-rate {
+  margin-left: 4px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line-2);
+  color: var(--ink-3);
+  font-weight: 560;
+}
+
+.hc-rate {
+  letter-spacing: 0.06em;
+}
+
+.ix-boxes-lg + .ix-live {
+  margin-left: 0;
+}

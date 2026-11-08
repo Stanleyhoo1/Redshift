@@ -48,6 +48,7 @@ TARGET_RGBA = {          # same colours as the dashboard: mineral #b48cff, ice #
 }
 
 BOULDER_PARK_Z = -60.0     # hidden boulders wait this far below the lowest terrain
+HITCH_ARM = 0.35           # protocol v9: a tow bar's hitch point sits this far beyond each bumper
 
 WHEEL_LAYOUT = [  # (sx, sy): front-left, rear-left, front-right, rear-right
     (1, 1), (-1, 1), (1, -1), (-1, -1),
@@ -84,6 +85,13 @@ def rover_body_xml(cfg: Config, rid: str, x: float, y: float, z: float, yaw: flo
         f'  <geom name="{rid}_head" type="box" size="0.06 0.06 0.035" pos="0.18 0 {lh:.3f}" material="darkmetal" {vis}/>',
         f'  <site name="{rid}_lidar" pos="0.18 0 {lh + 0.05:.3f}" size="0.03" group="{GROUP_ROVER}"/>',
         f'  <site name="{rid}_imu" pos="0 0 0" size="0.02" group="{GROUP_ROVER}"/>',
+        # protocol v9: the chassis skin (touch sensor: contact force on the body) and the tow hitches. The
+        # hitch points sit at the ends of a virtual tow bar HITCH_ARM beyond each bumper; a tow constraint
+        # (equality "connect", inactive until a helper hitches up) joins one rover's rear to another's front
+        f'  <site name="{rid}_skin" type="box" size="{cx + 0.03:.3f} {cy + 0.03:.3f} {cz + 0.04:.3f}" '
+        f'group="{GROUP_ROVER}" rgba="0 0 0 0"/>',
+        f'  <site name="{rid}_hitch_rear" pos="{-(cx + HITCH_ARM):.3f} 0 0" size="0.03" group="{GROUP_ROVER}" rgba="0 0 0 0"/>',
+        f'  <site name="{rid}_hitch_front" pos="{cx + HITCH_ARM:.3f} 0 0" size="0.03" group="{GROUP_ROVER}" rgba="0 0 0 0"/>',
         f'  <geom name="{rid}_lens" type="cylinder" size="0.022 0.008" pos="0.245 0 {lh:.3f}" euler="0 1.5708 0" '
         f'material="lens" {vis}/>',
         f'  <geom name="{rid}_puck" type="cylinder" size="0.045 0.014" pos="0.18 0 {lh + 0.049:.3f}" '
@@ -136,9 +144,23 @@ def rover_actuator_xml(cfg: Config, rid: str) -> str:
 
 
 def rover_sensor_xml(rid: str) -> str:
-    """Simulated IMU: attitude (framequat, what an AHRS chip reports) and body rates (gyro)."""
+    """Simulated IMU: attitude (framequat, what an AHRS chip reports) and body rates (gyro); protocol v9: the
+    chassis skin (touch: normal force of everything touching the body)."""
     return (f'<framequat name="{rid}_imu_quat" objtype="site" objname="{rid}_imu"/>'
-            f'<gyro name="{rid}_imu_gyro" site="{rid}_imu"/>')
+            f'<gyro name="{rid}_imu_gyro" site="{rid}_imu"/>'
+            f'<touch name="{rid}_touch" site="{rid}_skin"/>')
+
+
+def tow_xml(rover_ids: list) -> str:
+    """Protocol v9: one inactive tow constraint per ordered pair (helper rear hitch -> towed front hitch). The
+    sim switches one on with data.eq_active when a helper hitches up. Soft at first (solref), see rescue.py."""
+    out = []
+    for a in rover_ids:
+        for b in rover_ids:
+            if a != b:
+                out.append(f'<connect name="tow_{a}_{b}" site1="{a}_hitch_rear" site2="{b}_hitch_front" '
+                           f'active="false" solref="0.08 1"/>')
+    return "".join(out)
 
 
 def boulder_sizes(cfg: Config) -> list:
@@ -187,6 +209,7 @@ class World:
     water_gids: np.ndarray = None   # liquid surface geoms (LiDAR: no return)
     life_mocap: list = None    # mocap id per creature (lifeforms.py order)
     life_gids: np.ndarray = None    # every creature geom (LiDAR hits go to the motion tracker)
+    tow_eq: dict = None        # protocol v9: (helper id, towed id) -> equality constraint id
 
 
 def _quat_z_to(u) -> str:
@@ -544,6 +567,7 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
   <sensor>
     {''.join(sensors)}
   </sensor>
+  {('<equality>' + tow_xml(rover_ids) + '</equality>') if len(rover_ids) > 1 else ''}
 </mujoco>
 """
     model = mujoco.MjModel.from_xml_string(xml)
@@ -594,6 +618,11 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
         bid, gids = body_geoms(name)
         life_mocap.append(int(model.body_mocapid[bid]))
         life_g += gids
+    tow_eq = {}
+    for a in rover_ids:
+        for b in rover_ids:
+            if a != b:
+                tow_eq[(a, b)] = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, f"tow_{a}_{b}"))
     return World(model, data, tiles, rover_ids, target_geom_ids, rover_geom_range, boulders,
                  spires=spire_info, water_gids=water_gids, life_mocap=life_mocap,
-                 life_gids=np.array(sorted(life_g), dtype=np.int32))
+                 life_gids=np.array(sorted(life_g), dtype=np.int32), tow_eq=tow_eq)
