@@ -2,12 +2,14 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useSim } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { planetLook } from './globeMath.js'
-import { GLOBE } from './globePalette.js'
 import { globeRefs } from './globeDebug.js'
 import { Starfield } from './Starfield.jsx'
+import { Planet } from './Planet.jsx'
 import { GlobeRig } from './GlobeRig.jsx'
 
 // Everything in the planet scene (an r3f portal with its own camera, see GlobeLayer.jsx).
+// The planet turns inside `spin`; its sun is fixed in the planet's frame, so the site stays
+// in daylight while it turns, and the stars stay still.
 export function GlobeWorld() {
   const world = useSim((s) => s.world)
   const high = useGraphics() === 'high'
@@ -25,11 +27,7 @@ export function GlobeWorld() {
     <>
       <Starfield high={high} />
       <group ref={spin}>
-        {/* Stand-in until Task 13 draws the planet. */}
-        <mesh>
-          <sphereGeometry args={[1, 64, 32]} />
-          <meshBasicMaterial color={GLOBE.mare} />
-        </mesh>
+        <Planet look={look} high={high} />
       </group>
       <GlobeRig look={look} spin={spin} />
     </>
