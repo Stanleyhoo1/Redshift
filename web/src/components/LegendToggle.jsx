@@ -3,7 +3,7 @@ import { degrees } from '../lib/format.js'
 
 // The map key folds to a one-line pill, so on short screens it does not cover the controls
 // panel or the question strips. Remembered per browser (localStorage when it is available);
-// the first time, it starts folded on screens 820 px tall or less.
+// the first time, it starts folded on every screen size (the user opens it when needed).
 
 const KEY = 'redshift.legend'
 
@@ -13,16 +13,12 @@ function read() {
     if (v === 'open') return true
     if (v === 'closed') return false
   } catch {
-    // private mode or storage disabled: fall through to the screen size
+    // private mode or storage disabled: start folded
   }
-  try {
-    return !window.matchMedia('(max-height: 820px)').matches
-  } catch {
-    return true
-  }
+  return false
 }
 
-let open = typeof window === 'undefined' ? true : read()
+let open = typeof window === 'undefined' ? false : read()
 const subs = new Set()
 
 export function setLegendOpen(value) {
@@ -42,7 +38,7 @@ const subscribe = (fn) => {
   return () => subs.delete(fn)
 }
 
-export const useLegendOpen = () => useSyncExternalStore(subscribe, () => open, () => true)
+export const useLegendOpen = () => useSyncExternalStore(subscribe, () => open, () => false)
 
 // The fold button. Open, it is a small chevron in the legend's top-right corner; folded, it is
 // the whole legend: "Map key" and the slope limit, which flashes when the limit changes.

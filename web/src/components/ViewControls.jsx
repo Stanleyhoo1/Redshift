@@ -5,7 +5,9 @@ import { shortName } from '../lib/format.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { useGraphics, visualPrefs } from '../state/visualPrefs.js'
 import { ViewModeControl } from '../globe/ViewModeControl.jsx'
+import { FoldButton, FoldSection, useFold } from './Fold.jsx'
 import '../styles/scene.css'
+import '../styles/declutter-map.css'
 
 // The realistic ground is the first impression: slope colours start off (once per page
 // load; the S key and the toggle still switch them).
@@ -15,7 +17,7 @@ let slopeDefaultApplied = false
 function GraphicsControl() {
   const graphics = useGraphics()
   return (
-    <div className="hud-group">
+    <div className="map-camera-rows">
       {/* v7 planet view: View, Sector | Planet, laid out like the Graphics row below it */}
       <ViewModeControl />
       <div className="gfx-row">
@@ -66,10 +68,19 @@ function ConnStatus() {
   )
 }
 
-function Toggle({ label, on, onChange, hint, keyHint }) {
+// `short` is the visible text when the full label is too long for the two-column grid; the
+// full label stays the button's accessible name and tooltip.
+function Toggle({ label, short, on, onChange, hint, keyHint }) {
   return (
-    <button type="button" className="toggle" aria-pressed={on} onClick={() => onChange(!on)} title={keyHint ? `${label} (${keyHint})` : label}>
-      <span className="toggle-label">{label}</span>
+    <button
+      type="button"
+      className="toggle"
+      aria-pressed={on}
+      aria-label={short ? label : undefined}
+      onClick={() => onChange(!on)}
+      title={keyHint ? `${label} (${keyHint})${hint ? `: ${hint}` : ''}` : label}
+    >
+      <span className="toggle-label">{short || label}</span>
       {hint && <span className="toggle-hint">{hint}</span>}
       <span className="switch" aria-hidden="true" />
     </button>
@@ -157,35 +168,56 @@ export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
     if (!truth || truth.gen !== gen) realityHint = 'Loading'
     else if (truth.error) realityHint = 'Unavailable'
   }
+  const layers = [view.reality, view.frontiers, view.paths, view.slope, view.lidar, ...(v4 ? [view.life] : [])]
+  const layersOn = layers.filter(Boolean).length
+  const followName = follow ? meta.find((m) => m.id === follow) : null
+  const graphics = useGraphics()
+  const [open, setOpen] = useFold('map.controls', true)
   return (
-    <div className="hud hud-controls" ref={ref}>
-      <ConnStatus />
-      <div className="hud-group">
-        <Toggle label="Reality" on={view.reality} onChange={set('reality')} hint={realityHint} keyHint="R" />
-        <Toggle label="Frontiers" on={view.frontiers} onChange={set('frontiers')} keyHint="F" />
-        <Toggle label="Paths" on={view.paths} onChange={set('paths')} keyHint="P" />
-        <Toggle label="Slope colours" on={view.slope} onChange={set('slope')} keyHint="S" />
-        <Toggle label="LiDAR" on={view.lidar} onChange={set('lidar')} hint={view.lidar && noScan ? 'No data' : ''} keyHint="L" />
-        {v4 && <Toggle label="Life" on={view.life} onChange={set('life')} keyHint="B" />}
+    <div className="hud hud-controls" ref={ref} data-folded={!open || undefined}>
+      <div className="map-controls-head">
+        <ConnStatus />
+        <FoldButton open={open} onToggle={() => setOpen(!open)} label="map controls" controls="map-controls-body" />
       </div>
-      <div className="hud-group">
-        <div className="hud-label" id="follow-label">
-          Follow
+      {open && (
+        <div className="map-controls-body" id="map-controls-body">
+          <FoldSection id="map.layers" title="Layers" summary={`${layersOn} of ${layers.length} on`} className="hud-group map-fold">
+            <div className="map-layer-grid">
+              <Toggle label="Reality" on={view.reality} onChange={set('reality')} hint={realityHint} keyHint="R" />
+              <Toggle label="Frontiers" on={view.frontiers} onChange={set('frontiers')} keyHint="F" />
+              <Toggle label="Paths" on={view.paths} onChange={set('paths')} keyHint="P" />
+              <Toggle label="Slope colours" short="Slope" on={view.slope} onChange={set('slope')} keyHint="S" />
+              <Toggle label="LiDAR" on={view.lidar} onChange={set('lidar')} hint={view.lidar && noScan ? 'No data' : ''} keyHint="L" />
+              {v4 && <Toggle label="Life" on={view.life} onChange={set('life')} keyHint="B" />}
+            </div>
+          </FoldSection>
+          <FoldSection
+            id="map.camera"
+            title="Camera"
+            summary={`${followName ? shortName(followName.name, followName.id) : 'Overview'}, ${graphics === 'low' ? 'Low' : 'High'} graphics`}
+            className="hud-group map-fold"
+          >
+            <div className="hud-label" id="follow-label">
+              Follow
+            </div>
+            <div className={`seg${meta.length > 3 ? ' seg-follow-many' : ''}`} role="group" aria-labelledby="follow-label">
+              <button type="button" aria-pressed={!follow} onClick={onOverview} title="Overview (0)">
+                Off
+              </button>
+              {meta.map((m, i) => (
+                <button key={m.id} type="button" aria-pressed={follow === m.id} onClick={() => onSelect(m.id)} title={`Follow ${m.name} and show its sensors (${i + 1})`}>
+                  <span className="dot" style={{ background: m.color }} />
+                  {shortName(m.name, m.id)}
+                </button>
+              ))}
+            </div>
+            <GraphicsControl />
+          </FoldSection>
+          <FoldSection id="map.mission" title="Mission" summary="Reset, new mission" defaultOpen={false} className="hud-group map-fold">
+            <ResetControl />
+          </FoldSection>
         </div>
-        <div className={`seg${meta.length > 3 ? ' seg-follow-many' : ''}`} role="group" aria-labelledby="follow-label">
-          <button type="button" aria-pressed={!follow} onClick={onOverview} title="Overview (0)">
-            Off
-          </button>
-          {meta.map((m, i) => (
-            <button key={m.id} type="button" aria-pressed={follow === m.id} onClick={() => onSelect(m.id)} title={`Follow ${m.name} and show its sensors (${i + 1})`}>
-              <span className="dot" style={{ background: m.color }} />
-              {shortName(m.name, m.id)}
-            </button>
-          ))}
-        </div>
-      </div>
-      <GraphicsControl />
-      <ResetControl />
+      )}
     </div>
   )
 }

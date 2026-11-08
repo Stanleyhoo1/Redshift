@@ -1,0 +1,102 @@
+/* Map area declutter: the left control panel folds as a whole (map.controls) and in three
+   sections (map.layers, map.camera, map.mission); the layer switches sit in two columns. */
+
+.hud-controls {
+  gap: 6px;
+}
+
+.map-controls-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.hud-controls[data-folded] {
+  width: auto;
+  padding: 6px 8px;
+}
+
+.hud-controls[data-folded] .conn {
+  font-size: 13px;
+}
+
+.map-controls-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hud-controls .map-fold {
+  padding-top: 6px;
+}
+
+.hud-controls .map-fold .fold-head-btn {
+  font-size: 11px;
+  padding: 2px 2px;
+}
+
+.hud-controls .map-fold .fold-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-top: 4px;
+}
+
+.hud-controls .map-fold .fold-body[hidden] {
+  display: none;
+}
+
+.map-layer-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 6px;
+  row-gap: 0;
+}
+
+.map-layer-grid .toggle {
+  gap: 6px;
+  padding: 5px 4px;
+  font-size: 13px;
+  min-width: 0;
+}
+
+.map-layer-grid .toggle-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-layer-grid .toggle-hint {
+  display: none;
+}
+
+.map-layer-grid .switch {
+  width: 24px;
+  height: 14px;
+}
+
+.map-layer-grid .switch::after {
+  top: 2px;
+  left: 2px;
+  width: 10px;
+  height: 10px;
+}
+
+.map-layer-grid .toggle[aria-pressed='true'] .switch::after {
+  transform: translateX(10px);
+}
+
+.map-camera-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.hud-controls .map-fold .reset .btn {
+  padding-top: 5px;
+  padding-bottom: 5px;
+  font-size: 13px;
+}
