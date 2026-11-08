@@ -534,3 +534,12 @@ Nothing required. The server must ignore any text the client sends.
 | `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase for `POST /api/launch`; 1 = start at once (`AUTO_RESET_S` above 0 also starts at once) |
 | `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features, 0 = leave it out (each is built in its own v7 step) |
 | `WEAR` | normal | `off`, `normal` or `harsh`: how fast wheels and motors wear out |
+
+### Landforms (`MESAS`, `CANYON`, `PITS`, `BOULDER_FIELDS`)
+
+Optional `features` keys, sent only when the flag is on:
+
+- `mesas`: `[{id, kind, x, y, radius, height, level}]`. `kind` is `mesa` or `butte`.
+- `canyon`: `{id, path: [[x, y]...], width, depth, ramps: [{x, y, heading, length}]}` or null.
+- `pits`: `[{id, kind, x, y, radius, depth}]`. `kind` is `sinkhole` or `skylight`.
+- `boulder_fields`: `[{id, x, y, radius, count}]`. The boulders are geoms `bfield_<i>` and are in the truth heights like rocks.
