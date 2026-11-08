@@ -155,7 +155,8 @@ export function Lander() {
               {cached !== null && cached > 0 && (
                 <span className="lander-cache" data-some={cached > 0 || undefined} title="Samples in the lander's cache">
                   <i aria-hidden="true" />
-                  {cached} cached
+                  {cached}
+                  <span className="lander-cache-word"> cached</span>
                 </span>
               )}
             </div>

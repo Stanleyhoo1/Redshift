@@ -267,9 +267,21 @@ function Rover({ meta, selected, onSelect }) {
       <sprite ref={sign} material={faultMats.sign} position={[0, 3.55, 0]} scale={1.15} visible={false} renderOrder={10} />
       {labelsReady && (
         <Html position={[0, 2.5, 0]} center zIndexRange={[12, 0]} style={{ pointerEvents: 'none' }}>
-          <button type="button" className="rover-tag" data-selected={selected || undefined} data-fault={faulted || undefined} data-ask={(asking && !faulted) || undefined} onClick={tagClick} title={`Show ${meta.name}'s sensors`}>
-            <span className="dot" style={{ background: meta.color }} />
-            {meta.name}
+          <button
+            type="button"
+            className="rover-tag"
+            data-selected={selected || undefined}
+            data-fault={faulted || undefined}
+            data-ask={(asking && !faulted) || undefined}
+            onClick={tagClick}
+            title={`Show ${meta.name}'s sensors`}
+            aria-label={`${meta.name}${faulted ? ', fault' : asking ? ', waiting for your answer' : ''}: show its sensors`}
+          >
+            {/* Compact: a coloured dot with the rover's number; the name shows on hover or when selected. */}
+            <span className="dot rover-tag-num" style={{ background: meta.color }} aria-hidden="true">
+              {String(meta.name).match(/\d+$/)?.[0] ?? ''}
+            </span>
+            <span className="rover-tag-name">{meta.name}</span>
             <TagSampling roverId={meta.id} />
             {faulted && <span className="rover-tag-fault">Fault</span>}
             {asking && !faulted && (
