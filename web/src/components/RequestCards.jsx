@@ -28,7 +28,8 @@ const STALE_AFTER = 3 // s past the deadline before a request the sim still list
 const toSeconds = () => performance.now() / 1000
 
 function useCompact() {
-  const query = '(max-height: 820px), (max-width: 1240px)'
+  // Matches the compact card in declutter-top.css (a narrow map column or a short window).
+  const query = '(max-height: 820px), (max-width: 1440px)'
   const [match, setMatch] = useState(() => window.matchMedia(query).matches)
   useEffect(() => {
     const mq = window.matchMedia(query)
@@ -339,9 +340,11 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect, onF
             </span>
           )}
           {!kind && waiting && (
-            <span className="rq-wait" title="No time limit: the rover waits for your answer">
+            <span className="rq-wait" title={`${name} holds position until you answer. No time limit.`}>
               <i aria-hidden="true" />
-              Waiting for you
+              <span>
+                Waiting<span className="rq-wait-more"> for you</span>
+              </span>
             </span>
           )}
           {onFold && <FoldButton open onToggle={onFold} label="questions" className="rq-fold" />}
@@ -393,7 +396,9 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect, onF
                 {answer.error}
               </p>
             ) : (
-              <p className="rq-hint">{hint}</p>
+              <p className="rq-hint" data-fold={(waiting && !places) || undefined}>
+                {hint}
+              </p>
             )}
           </>
         )}
@@ -541,7 +546,7 @@ export function RequestCards({ onSelect, collapsed = false, onExpand }) {
         byId={byId}
         source={sourceOf(main.id)}
         now={now}
-        imgSize={compact ? 114 : 138}
+        imgSize={compact ? 60 : 138}
         onSelect={onSelect}
         onFold={() => setUnfolded(false)}
       />

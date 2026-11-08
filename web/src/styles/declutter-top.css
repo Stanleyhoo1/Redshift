@@ -224,3 +224,102 @@
     rq-card-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1),
     rq-glow 4.8s ease-in-out 400ms 2;
 }
+
+/* Narrow map column or short window: a compact card. A small picture beside the head and
+   the question (it grows while you point at it), the answers in one row across the card,
+   and the "holds position" line folded into the Waiting pill's tooltip. */
+@media (max-height: 820px), (max-width: 1440px) {
+  .rq-stack {
+    width: min(372px, 100%);
+  }
+  .rq-stack > .hud-request {
+    --rq-w: 84px;
+    --rq-h: 63px;
+    display: grid;
+    grid-template-columns: var(--rq-w) minmax(0, 1fr);
+    align-items: start;
+    column-gap: 10px;
+    row-gap: 7px;
+    padding: 9px 10px 11px 9px;
+  }
+  .hud-request > .rq-img {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+    z-index: 2;
+    transform-origin: top left;
+    transition: transform 160ms ease-out, box-shadow 160ms ease-out;
+  }
+  .hud-request > .rq-img:hover {
+    transform: scale(2.1);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
+  }
+  .hud-request .rq-main {
+    display: contents;
+  }
+  .hud-request .rq-head {
+    grid-column: 2;
+    grid-row: 1;
+    flex-wrap: nowrap;
+    gap: 6px;
+    min-height: 22px;
+  }
+  .hud-request .rq-name {
+    font-size: 14.5px;
+  }
+  .hud-request .rq-asks {
+    display: none;
+  }
+  .hud-request .rq-wait {
+    padding: 2px 8px 2px 7px;
+    font-size: 11.5px;
+    gap: 5px;
+  }
+  .hud-request .rq-wait-more {
+    display: none;
+  }
+  .hud-request .rq-left {
+    font-size: 19px;
+  }
+  .hud-request .rq-q {
+    grid-column: 2;
+    grid-row: 2;
+    font-size: 13.5px;
+    line-height: 1.36;
+  }
+  .hud-request .rq-opts,
+  .hud-request .rq-out,
+  .hud-request .rq-hint,
+  .hud-request .rq-err {
+    grid-column: 1 / -1;
+  }
+  .hud-request .rq-opts {
+    flex-wrap: nowrap;
+    gap: 6px;
+  }
+  .hud-request .rq-opts:has(> .rq-opt:nth-child(4)) {
+    flex-wrap: wrap;
+  }
+  .hud-request .rq-opt {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 4px 8px;
+    font-size: 13px;
+  }
+  .hud-request .rq-opt-label {
+    white-space: normal;
+    text-align: center;
+  }
+  .hud-request .rq-hint {
+    font-size: 12px;
+  }
+  .hud-request .rq-hint[data-fold] {
+    display: none;
+  }
+  .hud-request .rq-img-cap {
+    left: 3px;
+    bottom: 3px;
+    padding: 0 4px;
+    font-size: 10px;
+    gap: 4px;
+  }
+}
