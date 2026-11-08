@@ -1,5 +1,5 @@
 // v7 terrain colours shared by the 3D scene and the legend swatches.
-export const ICE = { sheet: '#cfe8ff', zone: '#9fd8ff' }
+export const ICE = { sheet: '#a8d2ff', zone: '#9fd8ff' }
 export const FLORA = { violet: '#8f3ddb', teal: '#1fbdb3', bulb: '#b8ff48', ring: '#b6ff5a' }
 export const TERRAIN = {
   geyser: '#c8913a',
