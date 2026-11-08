@@ -489,12 +489,12 @@ export function sanitizeFeatures(f, prev) {
 // v7: geysers (vents and eruption state), dunes, mesas, pits, canyon, boulder_fields.
 const EXTRA_FEATURE_KEYS = ['geysers', 'dunes', 'mesas', 'pits', 'canyon', 'boulder_fields']
 
-const LIFE_KINDS = new Set(['grazer'])
+const LIFE_KINDS = new Set(['grazer', 'skitterer', 'drifter', 'crawler', 'burrower'])
 function sanitizeLifeforms(list) {
   if (!Array.isArray(list)) return null
   return list
     .filter((l) => isObj(l) && l.id != null && Number.isFinite(l.x) && Number.isFinite(l.y))
-    .map((l) => ({ id: String(l.id), kind: LIFE_KINDS.has(l.kind) ? l.kind : String(l.kind || 'grazer'), x: l.x, y: l.y, z: num(l.z, null), yaw: num(l.yaw, 0), speed: num(l.speed, 0), size: num(l.size, 1) > 0.1 ? num(l.size, 1) : 1 }))
+    .map((l) => ({ id: String(l.id), kind: LIFE_KINDS.has(l.kind) ? l.kind : String(l.kind || 'grazer'), x: l.x, y: l.y, z: num(l.z, null), yaw: num(l.yaw, 0), speed: num(l.speed, 0), size: num(l.size, 1) > 0.1 ? num(l.size, 1) : 1, ...(Number.isFinite(l.up) ? { up: Math.min(1, Math.max(0, l.up)) } : {}) }))
 }
 
 function sanitizeTracks(list) {
