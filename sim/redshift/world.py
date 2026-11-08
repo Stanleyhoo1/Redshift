@@ -526,10 +526,19 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
     # lifeforms (lifeforms.py moves them)
     life_names = []
     for h in getattr(terrain, "herds", []):
+        kind = getattr(h, "kind", "grazer")
         for k, (x, y, yaw, size, _speed) in enumerate(h.members):
             name = f"life_{h.id}_{k}"
             life_names.append(name)
-            bodies.append(creature_body_xml(name, x, y, float(terrain.height_at(x, y)), yaw, size))
+            if kind == "grazer":
+                bodies.append(creature_body_xml(name, x, y, float(terrain.height_at(x, y)), yaw, size))
+            else:                   # v7 life variety: the other kinds (v7_life.py)
+                from . import v7_life
+                bodies.append(v7_life.body_xml(kind, name, x, y, float(terrain.height_at(x, y)), yaw, size,
+                                               GROUP_TARGET, _yaw_quat))
+    if any(getattr(h, "kind", "grazer") != "grazer" for h in getattr(terrain, "herds", [])):
+        from . import v7_life
+        assets.append(v7_life.materials_xml(terrain))
 
     span = cfg.map_size
     xml = f"""

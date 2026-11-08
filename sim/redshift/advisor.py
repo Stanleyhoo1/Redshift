@@ -602,8 +602,11 @@ class Advisor:
         if jpeg:
             self.frames += 1
         if job.get("type") == "describe":
-            tk = self.planner.submit_description(job["rover"], job["t"], job["perception"], job["obs"], jpeg,
-                                                 **self._gravity_kw())
+            kw = self._gravity_kw()
+            if getattr(self.cfg, "life_variety", False):      # v7: the label may name a kind it sees
+                from .gemma import KIND_LOOKS
+                kw["kinds"] = tuple(KIND_LOOKS)
+            tk = self.planner.submit_description(job["rover"], job["t"], job["perception"], job["obs"], jpeg, **kw)
         else:
             tk = self.planner.submit_interpretation(job["rover"], job["t"], job["perception"], job["anomaly"], jpeg,
                                                     INTERP_OPTIONS, default=RULE_REACTION[job["kind"]],

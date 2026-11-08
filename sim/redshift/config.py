@@ -131,6 +131,8 @@ SETTINGS: tuple = (
             "Tall alien crystals that block routes and can topple across one."),
     Setting("lifeforms", "bool", "Lifeforms", "features",
             "Herds of grazers. Rovers watch from 4 m or more and never touch them."),
+    Setting("life_variety", "bool", "More lifeforms", "features",
+            "Skitterers, drifters, crawlers and burrowers join the grazers."),
     Setting("mesas", "bool", "Mesas", "features", "Flat-topped hills with cliff walls no rover can climb."),
     Setting("canyon", "bool", "Canyon", "features", "A winding trench with two ramps, the only ways across."),
     Setting("dunes", "bool", "Dunes", "features", "Rippled loose sand where the wheels slip."),
@@ -293,6 +295,8 @@ class Config:
     ice_sheets: bool = False
     ground_detail: bool = False
     flora: bool = False
+    biomes: bool = False
+    life_variety: bool = False
     wear: bool = False
     wear_rate: float = 1.0          # how fast parts wear: 1.0 normal, 4.0 harsh (WEAR_RATES)
 
@@ -449,6 +453,8 @@ class Config:
             ice_sheets=_env_bool("ICE_SHEETS", True),
             ground_detail=_env_bool("GROUND_DETAIL", True),
             flora=_env_bool("FLORA", True),
+            biomes=_env_bool("BIOMES", True),
+            life_variety=_env_bool("LIFE_VARIETY", True),
             wear=wear != "off",
             wear_rate=WEAR_RATES.get(wear, 1.0),
         )
