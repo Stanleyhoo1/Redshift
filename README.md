@@ -45,6 +45,8 @@ Stop with Ctrl+C, then `docker compose down`.
 | `GRAVITY_G` | 2.0 | gravity in Earth g (0.5 to 3) |
 | `AUTO_LAUNCH` | 0 | 0: the fleet waits on the setup screen until you press Launch. 1: start at once with these values |
 | `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 terrain features, each on by default (0 leaves it out). See "Terrain" below |
+| `BIOMES` | 1 | each world gets its own ground, colours and terrain mix (0: the old rust world). See "Biomes" below |
+| `LIFE_VARIETY` | 1 | skitterers, drifters, crawlers and burrowers join the grazers (0: grazers only) |
 | `WEAR` | normal | how fast parts wear out: off, normal or harsh (the setting exists, but wear itself is not part of this build yet) |
 | `AUTO_RESET_S` | 0 | off: the planet only changes when you press Reset sim. Set it (e.g. 60) to land on a new random planet that many seconds after exploration finishes |
 | `GEMMA_ENABLED` | 1 | 0 = rules only |
@@ -84,6 +86,22 @@ Each feature can be switched off on the setup screen or with its env var. With a
 - **Geysers:** vents that erupt on a schedule. Steam scatters the LiDAR (those returns never reach the map), and rovers learn to keep clear of a vent once they have seen it erupt.
 - **Alien flora:** groves of fungal trees with violet and teal caps and glowing lime bulb bushes. A rover identifies a plant from its LiDAR and camera and keeps at least 4 m away (planetary protection, like the grazers).
 - **Ground detail:** pebbles, cracks and small craters for looks only. Drawn by the dashboard, nothing the rovers sense.
+
+### Biomes
+
+With biomes on (the default; `BIOMES=0` or the setup screen's Biomes switch turns them off) the seed picks a **primary biome** for the whole sector and a **secondary biome** that covers a few soft regions, about 25 to 40 percent of the ground. The lander always stands on the primary ground.
+
+| Biome | Ground | More of | Less of, or none |
+|---|---|---|---|
+| Basalt fields | dark blue-grey volcanic rock | pits, boulder fields, vents | dunes, ice |
+| Verdigris lowlands | grey-green mineral | alien flora (twice as much) | pits, vents, no ice |
+| Frost plains | pale blue-grey and white | ice sheets (two and a half times) | vents, no flora |
+| Ash wastes | lavender-grey ash | geysers (twice), dunes, pits | no ice |
+| Salt flats | pale bone and cream, slate rock | dunes (twice), mesas, canyon | pits, no geysers |
+| Obsidian badlands | glassy near-black, violet sheen | canyon, boulder fields, mesas | dunes, no ice |
+| Rust plains | today's red-brown | (only ever a secondary region) | |
+
+How it picks features: every feature setting stays the upper limit. The biome only scales how many of each feature the generator tries to place: the count is multiplied by 75 % of the primary biome's weight plus 25 % of the secondary's, rounded (a primary weight of 0 means none at all, and the canyon, a single feature, is there only when its weight is 0.5 or more). The biome also sets the camera's soil, rock, sky and light colours, and the dashboard's ground, sky, haze, planet and legend colours, blending into the secondary biome's colours across its regions. The lifeform mix also follows the primary biome when More lifeforms is on. The rovers never read the biome: their cameras only see the colours.
 
 The planet view (`G`, or View: Planet) shows the whole world from orbit with the landing sector marked.
 - **Reset sim and New mission:** Reset sim lands the fleet on a new random planet with the same settings. New mission opens the setup screen first, to change gravity, fleet size, sector size, features, wear or speed; the gravity readout and the slope figure show how steep the rovers can climb and tow at that gravity.
