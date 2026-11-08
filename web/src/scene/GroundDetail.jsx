@@ -178,7 +178,7 @@ export function GroundDetail({ reality }) {
   return (
     <group>
       <instancedMesh ref={pebble} args={[geos.pebble, undefined, Math.max(1, items.pebble.length)]} frustumCulled={false} castShadow receiveShadow>
-        <meshStandardMaterial color="#6e5f53" roughness={0.9} flatShading />
+        <meshStandardMaterial color="#8a7564" roughness={0.9} flatShading />
       </instancedMesh>
       <instancedMesh ref={crack} args={[geos.crack, undefined, Math.max(1, items.crack.length)]} frustumCulled={false} renderOrder={1}>
         <meshStandardMaterial color="#1f1915" roughness={1} transparent opacity={0.72} depthWrite={false} polygonOffset polygonOffsetFactor={-2} polygonOffsetUnits={-2} />

@@ -104,7 +104,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <Atmosphere />
       <DustStorm />
       <Ground />
-      <Terrain slopeColors={view.slope} />
+      <Terrain slopeColors={view.slope} reality={view.reality} />
       <Gravel />
       <Water reality={view.reality} />
       <HazardVisuals reality={view.reality} />
