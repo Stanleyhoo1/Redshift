@@ -276,7 +276,12 @@ class Simulation:
         return {"water": [w.to_msg() for w in self.terrain.water],
                 "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
                             "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
-                           for sp in self.hazards.all_spires()]}
+                           for sp in self.hazards.all_spires()],
+                **self._v7_surface_features()}
+
+    def _v7_surface_features(self) -> dict:
+        from . import v7_surface
+        return v7_surface.features(self.terrain)
 
     def close(self) -> None:
         """Stop tier 2's worker thread (the shared Gemma planner itself keeps running)."""
