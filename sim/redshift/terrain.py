@@ -165,6 +165,8 @@ class Terrain:
         self._placed = []                  # (x, y, radius) of mounds and craters
         self._ridges = []                  # ridge spines (p0, p1)
         self.heights = self._make_heights(rng)
+        from . import v7_biomes
+        v7_biomes.attach(self)                            # v7 biomes (own stream): before every v7 feature
         self.landform_mask = None                         # v7 landforms: cells nothing else may use
         self.landforms = None
         if v7_landforms.any_on(cfg):
@@ -198,6 +200,11 @@ class Terrain:
         if getattr(cfg, "flora", False):
             from . import v7_flora
             self.flora = v7_flora.place(cfg, self)
+
+    def biome_id_at(self, x: float, y: float):
+        """v7 biomes: the biome id at (x, y), primary or secondary by region (None with biomes off)."""
+        from . import v7_biomes
+        return v7_biomes.biome_id_at(self, x, y)
 
     # ------------------------------------------------------------------ heights
     def _make_heights(self, rng: np.random.Generator) -> np.ndarray:

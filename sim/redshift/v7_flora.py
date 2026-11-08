@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
+from . import v7_biomes
+
 K_FLORA = 7109
 ID_RANGE_M = 10.0              # LiDAR returns closer than this make a plant a candidate
 CAMERA_EVERY_S = 2.0           # at most one identification frame per rover per this many seconds
@@ -62,6 +64,13 @@ def place(cfg, terrain) -> list:
     n_trees = max(3, int(round(9 * area)))
     n_bush = max(4, int(round(13 * area)))
     n_groves = max(2, int(round(2 * area)))
+    w = v7_biomes.weight(terrain, "flora")                      # v7 biomes: 1.0 (no change) when off
+    if w != 1.0:
+        if w <= 0.0:
+            return []
+        n_trees = max(1, int(round(n_trees * w)))
+        n_bush = max(1, int(round(n_bush * w)))
+        n_groves = max(1, int(round(n_groves * min(w, 2.0))))
     slope = terrain.slope
 
     def gentle(x, y, r, lim):
