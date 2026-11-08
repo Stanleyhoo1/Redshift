@@ -1,4 +1,4 @@
-# Redshift
+# RedShift
 
 A fleet of autonomous rovers exploring an unknown super-Earth, in a MuJoCo physics simulation with a live 3D dashboard. Built for the Agentverse 2026 Robotics track.
 
