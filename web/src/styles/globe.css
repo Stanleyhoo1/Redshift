@@ -32,3 +32,152 @@
     padding-top: 6px;
   }
 }
+
+/* The sector card hangs to the right of the marker (drei <Html> puts its top left on the
+   site), over the darker side of the disc, joined to the ring by a cyan leader line. */
+.globe-card-wrap {
+  pointer-events: none;
+}
+
+.globe-card {
+  position: relative;
+  width: 228px;
+  transform: translate(58px, -50%); /* clear of the ring, so the leader line shows */
+  padding: 11px 12px 12px;
+  background: rgba(8, 12, 19, 0.84);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.35;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.35s ease;
+}
+
+.globe-card[data-settled] {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Set every frame by SiteMarker when the site turns away from the camera. */
+.globe-card[data-away] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.globe-card::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 100%;
+  width: 26px;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(79, 224, 239, 0), var(--signal));
+}
+
+.gc-title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 620;
+}
+
+.gc-sub {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+
+.gc-stats {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  justify-content: space-between;
+  gap: 2px 10px;
+  margin: 9px 0 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.gc-stats dt {
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+
+.gc-stats dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 560;
+}
+
+.gc-rovers {
+  list-style: none;
+  margin: 0 0 9px;
+  padding: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.gc-rover {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 3px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.gc-rover:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.gc-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.gc-state {
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.gc-down {
+  width: 100%;
+}
+
+@media (max-width: 640px) {
+  .globe-card {
+    width: 190px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .globe-card {
+    transition: none;
+  }
+}
+
+.globe-facts {
+  margin: -2px 0 9px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+/* App keeps an open sensor panel mounted while the planet is up, so it comes back as it
+   was (camera view, charts). This wrapper hides it then and is invisible to layout
+   otherwise: the panel still sits in .view, and its HUD rect drops out while hidden. */
+.globe-keep {
+  display: contents;
+}
+
+.globe-keep[hidden] {
+  display: none;
+}
