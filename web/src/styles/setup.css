@@ -756,3 +756,29 @@
     animation: none;
   }
 }
+
+/* ---- polish: a switched-off feature reads as off at a glance (dimmer name and help), and a
+   switched-on one carries a checkmark, not just a filled square ---- */
+
+.su-tile {
+  grid-template-columns: 14px minmax(0, 1fr);
+}
+
+.su-tile-mark {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+}
+
+.su-tile[aria-pressed='false'] .su-tile-name {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+.su-tile[aria-pressed='false'] .su-tile-help {
+  opacity: 0.6;
+}
+
+.su-tile[aria-pressed='true'] .su-tile-mark {
+  background: var(--signal) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.2l2.3 2.3 4.7-4.9' fill='none' stroke='%2303252a' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 10px no-repeat;
+}

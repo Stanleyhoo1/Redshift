@@ -57,7 +57,7 @@ function ConnStatus() {
   if (conn === 'open') {
     state = stale ? 'stale' : ready ? 'open' : 'connecting'
     label = stale ? 'No data' : ready ? 'Live' : 'Waiting for sim'
-  } else if (conn === 'reconnecting') label = 'Reconnecting'
+  } else if (conn === 'reconnecting') label = ready ? 'Reconnecting' : 'Connecting' // never connected yet: still connecting
   return (
     <div className="conn" data-state={state} role="status">
       <span className="conn-dot" aria-hidden="true" />
