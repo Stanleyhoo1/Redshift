@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import { useSim } from '../state/store.js'
@@ -36,7 +36,7 @@ function baseAt(x, y, r) {
 export function BoulderFields({ reality }) {
   const fields = useSim((s) => s.features?.boulder_fields)
   const meshes = useRef([])
-  const last = useRef({ at: -1e9, reality: null })
+  const last = useRef({ at: -1e9, reality: null, rocks: null, meshes: [] })
   // Every boulder with its shape, spin and a little size jitter, stable per field id.
   const rocks = useMemo(() => {
     const out = VARIANTS.map(() => [])
@@ -53,16 +53,18 @@ export function BoulderFields({ reality }) {
     return out
   }, [fields])
   const total = rocks.reduce((a, l) => a + l.length, 0)
-  useEffect(() => {
-    last.current.at = -1e9
-  }, [rocks])
 
   useFrame(({ clock }) => {
     const now = clock.elapsedTime
     const L = last.current
-    if (now - L.at < REFRESH_S && L.reality === reality) return
+    // New meshes start with identity matrices and a new world moves the boulders: place them at
+    // once, otherwise every REFRESH_S (the known ground grows slowly).
+    const fresh = L.rocks !== rocks || meshes.current.some((m, v) => m && m !== L.meshes[v])
+    if (!fresh && now - L.at < REFRESH_S && L.reality === reality) return
     L.at = now
     L.reality = reality
+    L.rocks = rocks
+    L.meshes = meshes.current.slice()
     for (let v = 0; v < VARIANTS.length; v++) {
       const mesh = meshes.current[v]
       const list = rocks[v]
