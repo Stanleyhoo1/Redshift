@@ -414,7 +414,10 @@ function RequestStrip({ q, meta, byId, now, onOpen }) {
   )
 }
 
-export function RequestCards({ onSelect }) {
+// collapsed: while you place a hazard or look at the planet, every question (the main one too)
+// shrinks to its one-line strip, so the cards never cover the ground you click or the planet.
+// onExpand runs first when a strip is opened from there (stops placing, flies back down).
+export function RequestCards({ onSelect, collapsed = false, onExpand }) {
   const requests = useSim((s) => s.requests)
   const meta = useSim((s) => s.roverMeta)
   const chat = useSim((s) => s.chat)
@@ -482,8 +485,20 @@ export function RequestCards({ onSelect }) {
     return null
   }
   const openStrip = (id) => {
+    if (collapsed) onExpand?.()
     setGhost(null)
     setPick(id)
+  }
+  if (collapsed) {
+    const all = [main, ...rest]
+    return (
+      <div className="rq-stack" ref={stackRef} data-collapsed="">
+        {all.slice(0, 3).map((q) => (
+          <RequestStrip key={q.id} q={q} meta={byId[q.rover]} byId={byId} now={now} onOpen={() => openStrip(q.id)} />
+        ))}
+        {all.length > 3 && <div className="rq-more">{all.length - 3} more waiting</div>}
+      </div>
+    )
   }
   return (
     <div className="rq-stack" ref={stackRef}>
