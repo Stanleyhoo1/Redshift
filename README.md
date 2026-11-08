@@ -152,7 +152,7 @@ Weights are the official Agentverse 2026 Robotics Track ones.
 **Ambition & technical quality (15 %)**
 - Two simulator backends behind one topic contract (Gazebo Harmonic, and a numpy mock world rendered in worker processes), checked against each other by `check_topics.py`.
 - Everything runs on simulated time at a selectable speed.
-- 428 Python and 98 TypeScript unit tests. The end-to-end smoke test drives every injected change, the full rescue and the operator commands on both backends, with the live Gemma advisor.
+- 434 Python and 98 TypeScript unit tests. The end-to-end smoke test drives every injected change, the full rescue and the operator commands on both backends, with the live Gemma advisor.
 
 **Pre-launch configuration and fog-of-war globe**
 - *Configuration:* sector size, gravity 1–3 g (feeds both the Gazebo `<gravity>` and the planner), fleet of 1–2 rovers + 0–1 drone (default 2 + 1), edge profile, simulator backend, seed, simulation speed, agent brain on/off (it warns when no API key is set).
@@ -215,7 +215,7 @@ Without Gazebo, `start_all.sh` warns and only the mock backend works. Without RO
 ## Testing
 
 ```bash
-python3 -m pytest -q                                   # 428 unit tests: autonomy, brain, sim, backend
+python3 -m pytest -q                                   # 434 unit tests: autonomy, brain, sim, backend
 (cd web_ui && npm run typecheck && npm test)           # TypeScript + 98 vitest tests
 python3 backend_bridge/scripts/smoke_test.py --backend mock     # end-to-end against a running backend
 python3 backend_bridge/scripts/smoke_test.py --backend gazebo
@@ -244,17 +244,18 @@ The brain checks pass whichever brain answered (Gemma, or the local rules with `
 Timeouts are in simulated seconds: below 1× they are stretched to wall time.
 
 Latest runs (2 rovers + drone, 1×, with the live Gemma advisor):
-- **Gazebo 50/50.**
+- **Gazebo 49/50, after the core-escape fix below.** Every behaviour check passed; the pacing check failed at RTF 0.72 (see below).
+  - The strike site left a single reachable stand-off cell, 46 m from the rescuer. It got there after 148 s, docked at 1.43 m after 162 s, and both rovers were mapping again after 173 s.
+  - Operator commands: the unsafe one was rejected in 2.1 s; the 0.20 m/s cap was applied; the stop was decided in 0.01 s; *resume at full speed* → Gemma `SLOW_AND_REPLAN` at 0.83 m/s and the cap was lifted. 13 brain decisions (12 by Gemma), median round-trip 2.05 s.
+- **Gazebo 50/50, earlier the same night.**
   - Rockslide → `path_blocked` in 1.5 s, and Gemma's `SLOW_AND_REPLAN` (cap 0.30 m/s) after its 2.1 s round-trip.
   - Dust → CAUTION in 3.0 s, back to fused navigation 24 s after the inject. Tip → `resume` after 55 s.
   - Strike → `sos` in 2.5 s and Gemma's `DEPLOY_RECOVERY_ROVER` at 2.3 s. The rescuer drove 37 m, reached its stand-off after 84 s, docked at 1.45 m after 99 s, and both rovers were mapping again after 112 s.
   - Operator commands: the unsafe one was rejected in 1.7 s; the 0.20 m/s cap was applied; the stop was decided in 0.01 s and the rover was at 0.03 m/s 0.3 s later.
   - 12 brain decisions (10 by Gemma), median measured round-trip 1.94 s. Pacing: RTF 0.77 at 1× (the check needs ≥ 0.75).
-- **Mock 49/49** (Gazebo has one extra check: no fallback to mock). Rescue docked after 85 s, both rovers back after 96 s. *Resume at full speed* → Gemma `SLOW_AND_REPLAN` at 0.83 m/s and the operator cap lifted. 12 decisions (11 by Gemma), median 1.96 s. Also 33/33 with one rover.
+- **Mock 49/49** (Gazebo has one extra check: no fallback to mock), twice in a row. Rescue docked after 83–85 s, both rovers back after 94–96 s. In the second run Rover 2 found itself standing on a fresh obstacle cell while exploring, traced `core_escape` (0.5 m across the cell) and carried on. Also 33/33 with one rover.
 
-Known intermittent issue: the following Gazebo run failed 2 of 41 checks, for one reason. When the strike landed, Rover 2 was itself recovering from a slip 1.3 m from the sector's south edge. It reversed only 1.4 m up a 9° slope in 15 s, marked a 1 m no-go zone and waited for the drone. It then took the SOS and began to turn toward Rover 1. Turning in place on that slope at 2.2 g, it skidded and slid 1.5 m back downhill, with its wheels stopped, into the centre of its own zone. A planner whose start lies inside a lethal core finds no way out, so every retry ended in `rescue_noroute`, and Rover 1 was never repaired. The operator slow-down check failed as a consequence: Rover 1 was still disabled, so its limit was 0 m/s and the local check correctly refused 0.2 m/s. The smoke test already strikes only when a stand-off is reachable from where the rescuer is (`rescue_room`; 15 such cells here), and that gate cannot foresee the slide.
-
-RTF with the brain on was 0.77–0.87 at 1× on Gazebo and 0.88–0.91 on the mock, against 0.99–1.03 in earlier runs. Whether the brain node or other load on the machine caused the drop has not been isolated.
+Pacing: tonight's runs paced 0.72–0.87 at 1× on Gazebo and 0.86–0.91 on the mock, against 0.99–1.03 and 1.0 the evening before. It is not the brain. Back-to-back Gazebo deploys measured a median RTF of 0.67 with `ai_brain: false` and 0.68 with it on; `fleet_brain_node` used about 8 % of one core. During those deploys Gazebo used 1.1–1.5 cores, and the machine was about 40 % idle. The cause of the drop has not been isolated.
 
 At 2× with 2 rovers + drone, every behaviour check passes, but the pacing check fails on both backends: Gazebo reaches 1.24× and the mock 1.29× (see *Simulation speed*).
 
@@ -268,6 +269,7 @@ When a check fails, the smoke test prints the rover's state, the world event and
 - **False slip safe-holds under CPU load.** Ground speed was differentiated over message arrival times, so bunched odometry deliveries read as a stall. It now uses the odometry's simulated timestamps.
 - **Mock only: a gentle stall read as a 263 g impact.** The pacer splits physics steps at sensor due times, so a step can last microseconds; backing into a rock zeroed the ground speed in one step, and the accelerometer read that velocity step divided by the step length. The health model wrote the rover off after an ordinary recovery reverse. The mock accelerometer now follows the stall through ≈ 50 ms of tyre compliance.
 - **A lost rescue re-plan.** `rescue_start` arrived 0.1 s after RESUMING's re-plan, and the 1 s re-plan rate limit dropped it, so the rescuer first drove its old frontier route away from its teammate. A request inside the gap is now held and served when the gap ends.
+- **A rescuer that slid into its own no-go zone.** When the strike landed, Rover 2 was itself recovering from a slip 1.3 m from the sector's south edge. It had reversed only 1.4 m up a 9° slope in 15 s and marked a 1 m zone. When it took the SOS, it turned in place on that slope at 2.2 g, skidded, and slid 1.5 m back downhill, wheels stopped, into the middle of its zone. A start inside a lethal core had no way out, so every retry ended in `rescue_noroute`. Now a robot standing on core cells may cross the blob it stands in, at most 3 m from where it is and at a high cost, so it leaves by the shortest way and never crosses any other obstacle. Those cells don't halt the route afterwards, and the escape is traced as `core_escape`.
 - **Test only: a strike where no rescue was possible.** The smoke test struck Rover 1 wherever it happened to be. Once, that was a pocket enclosed by steep cells, rockslide boulders, hazard zones and the 3 m sector-edge band: no stand-off cell was reachable even at 0.3 m clearance out to 6 m, so `rescue_noroute` was the correct answer. The smoke test now decodes the live map and waits until a free stand-off 2.0–2.45 m from Rover 1 is reachable from Rover 2 before it strikes.
 
 ## Repository layout

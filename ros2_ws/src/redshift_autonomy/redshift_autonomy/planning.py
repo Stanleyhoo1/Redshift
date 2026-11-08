@@ -16,6 +16,9 @@ import cv2
 import numpy as np
 
 RING = 1.0e6          # inflated-but-not-core lethal (escapable when starting inside it)
+RING_STEP = 30.0      # per-cell cost of crossing an inflation ring in escape mode
+CORE_STEP = 100.0     # ... and of the lethal core the robot stands in: out by the shortest way
+ESCAPE_CORE_M = 3.0   # how far from the start a core escape may run (a 2.5 m no-go zone plus margin)
 SQ2 = math.sqrt(2.0)
 _NBRS = [(-1, -1, SQ2), (-1, 0, 1.0), (-1, 1, SQ2), (0, -1, 1.0),
          (0, 1, 1.0), (1, -1, SQ2), (1, 0, 1.0), (1, 1, SQ2)]
@@ -56,6 +59,20 @@ def build_costmap(known, lethal, caution, slope_deg, elev, limits, res, origin, 
                    w_energy=float(w_energy))
 
 
+def core_escape_mask(cm: CostMap, start, radius_m: float = ESCAPE_CORE_M):
+    """Core lethal cells a robot standing ON a core cell may cross to get out: the 8-connected core blob under it,
+    within radius_m of the start. None when the start is not a core cell. A robot that slid, drifted or was pushed
+    into a no-go zone (or onto an obstacle cell) can then plan its way out, but never through another obstacle."""
+    sr, sc = start
+    if not cm.cost[sr, sc] == np.inf:
+        return None
+    _, labels = cv2.connectedComponents((cm.cost == np.inf).astype(np.uint8), connectivity=8)
+    H, W = cm.cost.shape
+    rr, cc = np.ogrid[0:H, 0:W]
+    near = (rr - sr) ** 2 + (cc - sc) ** 2 <= (radius_m / cm.res) ** 2
+    return (labels == labels[sr, sc]) & near
+
+
 def astar(cm: CostMap, start, goal, max_expansions: int = 250_000):
     """8-connected A*. Returns (path [(r, c)...] or None, stats)."""
     t0 = time.perf_counter()
@@ -71,6 +88,8 @@ def astar(cm: CostMap, start, goal, max_expansions: int = 250_000):
         stats['ms'] = (time.perf_counter() - t0) * 1000
         return None, stats
     escape = cost_l[sr * W + sc] >= RING
+    core_ok = core_escape_mask(cm, start) if escape else None
+    core_l = core_ok.ravel().tolist() if core_ok is not None else None
     elev_l = np.nan_to_num(cm.elev, nan=0.0).ravel().tolist()
     known_l = cm.known.ravel().tolist()
     res = cm.res
@@ -104,7 +123,7 @@ def astar(cm: CostMap, start, goal, max_expansions: int = 250_000):
         r, c = divmod(i, W)
         ci = cost_l[i]
         if ci >= RING:
-            ci = 30.0
+            ci = RING_STEP if ci < math.inf else CORE_STEP
         for dr, dc, dd in _NBRS:
             rr, cc = r + dr, c + dc
             if rr < 0 or rr >= H or cc < 0 or cc >= W:
@@ -115,11 +134,16 @@ def astar(cm: CostMap, start, goal, max_expansions: int = 250_000):
             cj = cost_l[j]
             if cj >= RING:
                 if escape and cj < math.inf:
-                    cj = 30.0
+                    cj = RING_STEP
+                elif core_l is not None and core_l[j]:
+                    cj = CORE_STEP
                 else:
                     continue
-            if dr and dc and (cost_l[r * W + cc] == math.inf or cost_l[rr * W + c] == math.inf):
-                continue  # no diagonal squeeze between core obstacles
+            if dr and dc:
+                a, b = r * W + cc, rr * W + c
+                if ((cost_l[a] == math.inf and not (core_l and core_l[a]))
+                        or (cost_l[b] == math.inf and not (core_l and core_l[b]))):
+                    continue  # no diagonal squeeze between core obstacles
             step = res * dd * 0.5 * (ci + cj)
             if known_l[i] and known_l[j]:
                 dz = elev_l[j] - elev_l[i]
@@ -188,10 +212,12 @@ def path_conflicts(path, blocked) -> frozenset:
 
 
 def first_block(path, path_xy, blocked, lethal, start_idx: int = 0, skip_m: float = 0.0,
-                accepted: frozenset = frozenset()):
+                accepted: frozenset = frozenset(), accepted_lethal: frozenset = frozenset()):
     """First route cell from `start_idx` that blocks it: inside `blocked` and not passed on purpose (`accepted`,
-    from `path_conflicts` at planning time), or on a lethal cell itself. Returns (index, metres along the route)
-    or None; the first `skip_m` metres (the segment under the robot) are ignored."""
+    from `path_conflicts` at planning time), or on a lethal cell itself unless it was already lethal when the route
+    was planned (`accepted_lethal` = path_conflicts(path, lethal): the core escape out of a zone the robot stood in).
+    Returns (index, metres along the route) or None; the first `skip_m` metres (the segment under the robot) are
+    ignored."""
     dist = 0.0
     for k in range(max(0, start_idx), len(path)):
         if k > start_idx:
@@ -200,7 +226,7 @@ def first_block(path, path_xy, blocked, lethal, start_idx: int = 0, skip_m: floa
         if dist < skip_m:
             continue
         r, c = path[k]
-        if blocked[r, c] and (k not in accepted or lethal[r, c]):
+        if blocked[r, c] and (k not in accepted or (lethal[r, c] and k not in accepted_lethal)):
             return k, dist
     return None
 
@@ -223,10 +249,15 @@ def add_keepout(cm: CostMap, xy, radius_m: float) -> CostMap:
 
 def reachable_from(cm: CostMap, start) -> np.ndarray:
     """Cells `astar` can reach from `start` (8-connected): free and caution ground, plus the inflation rings when the
-    start is inside one (astar's escape mode). Lets a caller skip goals in other regions without running A*."""
+    start is inside one, and the core blob under it when it stands on one (astar's escape mode). Lets a caller skip
+    goals in other regions without running A*."""
     sr, sc = start
     escape = cm.cost[sr, sc] >= RING
-    passable = (cm.cost < (np.inf if escape else RING)).astype(np.uint8)
+    passable = cm.cost < (np.inf if escape else RING)
+    core_ok = core_escape_mask(cm, start) if escape else None
+    if core_ok is not None:
+        passable |= core_ok
+    passable = passable.astype(np.uint8)
     passable[sr, sc] = 1
     _, labels = cv2.connectedComponents(passable, connectivity=8)
     return labels == labels[sr, sc]

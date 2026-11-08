@@ -5,7 +5,7 @@ import pytest
 
 from redshift_autonomy.physics_model import RoverPhysics
 from redshift_autonomy.planning import (RING, add_keepout, astar, build_costmap, cell_to_world, cells_to_world,
-                                        clearance_mask,
+                                        clearance_mask, core_escape_mask,
                                         find_frontiers, first_block, path_blocked, path_conflicts, pure_pursuit,
                                         reachable_from, score_frontiers, standoff_cells, world_to_cell)
 
@@ -262,6 +262,77 @@ def test_reachable_from_excludes_an_enclosed_pocket():
     assert cm.cost[9, 9] == RING                                  # inside the wall's inflation ring: may escape it
     ring_start = reachable_from(cm, (9, 9))
     assert ring_start[9, 9] and ring_start[2, 2] and not ring_start[20, 20]
+
+
+def zone_costmap(n=40, zones=((20, 20, 2),), walls=()):
+    """Flat ground with lethal discs (row, col, radius in cells), e.g. a permanent no-go zone a rover slid into."""
+    known, lethal, caution, elev = flat(n)
+    rr, cc = np.mgrid[0:n, 0:n]
+    for r0, c0, rad in zones:
+        lethal |= (rr - r0) ** 2 + (cc - c0) ** 2 <= rad ** 2
+    for sl in walls:
+        lethal[sl] = True
+    return lethal, build_costmap(known, lethal, caution, slope_of(elev), elev, lim(2.2), RES, ORIGIN,
+                                 inflation_m=0.6)
+
+
+def core_run(cm, path):
+    """Indices of the route's cells that are core lethal."""
+    return [k for k, rc in enumerate(path) if cm.cost[rc] == np.inf]
+
+
+def test_astar_leaves_the_lethal_core_it_stands_in():
+    """A rover that slid (or was pushed) into the middle of a no-go zone must still be able to plan its way out:
+    only through the blob it stands in, and never back into a core cell once out."""
+    _, cm = zone_costmap()
+    assert cm.cost[20, 20] == np.inf
+    assert core_escape_mask(cm, (20, 20))[20, 20]
+    path, _ = astar(cm, (20, 20), (36, 36))
+    assert path is not None and path[0] == (20, 20) and path[-1] == (36, 36)
+    k = core_run(cm, path)
+    assert k == list(range(len(k)))                    # the core cells are the leading run of the route
+    assert len(k) <= 3                                 # out by the shortest way: start + 2 cells of a 2-cell zone
+
+
+def test_core_escape_never_crosses_another_obstacle():
+    # a separate wall between the zone and the goal, with a gap at its south end: go round it, never through it
+    _, cm = zone_costmap(zones=((20, 12, 2),), walls=[np.s_[6:40, 18]])
+    path, _ = astar(cm, (20, 12), (20, 30))
+    assert path is not None
+    assert all(c != 18 or r < 6 for r, c in path)
+    assert all(rc in [path[i] for i in range(4)] for rc in [path[i] for i in core_run(cm, path)])
+
+
+def test_core_escape_is_bounded():
+    # standing in the middle of a lethal area far wider than the 3 m escape radius: no route, as before
+    known, lethal, caution, elev = flat()
+    lethal[5:35, 5:35] = True
+    cm = build_costmap(known, lethal, caution, slope_of(elev), elev, lim(2.2), RES, ORIGIN, inflation_m=0.6)
+    assert astar(cm, (20, 20), (38, 38))[0] is None
+    assert not reachable_from(cm, (20, 20))[38, 38]
+    assert core_escape_mask(cm, (2, 2)) is None        # not in a core: no escape cells at all
+
+
+def test_reachable_from_a_core_start_includes_the_way_out():
+    _, cm = zone_costmap()
+    reach = reachable_from(cm, (20, 20))
+    assert reach[20, 20] and reach[36, 36] and reach[2, 2]
+    assert not reachable_from(*zone_costmap(walls=[np.s_[:, 30]])[1:], (20, 20))[20, 36]   # walled off: still not
+
+
+def test_escape_route_through_its_own_core_is_not_blocked_by_the_unchanged_map():
+    lethal, cm = zone_costmap()
+    path, _ = astar(cm, (20, 20), (36, 36))
+    xy = cells_to_world(path, RES, ORIGIN)
+    blocked = clearance_mask(lethal, 0.5, RES)
+    accepted, already = path_conflicts(path, blocked), path_conflicts(path, lethal)
+    assert already and first_block(path, xy, blocked, lethal, accepted=accepted) is not None
+    assert first_block(path, xy, blocked, lethal, accepted=accepted, accepted_lethal=already) is None
+    k_rock = len(path) // 2                             # a boulder later lands on the route: that still blocks it
+    rocked = lethal.copy()
+    rocked[path[k_rock]] = True
+    hit = first_block(path, xy, clearance_mask(rocked, 0.5, RES), rocked, accepted=accepted, accepted_lethal=already)
+    assert hit is not None and hit[0] <= k_rock
 
 
 def test_pure_pursuit_turns_toward_path():

@@ -295,6 +295,7 @@ class RoverAgent(AgentBase):
         self._vhist = collections.deque(maxlen=8)
         self.path = None            # [(r, c)]
         self._path_ok = frozenset()  # route indices planned past lethal cells on purpose (see check_blocked)
+        self._path_core = frozenset()  # ... and on cells already lethal at planning time (a core escape)
         self.path_xy = None
         self.path_idx = 0
         self.goal = None            # (x, y)
@@ -622,6 +623,14 @@ class RoverAgent(AgentBase):
                 self.trace('tight_clearance', ['MAP'], f'Only {st["expansions"]} cells reachable at '
                            f'{self.radius:.1f} m clearance', 'Inflation rings close the pocket; core hazards still '
                            'excluded', 0.7, 'Planning with 0.3 m clearance at reduced speed', 'warn')
+        if path is not None and cm.cost[start] == np.inf:
+            n_core = sum(1 for rc in path if cm.cost[rc] == np.inf)
+            self.trace('core_escape', ['ODOM', 'MAP'],
+                       f'Standing inside a no-go cell at ({self.pose[0]:.1f}, {self.pose[1]:.1f}): slid, drifted or '
+                       'was pushed in', 'Leaving the lethal blob under the robot by the shortest way; no other '
+                       'obstacle may be crossed', 0.8,
+                       f'Escape route: {n_core * self.map.res:.1f} m across the zone, then {st["length_m"]:.1f} m '
+                       'in all', 'warn')
         return path, st, cm
 
     def _set_path(self, path):
@@ -633,6 +642,7 @@ class RoverAgent(AgentBase):
         self.goal_reached = False
         # cells this route passes on purpose (ring escape / tight clearance): the unchanged map must not halt it
         self._path_ok = path_conflicts(path, self._path_footprint()) if path else frozenset()
+        self._path_core = path_conflicts(path, self._lethal_core()) if path else frozenset()
         self.publish_path(self.path_xy)
 
     def _remaining_m(self):
@@ -719,7 +729,7 @@ class RoverAgent(AgentBase):
             return None
         lethal = self._lethal_core()
         return first_block(self.path, self.path_xy, self._path_footprint(lethal), lethal, self.path_idx,
-                           BLOCK_SKIP_M, self._path_ok)
+                           BLOCK_SKIP_M, self._path_ok, self._path_core)
 
     def _blocked_reason(self, k, dist):
         """Describe what blocks the path, from the map classes + camera detections around the blocking cell."""
