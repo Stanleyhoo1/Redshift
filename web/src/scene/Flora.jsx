@@ -5,6 +5,7 @@ import { useSim } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { groundAt, knownAt } from './ground.js'
 import { reducedMotion } from './sceneConstants.js'
+import { ringFade } from './mapMarkers.js'
 import { FLORA } from '../lib/terrainTheme.js'
 
 // v7 alien flora (PROTOCOL.md, `features.flora` and `fleet.flora_zones`). Fungal trees: a thin pale
@@ -43,6 +44,7 @@ function glowCaps(shader) {
   )
 }
 
+// Drawn only when the camera is close (ringFade), so the overview stays calm.
 function Ring({ x, y, r }) {
   const geo = useMemo(() => {
     const pts = []
@@ -54,10 +56,17 @@ function Ring({ x, y, r }) {
     }
     return new THREE.BufferGeometry().setFromPoints(pts)
   }, [x, y, r])
-  const ref = useRef()
+  const line = useRef()
+  const mat = useRef()
+  useFrame(({ camera }) => {
+    if (!line.current || !mat.current) return
+    const f = ringFade(Math.hypot(camera.position.x - x, camera.position.y - groundAt(x, y), camera.position.z + y))
+    line.current.visible = f > 0.01
+    mat.current.opacity = 0.8 * f
+  })
   return (
-    <line ref={ref} geometry={geo} onUpdate={(l) => l.computeLineDistances()}>
-      <lineDashedMaterial color="#b6ff5a" dashSize={0.8} gapSize={0.6} transparent opacity={0.8} />
+    <line ref={line} geometry={geo} visible={false} onUpdate={(l) => l.computeLineDistances()}>
+      <lineDashedMaterial ref={mat} color="#b6ff5a" dashSize={0.8} gapSize={0.6} transparent opacity={0} />
     </line>
   )
 }

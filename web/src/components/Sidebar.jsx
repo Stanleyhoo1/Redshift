@@ -9,6 +9,9 @@ import { PlannerPill } from './Planner.jsx'
 import { SamplesPanel } from './Samples.jsx'
 import { ModeSwitch, PriorityChip } from './Autonomy.jsx'
 import { BIOMES, biomeOf } from '../lib/biomes.js'
+import { FoldButton, FoldSection, setFold, useFold } from './Fold.jsx'
+import { STATE_STYLE } from '../lib/theme.js'
+import '../styles/declutter-side.css'
 
 const WORD = 'Redshift'
 const INK = [232, 238, 245]
@@ -19,7 +22,7 @@ const RED = [255, 92, 70]
 function Wordmark() {
   const n = WORD.length
   return (
-    <h1 className="wordmark" aria-label={WORD}>
+    <h1 className="wordmark" aria-label={WORD} title="Autonomous super-Earth survey">
       {[...WORD].map((ch, i) => {
         const t = i / (n - 1)
         const k = Math.pow(t, 1.7)
@@ -105,7 +108,7 @@ function useUnread(tab) {
 }
 
 // The lower part of the sidebar: the event log and the operator comms, as two tabs.
-function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
+function LowerTabs({ tab, setTab, onFocusEvent, selected, input }) {
   const events = useSim((s) => s.events.length)
   const asking = useSim((s) => s.requests.length)
   // v4b: the Samples tab, when the sim collects samples.
@@ -116,20 +119,6 @@ function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
     if (tab === 'samples' && !hasSamples) setTab('events')
   }, [tab, hasSamples, setTab])
   const unread = useUnread(tab)
-  const input = useRef(null)
-
-  // "/" jumps to the message box, like many chat tools.
-  useEffect(() => {
-    const onKey = (e) => {
-      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey || appStore.get().modal) return
-      if (e.target instanceof Element && e.target.closest('input, textarea, select, [contenteditable="true"]')) return
-      e.preventDefault()
-      setTab('comms')
-      requestAnimationFrame(() => input.current?.focus())
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [setTab])
 
   const tabKeys = (e) => {
     if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
@@ -187,23 +176,125 @@ function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
   )
 }
 
+// Short folded summaries, so a folded section still says what is in it.
+function useSummaries() {
+  const explored = useSim((s) => s.fleet.explored_pct)
+  const found = useSim((s) => (Number.isFinite(s.fleet.targets_found) ? s.fleet.targets_found : s.targets.length))
+  const total = useSim((s) => s.fleet.targets_total)
+  const score = useSim((s) => s.fleet.science_score)
+  const nRovers = useSim((s) => s.roverMeta.length)
+  const states = useSim((s) => s.roverMeta.map((m) => s.rovers[m.id]?.state || '').join(','))
+  const events = useSim((s) => s.events.length)
+  const asking = useSim((s) => s.requests.length)
+  const mission = [
+    Number.isFinite(explored) ? `${fixed(explored, 1)} % explored` : null,
+    `${found} of ${Number.isFinite(total) ? total : '--'} targets`,
+    Number.isFinite(score) ? `${fixed(score, 0)} pts` : null,
+  ]
+    .filter(Boolean)
+    .join(', ')
+  const list = states.split(',')
+  const trouble = ['fault', 'recovering', 'charging'].map((k) => [k, list.filter((x) => x === k).length]).filter(([, n]) => n > 0)
+  const rovers = [`${nRovers} ${nRovers === 1 ? 'rover' : 'rovers'}`, ...trouble.map(([k, n]) => `${n} ${k}`)].join(', ')
+  const log = [`${events} ${events === 1 ? 'event' : 'events'}`, asking ? `${asking} ${asking === 1 ? 'question' : 'questions'} waiting` : null].filter(Boolean).join(', ')
+  return { mission, rovers, log, asking }
+}
+
+// The whole sidebar folded to a narrow rail: each rover's colour and state, and the questions waiting.
+function SideRail({ onOpen, onSelect, selected }) {
+  const meta = useSim((s) => s.roverMeta)
+  const rovers = useSim((s) => s.rovers)
+  const asking = useSim((s) => s.requests.length)
+  return (
+    <aside className="side side-rail" aria-label="Sidebar, folded">
+      <FoldButton open={false} onToggle={onOpen} label="the sidebar" className="rail-open" />
+      <ul className="rail-rovers">
+        {meta.map((m) => {
+          const st = rovers[m.id]?.state || 'unknown'
+          return (
+            <li key={m.id}>
+              <button
+                type="button"
+                className="rail-rover"
+                data-state={st}
+                aria-pressed={selected === m.id}
+                style={{ '--rover': m.color, '--state': STATE_STYLE[st]?.color }}
+                title={`${m.name}: ${STATE_STYLE[st]?.label ?? st}`}
+                aria-label={`${m.name}, ${STATE_STYLE[st]?.label ?? st}`}
+                onClick={() => onSelect(m.id)}
+              >
+                <span className="rail-num" aria-hidden="true">
+                  {m.name.match(/\d+/)?.[0] ?? m.name.slice(0, 1)}
+                </span>
+                <span className="rail-state" aria-hidden="true" />
+              </button>
+            </li>
+          )
+        })}
+      </ul>
+      {asking > 0 && (
+        <button type="button" className="rail-ask" onClick={onOpen} title={`${asking} ${asking === 1 ? 'question' : 'questions'} waiting`} aria-label={`${asking} ${asking === 1 ? 'question' : 'questions'} waiting, open the sidebar`}>
+          {asking}
+          <small>ask</small>
+        </button>
+      )}
+    </aside>
+  )
+}
+
 export function Sidebar({ follow, selected, onSelect, onFocusEvent, inert = false }) {
   // With Comms open the fleet stats fold into one row, so the conversation has room.
   const [tab, setTab] = useState('events')
+  const [panelOpen, setPanelOpen] = useFold('side.panel', true)
+  const sum = useSummaries()
+  const input = useRef(null)
+
+  // The rail is set on the root, so --side-w and the map grid follow it.
+  useEffect(() => {
+    const root = document.documentElement
+    if (panelOpen) delete root.dataset.side
+    else root.dataset.side = 'rail'
+    window.dispatchEvent(new Event('resize'))
+  }, [panelOpen])
+
+  // "/" jumps to the message box, like many chat tools. It opens the sidebar and the log first.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey || appStore.get().modal) return
+      if (e.target instanceof Element && e.target.closest('input, textarea, select, [contenteditable="true"]')) return
+      e.preventDefault()
+      setFold('side.panel', true)
+      setFold('side.log', true)
+      setTab('comms')
+      requestAnimationFrame(() => requestAnimationFrame(() => input.current?.focus()))
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  if (!panelOpen) return <SideRail onOpen={() => setPanelOpen(true)} onSelect={onSelect} selected={selected} />
+
   return (
-    <aside className="side" data-tab={tab} inert={inert}>
+    <aside className="side" data-tab={tab} data-ask={sum.asking > 0 || undefined} inert={inert}>
       <header className="side-head">
         <div className="side-head-top">
           <Wordmark />
           <PlannerPill />
+          <FoldButton open onToggle={() => setPanelOpen(false)} label="the sidebar" className="side-collapse" />
         </div>
         <Subtitle />
         <PriorityChip />
         <WorldFacts />
       </header>
-      <FleetStats />
-      <RoverList follow={follow} selected={selected} onSelect={onSelect} />
-      <LowerTabs tab={tab} setTab={setTab} onFocusEvent={onFocusEvent} selected={selected} />
+      <FoldSection id="side.mission" title="Mission" summary={sum.mission} className="side-fold" defaultOpen={typeof window === 'undefined' || window.innerHeight > 800}>
+        <FleetStats />
+      </FoldSection>
+      <FoldSection id="side.rovers" title="Rovers" summary={sum.rovers} className="side-fold">
+        <RoverList follow={follow} selected={selected} onSelect={onSelect} />
+      </FoldSection>
+      <FoldSection id="side.log" title="Log" summary={sum.log} className="side-fold side-fold-log">
+        <LowerTabs tab={tab} setTab={setTab} onFocusEvent={onFocusEvent} selected={selected} input={input} />
+      </FoldSection>
     </aside>
   )
 }

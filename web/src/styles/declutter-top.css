@@ -1,0 +1,426 @@
+/* The overlays over the top of the map: the hazard bar (folds to a pill) and the questions
+   (docked at the top right of the map, smaller, folding to a count chip). */
+
+/* Everything here lines up on the right edge of the map, under the top edge, so the
+   centre of the map (and the rovers) stays clear. .hud-top already sits inside the map
+   column, so it follows the sidebar when that narrows. */
+.hud-top {
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* ---- Hazards */
+
+.hud-hazards.hz-folded {
+  width: auto;
+  padding: 0;
+  gap: 4px;
+  background: rgba(8, 12, 19, 0.78);
+}
+
+.hz-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px 6px 9px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.hz-pill:hover {
+  color: var(--ink);
+}
+
+.hz-pill:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+.hz-pill > svg:first-child {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: var(--warn, #f2b84b);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.hz-pill .hz-badge {
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.hz-pill .fold-chev {
+  color: var(--ink-3-hud, var(--ink-3));
+}
+
+.hz-folded .hz-status {
+  max-width: 320px;
+  margin: 0;
+  padding: 0 10px 7px;
+  font-size: 12px;
+}
+
+.hz-fold {
+  margin-left: auto;
+}
+
+/* ---- Questions */
+
+.rq-stack {
+  width: min(440px, 100%);
+  align-items: flex-end;
+}
+
+.rq-stack > .hud-request {
+  align-self: stretch;
+}
+
+.hud-request {
+  --rq-w: 132px;
+  --rq-h: 99px;
+  gap: 11px;
+  padding: 10px 11px 13px 10px;
+}
+
+.rq-stack > .rq-strip {
+  align-self: stretch;
+}
+
+.rq-fold {
+  margin-left: auto;
+  margin-right: -4px;
+}
+
+.rq-more-btn {
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-2);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.rq-more-btn:hover {
+  color: var(--ink);
+}
+
+.rq-more-btn:focus-visible,
+.rq-chip:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+/* Folded: a chip with the count, pulsing whenever a new question arrives. */
+.rq-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  border-color: color-mix(in srgb, var(--signal) 55%, var(--line-2));
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  animation:
+    rq-in 380ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    rq-glow 2.4s ease-in-out 400ms 4;
+}
+
+.rq-chip b {
+  color: var(--ink);
+}
+
+.rq-chip .rover-dot {
+  background: var(--rover);
+}
+
+.rq-chip:hover {
+  color: var(--ink);
+}
+
+@media (max-height: 820px), (max-width: 1240px) {
+  .rq-stack {
+    width: min(400px, 100%);
+  }
+  .hud-request {
+    --rq-w: 116px;
+    --rq-h: 87px;
+    gap: 10px;
+    padding: 9px 10px 12px 9px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rq-chip {
+    animation: none;
+  }
+}
+
+/* The head wraps instead of running out of the narrower card; the fold chevron sits in the
+   top right corner. */
+.hud-request {
+  position: relative;
+}
+
+.rq-head {
+  flex-wrap: wrap;
+  row-gap: 4px;
+  padding-right: 22px;
+}
+
+.rq-fold {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  margin: 0;
+}
+
+.rq-q {
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+/* The placement hint and the banners stay centred over the map. */
+.hud-top > .banner-place,
+.hud-top > .banners {
+  align-self: center;
+}
+
+/* The card never enters from fully transparent: a busy frame (or a slow GPU) could
+   otherwise leave an empty gap above the "+N more waiting" chip while it fades in. */
+@keyframes rq-card-in {
+  from {
+    opacity: 0.55;
+    transform: translateY(-6px);
+  }
+}
+
+.rq-stack > .hud-request,
+.rq-stack > .hud-request[data-kind] {
+  animation: rq-card-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.rq-stack > .hud-request[data-kind='open'] {
+  animation:
+    rq-card-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    rq-glow 2.4s ease-in-out 400ms 4;
+}
+
+.rq-stack > .hud-request[data-kind='open'][data-wait] {
+  animation:
+    rq-card-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    rq-glow 4.8s ease-in-out 400ms 2;
+}
+
+/* Narrow map column or short window: a compact card. A small picture beside the head and
+   the question (it grows while you point at it), the answers in one row across the card,
+   and the "holds position" line folded into the Waiting pill's tooltip. */
+@media (max-height: 820px), (max-width: 1440px) {
+  .rq-stack {
+    width: min(372px, 100%);
+  }
+  .rq-stack > .hud-request {
+    --rq-w: 84px;
+    --rq-h: 63px;
+    display: grid;
+    grid-template-columns: var(--rq-w) minmax(0, 1fr);
+    align-items: start;
+    column-gap: 10px;
+    row-gap: 7px;
+    padding: 9px 10px 11px 9px;
+  }
+  .hud-request > .rq-img {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+    z-index: 2;
+    transform-origin: top left;
+    transition: transform 160ms ease-out, box-shadow 160ms ease-out;
+  }
+  .hud-request > .rq-img:hover {
+    transform: scale(2.1);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
+  }
+  .hud-request .rq-main {
+    display: contents;
+  }
+  .hud-request .rq-head {
+    grid-column: 2;
+    grid-row: 1;
+    flex-wrap: nowrap;
+    gap: 6px;
+    min-height: 22px;
+  }
+  .hud-request .rq-name {
+    font-size: 14.5px;
+  }
+  .hud-request .rq-asks {
+    display: none;
+  }
+  .hud-request .rq-wait {
+    padding: 2px 8px 2px 7px;
+    font-size: 11.5px;
+    gap: 5px;
+  }
+  .hud-request .rq-wait-more {
+    display: none;
+  }
+  .hud-request .rq-left {
+    font-size: 19px;
+  }
+  .hud-request .rq-q {
+    grid-column: 2;
+    grid-row: 2;
+    font-size: 13.5px;
+    line-height: 1.36;
+  }
+  .hud-request .rq-opts,
+  .hud-request .rq-out,
+  .hud-request .rq-hint,
+  .hud-request .rq-err {
+    grid-column: 1 / -1;
+  }
+  .hud-request .rq-opts {
+    flex-wrap: nowrap;
+    gap: 6px;
+  }
+  .hud-request .rq-opts:has(> .rq-opt:nth-child(4)) {
+    flex-wrap: wrap;
+  }
+  .hud-request .rq-opt {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 4px 8px;
+    font-size: 13px;
+  }
+  .hud-request .rq-opt-label {
+    white-space: normal;
+    text-align: center;
+  }
+  .hud-request .rq-hint {
+    font-size: 12px;
+  }
+  .hud-request .rq-hint[data-fold] {
+    display: none;
+  }
+  .hud-request .rq-img-cap {
+    left: 3px;
+    bottom: 3px;
+    padding: 0 4px;
+    font-size: 10px;
+    gap: 4px;
+  }
+}
+
+/* ---- Hazards, open: a single-column dropdown under where the pill sits, instead of the
+   full two-row bar across the map. Title and fold button on top, one hazard per line,
+   then the target and the status line. */
+@keyframes hz-drop-in {
+  from {
+    opacity: 0.6;
+    transform: translateY(-4px);
+  }
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) {
+  width: min(256px, 100%);
+  padding: 6px 8px 9px;
+  gap: 8px;
+  background: rgba(8, 12, 19, 0.9);
+  animation: hz-drop-in 180ms ease-out;
+}
+
+.hud-hazards:not(.hz-folded) > .hz-row:first-child {
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.hud-hazards:not(.hz-folded) .hz-title {
+  padding: 2px 2px 0;
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.hud-hazards:not(.hz-folded) .hz-title svg {
+  width: 14px;
+  height: 14px;
+}
+
+.hud-hazards:not(.hz-folded) .hz-fold {
+  order: 1;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-buttons {
+  order: 2;
+  display: flex;
+  flex: 1 1 100%;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-title span {
+  display: inline;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-sep {
+  display: block;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-btn {
+  flex: none;
+  justify-content: flex-start;
+  padding: 6px 9px;
+  font-size: 13px;
+}
+
+.hud-hazards:not(.hz-folded) .hz-btn .hz-badge {
+  margin-left: auto;
+}
+
+.hud-hazards:not(.hz-folded) .hz-sep {
+  width: auto;
+  height: 1px;
+  margin: 2px 4px;
+}
+
+.hud-hazards:not(.hz-folded) > .hz-row-2 {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-2);
+}
+
+.hud-hazards:not(.hz-folded) .hz-target {
+  flex-wrap: wrap;
+  gap: 5px 8px;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-status {
+  flex: none;
+  padding: 0 2px;
+  font-size: 12px;
+  -webkit-line-clamp: 3;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hud-top > .hud-hazards:not(.hz-folded) {
+    animation: none;
+  }
+}

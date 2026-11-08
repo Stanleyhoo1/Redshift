@@ -124,6 +124,9 @@ function Rover({ meta, selected, onSelect }) {
   // drei <Html> picks its DOM container once R3F has connected its events; mounting it
   // earlier makes it unmount and remount its own React root (a React error in dev).
   const labelsReady = useThree((s) => !!s.events.connected)
+  const camera = useThree((s) => s.camera)
+  const size = useThree((s) => s.size)
+  const tag = useRef()
   const markMats = useMemo(
     () => ({
       halo: new THREE.MeshBasicMaterial({ color: meta.color, map: glowTexture(), transparent: true, opacity: 0.2, depthWrite: false, blending: THREE.AdditiveBlending }),
@@ -132,7 +135,7 @@ function Rover({ meta, selected, onSelect }) {
     [meta.color],
   )
   useEffect(() => () => (markMats.halo.dispose(), markMats.ring.dispose()), [markMats])
-  useEffect(() => () => (roverPoses.delete(meta.id), dustSources.delete(meta.id)), [meta.id])
+  useEffect(() => () => (roverPoses.delete(meta.id), dustSources.delete(meta.id), tagShift.delete(meta.id)), [meta.id])
   useEffect(() => () => (document.body.style.cursor = ''), [])
 
   // Click (not drag) on the rover or its label selects it: sensor panel and follow.
@@ -196,6 +199,7 @@ function Rover({ meta, selected, onSelect }) {
     }
     if (inner.current) inner.current.quaternion.slerp(_q, Math.min(1, a * 1.2))
     roverPoses.set(meta.id, o.position)
+    spreadTag(tag.current, meta.id, camera, size)
 
     // Wheels: surface speed from the encoders when known (they spin faster than the rover
     // moves when it slips), signed by the direction of travel; skid steer turns spin the
@@ -284,6 +288,7 @@ function Rover({ meta, selected, onSelect }) {
       {labelsReady && (
         <Html position={[0, 2.5, 0]} center zIndexRange={[12, 0]} style={{ pointerEvents: 'none' }}>
           <button
+            ref={tag}
             type="button"
             className="rover-tag"
             data-selected={selected || undefined}
@@ -293,9 +298,13 @@ function Rover({ meta, selected, onSelect }) {
             data-ask={(asking && !faulted) || undefined}
             onClick={tagClick}
             title={`Show ${meta.name}'s sensors`}
+            aria-label={`${meta.name}${faulted ? ', fault' : asking ? ', waiting for your answer' : ''}: show its sensors`}
           >
-            <span className="dot" style={{ background: meta.color }} />
-            {meta.name}
+            {/* Compact: a coloured dot with the rover's number; the name shows on hover or when selected. */}
+            <span className="dot rover-tag-num" style={{ background: meta.color }} aria-hidden="true">
+              {String(meta.name).match(/\d+$/)?.[0] ?? ''}
+            </span>
+            <span className="rover-tag-name">{meta.name}</span>
             <TagSampling roverId={meta.id} />
             {faulted && <span className="rover-tag-fault">Fault</span>}
             {tagChip && (
@@ -313,6 +322,34 @@ function Rover({ meta, selected, onSelect }) {
       )}
     </group>
   )
+}
+
+// Rover tags that land on the same spot on screen (docked at the lander, or working side by
+// side) step sideways in id order instead of stacking, so each stays readable and clickable.
+const TAG_STEP = 40 // px: one compact tag plus a gap
+const TAG_ROW = 22 // px
+const tagShift = new Map()
+const _ta = new THREE.Vector3()
+const _tb = new THREE.Vector3()
+function spreadTag(el, id, camera, size) {
+  if (!el) return
+  const me = roverPoses.get(id)
+  _ta.set(me.x, me.y + 2.5, me.z).project(camera)
+  const ax = (_ta.x * 0.5 + 0.5) * size.width
+  const ay = (-_ta.y * 0.5 + 0.5) * size.height
+  let push = 0
+  const earlier = [...roverPoses.keys()].filter((k) => k !== id && String(k).localeCompare(String(id), undefined, { numeric: true }) < 0).sort()
+  for (const k of earlier) {
+    const rp = roverPoses.get(k)
+    _tb.set(rp.x, rp.y + 2.5, rp.z).project(camera)
+    const bx = (_tb.x * 0.5 + 0.5) * size.width + (tagShift.get(k) ?? 0)
+    const by = (-_tb.y * 0.5 + 0.5) * size.height
+    if (Math.abs(by - ay) < TAG_ROW && Math.abs(bx - (ax + push)) < TAG_STEP) push = Math.round(bx - ax + TAG_STEP)
+  }
+  if (push !== (tagShift.get(id) ?? 0)) {
+    tagShift.set(id, push)
+    el.style.transform = push ? `translateX(${push}px)` : ''
+  }
 }
 
 // While the rover samples: the instrument and whole-percent progress inside its own tag, in

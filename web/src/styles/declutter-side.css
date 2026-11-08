@@ -1,0 +1,241 @@
+/* Right sidebar declutter: foldable sections and the narrow rail (components/Sidebar.jsx). */
+
+:root[data-side='rail'] {
+  --side-w: 56px;
+}
+
+.side-head-top .side-collapse {
+  margin-left: 4px;
+}
+
+/* Points right: pushes the sidebar off to the right edge. */
+.side-collapse .fold-chev[data-open] {
+  transform: none;
+}
+
+.side-fold {
+  flex: none;
+  padding: 0 16px;
+  border-top: 1px solid var(--line);
+}
+
+.side-fold > .fold-head {
+  padding: 4px 0;
+}
+
+.side-fold-log:not([data-folded]) {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.side-fold-log > .fold-body:not([hidden]) {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin: 0 -16px;
+}
+
+.side-fold > .fold-body > .stats,
+.side-fold > .fold-body > .rovers {
+  margin-left: -16px;
+  margin-right: -16px;
+}
+
+/* A question is waiting while the log is folded: the summary says so in amber. */
+.side[data-ask] .side-fold-log[data-folded] .fold-summary {
+  color: var(--amber);
+}
+
+/* ---- the rail */
+
+.side-rail {
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+}
+
+.rail-open .fold-chev {
+  transform: rotate(180deg);
+}
+
+.rail-open {
+  padding: 8px;
+  border: 1px solid var(--line-2);
+}
+
+.rail-rovers {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rail-rover {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  width: 44px;
+  padding: 6px 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.rail-rover:hover,
+.rail-rover[aria-pressed='true'] {
+  border-color: var(--line-2);
+  color: var(--ink);
+}
+
+.rail-ask {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 40px;
+  padding: 6px 0;
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--amber) 14%, transparent);
+  color: var(--amber);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.rail-ask small {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Rover rows: the brain latency only shows when it runs high; otherwise it is in the row's tooltip. */
+.side .rover .brain-chip[data-level='ok'],
+.side .rover .brain-chip[data-level='none'] {
+  display: none;
+}
+
+/* ---- event log: one line per event until clicked */
+
+.ev {
+  display: block;
+  padding: 0;
+}
+
+.ev-toggle {
+  display: grid;
+  grid-template-columns: 3.1em 9px minmax(0, 1fr);
+  gap: 0 10px;
+  align-items: start;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ev-toggle:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.ev-toggle:focus-visible {
+  outline-offset: -2px;
+}
+
+.ev:not([data-open]) .ev-btn,
+.ev:not([data-open]) .ev-toggle {
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+.ev:not([data-open]) .ev-text {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ev:not([data-open]) .ev-text .src-tag,
+.ev:not([data-open]) .ev-why {
+  display: none;
+}
+
+.ev:not([data-open]) .ev-btn .ev-goto {
+  top: 8px;
+}
+
+/* Open: the reasoning is shown whole instead of clamped. */
+.ev[data-open] .ev-why {
+  display: block;
+  -webkit-line-clamp: unset;
+}
+
+/* ---- rail rovers: the rover number in its colour, ringed in the colour of its state */
+
+.rail-rover {
+  --state: var(--ink-3);
+}
+
+.rail-rover .rail-num {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--rover);
+  box-shadow:
+    0 0 0 2px var(--panel),
+    0 0 0 4px var(--state);
+  color: var(--void);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0;
+}
+
+.rail-rover .rail-state {
+  width: 18px;
+  height: 3px;
+  margin-top: 4px;
+  border-radius: 2px;
+  background: var(--state);
+}
+
+/* ---- short screens: a tighter header. The tagline stays for screen readers and in the
+   wordmark's tooltip; the world facts sit right under the wordmark. */
+@media (max-height: 760px) {
+  .side-head {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+  .side-head .subtitle {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .side-head .facts {
+    margin-top: 6px;
+  }
+  .side-head .facts-biome {
+    margin-top: 1px;
+  }
+}

@@ -114,6 +114,7 @@ const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
   const life = e.level === 'hazard' && LIFE_RE.test(e.msg)
   const hazard = e.level === 'hazard' && !life
   const level = life ? 'life' : e.damage ? 'damage' : e.level
+  const [open, setOpen] = useState(false)
   const content = (
     <>
       <span className="ev-time">{mmss(e.t)}</span>
@@ -146,12 +147,23 @@ const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
     </>
   )
   const decision = e.decision ? <Decision d={e.decision} /> : null
-  // Events with a location fly the camera there (the decision details sit outside that
-  // button, so expanding them never moves the camera).
+  // Each event is one line until clicked; the click opens the full text. Events with a location
+  // also fly the camera there (the decision details sit outside that button, so expanding them
+  // never moves the camera).
+  const full = `${life ? 'Lifeform' : hazard ? 'Hazard' : rover ? rover.name : e.rover || 'Fleet'} ${cleanMsg(e.msg, e.rover, byId)}`
   if (e.at && onFocus) {
     return (
-      <li className="ev ev-link" data-level={level} data-live={live || undefined} data-decision={!!decision || undefined}>
-        <button type="button" className="ev-btn" onClick={() => onFocus({ ...e, level: hazard ? 'hazard' : e.level === 'hazard' ? 'discovery' : e.level })} title={`Show where this happened (${e.at[0].toFixed(0)}, ${e.at[1].toFixed(0)})`}>
+      <li className="ev ev-link" data-level={level} data-live={live || undefined} data-decision={!!decision || undefined} data-open={open || undefined}>
+        <button
+          type="button"
+          className="ev-btn"
+          aria-expanded={open}
+          onClick={() => {
+            setOpen((o) => !o)
+            onFocus({ ...e, level: hazard ? 'hazard' : e.level === 'hazard' ? 'discovery' : e.level })
+          }}
+          title={`${open ? '' : `${full}\n`}Show where this happened (${e.at[0].toFixed(0)}, ${e.at[1].toFixed(0)})`}
+        >
           {content}
         </button>
         {decision}
@@ -159,8 +171,10 @@ const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
     )
   }
   return (
-    <li className="ev" data-level={level} data-live={live || undefined} data-decision={!!decision || undefined}>
-      {content}
+    <li className="ev" data-level={level} data-live={live || undefined} data-decision={!!decision || undefined} data-open={open || undefined}>
+      <button type="button" className="ev-toggle" aria-expanded={open} onClick={() => setOpen((o) => !o)} title={open ? 'Show less' : full}>
+        {content}
+      </button>
       {decision}
     </li>
   )

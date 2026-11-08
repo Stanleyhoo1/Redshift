@@ -22,6 +22,16 @@ export function markerFade(dist, near = MARKER_NEAR, far = MARKER_FAR) {
   return smooth(Math.min(1, Math.max(0, (dist - near) / (far - near))))
 }
 
+// Keep-out rings (plant groups, geyser vents) only belong to a close look: from the overview a
+// dashed circle round every group is clutter. 1 when the camera is within RING_NEAR metres of the
+// ring's centre, 0 beyond RING_FAR, smooth between (the reverse of markerFade).
+export const RING_NEAR = 45
+export const RING_FAR = 80
+export function ringFade(dist, near = RING_NEAR, far = RING_FAR) {
+  if (!Number.isFinite(dist)) return 0
+  return 1 - markerFade(dist, near, far)
+}
+
 // A '#rrggbb' colour as [r, g, b] in 0..1, as the screen shows it (the canvas is linear and
 // unconverted, so these match the legend's CSS swatches exactly).
 export function hexRgb(hex) {

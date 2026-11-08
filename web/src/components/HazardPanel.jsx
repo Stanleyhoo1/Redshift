@@ -7,10 +7,21 @@ import { PLACE_TEXT, placement, startPlacing, stopPlacing } from '../lib/placeme
 import { useHudRect } from '../lib/useHudRect.js'
 import { PartIcon } from './HealthBits.jsx'
 import { leaveGlobe } from '../globe/viewMode.js'
+import { FoldButton, useFold } from './Fold.jsx'
+import '../styles/declutter-top.css'
 
 const COOLDOWN_OK = 4000
 const COOLDOWN_ERR = 1200
 const HINT = 'Rovers are never told. They only find out through their own sensors.'
+// Folded to a small pill by default: injecting hazards is a demo tool, not the main view.
+// The ?debug page starts it open so the check scripts can click the hazard buttons directly.
+const OPEN_BY_DEFAULT = (() => {
+  try {
+    return new URLSearchParams(window.location.search).has('debug')
+  } catch {
+    return false
+  }
+})()
 
 const ICONS = {
   rockfall: (
@@ -105,6 +116,7 @@ export function HazardPanel() {
   const [status, setStatus] = useState(null) // { kind: 'ok' | 'error', text, key }
   const [cool, startCool] = useCooldowns()
   const ref = useHudRect('hazards')
+  const [unfolded, setUnfolded] = useFold('top.hazards', OPEN_BY_DEFAULT)
   const byId = useMemo(() => Object.fromEntries(meta.map((m) => [m.id, m])), [meta])
   const types = HAZARD_TYPES.filter((h) => (!h.v4 || v4) && (!h.v9 || v9))
   // v9: the Damage popover, open for one rover: { rover }; the part picked (null = any);
@@ -262,14 +274,39 @@ export function HazardPanel() {
 
   const hazardTypes = types.filter((h) => !h.discovery)
   const finds = types.filter((h) => h.discovery)
-  return (
-    <div className="hud hud-hazards" ref={ref} aria-label="Hazards" data-v4={v4 || undefined} data-v9={v9 || undefined}>
-      <div className="hz-row">
-        <div className="hz-title">
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M8 1.8 15 14H1z" />
-            <path d="M8 6.2v3.6M8 11.6v.2" />
+  const live = Object.values(badge).filter(Boolean).length
+  const open = unfolded || !!placing || !!dmg
+  const title = (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 1.8 15 14H1z" />
+      <path d="M8 6.2v3.6M8 11.6v.2" />
+    </svg>
+  )
+  if (!open) {
+    return (
+      <div className="hud hud-hazards hz-folded" ref={ref} aria-label="Hazards" data-v4={v4 || undefined} data-v9={v9 || undefined}>
+        <button type="button" className="hz-pill" aria-expanded={false} onClick={() => setUnfolded(true)} title={`Inject a hazard. ${HINT}`}>
+          {title}
+          <span>Hazards</span>
+          {badge.dust_storm && <span className="hz-badge">Storm {badge.dust_storm}</span>}
+          {badge.rover_fault && <span className="hz-badge">Fault {badge.rover_fault}</span>}
+          <svg className="fold-chev" viewBox="0 0 12 12" aria-hidden="true">
+            <path d="M4.5 3l3 3-3 3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
+        </button>
+        {status && (
+          <p className="hz-status" data-kind={status.kind} key={status.key} role={status.kind === 'error' ? 'alert' : 'status'}>
+            {status.text}
+          </p>
+        )}
+      </div>
+    )
+  }
+  return (
+    <div className="hud hud-hazards" ref={ref} aria-label="Hazards" data-v4={v4 || undefined} data-v9={v9 || undefined} data-live={live || undefined}>
+      <div className="hz-row">
+        <div className="hz-title" title={HINT}>
+          {title}
           <span>Hazards</span>
         </div>
         <div className="hz-buttons">
@@ -277,9 +314,10 @@ export function HazardPanel() {
           {finds.length > 0 && <i className="hz-sep" aria-hidden="true" />}
           {finds.map(button)}
         </div>
+        <FoldButton open onToggle={() => { stopPlacing(); if (dmg) closeDamage(); setUnfolded(false) }} label="hazards" className="hz-fold" />
       </div>
       <div className="hz-row hz-row-2">
-        <div className="hz-target">
+        <div className="hz-target" title={HINT}>
           <span className="hz-label" id="hz-target-label">
             Target
           </span>
@@ -296,7 +334,7 @@ export function HazardPanel() {
           </div>
         </div>
         <p className="hz-status" data-kind={status?.kind} key={status?.key ?? 'hint'} role={status?.kind === 'error' ? 'alert' : 'status'} title={status ? undefined : HINT}>
-          {status ? status.text : HINT}
+          {status ? status.text : 'Rovers find out only through their sensors.'}
         </p>
       </div>
       {dmg && byId[dmg.rover] && (

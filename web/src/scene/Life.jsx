@@ -419,15 +419,23 @@ function TrackTag({ id }) {
       const since = Number.isFinite(k.last_seen) ? k.last_seen : lostAtSim.get(id)
       if (Number.isFinite(since) && Number.isFinite(s.t)) ago = Math.max(0, Math.round(s.t - since))
     }
-    return `${k.status}\u0001${k.label ?? ''}\u0001${k.observer ?? ''}\u0001${more}\u0001${ago}`
+    // A waiting question about this track spells its tag out in full.
+    const asked = s.requests.some((r) => r.track_id === id) ? '1' : ''
+    return `${k.status}\u0001${k.label ?? ''}\u0001${k.observer ?? ''}\u0001${more}\u0001${ago}\u0001${asked}`
   })
   const names = useSim((s) => s.roverMeta)
   if (!info) return null
-  const [status, label, observer, more, ago] = info.split('\u0001')
+  const [status, label, observer, more, ago, asked] = info.split('\u0001')
   const watcher = observer ? names.find((m) => m.id === observer) : null
   const n = Number(more)
+  const lost = status === 'lost' ? (Number(ago) >= 0 ? `last seen ${ago} s ago` : 'lost') : ''
+  // Compact by default (just the id chip): the full label shows on hover, when the camera
+  // is close (data-near on the wrapper, set per frame) or for the track a question is about.
+  const full = [id, label || 'moving object', n ? `${n} more ${n === 1 ? 'track' : 'tracks'} close by` : '', lost, watcher && !lost ? `${watcher.name} is watching` : '']
+    .filter(Boolean)
+    .join(', ')
   return (
-    <div className="track-tag" data-lost={status === 'lost' || undefined} title={n ? `${n} more ${n === 1 ? 'track' : 'tracks'} close by` : undefined}>
+    <div className="track-tag" data-lost={status === 'lost' || undefined} data-full={asked || undefined} title={full} aria-label={full}>
       <span className="track-tag-id">{id}</span>
       <span className="track-tag-label">{label || 'moving object'}</span>
       {n > 0 && <span className="track-tag-more">+{n}</span>}
@@ -440,6 +448,40 @@ function TrackTag({ id }) {
   )
 }
 
+// Close up (camera within NEAR m) the track tag shows its full label. Where a rover tag sits
+// on the same spot on screen, the chip slides down under it instead of covering it.
+const NEAR = 38 // m
+const TAG_W = 70 // px: half a rover tag plus half a track chip, side to side
+const TAG_H = 24 // px: one tag height plus a small gap
+const _tagA = new THREE.Vector3()
+const _tagB = new THREE.Vector3()
+function placeTag(el, p, camera, size) {
+  if (!el) return
+  _tagA.set(p.x, p.gz + 1.9, -p.y)
+  const near = camera.position.distanceTo(_tagA) < NEAR
+  if (near !== p.near) {
+    p.near = near
+    if (near) el.dataset.near = ''
+    else delete el.dataset.near
+  }
+  _tagA.project(camera)
+  const ax = (_tagA.x * 0.5 + 0.5) * size.width
+  const ay = (-_tagA.y * 0.5 + 0.5) * size.height
+  let push = 0
+  for (const rp of roverPoses.values()) {
+    _tagB.set(rp.x, rp.y + 2.5, rp.z).project(camera)
+    if (_tagB.z > 1) continue
+    const bx = (_tagB.x * 0.5 + 0.5) * size.width
+    const by = (-_tagB.y * 0.5 + 0.5) * size.height
+    if (Math.abs(bx - ax) < TAG_W && Math.abs(by - ay) < TAG_H) push = Math.max(push, by - ay + TAG_H)
+  }
+  push = Math.round(push)
+  if (push !== p.nudge) {
+    p.nudge = push
+    el.style.transform = push ? `translateY(${push}px)` : ''
+  }
+}
+
 function TrackMarker({ id }) {
   const size = useThree((s) => s.size)
   const labelsReady = useThree((s) => !!s.events.connected)
@@ -448,7 +490,9 @@ function TrackMarker({ id }) {
   const arrow = useMemo(() => new FatPolyline(5, { color: LIFE, width: 2.2, opacity: 0.95 }), [])
   const ringXyz = useMemo(() => new Float32Array((RING_SEGS + 1) * 3), [])
   const arrowXyz = useMemo(() => new Float32Array(5 * 3), [])
-  const st = useRef({ x: null, y: null, gz: 0, lostAt: null })
+  const st = useRef({ x: null, y: null, gz: 0, lostAt: null, near: false, nudge: 0 })
+  const wrap = useRef()
+  const camera = useThree((s) => s.camera)
   useEffect(() => () => (ring.dispose(), arrow.dispose(), trackPoses.delete(id), lostAtSim.delete(id)), [ring, arrow, id])
   useEffect(() => {
     ring.setResolution(size.width, size.height)
@@ -510,6 +554,7 @@ function TrackMarker({ id }) {
       ringXyz[q * 3 + 2] = -y
     }
     ring.set(ringXyz, RING_SEGS + 1)
+    placeTag(wrap.current, p, camera, size)
 
     // Velocity arrow: where it will be in about 4 s, from the edge of the ring.
     const sp = Math.hypot(k.vx, k.vy)
@@ -545,7 +590,9 @@ function TrackMarker({ id }) {
       <group ref={group} visible={false}>
         {labelsReady && (
           <Html position={[0, 1.9, 0]} center zIndexRange={[11, 0]} style={{ pointerEvents: 'none' }}>
-            <TrackTag id={id} />
+            <div className="track-tag-wrap" ref={wrap}>
+              <TrackTag id={id} />
+            </div>
           </Html>
         )}
       </group>

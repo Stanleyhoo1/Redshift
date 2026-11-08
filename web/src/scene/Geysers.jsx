@@ -5,6 +5,7 @@ import { useSim } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { groundAt, knownAt } from './ground.js'
 import { reducedMotion } from './sceneConstants.js'
+import { ringFade } from './mapMarkers.js'
 import { DrapedDisc, useDrape } from './drape.js'
 
 // v7 geysers (PROTOCOL.md, `features.geysers` and `fleet.geyser_zones`). Each vent is a squat sinter
@@ -108,6 +109,7 @@ function WetPatch({ v, fades, reality }) {
   )
 }
 
+// Drawn only when the camera is close (ringFade), so the overview stays calm.
 function Ring({ x, y, r }) {
   const geo = useMemo(() => {
     const pts = []
@@ -119,9 +121,17 @@ function Ring({ x, y, r }) {
     }
     return new THREE.BufferGeometry().setFromPoints(pts)
   }, [x, y, r])
+  const line = useRef()
+  const mat = useRef()
+  useFrame(({ camera }) => {
+    if (!line.current || !mat.current) return
+    const f = ringFade(Math.hypot(camera.position.x - x, camera.position.y - groundAt(x, y), camera.position.z + y))
+    line.current.visible = f > 0.01
+    mat.current.opacity = 0.85 * f
+  })
   return (
-    <line geometry={geo} onUpdate={(l) => l.computeLineDistances()}>
-      <lineDashedMaterial color="#f6e7cf" dashSize={0.9} gapSize={0.6} transparent opacity={0.85} />
+    <line ref={line} geometry={geo} visible={false} onUpdate={(l) => l.computeLineDistances()}>
+      <lineDashedMaterial ref={mat} color="#f6e7cf" dashSize={0.9} gapSize={0.6} transparent opacity={0} />
     </line>
   )
 }
