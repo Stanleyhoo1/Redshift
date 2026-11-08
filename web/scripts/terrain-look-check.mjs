@@ -36,8 +36,11 @@ page.on('pageerror', (err) => problems.push(`[pageerror] ${err.message}`))
 await page.goto(`${url}/?debug`, { waitUntil: 'domcontentloaded' })
 await page.waitForFunction(() => window.__redshift && window.__redshift.state().features, null, { timeout: 60000 })
 await page.waitForTimeout(waitS * 1000)
-await page.keyboard.press('s')
-await page.keyboard.press('r')
+// Slope colours off and Reality on, through the layer toggles (aria-pressed is their state).
+for (const [label, want] of [['Slope colours', false], ['Reality', process.env.REALITY !== '0']]) {
+  const b = page.locator('button.toggle', { hasText: label }).first()
+  if ((await b.getAttribute('aria-pressed')) !== String(want)) await b.click()
+}
 await page.waitForTimeout(2500)
 const info = await page.evaluate(() => {
   const s = window.__redshift.state()

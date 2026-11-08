@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
-import { simStore, useSim, nowSeconds, roverPoses } from '../state/store.js'
+import { simStore, useSim, useApp, nowSeconds, roverPoses } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { SIGNAL, SLOPE, REGOLITH, VOID } from '../lib/theme.js'
 import { reducedMotion } from './sceneConstants.js'
@@ -518,7 +518,46 @@ class TerrainMesh {
   }
 }
 
-export function Terrain({ slopeColors }) {
+// v7, Reality on with landforms present: the true ground as a terrain of its own (all of it
+// known), drawn a little below the measured terrain, so mesas, the canyon, pits and dunes show
+// in 3D before the fleet has mapped them.
+function truthTerrain(truth) {
+  const { nx, ny, res, ox, oy, heights } = truth
+  const n = nx * ny
+  const slope = new Float32Array(n)
+  let minH = Infinity
+  let maxH = -Infinity
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i
+      const h = heights[k]
+      if (h < minH) minH = h
+      if (h > maxH) maxH = h
+      const hx = (heights[j * nx + Math.min(i + 1, nx - 1)] - heights[j * nx + Math.max(i - 1, 0)]) / (2 * res)
+      const hy = (heights[Math.min(j + 1, ny - 1) * nx + i] - heights[Math.max(j - 1, 0) * nx + i]) / (2 * res)
+      slope[k] = (Math.atan(Math.hypot(hx, hy)) * 180) / Math.PI
+    }
+  }
+  const width = (nx - 1) * res
+  const depth = (ny - 1) * res
+  return {
+    nx, ny, res, ox, oy, width, depth, cx: ox + width / 2, cy: oy + depth / 2, minH, maxH,
+    h: heights, slope, known: new Uint8Array(n).fill(1), revealAt: new Float32Array(n).fill(-1e6),
+    dirty: new Int32Array(1), dirtyFlag: new Uint8Array(n), dirtyCount: 0,
+  }
+}
+
+function TruthGround({ material }) {
+  const truth = useApp((a) => a.truth)
+  const gen = useSim((s) => s.gen)
+  const mesh = useMemo(() => (truth && truth.heights && truth.gen === gen ? new TerrainMesh(truthTerrain(truth)) : null), [truth, gen])
+  useEffect(() => () => mesh?.dispose(), [mesh])
+  if (!mesh) return null
+  return <mesh geometry={mesh.geometry} material={material} position={[0, -0.12, 0]} frustumCulled={false} renderOrder={0} receiveShadow />
+}
+
+export function Terrain({ slopeColors, reality = false }) {
+  const landforms = useSim((s) => !!s.features && V7_LANDFORM_KEYS.some((k) => (Array.isArray(s.features[k]) ? s.features[k].length > 0 : !!s.features[k])))
   const terrain = useSim((s) => s.terrain)
   const roverMeta = useSim((s) => s.roverMeta)
   const graphics = useGraphics()
@@ -570,5 +609,10 @@ export function Terrain({ slopeColors }) {
   })
 
   if (!mesh) return null
-  return <mesh geometry={mesh.geometry} material={material} customDepthMaterial={depthMaterial} frustumCulled={false} renderOrder={0} castShadow receiveShadow />
+  return (
+    <>
+      <mesh geometry={mesh.geometry} material={material} customDepthMaterial={depthMaterial} frustumCulled={false} renderOrder={0} castShadow receiveShadow />
+      {reality && landforms && <TruthGround material={material} />}
+    </>
+  )
 }
