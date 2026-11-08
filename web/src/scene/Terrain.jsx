@@ -55,7 +55,10 @@ function syncBiome(u, world, features) {
     u.uBiome.value = blackTexture()
     return
   }
-  const tex = new THREE.DataTexture(map.w, map.nx, map.ny, THREE.RedFormat, THREE.FloatType)
+  // 8 bit (R8): linear filtering works everywhere, unlike float textures without OES_texture_float_linear
+  const bytes = new Uint8Array(map.w.length)
+  for (let k = 0; k < bytes.length; k++) bytes[k] = Math.round(map.w[k] * 255)
+  const tex = new THREE.DataTexture(bytes, map.nx, map.ny, THREE.RedFormat, THREE.UnsignedByteType)
   tex.magFilter = THREE.LinearFilter
   tex.minFilter = THREE.LinearFilter
   tex.needsUpdate = true
