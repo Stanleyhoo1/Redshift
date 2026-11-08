@@ -48,6 +48,11 @@ const shot = async (name) => {
 }
 
 await shot('overview-plain')
+// The map key starts folded on short screens: open it for the legend measurement and crop.
+if ((await page.locator('.legend-toggle[aria-expanded="false"]').count()) > 0) {
+  await page.locator('.legend-toggle').click()
+  await page.waitForTimeout(400)
+}
 const legend = await page.locator('.hud-legend').boundingBox()
 console.log(`legend box ${JSON.stringify(legend)} viewport ${width}x${height} fits ${legend ? legend.y >= 0 && legend.y + legend.height <= height : 'n/a'}`)
 await page.locator('.hud-legend').screenshot({ path: path.join(outDir, `${prefix}-legend.png`) })

@@ -120,3 +120,64 @@
     margin-top: 7px;
   }
 }
+
+/* The fold button: a small chevron in the corner while the key is open, the whole pill when
+   it is folded (every other part of the key is hidden then). */
+.legend-toggle {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3-hud, var(--ink-3));
+  font: inherit;
+  cursor: pointer;
+}
+
+.legend-toggle:hover {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.legend-toggle-chev {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.hud-legend[data-collapsed] {
+  min-width: 0;
+  padding: 0;
+}
+
+.hud-legend[data-collapsed] > :not(.legend-toggle) {
+  display: none;
+}
+
+.hud-legend[data-collapsed] .legend-toggle {
+  position: static;
+  padding: 8px 12px 8px 14px;
+  border-radius: 10px;
+  color: var(--ink);
+}
+
+.legend-toggle-text {
+  font-size: 13.5px;
+  font-weight: 620;
+}
+
+.legend-toggle-lim {
+  margin-left: 4px;
+  color: var(--ink-3-hud, var(--ink-3));
+  font-weight: 500;
+}
+
+.legend-toggle-lim[data-flash] {
+  animation: limit-flash 8s ease-out;
+}

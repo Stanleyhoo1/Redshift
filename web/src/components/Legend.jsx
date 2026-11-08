@@ -3,6 +3,7 @@ import { degrees, fixed } from '../lib/format.js'
 import { KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
 import '../styles/scene.css'
 import { TerrainLegend } from './TerrainLegend.jsx'
+import { LegendToggle, useLegendOpen } from './LegendToggle.jsx'
 
 export function Legend({ slopeColors, frontiers, life = true }) {
   const limit = useSim((s) => s.limit)
@@ -11,8 +12,10 @@ export function Legend({ slopeColors, frontiers, life = true }) {
   const hasTrace = useSim((s) => s.v4 || s.targets.some((t) => t.kind === 'trace'))
   const lim = Number.isFinite(limit.current) ? limit.current : 30
   const caution = lim * 0.6
+  const open = useLegendOpen()
   return (
-    <div className="hud hud-legend" aria-label="Map legend">
+    <div className="hud hud-legend" aria-label="Map legend" data-collapsed={!open || undefined}>
+      <LegendToggle open={open} lim={lim} changedAt={limit.changedAt} />
       {slopeColors ? (
         <>
           <div className="legend-title" key={limit.changedAt ?? 'base'} data-flash={limit.changedAt !== null || undefined}>
