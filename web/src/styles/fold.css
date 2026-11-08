@@ -1,0 +1,104 @@
+/* Collapsible dashboard areas (components/Fold.jsx). */
+
+.fold-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  padding: 3px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3-hud, var(--ink-3));
+  font: inherit;
+  cursor: pointer;
+}
+
+.fold-btn:hover {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.fold-btn:focus-visible,
+.fold-head-btn:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+.fold-chev {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  transition: transform 160ms ease;
+}
+
+.fold-chev[data-open] {
+  transform: rotate(90deg);
+}
+
+.fold-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.fold-head-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 2px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fold-head-btn:hover {
+  color: var(--ink);
+}
+
+.fold-head-btn .fold-chev {
+  color: var(--ink-3-hud, var(--ink-3));
+}
+
+.fold-title {
+  flex: none;
+}
+
+.fold-summary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3-hud, var(--ink-3));
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fold-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.fold-body[hidden] {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fold-chev {
+    transition: none;
+  }
+}
