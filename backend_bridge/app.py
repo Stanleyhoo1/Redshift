@@ -6,16 +6,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import math
 import time
+from typing import Annotated
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from . import _paths  # noqa: F401
 from .config_schema import MissionConfig, options, physics_preview
@@ -90,6 +92,7 @@ class Hub:
         self._bg: set[asyncio.Task] = set()
         self.speed = 1.0                     # target sim speed (real-time factor) of the current mission
         self._sim0: tuple[float | None, float | None] = (None, None)   # (running_since, sim time when it began)
+        self._cmd_ids = itertools.count(1)   # operator command ids "cmd-<n>", unique for this backend process
 
     # ------------------------------------------------------------------ outbound (never blocks the caller)
     def attach(self, ws: WebSocket, camera: str) -> Client:
@@ -170,6 +173,13 @@ class Hub:
         if self.loop and self.queue:
             self.loop.call_soon_threadsafe(self.queue.put_nowait, msg)
 
+    def on_brain(self, decision: dict):
+        """A /brain/decision (ROS thread): pushed to every client at once, unchanged (docs/protocol.md §9.8)."""
+        self.from_ros({'type': 'brain', 'decision': decision})
+
+    def next_command_id(self) -> str:
+        return f'cmd-{next(self._cmd_ids)}'
+
     @staticmethod
     def _specs(cfg: MissionConfig) -> dict:
         return {r: (ROVER_SPEC if r.startswith('rover') else SCOUT_SPEC) for r in cfg.robots}
@@ -206,6 +216,7 @@ class Hub:
                 'percent_mapped': float(st.get('percent', 0.0)), 'science_found': len(st.get('science', [])),
                 'hazard_cells': int(st.get('hazard_cells', 0)),
                 'env': {'dust_level': float(env.get('dust_level', 0.0)), 'seismic': bool(env.get('seismic', False))},
+                'brain': self.link.brain_status() if self.link else None,
                 'config': m.config.model_dump() if m.config else None}
 
     async def broadcaster(self):
@@ -297,6 +308,18 @@ class AnomalyBody(BaseModel):
     duration_s: float = Field(25.0, ge=3.0, le=120.0)
 
 
+# operator text for the advisory brain: 1-200 characters once trimmed; runs of whitespace (newlines, tabs) collapse
+# to one space so a pasted multi-line command reads as one line in traces and the prompt
+OperatorText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+                         AfterValidator(lambda v: ' '.join(v.split()))]
+
+
+class CommandBody(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    text: OperatorText
+    robot: str | None = None
+
+
 def invalid(e: ValidationError) -> JSONResponse:
     errs = e.errors(include_url=False, include_context=False)
     msg = '; '.join(f"{'.'.join(str(x) for x in er.get('loc', ())) or 'body'}: {er.get('msg')}" for er in errs)
@@ -329,7 +352,8 @@ async def lifespan(_app: FastAPI):
     if HAVE_ROS:
         try:
             hub.link = RosLink(on_trace=lambda t: hub.from_ros({'type': 'trace', 'entry': t}),
-                               on_event=lambda e: hub.from_ros({'type': 'event', 'event': e}))
+                               on_event=lambda e: hub.from_ros({'type': 'event', 'event': e}),
+                               on_brain=hub.on_brain)
         except Exception as e:  # noqa: BLE001
             hub.link_error = f'ROS link failed: {e}'
     else:
@@ -441,6 +465,29 @@ async def api_damage(request: Request):
         return {'ok': False, 'detail': msg}
     res = hub.command({'op': 'critical_damage', 'robot': r})
     return res if not res['ok'] else {'ok': True, 'detail': f'Debris strike: critical damage on {display_name(r)}'}
+
+
+@app.post('/api/command')
+async def api_command(request: Request):
+    """Operator command → /operator/command for fleet_brain_node. The answer (a /brain/decision carrying this
+    command_id) arrives over the WebSocket; the local safety layer judges the command whatever Gemma says."""
+    body, err = await parse_body(request, CommandBody)
+    if err:
+        return err
+    m = hub.mgr
+    if m is None or m.status not in ('running', 'degraded') or not m.config:
+        return JSONResponse({'ok': False, 'detail': 'No running mission'}, status_code=409)
+    if body.robot is not None and body.robot not in m.config.robots:
+        return JSONResponse({'ok': False, 'detail': f'robot: {body.robot!r} is not in the fleet {m.config.robots}'},
+                            status_code=422)
+    if hub.link is None:
+        return JSONResponse({'ok': False, 'detail': hub.link_error or 'ROS link unavailable'}, status_code=503)
+    cid = hub.next_command_id()
+    n = hub.link.publish_operator_command({'id': cid, 'text': body.text, 'robot': body.robot,
+                                           't': round(time.time(), 3)})
+    if n == 0:
+        return {'ok': False, 'id': cid, 'detail': 'The agent brain is not listening on /operator/command'}
+    return {'ok': True, 'id': cid}
 
 
 @app.post('/api/sim/speed')

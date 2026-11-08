@@ -22,6 +22,8 @@ from std_msgs.msg import String
 from . import grid_map as gm
 from .agent_fsm import (DOCK_M, ImuWindow, ReplanGate, RoverFSM, RoverInputs, ScoutFSM, ScoutInputs, display_name,
                         role_of, unit_label)
+from .brain_bridge import (CAPPED_DRIVES, BrainAltitude, BrainCap, DropGuard, altitude_trace, cap_trace,
+                           parse_decision)
 from .edge_budget import PROFILES, EdgeBudget
 from .grid_map import slope_from_elevation
 from .physics_model import RoverPhysics
@@ -49,6 +51,10 @@ DOCK_CLEAR_M = 0.9           # a LiDAR corridor return this much short of the te
                              # the way: the docking creep stops (the teammate's own near face is ≈0.45–0.6 m short).
                              # The corridor ignores returns within 1.0 m, so the last ≈0.45 m of the creep is unguarded.
 START_BATTERY = {'rover_0': 82.0, 'rover_1': 91.0}
+# advisory brain (/brain/decision, fleet_brain_node): a cap only ever lowers the local speed (brain_bridge.BrainCap)
+BRAIN_REPLAN_STATES = ('EXPLORING', 'CAUTION', 'RESCUE_TRANSIT')   # SLOW_AND_REPLAN → quiet re-plan in these
+BRAIN_AGL_STATES = ('SURVEY', 'FLY_TO_SCAN')   # scout states that fly an advisory cruise AGL (never take-off / scan)
+AGL_HOLD_STATES = BRAIN_AGL_STATES + ('SCANNING',)   # ... plus a scan, which holds the AGL it started at
 
 
 class MapView:
@@ -319,6 +325,11 @@ class RoverAgent(AgentBase):
         self._mode_sent = None
         self._started = False
         self._t_boot = self.now_s()
+        self.brain_cap = BrainCap(r)
+        self._brain_replan = False
+        self._cap_applied = False           # the last drive ran under brain_cap.apply ('follow' with a path / 'dock')
+        self._brain_guard = DropGuard(self.get_logger().warning)
+        self.create_subscription(String, '/brain/decision', self.on_brain, 10)
         self.create_subscription(Imu, f'/{r}/imu', self.on_imu, SENSOR_QOS)
         self.create_subscription(Odometry, f'/{r}/wheel_odom', self.on_wheel, SENSOR_QOS)
         self.create_subscription(String, '/fleet/scan_complete', self.on_scan_complete, 10)
@@ -387,6 +398,27 @@ class RoverAgent(AgentBase):
         self.rescue_seen[d['id']] = d
         if d.get('target') == self.robot and d.get('phase') == 'REPAIRING':
             self._repairing_by = d.get('rescuer')
+
+    def on_brain(self, m: String):
+        """Advisory decision for this rover: a speed cap (min with the local speed, sim-time expiry) and, for
+        SLOW_AND_REPLAN, a quiet re-plan once no hold binds. Malformed or foreign decisions are ignored; one that
+        cannot be handled is dropped with a throttled warning."""
+        self._brain_guard.call('/brain/decision', self._on_brain, m.data)
+
+    def _on_brain(self, data: str):
+        now = self.now_s()
+        cap = self.brain_cap.offer(parse_decision(data), now)
+        if cap is None:
+            return
+        if cap.action == 'SLOW_AND_REPLAN' and not cap.released:
+            self._brain_replan = True
+        if (self._last_drive in CAPPED_DRIVES and self.brain_cap.holding(now, self.fsm.state)
+                and self.cmd != (0.0, 0.0)):
+            self.cmd = (0.0, 0.0)          # a hold takes effect now, not after the next tick's A*
+            self.send_cmd(0.0, 0.0)
+        tx = cap_trace(cap)
+        self.trace('brain_cap', ['FLEET'], tx['input'], tx['reasoning'], tx['confidence'], tx['action'],
+                   tx['severity'], force=True)   # one per decision (rate-limited upstream): a lifted stop must show
 
     # ------------------------------------------------------------------ fleet: SOS / rescue
     def peer_xy(self, robot: str, fallback=None):
@@ -816,7 +848,8 @@ class RoverAgent(AgentBase):
             self.goal_kind = 'frontier'
         self.emit(out.traces)
         self._slope_trace(inp)
-        if out.drive == 'stop' and self.cmd != (0.0, 0.0):
+        brain_hold = self.brain_cap.holding(now, self.fsm.state)
+        if (out.drive == 'stop' or (brain_hold and out.drive in CAPPED_DRIVES)) and self.cmd != (0.0, 0.0):
             self.cmd = (0.0, 0.0)          # halt before the (possibly long) A* below, not after it
             self.send_cmd(0.0, 0.0)
 
@@ -863,6 +896,12 @@ class RoverAgent(AgentBase):
             self.blocked = False
             self.replan(visible=True)
             self.publish_claim()
+        if self._brain_replan and not brain_hold:
+            # advisory SLOW_AND_REPLAN: refresh the route quietly unless the FSM has just re-planned it (deferred
+            # while a brain hold binds: the rover is stopped, the re-plan runs when it may move again)
+            self._brain_replan = False
+            if self.fsm.state in BRAIN_REPLAN_STATES and mono - self._last_replan > 1.0:
+                self.replan(visible=False)
 
         if out.mode != self._mode_sent:
             self.pub_mode.publish(String(data=out.mode))
@@ -887,9 +926,12 @@ class RoverAgent(AgentBase):
             self.rev_idx = 0
         x, y, yaw = self.pose
         v = w = 0.0
+        self._cap_applied = False
         if out.drive == 'follow' and self.path_xy is not None:
             vmax = self.limits.v_max * out.speed_scale
             v, w, idx, done = pure_pursuit(self.pose, self.path_xy, lookahead=1.5, v_max=vmax, w_max=self.w_max)
+            v, w = self.brain_cap.apply(v, w, self.now_s(), self.fsm.state)   # advisory: never faster than local
+            self._cap_applied = True
             self.path_idx = max(self.path_idx, idx)
             if done:
                 self.goal_reached = True
@@ -907,6 +949,8 @@ class RoverAgent(AgentBase):
                 elif rng > DOCK_M - 0.05 and near >= rng - DOCK_CLEAR_M:
                     v = self.limits.v_max * out.speed_scale
                     w = float(np.clip(1.5 * alpha, -0.4, 0.4))
+            v, w = self.brain_cap.apply(v, w, self.now_s(), self.fsm.state)   # operator caps only while docking
+            self._cap_applied = True
         elif out.drive == 'reverse' and out.reverse_path:
             rp = out.reverse_path
             while self.rev_idx < len(rp) - 1 and math.hypot(rp[self.rev_idx][0] - x, rp[self.rev_idx][1] - y) < 0.6:
@@ -945,7 +989,8 @@ class RoverAgent(AgentBase):
               'path_remaining_m': round(self._remaining_m(), 1), 'caution': self.fsm.caution,
               'role': self.role, 'name': self.name, 'health': self.health.state().as_dict(),
               'rescue': self._rescue_info(), 'v_cmd': round(self.cmd[0], 3), 'v_wheel': round(self.v_wheel, 3),
-              'v_ground': round(tw.linear.x, 3) if tw else 0.0, 't': time.time()}
+              'v_ground': round(tw.linear.x, 3) if tw else 0.0,
+              'brain_cap': self.brain_cap.info(self.now_s(), self.fsm.state, self._cap_applied), 't': time.time()}
         self.pub_state.publish(String(data=json.dumps(st)))
 
     def _rescue_info(self):
@@ -992,6 +1037,10 @@ class ScoutAgent(AgentBase):
         self._orbit_a = 0.0
         self._blacklist: dict = {}
         self._lawn = self._lawnmower()
+        self.brain_alt = BrainAltitude(r)
+        self._agl_cmd = self.cruise            # AGL the altitude hold is flying to (cruise or the advisory one)
+        self._brain_guard = DropGuard(self.get_logger().warning)
+        self.create_subscription(String, '/brain/decision', self.on_brain, 10)
         self.rover_xy: dict = {}
         for rv in (x for x in self.robots if x.startswith('rover')):
             self.create_subscription(Odometry, f'/{rv}/odom', lambda m, rv=rv: self.rover_xy.__setitem__(
@@ -1043,6 +1092,29 @@ class ScoutAgent(AgentBase):
         except json.JSONDecodeError:
             pass
 
+    def on_brain(self, m: String):
+        """Advisory ADJUST_DRONE_ALTITUDE for this drone: cruise AGL clamped to 6-20 m for 60 s (sim). A decision
+        that cannot be handled is dropped with a throttled warning."""
+        self._brain_guard.call('/brain/decision', self._on_brain, m.data)
+
+    def _on_brain(self, data: str):
+        d = parse_decision(data)
+        agl = self.brain_alt.offer(d, self.now_s())
+        if agl is None:
+            return
+        tx = altitude_trace(agl, d, self.fsm.state in BRAIN_AGL_STATES)
+        self.trace('brain_cap', ['FLEET'], tx['input'], tx['reasoning'], tx['confidence'], tx['action'],
+                   tx['severity'], force=True)   # one per decision (rate-limited upstream): a lifted stop must show
+
+    def agl_target(self) -> float:
+        """Altitude-hold set-point. The advisory AGL applies only while surveying / flying to a scan: take-off keeps
+        the cruise AGL (its completion test is 90 % of it) and a scan holds the altitude it started at."""
+        if self.fsm.state == 'SCANNING':
+            return self._agl_cmd
+        agl = self.brain_alt.target(self.now_s()) if self.fsm.state in BRAIN_AGL_STATES else None
+        self._agl_cmd = self.cruise if agl is None else agl
+        return self._agl_cmd
+
     def scan_stats(self, xy, radius=4.0):
         m = self.map
         if not m.ready:
@@ -1081,8 +1153,8 @@ class ScoutAgent(AgentBase):
                 self.trace('survey_target', ['MAP', 'DEPTH'],
                            f'{len(fr)} unmapped frontier regions; next {f.size} cells at '
                            f'({self.target[0]:.1f}, {self.target[1]:.1f})',
-                           f'Nadir footprint ~{2 * self.cruise:.0f} m wide maximises new coverage per Wh', 0.85,
-                           f'Flying survey leg at {self.CRUISE_V:.0f} m/s, {self.cruise:.0f} m AGL')
+                           f'Nadir footprint ~{2 * self._agl_cmd:.0f} m wide maximises new coverage per Wh', 0.85,
+                           f'Flying survey leg at {self.CRUISE_V:.0f} m/s, {self._agl_cmd:.0f} m AGL')
                 return
             if float(self.map_stats.get('percent', 0.0)) > 95.0:
                 self.frontiers_left = False
@@ -1119,7 +1191,8 @@ class ScoutAgent(AgentBase):
             self.pick_target()
 
         # ---- altitude hold (PID on AGL; VelocityControl sinks slightly at zero command)
-        err = self.cruise - self.agl
+        agl_cmd = self.agl_target()
+        err = agl_cmd - self.agl
         self._integ = float(np.clip(self._integ + 0.25 * err / LOOP_HZ, -0.6, 0.6))
         vz = float(np.clip(1.0 * err - 0.4 * self.vz + self._integ, -self.vz_max, self.vz_max))
 
@@ -1132,7 +1205,7 @@ class ScoutAgent(AgentBase):
             vx, vy = self._toward(px, py, 1.5)
         elif out.target_xy:
             vx, vy = self._toward(*out.target_xy, self.DASH_V)
-        elif out.state == 'SURVEY' and self.target is not None and self.agl > 0.7 * self.cruise:
+        elif out.state == 'SURVEY' and self.target is not None and self.agl > 0.7 * agl_cmd:
             vx, vy = self._toward(*self.target, self.CRUISE_V)
             self.goal_reached = math.hypot(self.target[0] - x, self.target[1] - y) < 2.5
             if self.goal_reached:
@@ -1165,7 +1238,10 @@ class ScoutAgent(AgentBase):
               'altitude_agl': round(self.agl, 2), 'pose': [round(v, 3) for v in self.pose] + [round(self.z, 3)],
               'scan_job': (self.fsm._job or {}).get('id'), 'orbit': bool(out and out.orbit),
               'role': self.role, 'name': self.name, 'health': self.health.state().as_dict(), 'rescue': None,
-              'v_cmd': None, 'v_wheel': None, 'v_ground': round(speed, 3), 't': time.time()}
+              'v_cmd': None, 'v_wheel': None, 'v_ground': round(speed, 3),
+              'brain_agl': self.brain_alt.info(self.now_s(),
+                                               self._agl_cmd if self.fsm.state in AGL_HOLD_STATES else None),
+              't': time.time()}
         self.pub_state.publish(String(data=json.dumps(st)))
 
 

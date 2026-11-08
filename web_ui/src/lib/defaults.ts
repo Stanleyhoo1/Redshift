@@ -11,6 +11,7 @@ export const DEFAULT_CONFIG: MissionConfig = {
   seed: 42,
   gazebo_gui: false,
   sim_speed: 1.0,
+  ai_brain: true,
 }
 
 export const DEFAULT_OPTIONS: Options = {

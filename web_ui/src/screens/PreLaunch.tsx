@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api'
+import { advisorPlan } from '../lib/brain'
 import { DEFAULT_CONFIG, DEFAULT_OPTIONS } from '../lib/defaults'
 import { fmtSpeed, robotName } from '../lib/format'
 import { useStore } from '../lib/store'
 import type { MissionConfig } from '../lib/types'
-import { BackendPicker, EdgePicker, Field, SectorPicker, SpeedPicker, Stepper } from './prelaunch/ConfigFields'
+import { BackendPicker, BrainToggle, EdgePicker, Field, SectorPicker, SpeedPicker, Stepper } from './prelaunch/ConfigFields'
 import { GravityControl, Wordmark } from './prelaunch/GravityControl'
 import { usePhysicsPreview } from './prelaunch/usePhysicsPreview'
 
@@ -17,10 +18,13 @@ export default function PreLaunch() {
   const [deploying, setDeploying] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // adopt server defaults once they arrive, unless the operator already changed something
+  // adopt server defaults once they arrive, unless the operator already changed something; the brain toggle follows
+  // /api/options brain.default_enabled
   useEffect(() => {
-    if (optionsLive && !touched && !useStore.getState().lastConfig) setCfg(options.defaults)
-  }, [optionsLive, options.defaults, touched])
+    if (optionsLive && !touched && !useStore.getState().lastConfig) {
+      setCfg({ ...options.defaults, ai_brain: options.brain?.default_enabled ?? options.defaults.ai_brain })
+    }
+  }, [optionsLive, options.defaults, options.brain, touched])
 
   const update = (patch: Partial<MissionConfig>) => {
     setTouched(true)
@@ -33,21 +37,26 @@ export default function PreLaunch() {
   const backend = options.backends.find((b) => b.id === cfg.sim_backend)
   const speed = cfg.sim_speed ?? 1
   const speeds = options.sim_speed?.choices ?? DEFAULT_OPTIONS.sim_speed.choices
+  const brainOn = cfg.ai_brain ?? options.brain?.default_enabled ?? true
+  // names the advisor model only as /api/options reports it (no brain block: model unknown, no claim it will advise)
+  const brainSummary = advisorPlan(options.brain, brainOn).summary
 
   const summary = useMemo(() => {
     const r = cfg.fleet.rovers
     const d = cfg.fleet.drones
     const fleet = `${r} rover${r === 1 ? '' : 's'}${d ? ` and ${d} drone${d === 1 ? '' : 's'}` : ''}`
-    return `${sector?.label ?? cfg.sector} sector at ${cfg.gravity_g.toFixed(1)} g with ${fleet} on ${profile?.label ?? cfg.edge_profile}, simulated in ${backend?.label ?? cfg.sim_backend}${speed === 1 ? '' : ` at ${fmtSpeed(speed)} speed`}.`
-  }, [cfg, sector, profile, backend, speed])
+    const brain = brainSummary ? ` ${brainSummary}` : ''
+    return `${sector?.label ?? cfg.sector} sector at ${cfg.gravity_g.toFixed(1)} g with ${fleet} on ${profile?.label ?? cfg.edge_profile}, simulated in ${backend?.label ?? cfg.sim_backend}${speed === 1 ? '' : ` at ${fmtSpeed(speed)} speed`}.${brain}`
+  }, [cfg, sector, profile, backend, speed, brainSummary])
 
   const deploy = async () => {
     setDeploying(true)
     setError(null)
     try {
-      const res = await api.deploy(cfg)
+      const sent: MissionConfig = { ...cfg, ai_brain: brainOn }
+      const res = await api.deploy(sent)
       if (!res.ok) throw new Error(res.detail ?? 'Backend refused the deployment')
-      useStore.getState().beginDeploy(cfg)
+      useStore.getState().beginDeploy(sent)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -64,7 +73,7 @@ export default function PreLaunch() {
           <p className="mb-6 text-[13px] text-haze">Agentverse 2026, Robotics track</p>
           <Wordmark g={cfg.gravity_g} min={options.gravity.min} max={options.gravity.max} />
           <p className="font-semi-cond mt-5 max-w-[34ch] text-[22px] leading-snug font-[500] text-bone">
-            Two autonomous rovers and a survey drone map a Super-Earth sector, thinking entirely on their own edge hardware, and rescue each other when one breaks down.
+            Two autonomous rovers and a survey drone map a Super-Earth sector, keeping every safety decision on their own edge hardware, and rescue each other when one breaks down.
           </p>
         </header>
         <div className="max-w-[640px]">
@@ -115,6 +124,10 @@ export default function PreLaunch() {
 
         <Field title="Edge compute" hint="Simulated onboard computer: sets latency, power and planner budget">
           <EdgePicker profiles={options.edge_profiles} value={cfg.edge_profile} onChange={(edge_profile) => update({ edge_profile })} />
+        </Field>
+
+        <Field title="Agent brain" hint="Advisory only: the on-board safety layer keeps authority">
+          <BrainToggle on={brainOn} onChange={(ai_brain) => update({ ai_brain })} option={options.brain} />
         </Field>
 
         <Field title="Simulation">

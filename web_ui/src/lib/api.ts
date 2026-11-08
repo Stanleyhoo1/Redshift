@@ -1,5 +1,6 @@
 // Typed REST client for docs/protocol.md §6. All paths are same-origin (Vite proxies /api in dev).
 import type {
+  CommandResponse,
   DeployResponse,
   MissionConfig,
   MissionStatusResponse,
@@ -86,4 +87,6 @@ export const api = {
   /** §8.9: debris strike → critical damage on `robot` (default: the first rover) */
   injectDamage: (robot?: string) => post<OkResponse>('/api/inject/damage', robot ? { robot } : {}),
   setSpeed: (speed: number) => post<OkResponse & { speed?: number }>('/api/sim/speed', { speed }),
+  /** Operator command for the advisory brain (409 when no mission runs). `robot` null = the brain's default rover. */
+  command: (text: string, robot: string | null) => post<CommandResponse>('/api/command', { text, robot }),
 }

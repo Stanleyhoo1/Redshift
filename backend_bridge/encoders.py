@@ -127,8 +127,15 @@ def robot_telemetry(c: RobotCache) -> dict:
         'name': a.get('name') or display_name(c.name),
         'health': a.get('health'),
         'rescue': a.get('rescue'),
+        # advisory-brain limits the planner is honouring right now (docs/protocol.md §9.6); null when none
+        'brain_cap': _obj(a.get('brain_cap')),
+        'brain_agl': _obj(a.get('brain_agl')),
         'sensors': sensor_readings(c, imu, unc),
     }
+
+
+def _obj(v) -> dict | None:
+    return v if isinstance(v, dict) else None
 
 
 def sensor_readings(c: RobotCache, imu: dict, unc: dict) -> dict:

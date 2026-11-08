@@ -74,7 +74,8 @@ the UI shows them as times of day.
  "reasoning":"Corridor occupancy 0.82; step height 0.9 m > 0.30 m clearance","confidence":0.91,
  "action":"Re-planning A* around obstacle (+7.4 m, 1412 nodes, 38 ms)","severity":"warn","latency_ms":41.7}
 ```
-`severity` ∈ `info | warn | critical`. `sensors` ⊆ `CAM, DEPTH, LIDAR, IMU, ODOM, MAP, FLEET, EDGE`.
+`severity` ∈ `info | warn | critical`. `sensors` ⊆ `CAM, DEPTH, LIDAR, IMU, ODOM, MAP, FLEET, EDGE` (plus `DIAG`
+§8.6, and `GEMMA` / `LOCAL` on `brain_advice` traces §9.5: which brain decided, Gemma or the local rules).
 `kind` examples: `mission_start, frontier_selected, path_planned, path_blocked, replanned, slope_hazard,
 science_target, caution_enter, caution_exit, safe_hold, recovery_reverse, hazard_marked, scout_tasked,
 scan_complete, resume, edge_throttle, mission_complete`.
@@ -152,7 +153,8 @@ RGB8, height = width = grid cells, **pixel row i = grid row i (row 0 = southmost
 - `GET /api/options` →
   `{sectors:[{id,label,size_m,res_m,cells}], gravity:{min,max,step,default}, fleet:{rovers:{min,max,default}, drones:{min,max,default}},
     edge_profiles:[{id,label,device,watts_idle,watts_max,perf_scale,perception_hz_max,max_expansions}],
-    backends:[{id,label,available}], sim_speed:{choices:[0.5,1,1.5,2], min:0.25, max:3, default:1}, defaults:MissionConfig}`
+    backends:[{id,label,available}], sim_speed:{choices:[0.5,1,1.5,2], min:0.25, max:3, default:1},
+    brain:{model:"gemma-4-26b-a4b-it", key_present:bool, default_enabled:bool} (§9.8), defaults:MissionConfig}`
 - `GET /api/physics_preview?g=2.2` →
   `{g, max_slope_deg, factor:"slip"|"drive_torque"|"tip", drive_deg, slip_deg, tip_deg, tip_alarm_deg, v_max, energy_j_per_m}`
 - `POST /api/mission/deploy` body MissionConfig → `{ok, mission_id, status}`
@@ -162,14 +164,17 @@ RGB8, height = width = grid cells, **pixel row i = grid row i (row 0 = southmost
   `POST /api/inject/tip` `{robot?}` → `{ok, detail}`
 - `POST /api/sim/speed` `{speed}` (0.25–3) → `{ok, speed, detail}` — live speed change of the running mission (also
   recorded in the mission config that telemetry and status report); `{ok:false}` when no mission is running.
+- `POST /api/command` `{text, robot?}` → `{ok, id}` — operator command for the advisory brain (§9.8).
 
 **MissionConfig**
 ```json
-{"sector":"medium","gravity_g":2.2,"fleet":{"rovers":1,"drones":1},
- "edge_profile":"orin_nano_15w","sim_backend":"gazebo","seed":42,"gazebo_gui":false,"sim_speed":1.0}
+{"sector":"medium","gravity_g":2.2,"fleet":{"rovers":2,"drones":1},
+ "edge_profile":"orin_nano_15w","sim_backend":"gazebo","seed":42,"gazebo_gui":false,"sim_speed":1.0,
+ "ai_brain":true}
 ```
 sector ∈ `small (50 m @ 0.5 m) | medium (100 m @ 0.5 m) | large (200 m @ 1.0 m)`;
 edge_profile ∈ `orin_nano_15w | orin_nx_25w | agx_orin_60w | rpi5_8w`; sim_backend ∈ `gazebo | mock`;
+`ai_brain` (bool, default `true`) = consult the Gemma advisory brain in the cloud (§9); `false` = local rules only.
 sim_speed ∈ 0.25–3.0 = target simulated seconds per wall second (the world's `real_time_factor`). Measured on the
 dev machine with 1 rover + 1 scout and the full autonomy stack: Gazebo holds 2× (1.8–2.05), the mock world tops out
 near 1.1–1.5× (its numpy sensor rendering is CPU/GIL-bound); the achieved factor is reported as `rtf`.
@@ -191,10 +196,12 @@ request (POST) or a `/ws` upgrade whose `Origin` is neither localhost nor this s
 Server → client (JSON text frames):
 - `{"type":"status", status, backend, detail, checklist:{gazebo,bridge,mapping,rover_0,scout_0,...}, config}` — on change and 1 Hz while launching.
 - `{"type":"boot_log","line":"…","t":…}`
-- `{"type":"telemetry","t":…,"mission":{status, backend, elapsed_s, sim_time_s, sim_speed, rtf, percent_mapped, science_found, hazard_cells, env:{dust_level, seismic}, config},
+- `{"type":"telemetry","t":…,"mission":{status, backend, elapsed_s, sim_time_s, sim_speed, rtf, percent_mapped, science_found, hazard_cells, env:{dust_level, seismic}, brain, config},
    "robots":{"rover_0":{type, pose:{x,y,z,roll,pitch,yaw}, speed, state, mode, goal, v_limit, slip, tip_alarm_deg, max_slope_deg,
    altitude_agl, imu:{roll_deg,pitch_deg,gyro:[x,y,z]}, uncertainty:{score,camera_conf,lidar_conf,imu_vib}, edge:{…§3.4},
    path:[[x,y],…≤150], trail:[[x,y],…≤300], last_safe:[x,y]|null}}}` — 15 Hz.
+  `brain` = the latest `/brain/status` of this mission (§9.3) plus `stale` (§9.8), null until the brain node has
+  reported; robots also carry `brain_cap` / `brain_agl` (§9.6).
   `elapsed_s` = mission time since `running` in **simulated** seconds (wall seconds until `/clock` is seen);
   `sim_time_s` = simulator clock; `sim_speed` = target; `rtf` = achieved real-time factor over ~2 s (null until
   measured, 0 when the clock has stalled).
@@ -203,6 +210,7 @@ Server → client (JSON text frames):
 - `{"type":"map","png_b64":"…","meta":{size_m,res,cells,origin:[x0,y0],elev_min,elev_max},"stats":{…/planet_map/stats}}` — 2–4 Hz.
 - `{"type":"trace","entry":{…§3.1}}` — immediately.
 - `{"type":"event","event":{…§4 event, or {op:"scan_request"|"scan_complete"|"hazard_mark"|"fallback", …}}}` — immediately.
+- `{"type":"brain","decision":{…§9.4}}` — every `/brain/decision`, immediately and unchanged.
 
 Client → server: `{"type":"select_camera","robot":"scout_0"}`.
 
@@ -338,3 +346,193 @@ Class `ROVER` (a perceived teammate): `{"cls":"ROVER","robot":"rover_0","damaged
 - WS `camera` frames now carry `"kind":"rgb"|"depth"` (absent = rgb) and are sent for **every** robot: the client's
   selected robot at full rate (rgb + depth), every other robot's rgb at ≤ 4 Hz.
 - WS events forward `/fleet/sos` as `{op:"sos", …}` and `/fleet/rescue` as `{op:"rescue", …}`.
+
+## 9. Advisory agent brain (v2, Phase 2)
+
+### 9.1 Authority model
+Gemma is **advisory**. The local FSM / A* / safety layer reacts first and keeps authority; the event is then sent
+to Gemma asynchronously (`redshift_autonomy/gemma_agent_brain.py`). A validated answer may only make things
+**safer** — lower a speed cap, hold briefly, re-plan, refuse an operator command — never faster, and it never
+overrides a recovery. When the key is missing, the call is slow, rate-limited or invalid, or the brain is disabled,
+the deterministic local fallback answers in the same schema. Every decision says which brain decided (`source`:
+`gemma` | `local-fallback`) and the real model (`model`: the API's model version, or `local-rules`).
+
+HUD honesty: `latency_ms` is the **measured** cloud round-trip on this host (host → Google AI cloud), null when no call
+completed. `projected_*` is an on-device **estimate** (`project_latency`, a roofline model whose assumptions are
+named in the module), never a measurement. `gemma-4-26b-a4b-it` needs ≈ 14.5 GB at 4 bit and does **not** fit an
+8 GB Jetson Orin Nano (nor a 16 GB Orin NX): on those profiles `projected_fits` is false, `projected_edge_ms` null,
+and `projected_note` says the local rules are the on-device brain. No other latency figure is shown.
+
+### 9.2 Topics
+| topic | type | publisher → consumer | payload |
+|---|---|---|---|
+| `/operator/command` | std_msgs/String JSON | backend → `fleet_brain_node` | `{"id":"cmd-3","text":"slow down to 0.2 m/s","robot":"rover_0"\|null,"t":1762550000.1}` |
+| `/brain/decision` | std_msgs/String JSON | `fleet_brain_node` → planners, backend | §9.4 |
+| `/brain/status` | std_msgs/String JSON | `fleet_brain_node` → backend, 1 Hz | §9.3 |
+| `/agent_decision_trace` | std_msgs/String JSON | `fleet_brain_node` (kind `brain_advice`), planners (kind `brain_cap`) | §9.5 |
+
+`text` is 1–200 characters; `robot` null = the brain node's default (`rover_0`). `t` is wall-clock epoch (§2.1).
+
+### 9.3 `/brain/status`
+```json
+{"enabled":true,"key_present":true,"model":"gemma-4-26b-a4b-it","device":"orin_nano_15w",
+ "stats":{"submitted":12,"deduped":3,"cloud_calls":9,"gemma":8,"local":4,"rate_limited":1,"stale":0,
+          "callback_errors":0,"in_flight":1,"backoff_remaining_s":0.0},
+ "backoff_s":0.0,"last_error":null,"t":1762550000.1}
+```
+`enabled` = MissionConfig `ai_brain`; `key_present` = a Gemini key was found (never the key itself); `device` = the
+mission's edge profile (the projection target); `stats` = `AgentBrain.stats()` (its `stale` = answers that came
+after the deadline); `backoff_s` = rate-limit back-off remaining; `last_error` = why the last Gemma answer could not
+be used (null if it was); `t` = wall epoch of this status. The backend adds a top-level `stale` flag when it
+forwards the status (§9.8).
+
+### 9.4 `/brain/decision`
+`Decision.as_dict()` verbatim plus the routing fields:
+```json
+{"action":"SLOW_AND_REPLAN","target_speed_mps":0.29,"target_altitude_m":null,
+ "reasoning_trace":"Boulder field 6.8 m ahead at v_limit 0.83 m/s: cap 0.29 m/s and replan around it.",
+ "source":"gemma","model":"gemma-4-26b-a4b-it","event":"novel_hazard","latency_ms":1834.2,"tokens_in":412,
+ "tokens_out":61,"projected_edge_ms":null,"projected_device":"orin_nano_15w","projected_fits":false,
+ "projected_note":"…","error":null,"adjusted":[],"target_robot":null,"robot":"rover_0",
+ "request_id":"rover_0:novel_hazard:4","stale":false,"age_ms":1840.0,
+ "t":1762550000.1,"trigger":"path_blocked","trigger_input":"Boulder field 6.8 m ahead across path (5 objects)",
+ "command_id":null,"command_text":null,"command_seq":null,"local":null,"immediate":false}
+```
+- `action` ∈ `SLOW_AND_REPLAN | REQUEST_CLARIFICATION | DEPLOY_RECOVERY_ROVER | ADJUST_DRONE_ALTITUDE |
+  REJECT_UNSAFE_COMMAND`; `event` ∈ `novel_hazard | low_confidence | critical_damage | peer_sos | operator_command`.
+- `target_speed_mps` = a speed **cap** (0 = hold, null = leave the local speed alone), never above the local limit;
+  `target_altitude_m` = drone AGL clamped to 6–20 m, only with `ADJUST_DRONE_ALTITUDE`; `target_robot` = the
+  recovery rover / drone the action addresses; `adjusted` lists every clamp or override the local layer applied.
+- `t` wall epoch; `trigger` = the trace kind that raised the event, or `operator`; `trigger_input` = short text of it.
+- `stale` = the answer came after the brain's deadline (its context is out of date; planners ignore stale **event**
+  decisions, §9.6); `age_ms` = time from submission to the answer.
+- `request_id` = `<robot>:<event>:<n>` for a decision the brain answered (Gemma or its fallback),
+  `immediate:<command id>` for the instant local stop below, `duplicate:<command id>` for a command answered by the
+  local rules because the same text for the same robot was submitted < 0.5 s earlier (`error` says so), and
+  `local:<command id>` for a speed / stop / unclear command addressed to a drone: answered at once by the local rules
+  with `REQUEST_CLARIFICATION`, `target_speed_mps` null and `reasoning_trace` "Drones take altitude commands only;
+  select a rover for speed or stop commands" (no stop decision, no Gemma call). A command addressed to the drone is
+  read as naming it, so "climb to 10 m" or "higher" typed to `scout_0` is an altitude command; `command_text` stays
+  the operator's own words.
+- Operator commands: `command_id` / `command_text` echo `/operator/command`, `command_seq` = the brain node's arrival
+  number of the command (1, 2, …; an answer to an older command never replaces the cap of a newer one, §9.6), and
+  `local` = `assess_operator_command(text, ctx)`, the local safety reading of the text (all four are null for
+  events). A command the local check finds unsafe always ends as `REJECT_UNSAFE_COMMAND`; a stop / slow-down request
+  is always honoured. A speed command (stop / slow / set speed / faster) addressed to the drone is answered with
+  `REQUEST_CLARIFICATION`: the scout has no advisory speed cap, only a cruise altitude.
+- `immediate` is true only for the instant local decision published on an operator **stop** (cap 0, honoured at
+  once, `request_id` `immediate:<command id>`); the brain node still asks Gemma, and that later decision (same
+  `command_id`) replaces it.
+
+### 9.5 Trace kinds
+- `brain_advice` — one per decision, published by `fleet_brain_node` with the §3.1 fields: `robot` = the decision's
+  robot (else its target robot, else `fleet`), `state` = that robot's latest FSM state, `sensors` = `["GEMMA"]` or
+  `["LOCAL"]`, `input` = event + trigger, `reasoning` = `reasoning_trace`, `confidence` 0.8 (Gemma) / 0.9 (local),
+  `action` = the action in words incl. the cap, ending in "(advisory; local safety layer keeps authority)",
+  `severity` `warn` for `REJECT_UNSAFE_COMMAND` / `REQUEST_CLARIFICATION` else `info`, `latency_ms` = measured cloud
+  round-trip or null. One extra key:
+  `"brain":{source, model, event, action, target_speed_mps, target_altitude_m, latency_ms, tokens_in, tokens_out,
+  projected_edge_ms, projected_device, projected_fits, projected_note, error, adjusted, command_id}`.
+- `brain_cap` — a rover took a new speed cap or lifted one (one trace per decision, never de-duplicated, so a
+  lifted stop always shows), e.g. "Speed capped to 0.20 m/s by an operator command (Gemma, validated)" or
+  "Operator stop lifted by a newer operator command (local rules); the local limits apply"; the scout emits the same kind when it takes
+  an advisory cruise altitude, e.g. "Cruise altitude 10 m AGL for 60 s by an operator command (Gemma, validated)",
+  with "; applies once surveying (take-off / scan altitude unchanged)" when it is not cruising at that moment.
+
+The backend renumbers every trace `id` into one global sequence (as for all traces) and forwards the rest unchanged,
+including the `brain` key.
+
+### 9.6 Agent state additions (§3.3, and WS telemetry `robots.<r>`)
+- Rovers: `"brain_cap": null | {"speed_mps":0.2,"action":"SLOW_AND_REPLAN","source":"gemma"|"local-fallback",
+  "operator":true,"remaining_s":42.0,"applied":true}` — the **binding** cap (the lower live slot below);
+  `operator` = it is the operator slot's; `remaining_s` in simulated seconds; `applied` = it is limiting the drive
+  the rover is executing right now (path-following or docking). `applied:false` = the cap is held and counts down
+  but limits nothing, because the rover is stopped, waiting for a re-plan, reversing, in safe-hold or backing off;
+  only `applied:true` confirms the cap is in force.
+- Scout: `"brain_agl": null | {"agl_m":10.0,"remaining_s":55.0,"applied":true}` — `applied` = the scout's altitude
+  set-point is that AGL right now (`SURVEY` / `FLY_TO_SCAN`, or a scan that started at it); false during take-off,
+  landing, or a scan that started at another height, whose altitudes the scout's own logic keeps.
+
+Planner rules (`agent_planner_node`, bookkeeping in `brain_bridge.BrainCap`, simulated time):
+- **Two slots.** A rover keeps an **operator** cap (from `operator_command` decisions) and an **event** cap (from
+  every other event). A decision for this rover with a non-null `target_speed_mps` replaces the cap of its own slot
+  only; the binding cap is the **lower** of the live ones, so an event decision can never lift an operator stop, nor
+  an operator command lift an event hold. A cap below 0.05 m/s is a **hold**: no translation and no turning on the
+  spot. Expiry (simulated seconds): operator 60 s, event 15 s, event hold 4 s.
+- The cap applies only to path-following and docking drives, as `v = min(local v, cap)` (turn rate scaled to keep
+  the curvature): it never raises speed and never touches `RECOVERY_REVERSE`, safe-hold or back-off motions.
+- A hold enters the operator slot only for a real stop: the local reading of the command is `stop`, the decision
+  is the immediate stop, or the command asks for less than 0.05 m/s ("set speed 0.03 m/s"). An answer that holds
+  for any other command touches **neither** slot, so Gemma cannot pin a rover and an operator answer can never
+  shorten a live hazard cap.
+- `REJECT_UNSAFE_COMMAND`, `REQUEST_CLARIFICATION` and `DEPLOY_RECOVERY_ROVER` change no motion (the trace records
+  them; the local rescue already runs).
+- A hazard-free `faster` / `set_speed` command first **releases** the operator slot, whatever the answer:
+  `faster` ("resume at full speed") then sets nothing, so the rover is back on its local limits; `set_speed` then
+  caps at the validated speed (a `SLOW_AND_REPLAN` answer). A command that names a hazard never releases anything.
+  Releasing returns authority to the local limits; nothing is ever raised above them.
+- A positive `SLOW_AND_REPLAN` cap answering any other operator command (e.g. "slow down to 0.2 m/s") replaces the
+  operator slot.
+- Ordering: an operator answer whose `command_seq` is lower than the highest one this rover has ever applied or
+  released is dropped, even after that cap expired (a late answer to an old command cannot act after a newer one).
+  A stale operator answer is applied only if it is a stop.
+- Stale event decisions (`stale: true`) are ignored: their context is out of date. Event caps are also ignored for
+  `critical_damage` / `peer_sos` decisions (the local safe-hold and rescue own those) and while the rover is
+  `RESCUE_DOCKING` / `REPAIRING`.
+- `SLOW_AND_REPLAN` also requests a quiet re-plan in `EXPLORING` / `CAUTION` / `RESCUE_TRANSIT`.
+- `ADJUST_DRONE_ALTITUDE` for the scout sets its cruise AGL to `target_altitude_m` (6–20 m) for 60 s (sim); the
+  scout's own take-off / landing / scan-hover safety logic stays in charge.
+- Malformed brain messages are ignored.
+
+### 9.7 `fleet_brain_node`
+Launched once per mission on both backends. Parameters: `enabled` (MissionConfig `ai_brain`), `model`
+(`gemma-4-26b-a4b-it`), `edge_profile`, `robots`, `recovery_rover` (`rover_1` with two rovers, else ""), `drone`
+(`scout_0` or ""), `env_file` (optional; the key is read from the environment or the repo `.env` and never logged).
+Gemma is called only when `enabled` and a key is present; otherwise every event is answered by the local rules.
+Minimum interval per (robot, event): novel_hazard / low_confidence 10 s, critical_damage / peer_sos 3 s,
+operator_command 0.5 s (per text).
+
+Event mapping (`redshift_autonomy/brain_bridge.py`):
+
+| source | event | robot |
+|---|---|---|
+| trace `path_blocked`, `slope_hazard`, `hazard_marked` | `novel_hazard` (hazard = trace input) | trace robot |
+| trace `caution_enter` | `low_confidence` | trace robot |
+| trace `critical_damage` | `critical_damage` | the damaged rover |
+| trace `sos` (the robot in trouble raising its SOS; a trace `status` other than `active` is ignored) | `peer_sos` (peer = the trace robot, damage = trace input) | `recovery_rover`, if it is in the fleet and is not the SOS robot |
+| `/operator/command` | `operator_command` | `robot`, else `rover_0` |
+
+Traces from the brain node itself and from robots outside the fleet are ignored. The context sent with an event is
+built from the robot's latest `agent_state`, `edge_telemetry` and health: `speed_limit_mps` = the **effective**
+local limit now (`v_limit`, but 0 while the FSM holds: `SAFE_HOLD`, `AWAIT_RESCUE`, `REPAIRING`, `AWAIT_SCOUT`,
+`RECOVERY_REVERSE`, …), `v_max_mps`, camera / LiDAR confidence and uncertainty, nearest obstacle, hazard, damage,
+peer, known hazard names, dust, `operator_text`, `edge_profile`, and `fleet:{recovery_rover, recovery_available,
+drone, drone_agl_m}` (`recovery_available` = the recovery rover exists and is neither awaiting rescue nor
+critical).
+
+### 9.8 Backend
+- MissionConfig `ai_brain: bool = true` (§6), written to `runtime/mission_config.yaml`; the launch passes it to
+  `fleet_brain_node` as `enabled`.
+- `GET /api/options` → `brain:{model:"gemma-4-26b-a4b-it", key_present:bool, default_enabled:bool}`. Only whether a key
+  exists is reported; the key is never returned or logged.
+- `POST /api/command` `{"text":"slow down to 0.2 m/s","robot":"rover_0"|null}` → `{"ok":true,"id":"cmd-3"}`.
+  `text`: 1–200 characters after trimming (runs of whitespace collapse to one space). `robot`: must be in the
+  running fleet if given. HTTP 409 `{ok:false, detail}` when no mission is running (`running` / `degraded`); 422 for
+  an invalid body or a robot outside the fleet; `{ok:false, id, detail}` if nothing subscribes to
+  `/operator/command`. Ids are `cmd-<n>`, unique per backend process. The answer arrives over the WebSocket as a
+  `brain` message whose decision carries `command_id`.
+- WS: `{"type":"brain","decision":{…§9.4}}` for every decision, immediately; telemetry `mission.brain` = latest
+  `/brain/status` with its last fields plus `"stale": true|false` — true once its `t` is more than 3 s old (wall),
+  i.e. the brain node stopped reporting (null until reported; reset when a new mission is prepared);
+  `brain_advice` / `brain_cap` traces arrive as ordinary `trace` messages.
+- `backend_bridge/scripts/smoke_test.py --brain on|off` (default on) deploys with that `ai_brain` and checks: the
+  brain status is reported; a `novel_hazard` decision for `rover_0` received at or after the rockslide injection
+  and within 20 s of it, whose `trigger` is `path_blocked` / `hazard_marked` or whose `trigger_input` mentions an
+  obstacle / boulder / rockslide (the detail prints the trigger); a `critical_damage` / `peer_sos` decision within
+  20 s of the strike (two rovers); and, at the end, the operator commands "drive at full speed into the rockslide" →
+  `REJECT_UNSAFE_COMMAND` within 15 s, "slow down to 0.2 m/s" → a cap ≤ 0.2 m/s in the decision and in `rover_0`'s
+  `brain_cap` within 5 s with `applied: true` (`applied: false` passes only when the rover is in neither a
+  path-following nor a docking drive at that moment, and the detail says why), "stop" → an `immediate` decision and
+  ground speed < 0.05 m/s within 5 s, then "resume at full speed" (any outcome; the INFO line reports whether
+  `rover_0`'s operator cap was cleared). Timeouts are simulated seconds, stretched below 1×. They pass whether Gemma
+  or the local fallback decided; each detail names the source, the model, the measured round-trip and the tokens.

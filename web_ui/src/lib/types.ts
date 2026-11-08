@@ -1,13 +1,16 @@
-// Mirrors docs/protocol.md (v1 + §8 fleet health / SOS / rescue). Keep in sync with that file — it is the source of truth.
-// Every §8 field is optional at runtime: older backends omit it.
+// Mirrors docs/protocol.md (v1 + §8 fleet health / SOS / rescue + the advisory Gemma brain). Keep in sync with that
+// file — it is the source of truth. Every §8 / brain field is optional at runtime: older backends omit it.
 
 export type XY = [number, number]
 export type XYZ = [number, number, number]
 
 export type RobotType = 'rover' | 'scout'
 export type Severity = 'info' | 'warn' | 'critical'
-/** DIAG = motor-controller diagnostics (§8.3 hw_status). */
-export type SensorTag = 'CAM' | 'DEPTH' | 'LIDAR' | 'IMU' | 'ODOM' | 'MAP' | 'FLEET' | 'EDGE' | 'DIAG'
+/**
+ * DIAG = motor-controller diagnostics (§8.3 hw_status). GEMMA / LOCAL tag `brain_advice` traces: which brain decided
+ * (the cloud Gemma advisor, or the deterministic on-board rules).
+ */
+export type SensorTag = 'CAM' | 'DEPTH' | 'LIDAR' | 'IMU' | 'ODOM' | 'MAP' | 'FLEET' | 'EDGE' | 'DIAG' | 'GEMMA' | 'LOCAL'
 export type PerceptionMode = 'FUSED' | 'LIDAR_ONLY'
 export type MissionStatus = 'idle' | 'launching' | 'running' | 'degraded' | 'failed' | 'stopped'
 
@@ -45,6 +48,8 @@ export interface MissionConfig {
   gazebo_gui: boolean
   /** target simulated seconds per wall second; changeable live via POST /api/sim/speed */
   sim_speed: number
+  /** advisory Gemma brain on/off (the launch passes it to fleet_brain_node as `enabled`); absent on older backends */
+  ai_brain?: boolean
 }
 
 // §6 GET /api/options
@@ -75,6 +80,12 @@ export interface BackendOption {
   label: string
   available: boolean
 }
+/** GET /api/options `brain`: never carries the key itself, only whether one is configured. */
+export interface BrainOption {
+  model: string
+  key_present: boolean
+  default_enabled: boolean
+}
 export interface Options {
   sectors: SectorOption[]
   gravity: RangeOption & { step: number }
@@ -83,6 +94,8 @@ export interface Options {
   backends: BackendOption[]
   sim_speed: { choices: number[]; min: number; max: number; default: number }
   defaults: MissionConfig
+  /** absent on older backends (and in the offline fallback options) */
+  brain?: BrainOption
 }
 
 // §6 GET /api/physics_preview
@@ -133,6 +146,8 @@ export interface TraceEntry {
   action: string
   severity: Severity
   latency_ms?: number | null
+  /** `brain_advice` traces only: the decision behind the row */
+  brain?: BrainTraceInfo
 }
 
 // §3.4 Edge telemetry
@@ -223,6 +238,30 @@ export interface RobotSensors {
   altitude_agl: number | null
 }
 
+// Advisory brain blocks in agent_state (forwarded in telemetry.robots[r])
+/** A speed cap the rover applied from a /brain/decision: v = min(local, cap) on follow / dock drives only. */
+export interface BrainCap {
+  speed_mps: number
+  action: BrainAction | string
+  source: BrainSource | string
+  /** true when the cap came from an operator command */
+  operator: boolean
+  /** simulated seconds until the cap expires */
+  remaining_s: number
+  /**
+   * true while the rover's drive is actually limited by the cap (it governs path-following / docking only); false when
+   * it is set but the current motion is one it does not touch. Absent on older backends: the HUD then never claims it.
+   */
+  applied?: boolean
+}
+/** Scout cruise altitude set by ADJUST_DRONE_ALTITUDE (clamped 6–20 m by the scout's own safety logic). */
+export interface BrainAgl {
+  agl_m: number
+  remaining_s: number
+  /** true while the scout flies at it (surveying); false until then (take-off / scan altitude unchanged) */
+  applied?: boolean
+}
+
 // §7 telemetry.robots[r]
 export interface RobotTelemetry {
   type: RobotType
@@ -248,6 +287,10 @@ export interface RobotTelemetry {
   health?: RobotHealth | null
   rescue?: RescueBlock | null
   sensors?: RobotSensors | null
+  /** rovers: the active advisory speed cap, null when none */
+  brain_cap?: BrainCap | null
+  /** scout: the active advisory cruise altitude, null when none */
+  brain_agl?: BrainAgl | null
 }
 
 // §3.2 + §8.8 detections (not forwarded on /ws today; documented for completeness)
@@ -287,6 +330,8 @@ export interface MissionTelemetry {
   hazard_cells: number
   env: MissionEnv
   config: MissionConfig | null
+  /** latest /brain/status (1 Hz); null before the brain node reports or when none runs */
+  brain?: BrainStatus | null
 }
 
 // /planet_map/stats
@@ -469,12 +514,144 @@ export interface EventMsg {
   type: 'event'
   event: WorldEvent
 }
-export type ServerMsg = StatusMsg | BootLogMsg | TelemetryMsg | CameraMsg | LidarMsg | MapMsg | TraceMsg | EventMsg
+/** every /brain/decision, pushed as soon as the backend sees it */
+export interface BrainMsg {
+  type: 'brain'
+  decision: BrainDecision
+}
+export type ServerMsg = StatusMsg | BootLogMsg | TelemetryMsg | CameraMsg | LidarMsg | MapMsg | TraceMsg | EventMsg | BrainMsg
 
 // client → server
 export interface SelectCameraMsg {
   type: 'select_camera'
   robot: string
+}
+
+// Advisory Gemma brain (fleet_brain_node). Gemma only ever makes things safer; the local FSM / safety layer keeps authority.
+export type BrainEvent = 'novel_hazard' | 'low_confidence' | 'critical_damage' | 'peer_sos' | 'operator_command'
+export type BrainAction =
+  | 'SLOW_AND_REPLAN'
+  | 'REQUEST_CLARIFICATION'
+  | 'DEPLOY_RECOVERY_ROVER'
+  | 'ADJUST_DRONE_ALTITUDE'
+  | 'REJECT_UNSAFE_COMMAND'
+/** which brain chose the action: the cloud model (validated) or the deterministic on-board rules */
+export type BrainSource = 'gemma' | 'local-fallback'
+
+/** gemma_agent_brain.assess_operator_command: the local, deterministic safety reading of operator text. */
+export interface OperatorAssessment {
+  intent: 'stop' | 'slow' | 'set_speed' | 'faster' | 'drone_altitude' | 'enter_hazard' | 'unclear' | string
+  /** null when unbounded ("faster" without a top speed; the backend turns ∞ into null) */
+  requested_speed_mps: number | null
+  requested_altitude_m: number | null
+  hazard: string | null
+  exceeds_limit: boolean
+  unsafe: boolean
+  reasons: string[]
+}
+
+/** /brain/decision: Decision.as_dict() plus the node's routing fields. */
+export interface BrainDecision {
+  action: BrainAction | string
+  /** speed cap (m/s); null = leave the local plan's speed alone */
+  target_speed_mps: number | null
+  /** drone AGL (m), only with ADJUST_DRONE_ALTITUDE */
+  target_altitude_m: number | null
+  reasoning_trace: string
+  source: BrainSource | string
+  /** model that produced the action (API modelVersion) or "local-rules" */
+  model: string
+  event: BrainEvent | string
+  /** MEASURED host → Google AI cloud round-trip; null when no cloud call completed */
+  latency_ms: number | null
+  tokens_in: number | null
+  tokens_out: number | null
+  /** roofline ESTIMATE on projected_device; null when the model does not fit */
+  projected_edge_ms: number | null
+  projected_device: string
+  projected_fits: boolean
+  /** honest one-line description of the projection, shown verbatim */
+  projected_note: string
+  /** why Gemma's answer could not be used (null when it was) */
+  error: string | null
+  /** every clamp / override the local layer applied */
+  adjusted: string[]
+  /** recovery rover to deploy / drone to move */
+  target_robot: string | null
+  robot: string | null
+  request_id: string | null
+  stale: boolean
+  age_ms: number | null
+  /** wall epoch s */
+  t: number
+  /** trace kind that raised the event, or "operator" */
+  trigger: string
+  trigger_input: string
+  command_id: string | null
+  command_text: string | null
+  /** operator commands only */
+  local: OperatorAssessment | null
+  /** the instant local decision on an operator STOP; Gemma's later answer for the same command replaces it */
+  immediate: boolean
+}
+
+/** AgentBrain.stats() */
+export interface BrainStats {
+  submitted: number
+  deduped: number
+  cloud_calls: number
+  /** answers whose action survived validation */
+  gemma: number
+  /** local-fallback decisions */
+  local: number
+  rate_limited: number
+  stale: number
+  callback_errors: number
+  in_flight: number
+  backoff_remaining_s: number
+}
+
+/** /brain/status (1 Hz) */
+export interface BrainStatus {
+  enabled: boolean
+  key_present: boolean
+  /** configured cloud model */
+  model: string
+  /** edge profile id used for the on-device projection */
+  device: string
+  stats: Partial<BrainStats>
+  backoff_s: number
+  last_error: string | null
+  t: number
+  /** set by the backend when the brain node stopped reporting: the other fields are its last report, not now */
+  stale?: boolean
+}
+
+/** `brain` key of a `brain_advice` trace entry */
+export interface BrainTraceInfo {
+  source: BrainSource | string
+  model: string
+  event: BrainEvent | string
+  action: BrainAction | string
+  target_speed_mps: number | null
+  target_altitude_m: number | null
+  latency_ms: number | null
+  tokens_in: number | null
+  tokens_out: number | null
+  projected_edge_ms: number | null
+  projected_device: string
+  projected_fits: boolean
+  projected_note: string
+  error: string | null
+  adjusted: string[]
+  command_id: string | null
+}
+
+/** POST /api/command */
+export interface CommandResponse {
+  ok: boolean
+  id: string
+  detail?: string
 }
 
 // Map class codes (§5, G channel = code·40)

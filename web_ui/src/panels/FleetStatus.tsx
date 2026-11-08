@@ -1,8 +1,9 @@
+import { brainChips } from '../lib/brain'
 import { useRobotIds } from '../lib/hooks'
 import { fmt, robotName, robotShort } from '../lib/format'
 import { batteryTone, healthTone } from '../lib/sensors'
 import { useStore } from '../lib/store'
-import { C, robotColor, stateColor, TONE_COLOR } from '../lib/theme'
+import { BRAIN_CHIP_COLOR, C, robotColor, stateColor, TONE_COLOR } from '../lib/theme'
 import { FleetGlyph } from '../screens/prelaunch/ConfigFields'
 import { StatePill } from '../ui/Panel'
 
@@ -27,12 +28,17 @@ function FleetChip({ id }: { id: string }) {
   const ht = healthTone(h?.pct, h?.critical)
   const crit = ht === 'crit' || r.state === 'AWAIT_RESCUE'
   const name = robotName(id, r.name)
+  // advisory brain: the rover's speed cap, else the drone's brain-set cruise altitude; one the robot does not report
+  // as applied reads "pending" in a muted colour
+  const chip = brainChips(r)[0] ?? null
+  const brain = chip?.text ?? null
+  const brainColor = chip ? BRAIN_CHIP_COLOR[chip.tone] : C.dim
   return (
     <button
       role="listitem"
       onClick={() => useStore.getState().selectRobot(id)}
       aria-pressed={selected}
-      title={`${name}${h ? `: health ${fmt(h.pct, 0)} %, battery ${fmt(h.battery_pct, 0)} %` : ''}`}
+      title={`${name}${h ? `: health ${fmt(h.pct, 0)} %, battery ${fmt(h.battery_pct, 0)} %` : ''}${brain ? `; brain ${brain}` : ''}`}
       className={`flex h-10 min-w-0 items-center gap-2 rounded-[3px] border px-2 text-left transition-colors ${
         crit ? 'animate-crit-flash border-ha bg-ha/20' : selected ? 'border-rule-2 bg-bay-2' : 'border-transparent hover:border-rule'
       }`}
@@ -51,6 +57,11 @@ function FleetChip({ id }: { id: string }) {
             </>
           ) : (
             <span>{isScout ? `${(r.altitude_agl ?? 0).toFixed(0)} m up` : `${r.speed.toFixed(2)} m/s`}</span>
+          )}
+          {brain && (
+            <span className="min-w-0 truncate font-[650]" style={{ color: brainColor }} aria-label={`Brain ${brain}`}>
+              {brain}
+            </span>
           )}
         </span>
       </span>

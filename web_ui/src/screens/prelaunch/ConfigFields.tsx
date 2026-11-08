@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
+import { advisorPlan } from '../../lib/brain'
 import { fmtSpeed } from '../../lib/format'
-import type { BackendOption, EdgeProfileOption, RangeOption, SectorOption } from '../../lib/types'
+import type { BackendOption, BrainOption, EdgeProfileOption, RangeOption, SectorOption } from '../../lib/types'
 
 export function Field({ title, hint, children }: { title: string; hint?: ReactNode; children: ReactNode }) {
   return (
@@ -213,5 +214,45 @@ export function SpeedPicker({ choices, value, onChange }: { choices: number[]; v
         )
       })}
     </div>
+  )
+}
+
+/**
+ * Advisory brain on/off (MissionConfig.ai_brain). Says plainly where it runs and what it may do, and warns when the
+ * backend has no API key (then the deterministic local rules answer every event, toggle or not). The model is named
+ * only as /api/options reports it: without that block the advisor model is unknown, and nothing claims Gemma advises.
+ */
+export function BrainToggle({ on, onChange, option }: { on: boolean; onChange: (on: boolean) => void; option?: BrainOption }) {
+  const plan = advisorPlan(option, on)
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      onClick={() => onChange(!on)}
+      className={`flex w-full items-start gap-3 rounded-[3px] border px-3.5 py-3 text-left transition-colors ${on ? choiceOn : choiceOff}`}
+    >
+      <span className={`relative mt-0.5 h-5 w-9 shrink-0 rounded-full border transition-colors ${on ? 'border-hb bg-hb/30' : 'border-rule-2 bg-void'}`} aria-hidden>
+        <span className={`absolute top-[2px] h-3.5 w-3.5 rounded-full transition-[left,background-color] ${on ? 'left-[18px] bg-hb' : 'left-[2px] bg-rule-2'}`} />
+      </span>
+      <span className="min-w-0">
+        <span className="font-semi-cond block text-[16px] font-[700] text-bone">{plan.title}</span>
+        <span className="mt-0.5 block text-[12px] leading-snug text-dim">
+          {plan.model ? (
+            <>
+              <span className="font-mono text-[11px] text-haze [font-stretch:82%]">{plan.model}</span> on Google AI cloud is consulted on novel hazards,
+              low confidence, damage, SOS calls and operator commands.
+            </>
+          ) : (
+            <>
+              <span className="text-haze">Advisor model unknown (backend not reporting).</span> If the backend runs an advisor, it is consulted on
+              novel hazards, low confidence, damage, SOS calls and operator commands.
+            </>
+          )}{' '}
+          It can only make the fleet safer; the on-board rules act first and keep authority{on ? '' : '. Off: the on-board rules answer alone'}.
+        </span>
+        {plan.noKey && <span className="mt-1 block text-[12px] text-nad">No API key on the backend: local rules only</span>}
+      </span>
+    </button>
   )
 }

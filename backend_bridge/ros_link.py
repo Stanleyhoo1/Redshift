@@ -1,5 +1,6 @@
 """rclpy side of the backend: one node in a background thread caching the fleet's topics for the WebSocket
-broadcaster, forwarding traces/events into asyncio, and publishing /world/command."""
+broadcaster, forwarding traces/events/brain decisions into asyncio, and publishing /world/command and
+/operator/command."""
 from __future__ import annotations
 
 import base64
@@ -34,13 +35,27 @@ from redshift_autonomy.ros_utils import cloud_to_numpy, quat_to_rpy
 
 MAP_QOS = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
                      durability=QoSDurabilityPolicy.TRANSIENT_LOCAL) if HAVE_ROS else None
+# /brain/status comes at 1 Hz: a status whose 't' is older than this (wall s) means the brain node stopped reporting
+BRAIN_STATUS_STALE_S = 3.0
+
+
+def parse_json_object(data) -> dict | None:
+    """A JSON object from a std_msgs/String payload, or None for anything else (bad JSON, a list, a number): a
+    malformed message from another node must never reach the browser or raise in a callback."""
+    try:
+        d = json.loads(data)
+    except (TypeError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
 
 
 class RosLink:
-    def __init__(self, on_trace: Callable[[dict], None], on_event: Callable[[dict], None]):
+    def __init__(self, on_trace: Callable[[dict], None], on_event: Callable[[dict], None],
+                 on_brain: Callable[[dict], None] | None = None):
         if not HAVE_ROS:
             raise RuntimeError('rclpy not importable: source /opt/ros/jazzy/setup.bash and ros2_ws/install/setup.bash')
         self.on_trace, self.on_event = on_trace, on_event
+        self.on_brain = on_brain or (lambda _d: None)
         self.lock = threading.RLock()
         self._ids = itertools.count(1)
         # uvicorn owns SIGINT/SIGTERM: its lifespan aborts the mission, then shutdown() tears ROS down in order
@@ -48,6 +63,7 @@ class RosLink:
         self.node = rclpy.create_node('redshift_backend')
         n = self.node
         self.cmd_pub = n.create_publisher(String, '/world/command', 10)
+        self.op_pub = n.create_publisher(String, '/operator/command', 10)
         self.robots: dict[str, RobotCache] = {}
         self.specs: dict = {}
         self._robot_subs: list = []
@@ -60,6 +76,10 @@ class RosLink:
         n.create_subscription(String, '/fleet/sos', lambda m: self._on_event_json(m.data, 'sos'), 10)
         n.create_subscription(String, '/fleet/rescue', lambda m: self._on_event_json(m.data, 'rescue'), 10)
         n.create_subscription(String, '/world/env_state', self._on_env, 10)
+        # advisory brain (fleet_brain_node): every decision goes to the browser at once; the 1 Hz status is cached
+        # for the telemetry mission block. Depth 50: decisions come in bursts (an event fans out to several robots).
+        n.create_subscription(String, '/brain/decision', self._on_brain_decision, 50)
+        n.create_subscription(String, '/brain/status', self._on_brain_status, 10)
         n.create_subscription(Image, '/planet_map/layers', self._on_layers, MAP_QOS)
         n.create_subscription(String, '/planet_map/stats', self._on_stats, MAP_QOS)
         # simulated time (Gazebo or the mock world) → mission clock + achieved real-time factor. ~100 Hz, so raw CDR.
@@ -95,6 +115,8 @@ class RosLink:
             self.stats: dict = {}
             self.first_global: dict = {}
             self.clock = RtfMeter()
+            self.brain: dict | None = None        # latest /brain/status of this mission's fleet_brain_node
+            self._brain_rx = 0.0                  # wall time it arrived (age fallback when its 't' is unusable)
 
     def set_fleet(self, robots: list[str], specs: dict):
         with self.lock:
@@ -184,9 +206,8 @@ class RosLink:
             c.cloud, c.cloud_t = m, time.time()
 
     def _on_trace(self, m):
-        try:
-            t = json.loads(m.data)
-        except json.JSONDecodeError:
+        t = parse_json_object(m.data)
+        if t is None:
             return
         t['id'] = next(self._ids)      # traces come from several processes: give them one global sequence
         self.on_trace(t)
@@ -200,6 +221,17 @@ class RosLink:
             ev = dict(ev, op=op)
         ev.setdefault('t', time.time())
         self.on_event(ev)
+
+    def _on_brain_decision(self, m):
+        d = parse_json_object(m.data)
+        if d is not None:
+            self.on_brain(d)               # forwarded verbatim: the HUD shows exactly what the brain node decided
+
+    def _on_brain_status(self, m):
+        d = parse_json_object(m.data)
+        if d is not None:
+            with self.lock:
+                self.brain, self._brain_rx = d, time.time()
 
     def _on_env(self, m):
         try:
@@ -254,6 +286,27 @@ class RosLink:
             return None
         return cloud_to_numpy(msg)
 
+    def brain_status(self, now: float | None = None) -> dict | None:
+        """Latest /brain/status of the running mission: None until the brain node has reported, else its last fields
+        plus "stale" — true once its 't' (wall epoch) is more than BRAIN_STATUS_STALE_S old, so the HUD never shows a
+        dead brain node's last numbers as live. A status without a usable 't' ages from when it arrived."""
+        with self.lock:
+            if self.brain is None:
+                return None
+            d, rx = dict(self.brain), self._brain_rx
+        t = d.get('t')
+        try:                       # a huge JSON integer would overflow float(): age it from its arrival instead
+            ref = float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) else rx
+        except OverflowError:
+            ref = rx
+        d['stale'] = (time.time() if now is None else now) - ref > BRAIN_STATUS_STALE_S
+        return d
+
     def publish_command(self, cmd: dict) -> int:
         self.cmd_pub.publish(String(data=json.dumps(cmd)))
         return self.cmd_pub.get_subscription_count()
+
+    def publish_operator_command(self, cmd: dict) -> int:
+        """/operator/command for fleet_brain_node; returns how many subscribers will receive it."""
+        self.op_pub.publish(String(data=json.dumps(cmd)))
+        return self.op_pub.get_subscription_count()

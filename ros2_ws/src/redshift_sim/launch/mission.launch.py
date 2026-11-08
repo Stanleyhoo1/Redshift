@@ -69,7 +69,25 @@ def _setup(context):
                              output='screen', parameters=[p]))
             acts.append(Node(package='redshift_autonomy', executable='agent_planner_node', name=f'{r}_planner',
                              output='screen', parameters=[p]))
+        # advisory Gemma brain, one per mission on either backend. Wall clock on purpose (no use_sim_time): the cloud
+        # round-trip, its de-duplication / back-off and the decision polling are wall time at any simulation speed.
+        rovers = [r for r in robots if r.startswith('rover')]
+        recovery = next((r for r in rovers if r != 'rover_0'), '')
+        drone = next((r for r in robots if not r.startswith('rover')), '')
+        acts.append(Node(package='redshift_autonomy', executable='fleet_brain_node', name='fleet_brain',
+                         output='screen', parameters=[{'enabled': _flag(cfg.get('ai_brain', True)),
+                                                       'model': str(cfg.get('ai_model') or 'gemma-4-26b-a4b-it'),
+                                                       'edge_profile': edge, 'robots': robots,
+                                                       'recovery_rover': recovery, 'drone': drone, 'g_mult': g,
+                                                       'env_file': str(cfg.get('env_file') or '')}]))
     return acts
+
+
+def _flag(v) -> bool:
+    """YAML / string truthiness for a config switch ("false", "0", "no" and "off" are off)."""
+    if isinstance(v, str):
+        return v.strip().lower() not in ('false', '0', 'no', 'off', '')
+    return bool(v)
 
 
 def generate_launch_description():

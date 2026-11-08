@@ -1,6 +1,9 @@
 import asyncio
+import itertools
 import json
 import math
+import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -83,10 +86,18 @@ def test_request_validation_and_origin_guard():
 class FakeLink:
     def __init__(self):
         self.cmds, self.stats, self.env, self.sim = [], {}, {}, (None, None)
+        self.op_cmds, self.op_listeners, self.brain = [], 1, None
 
     def publish_command(self, cmd):
         self.cmds.append(cmd)
         return 1
+
+    def publish_operator_command(self, cmd):
+        self.op_cmds.append(cmd)
+        return self.op_listeners
+
+    def brain_status(self):
+        return self.brain
 
     def sim_clock(self):
         return self.sim
@@ -196,3 +207,193 @@ def test_camera_fan_out_sends_every_robot_and_depth_for_the_selected(monkeypatch
     asyncio.run(appmod.hub._broadcast_tick({'tick': 1, 'map_v': -1}))
     cams = [(m['robot'], m['kind']) for m in sent if m['type'] == 'camera']
     assert cams == [('rover_0', 'rgb')]
+
+
+# ---------------------------------------------------------------------------------------------------- advisory brain
+FAKE_KEY = 'AIzaFAKE-unit-test-key-0123456789'
+
+
+def test_options_brain_block_never_leaks_the_key(monkeypatch):
+    from redshift_autonomy import gemma_agent_brain as gab
+    monkeypatch.setenv(gab.API_KEY_ENV, FAKE_KEY)
+    r = TestClient(appmod.app).get('/api/options')
+    assert r.status_code == 200 and FAKE_KEY not in r.text
+    assert r.json()['brain'] == {'model': 'gemma-4-26b-a4b-it', 'key_present': True, 'default_enabled': True}
+    monkeypatch.setattr(gab, 'load_api_key', lambda env_path=None: None)
+    assert TestClient(appmod.app).get('/api/options').json()['brain']['key_present'] is False
+
+
+def test_operator_command_validation_and_409_when_idle(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr(status='idle')
+    monkeypatch.setattr(appmod.hub, 'link', link)
+    monkeypatch.setattr(appmod.hub, 'mgr', mgr)
+    c = TestClient(appmod.app)
+    r = c.post('/api/command', json={'text': 'slow down to 0.2 m/s'})
+    assert r.status_code == 409 and r.json()['ok'] is False
+    mgr.status = 'stopped'
+    assert c.post('/api/command', json={'text': 'stop'}).status_code == 409
+    mgr.status = 'running'
+    for bad in ({}, {'text': ''}, {'text': '   '}, {'text': 'x' * 201}, {'text': 42}, {'text': 'stop', 'robot': 7}):
+        r = c.post('/api/command', json=bad)
+        assert r.status_code == 422 and isinstance(r.json()['detail'], str), bad
+    assert c.post('/api/command', json=['stop']).status_code == 422
+    r = c.post('/api/command', json={'text': 'stop', 'robot': 'rover_7'})
+    assert r.status_code == 422 and 'rover_7' in r.json()['detail']
+    assert link.op_cmds == []                                 # nothing invalid reached the brain
+    mgr.status = 'launching'
+    assert c.post('/api/command', json={'text': 'stop'}).status_code == 409
+    monkeypatch.setattr(appmod.hub, 'mgr', None)              # before the lifespan has built a manager
+    assert c.post('/api/command', json={'text': 'stop'}).status_code == 409
+
+
+def test_operator_command_publishes_with_fresh_ids(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    hub = Hub()
+    hub.link, hub.mgr = link, mgr
+    monkeypatch.setattr(appmod, 'hub', hub)
+    c = TestClient(appmod.app)
+    r1 = c.post('/api/command', json={'text': '  slow down\n to 0.2 m/s ', 'robot': 'rover_0'}).json()
+    r2 = c.post('/api/command', json={'text': 'stop', 'robot': None}).json()
+    r3 = c.post('/api/command', json={'text': 'climb to 15 m', 'robot': 'scout_0'}).json()
+    assert r1 == {'ok': True, 'id': 'cmd-1'} and r2 == {'ok': True, 'id': 'cmd-2'} and r3['id'] == 'cmd-3'
+    m1, m2 = link.op_cmds[0], link.op_cmds[1]
+    assert set(m1) == {'id', 'text', 'robot', 't'}
+    assert m1['id'] == 'cmd-1' and m1['text'] == 'slow down to 0.2 m/s' and m1['robot'] == 'rover_0'
+    assert m2['robot'] is None and abs(m2['t'] - time.time()) < 5
+    assert json.loads(json.dumps(link.op_cmds)) == link.op_cmds          # plain JSON on the wire
+    mgr.status = 'degraded'                                               # still a running mission
+    assert c.post('/api/command', json={'text': 'stop'}).json()['ok']
+    link.op_listeners = 0                                                 # brain node not up
+    r = c.post('/api/command', json={'text': 'stop'}).json()
+    assert r['ok'] is False and r['id'] == 'cmd-5' and 'not listening' in r['detail']
+
+
+def test_brain_decisions_are_pushed_to_every_client_unchanged():
+    decision = {'action': 'REJECT_UNSAFE_COMMAND', 'target_speed_mps': 0.0, 'source': 'local-fallback',
+                'model': 'local-rules', 'event': 'operator_command', 'latency_ms': None, 'command_id': 'cmd-1',
+                'immediate': False, 'robot': 'rover_0', 'projected_note': 'estimate', 'adjusted': ['x'],
+                'age_ms': float('nan')}
+
+    async def go():
+        hub = Hub()
+        hub.loop, hub.queue = asyncio.get_running_loop(), asyncio.Queue()
+        a, b = SlowWS(False), SlowWS(False)
+        ca, cb = hub.attach(a, 'rover_0'), hub.attach(b, 'scout_0')
+        pump = asyncio.create_task(hub.pump_queue())
+        t = threading.Thread(target=hub.on_brain, args=(decision,))      # RosLink calls it on the ROS thread
+        t.start()
+        t.join()
+        for _ in range(50):
+            if a.sent and b.sent:
+                break
+            await asyncio.sleep(0.01)
+        pump.cancel()
+        hub.drop(ca)
+        hub.drop(cb)
+        return a.sent, b.sent
+    sa, sb = asyncio.run(go())
+    assert sa == sb and len(sa) == 1
+    msg = json.loads(sa[0])
+    assert msg['type'] == 'brain' and msg['decision'] == dict(decision, age_ms=None)    # strict JSON for the browser
+
+
+def test_mission_dict_carries_latest_brain_status():
+    link, mgr = FakeLink(), FakeMgr()
+    hub = Hub()
+    hub.link, hub.mgr = link, mgr
+    assert hub.mission_dict()['brain'] is None
+    link.brain = {'enabled': True, 'key_present': False, 'model': 'gemma-4-26b-a4b-it', 'device': 'orin_nano_15w',
+                  'stats': {'cloud_calls': 0, 'local': 3}, 'backoff_s': 0.0, 'last_error': None, 't': 1.0}
+    assert hub.mission_dict()['brain'] == link.brain
+
+
+def test_ros_link_brain_callbacks_ignore_malformed_messages():
+    from types import SimpleNamespace
+
+    from backend_bridge.ros_link import RosLink, parse_json_object
+    assert parse_json_object('{"a": 1}') == {'a': 1}
+    for bad in ('{not json', '[1, 2]', '3', 'null', None, b'\xff'):
+        assert parse_json_object(bad) is None
+    link = RosLink.__new__(RosLink)                 # callbacks only: no rclpy node (a live backend may be running)
+    link.lock, got, traces = threading.RLock(), [], []
+    link.on_brain, link.on_trace = got.append, traces.append
+    link._ids = itertools.count(1)
+    link.reset()
+    assert link.brain_status() is None
+    for raw in ('{oops', '["x"]', '{"action": "SLOW_AND_REPLAN", "brain": {"source": "gemma"}}'):
+        link._on_brain_decision(SimpleNamespace(data=raw))
+        link._on_brain_status(SimpleNamespace(data=raw))
+        link._on_trace(SimpleNamespace(data=raw))
+    assert got == [{'action': 'SLOW_AND_REPLAN', 'brain': {'source': 'gemma'}}]
+    assert link.brain_status() == dict(got[0], stale=False)      # no 't': ages from its arrival, just now
+    assert traces == [dict(got[0], id=1)]           # trace entries keep their extra "brain" key
+    link.reset()                                    # a new mission starts without the old brain status
+    assert link.brain_status() is None
+
+
+def test_ros_link_brain_status_goes_stale_after_3_s_and_keeps_its_last_fields():
+    from types import SimpleNamespace
+
+    from backend_bridge.ros_link import BRAIN_STATUS_STALE_S, RosLink
+    assert BRAIN_STATUS_STALE_S == 3.0
+    link = RosLink.__new__(RosLink)                 # callbacks only: no rclpy node
+    link.lock = threading.RLock()
+    link.reset()
+    assert link.brain_status(now=1000.0) is None    # null before any status arrives, at any time
+    st = {'enabled': True, 'key_present': True, 'model': 'gemma-4-26b-a4b-it', 'device': 'orin_nano_15w',
+          'stats': {'cloud_calls': 4, 'stale': 1}, 'backoff_s': 0.0, 'last_error': None, 't': 1000.0}
+    link._on_brain_status(SimpleNamespace(data=json.dumps(st)))
+    assert link.brain_status(now=1000.5) == dict(st, stale=False)
+    assert link.brain_status(now=1003.0)['stale'] is False          # exactly 3 s: still fresh
+    old = link.brain_status(now=1003.5)
+    assert old == dict(st, stale=True)                               # the last fields are kept, flagged stale
+    assert old['stats'] == {'cloud_calls': 4, 'stale': 1}            # AgentBrain's own stale counter untouched
+    assert link.brain is not None and 'stale' not in link.brain      # the cache itself is never rewritten
+    st2 = dict(st, t=1010.0, stats={'cloud_calls': 5})
+    link._on_brain_status(SimpleNamespace(data=json.dumps(st2)))     # the node reports again → fresh
+    assert link.brain_status(now=1010.2) == dict(st2, stale=False)
+    for bad_t in (None, 'soon', True, float('nan')):                 # no usable 't': ages from its arrival
+        link._on_brain_status(SimpleNamespace(data=json.dumps(dict(st, t=bad_t))))
+        link._brain_rx = 2000.0
+        assert link.brain_status(now=2002.0)['stale'] is False
+        assert link.brain_status(now=2003.1)['stale'] is True
+    link._on_brain_status(SimpleNamespace(data=json.dumps(st)))      # real wall clock: t=1000.0 is long past
+    assert link.brain_status()['stale'] is True
+    link._on_brain_status(SimpleNamespace(data=json.dumps(dict(st, t=time.time()))))
+    assert link.brain_status()['stale'] is False
+    link.reset()
+    assert link.brain_status() is None
+
+
+def test_mission_dict_reports_a_stale_brain_status():
+    from types import SimpleNamespace
+
+    from backend_bridge.ros_link import RosLink
+    link = RosLink.__new__(RosLink)
+    link.lock = threading.RLock()
+    link.reset()
+    link.stats, link.env = {}, {'dust_level': 0.0, 'seismic': False}
+    link.sim_clock = lambda: (None, None)
+    hub = Hub()
+    hub.link, hub.mgr = link, FakeMgr()
+    assert hub.mission_dict()['brain'] is None
+    st = {'enabled': True, 'key_present': False, 'model': 'gemma-4-26b-a4b-it', 'device': 'orin_nano_15w',
+          'stats': {}, 'backoff_s': 0.0, 'last_error': None}
+    link._on_brain_status(SimpleNamespace(data=json.dumps(dict(st, t=time.time()))))
+    assert hub.mission_dict()['brain'] == dict(st, t=link.brain['t'], stale=False)
+    link._on_brain_status(SimpleNamespace(data=json.dumps(dict(st, t=time.time() - 10.0))))
+    m = hub.mission_dict()
+    assert m['brain']['stale'] is True and m['brain']['model'] == 'gemma-4-26b-a4b-it'
+    json.dumps(m, allow_nan=False)                                   # strict JSON for the browser
+
+
+def test_ros_link_brain_status_with_a_huge_integer_t_never_breaks_telemetry():
+    from types import SimpleNamespace
+
+    from backend_bridge.ros_link import RosLink
+    link = RosLink.__new__(RosLink)                 # callbacks only: no rclpy node
+    link.lock = threading.RLock()
+    link.reset()
+    link._on_brain_status(SimpleNamespace(data='{"enabled": true, "t": ' + '9' * 400 + '}'))
+    st = link.brain_status()                        # float() of that 't' overflows: it ages from its arrival instead
+    assert st is not None and st['stale'] is False and st['enabled'] is True

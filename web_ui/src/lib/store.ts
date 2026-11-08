@@ -1,5 +1,6 @@
 // Global client state. The WebSocket client (ws.ts) pushes every server message into `ingest`.
 import { create } from 'zustand'
+import { parseDecision, pushDecision } from './brain'
 import { DEFAULT_OPTIONS } from './defaults'
 import { clearHistory, notePathUpdate, noteFrame, pushImu, pushSensors } from './history'
 import { decodeMap, type DecodedMap } from './mapDecode'
@@ -7,6 +8,7 @@ import { clearDistressClock, type Received } from './rescue'
 import { sampleOf } from './sensors'
 import type {
   BootLogMsg,
+  BrainDecision,
   CameraKind,
   LidarMsg,
   MapMsg,
@@ -39,10 +41,19 @@ export interface EventRecord {
 export interface LidarFrame extends LidarMsg {
   receivedAt: number
 }
+/** An operator command this UI sent (POST /api/command); decisions are matched to it by `id`. */
+export interface SentCommand {
+  id: string
+  text: string
+  robot: string | null
+  /** performance.now() at send time */
+  sentAt: number
+}
 
 export const TRACE_CAP = 200
 const BOOT_CAP = 600
 const EVENT_CAP = 60
+const COMMAND_CAP = 6
 
 interface State {
   screen: Screen
@@ -65,6 +76,10 @@ interface State {
   map: DecodedMap | null
   traces: TraceEntry[]
   events: EventRecord[]
+  /** /brain/decision messages, newest first */
+  brainDecisions: BrainDecision[]
+  /** operator commands sent from this UI, newest first */
+  commands: SentCommand[]
   selectedRobot: string | null
   followRobot: boolean
   lastConfig: MissionConfig | null
@@ -77,6 +92,7 @@ interface State {
   setCameraKind: (k: CameraKind) => void
   beginDeploy: (cfg: MissionConfig) => void
   resetMission: () => void
+  noteCommand: (cmd: SentCommand) => void
   ingest: (msg: ServerMsg) => void
 }
 
@@ -101,6 +117,8 @@ export const useStore = create<State>()((set, get) => ({
   map: null,
   traces: [],
   events: [],
+  brainDecisions: [],
+  commands: [],
   selectedRobot: null,
   followRobot: false,
   lastConfig: null,
@@ -137,8 +155,12 @@ export const useStore = create<State>()((set, get) => ({
       map: null,
       traces: [],
       events: [],
+      brainDecisions: [],
+      commands: [],
     })
   },
+
+  noteCommand: (cmd) => set({ commands: [cmd, ...get().commands].slice(0, COMMAND_CAP) }),
 
   ingest: (msg) => {
     switch (msg.type) {
@@ -211,6 +233,15 @@ export const useStore = create<State>()((set, get) => ({
         const next = [...get().events, { seq: ++eventSeq, receivedAt: now, event: ev }]
         if (next.length > EVENT_CAP) next.splice(0, next.length - EVENT_CAP)
         set({ events: next })
+        break
+      }
+      case 'brain': {
+        // validated once here: a malformed decision is dropped, never rendered
+        const d = parseDecision(msg.decision)
+        if (!d) break
+        const list = get().brainDecisions
+        const next = pushDecision(list, d)
+        if (next !== list) set({ brainDecisions: next })
         break
       }
     }

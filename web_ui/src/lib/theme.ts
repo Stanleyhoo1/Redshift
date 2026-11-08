@@ -2,6 +2,7 @@
 // Semantic colours sit on real spectral emission lines: Hβ 486 nm (info), O III 501 nm (nominal),
 // Na D 589 nm (caution), Hα 656 nm (critical). The planet itself lives at the red end.
 // Rescue sits at 555 nm, the peak of human photopic sensitivity: the hi-vis yellow-green of rescue gear.
+import type { BrainChipTone } from './brain'
 import type { Tone } from './sensors'
 import type { SensorTag, Severity } from './types'
 
@@ -41,6 +42,9 @@ export const SENSOR_COLOR: Record<SensorTag, string> = {
   FLEET: '#9be564',
   EDGE: '#d6a6ff',
   DIAG: '#ff9f7a',
+  // which brain decided a brain_advice row: the cloud advisor vs the deterministic on-board rules
+  GEMMA: '#86a8ff',
+  LOCAL: '#d8d2ec',
 }
 
 /** Panel-only channel groups that are not trace sensor tags. */
@@ -54,6 +58,9 @@ export function sensorColor(tag: string): string {
 }
 
 export const TONE_COLOR: Record<Tone, string> = { ok: C.o3, warn: C.nad, crit: C.ha }
+
+/** Brain cap / altitude chips: a hold in red, a cap or altitude in caution amber, a cap not applied yet muted. */
+export const BRAIN_CHIP_COLOR: Record<BrainChipTone, string> = { hold: C.ha, cap: C.nad, agl: C.nad, pending: C.dim }
 
 /** Rescue-sequence trace kinds (§8.6 + rescue_dock) get the rescue colour in the trace. */
 export const RESCUE_KINDS = new Set(['rescue_start', 'rescue_dock', 'rescue_lock', 'docked', 'repair_start', 'repair_complete', 'repaired'])

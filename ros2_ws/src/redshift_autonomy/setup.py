@@ -24,6 +24,7 @@ setup(
             'perception_node = redshift_autonomy.perception_node:main',
             'mapping_coordinator_node = redshift_autonomy.mapping_coordinator_node:main',
             'agent_planner_node = redshift_autonomy.agent_planner_node:main',
+            'fleet_brain_node = redshift_autonomy.fleet_brain_node:main',
         ],
     },
 )

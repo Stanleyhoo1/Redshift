@@ -15,7 +15,7 @@ def test_defaults_and_robots():
 @pytest.mark.parametrize('bad', [{'gravity_g': 3.5}, {'gravity_g': 0.9}, {'fleet': {'rovers': 3, 'drones': 1}},
                                  {'fleet': {'rovers': 0, 'drones': 1}}, {'sector': 'huge'},
                                  {'edge_profile': 'gpu_9000'}, {'unknown_key': 1}, {'sim_speed': 0.1},
-                                 {'sim_speed': 5.0}])
+                                 {'sim_speed': 5.0}, {'ai_brain': 'maybe'}, {'ai_brain': 2}, {'ai_brain': None}])
 def test_rejects_invalid(bad):
     with pytest.raises(ValidationError):
         MissionConfig(**bad)
@@ -40,3 +40,31 @@ def test_physics_preview_matches_model_and_clamps():
     assert set(p) >= {'g', 'max_slope_deg', 'factor', 'drive_deg', 'slip_deg', 'tip_deg', 'tip_alarm_deg', 'v_max',
                       'energy_j_per_m'}
     assert physics_preview(9.0)['g'] == 3.0
+
+
+def test_ai_brain_flag_defaults_on_and_reaches_the_runtime_config():
+    assert MissionConfig().ai_brain is True
+    assert MissionConfig(ai_brain=False).ai_brain is False
+    assert MissionConfig(ai_brain=False).model_dump()['ai_brain'] is False     # mission_manager writes model_dump()
+    assert MissionConfig.model_validate_json('{"ai_brain": false}').ai_brain is False
+
+
+FAKE_KEY = 'AIzaFAKE-unit-test-key-0123456789'
+
+
+def test_options_brain_block_reports_key_presence_without_the_key(monkeypatch):
+    import json
+
+    from redshift_autonomy import gemma_agent_brain as gab
+    monkeypatch.setenv(gab.API_KEY_ENV, FAKE_KEY)
+    o = options()
+    assert o['brain'] == {'model': 'gemma-4-26b-a4b-it', 'key_present': True, 'default_enabled': True}
+    assert FAKE_KEY not in json.dumps(o)
+    assert o['defaults']['ai_brain'] is True
+    monkeypatch.setattr(gab, 'load_api_key', lambda env_path=None: None)
+    assert options()['brain']['key_present'] is False
+
+    def broken(env_path=None):
+        raise PermissionError('.env unreadable')
+    monkeypatch.setattr(gab, 'load_api_key', broken)
+    assert options()['brain']['key_present'] is False

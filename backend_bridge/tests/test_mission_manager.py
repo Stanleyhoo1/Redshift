@@ -88,6 +88,7 @@ def test_deploy_reaches_running_then_abort_kills_group(tmp_path):
             await mgr.deploy(MissionConfig(sim_backend='mock'))
             cfg = yaml.safe_load((tmp_path / 'runtime' / 'mission_config.yaml').read_text())
             assert cfg['sector'] == 'medium' and cfg['runtime_dir'].endswith('runtime/world')
+            assert cfg['ai_brain'] is True                   # the launch passes it to fleet_brain_node as "enabled"
             await wait_for(lambda: mgr.status == 'running')
             assert all(mgr.checklist.values()) and 'launching' in rec.statuses
             assert any('[rover_0_planner] rover_0: θmax 16.9°' in ln for ln in rec.logs)

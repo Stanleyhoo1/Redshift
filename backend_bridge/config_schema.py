@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import _paths  # noqa: F401
+from redshift_autonomy import gemma_agent_brain as gab
 from redshift_autonomy.agent_fsm import display_name, role_of
 from redshift_autonomy.edge_budget import PROFILES
 from redshift_autonomy.physics_model import RoverPhysics
@@ -34,6 +35,9 @@ class MissionConfig(BaseModel):
     seed: int = Field(42, ge=0, le=2**31 - 1)
     gazebo_gui: bool = False
     sim_speed: float = Field(1.0, ge=0.25, le=3.0)     # target real-time factor; also changeable live
+    # advisory Gemma brain (cloud). Off, or with no API key, fleet_brain_node still runs and answers with the local
+    # rules, so every decision keeps the same schema; the local safety layer has authority either way.
+    ai_brain: bool = True
 
     @property
     def robots(self) -> list[str]:
@@ -42,6 +46,15 @@ class MissionConfig(BaseModel):
 
 def gazebo_available() -> bool:
     return shutil.which('gz') is not None
+
+
+def brain_key_present() -> bool:
+    """Whether a Gemini API key is configured (environment or the repo .env). Only the boolean leaves this
+    function: the key itself is never returned, logged or sent to a client."""
+    try:
+        return gab.load_api_key() is not None
+    except Exception:  # noqa: BLE001 - an unreadable .env must not break the options endpoint
+        return False
 
 
 def options() -> dict:
@@ -57,6 +70,7 @@ def options() -> dict:
         'backends': [{'id': 'gazebo', 'label': 'Gazebo Harmonic', 'available': gazebo_available()},
                      {'id': 'mock', 'label': 'Mock physics', 'available': True}],
         'sim_speed': {'choices': list(SPEED_CHOICES), 'min': 0.25, 'max': 3.0, 'default': d.sim_speed},
+        'brain': {'model': gab.DEFAULT_MODEL, 'key_present': brain_key_present(), 'default_enabled': d.ai_brain},
         'defaults': d.model_dump(),
     }
 

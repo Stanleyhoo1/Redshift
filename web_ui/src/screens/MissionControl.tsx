@@ -3,6 +3,7 @@ import { api } from '../lib/api'
 import { fmtElapsed, robotShort } from '../lib/format'
 import { useStore } from '../lib/store'
 import { C } from '../lib/theme'
+import { BrainHud } from '../panels/BrainHud'
 import { CameraFeed } from '../panels/CameraFeed'
 import { DecisionTrace } from '../panels/DecisionTrace'
 import { EdgeHud } from '../panels/EdgeHud'
@@ -30,7 +31,11 @@ export default function MissionControl() {
           </div>
           <EdgeHud />
         </aside>
-        <GlobeStage />
+        {/* the advisory brain sits under the globe, beside the operator's inject controls, as a wide strip */}
+        <div className="grid min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_auto] gap-2.5">
+          <GlobeStage />
+          <BrainHud />
+        </div>
         <aside className="flex min-h-0 flex-col gap-2.5" aria-label="Sensors and decisions">
           <SensorReadings />
           <div className="min-h-0 flex-1">

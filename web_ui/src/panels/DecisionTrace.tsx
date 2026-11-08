@@ -1,8 +1,9 @@
 import { memo, useMemo, useState } from 'react'
+import { fmtMs, fmtTokens } from '../lib/brain'
 import { useRobotIds } from '../lib/hooks'
 import { fmt, fmtClock, kindLabel, robotName, robotShort } from '../lib/format'
 import { useStore } from '../lib/store'
-import { C, RESCUE_KINDS, SEVERITY_COLOR, stateColor } from '../lib/theme'
+import { C, RESCUE_KINDS, SENSOR_COLOR, SEVERITY_COLOR, stateColor } from '../lib/theme'
 import type { TraceEntry } from '../lib/types'
 import { FleetGlyph } from '../screens/prelaunch/ConfigFields'
 import { Panel, SensorChips, StatePill } from '../ui/Panel'
@@ -70,8 +71,11 @@ const Legend = ({ color, label }: { color: string; label: string }) => (
 
 const TraceRow = memo(function TraceRow({ t }: { t: TraceEntry }) {
   const sev = SEVERITY_COLOR[t.severity] ?? SEVERITY_COLOR.info
-  // rescue-sequence steps read in the rescue colour unless they carry a warning
-  const kindColor = t.severity === 'info' ? (RESCUE_KINDS.has(t.kind) ? C.rescue : undefined) : sev
+  // rescue-sequence steps read in the rescue colour, brain advice in the colour of the brain that decided (GEMMA /
+  // LOCAL), unless they carry a warning
+  const brainTag = t.kind === 'brain_advice' ? (t.sensors.includes('GEMMA') ? 'GEMMA' : 'LOCAL') : null
+  const kindColor =
+    t.severity !== 'info' ? sev : RESCUE_KINDS.has(t.kind) ? C.rescue : brainTag ? SENSOR_COLOR[brainTag] : undefined
   const conf = Math.max(0, Math.min(1, t.confidence ?? 0))
   return (
     <li
@@ -113,7 +117,18 @@ const TraceRow = memo(function TraceRow({ t }: { t: TraceEntry }) {
         </Step>
         <Step label="Act" node="arrow" color={sev}>
           <span className="text-[13px] leading-snug font-[620] text-bone">{t.action}</span>
-          {t.latency_ms != null && <span className="num ml-2 text-[11px] whitespace-nowrap text-dim">{fmt(t.latency_ms, 0)} ms</span>}
+          {t.brain ? (
+            // brain rows: latency_ms is the MEASURED cloud round-trip (null when no cloud call was made)
+            <span className="ml-2 text-[11px] text-dim">
+              <span className="font-mono text-[10.5px] [font-stretch:82%]">{t.brain.model}</span>
+              {t.brain.latency_ms != null && <span className="num whitespace-nowrap"> · {fmtMs(t.brain.latency_ms)} cloud, measured</span>}
+              {(t.brain.tokens_in != null || t.brain.tokens_out != null) && (
+                <span className="num whitespace-nowrap"> · {fmtTokens(t.brain.tokens_in, t.brain.tokens_out)} tokens</span>
+              )}
+            </span>
+          ) : (
+            t.latency_ms != null && <span className="num ml-2 text-[11px] whitespace-nowrap text-dim">{fmt(t.latency_ms, 0)} ms</span>
+          )}
         </Step>
       </div>
     </li>

@@ -108,3 +108,16 @@ def test_robot_telemetry_carries_role_health_rescue_and_live_sensors():
     bare = robot_telemetry(RobotCache('scout_0'))
     assert bare['role'] == 'drone' and bare['name'] == 'Survey Drone' and bare['health'] is None
     assert bare['sensors']['lidar_nearest_m'] is None and bare['sensors']['accel'] is None
+
+
+def test_robot_telemetry_carries_brain_cap_and_scout_agl():
+    c = RobotCache('rover_0')
+    assert robot_telemetry(c)['brain_cap'] is None and robot_telemetry(c)['brain_agl'] is None
+    cap = {'speed_mps': 0.2, 'action': 'SLOW_AND_REPLAN', 'source': 'gemma', 'operator': True, 'remaining_s': 42.0}
+    c.agent_state = {'state': 'EXPLORING', 'brain_cap': cap}
+    assert robot_telemetry(c)['brain_cap'] == cap
+    c.agent_state = {'state': 'EXPLORING', 'brain_cap': 'garbage'}       # malformed → no cap shown, no crash
+    assert robot_telemetry(c)['brain_cap'] is None
+    s = RobotCache('scout_0')
+    s.agent_state = {'state': 'SURVEY', 'brain_agl': {'agl_m': 8.0, 'remaining_s': 55.0}}
+    assert robot_telemetry(s)['brain_agl'] == {'agl_m': 8.0, 'remaining_s': 55.0}
