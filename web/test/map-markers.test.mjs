@@ -64,3 +64,12 @@ test('marker shaders are well formed and every uniform is provided', () => {
   assert.equal(g.getAttribute('aData').count, 8)
   assert.equal(g.instanceCount, 0)
 })
+
+test('keep-out rings show close up and fade out at overview zoom', async () => {
+  const { ringFade, RING_NEAR, RING_FAR } = await import('../src/scene/mapMarkers.js')
+  assert.equal(ringFade(RING_NEAR - 1), 1)
+  assert.equal(ringFade(RING_FAR + 1), 0)
+  const mid = ringFade((RING_NEAR + RING_FAR) / 2)
+  assert.ok(mid > 0 && mid < 1)
+  assert.equal(ringFade(NaN), 0)
+})
