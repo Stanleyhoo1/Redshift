@@ -31,6 +31,7 @@ from .lifeforms import LifeformManager
 from .mapping import FleetMap
 from .rover import Rover
 from .terrain import Terrain
+from . import v7_landforms
 from .world import build_world, rover_spawn_height
 
 
@@ -276,7 +277,8 @@ class Simulation:
         return {"water": [w.to_msg() for w in self.terrain.water],
                 "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
                             "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
-                           for sp in self.hazards.all_spires()]}
+                           for sp in self.hazards.all_spires()],
+                **v7_landforms.features(self.terrain)}
 
     def close(self) -> None:
         """Stop tier 2's worker thread (the shared Gemma planner itself keeps running)."""

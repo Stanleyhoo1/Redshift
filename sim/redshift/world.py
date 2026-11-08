@@ -448,6 +448,12 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
             f'pos="{rock.x:.3f} {rock.y:.3f} {rock.z:.3f}" euler="0 0 {rock.yaw:.3f}" material="rock" '
             f'group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/>'
         )
+    for k, rock in enumerate(getattr(terrain, "bfield", None) or []):     # v7 boulder fields
+        geoms.append(
+            f'<geom name="bfield_{k}" type="ellipsoid" size="{rock.sx:.3f} {rock.sy:.3f} {rock.sz:.3f}" '
+            f'pos="{rock.x:.3f} {rock.y:.3f} {rock.z:.3f}" euler="0 0 {rock.yaw:.3f}" material="rock" '
+            f'group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/>'
+        )
 
     decor = []
     for t in terrain.targets:

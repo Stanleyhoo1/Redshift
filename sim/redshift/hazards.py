@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 import mujoco
 import numpy as np
 
+from . import v7_landforms
+
 TYPES = ("rockfall", "sand", "dust_storm", "rover_fault", "spire_fall", "lifeform")
 POINT_TYPES = ("rockfall", "sand", "spire_fall", "lifeform")
 DROP_HEIGHT = 5.0      # boulders start this far above the ground
@@ -328,6 +330,8 @@ class HazardManager:
             return False
         if sim.terrain.wet_near(x, y, rad + 0.3):
             return False
+        if not v7_landforms.spot_clear(sim.terrain, x, y, rad + 0.5):
+            return False                       # v7: not in a pit, on a mesa wall or in the canyon
         for r in sim.rovers:
             if math.hypot(x - r.x, y - r.y) < rad + rover_clear:
                 return False
