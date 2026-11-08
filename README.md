@@ -103,6 +103,50 @@ The seed decides the planet. Each feature can be switched off on the setup scree
 </tr>
 </table>
 
+Terrain features, close up with Reality on (the rovers still have to find each one with their own sensors):
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/terrain/mesa.jpg" alt="Mesas"><br><b>Mesas and buttes</b>: cliff walls no rover can climb</td>
+<td width="50%"><img src="docs/images/terrain/canyon.jpg" alt="Canyon"><br><b>Canyon</b>: a winding trench, crossable only at its two ramps</td>
+</tr>
+<tr>
+<td><img src="docs/images/terrain/pits.jpg" alt="Pit"><br><b>Pits and skylights</b>: sheer drops the planner treats as impassable</td>
+<td><img src="docs/images/terrain/boulders.jpg" alt="Boulder field"><br><b>Boulder fields</b>: dense rocks to steer around</td>
+</tr>
+<tr>
+<td><img src="docs/images/terrain/dunes.jpg" alt="Dunes"><br><b>Dunes</b>: rippled loose sand where the wheels slip more</td>
+<td><img src="docs/images/terrain/ice.jpg" alt="Ice sheet"><br><b>Ice sheets</b>: level ground with almost no grip</td>
+</tr>
+<tr>
+<td><img src="docs/images/terrain/geyser.jpg" alt="Geyser"><br><b>Geysers</b>: vents on a schedule whose steam scatters the LiDAR</td>
+<td><img src="docs/images/terrain/flora.jpg" alt="Alien flora"><br><b>Alien flora</b>: fungal trees and glowing bulb bushes, kept at 4 m</td>
+</tr>
+<tr>
+<td><img src="docs/images/terrain/spires.jpg" alt="Crystal spires"><br><b>Crystal spires</b>: tall and brittle, they can topple</td>
+<td><img src="docs/images/terrain/water.jpg" alt="Lake"><br><b>Lakes</b>: liquid the rovers must spot and keep out of</td>
+</tr>
+</table>
+
+Lifeforms. The mix follows the biome, and the rovers never read the true kind:
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/life/grazer.jpg" alt="Grazers"><br><b>Grazers</b>: six-legged herds that wander and graze</td>
+<td width="50%"><img src="docs/images/life/skitterer.jpg" alt="Skitterers"><br><b>Skitterers</b>: small fast swarms that scatter from a rover</td>
+</tr>
+<tr>
+<td><img src="docs/images/life/drifter.jpg" alt="Drifters"><br><b>Drifters</b>: glowing bells drifting with the wind, trailing tendrils</td>
+<td><img src="docs/images/life/crawler.jpg" alt="Crawler"><br><b>Crawlers</b>: big, slow and shelled, kept at 6 m</td>
+</tr>
+<tr>
+<td><img src="docs/images/life/burrower.jpg" alt="Burrower"><br><b>Burrowers</b>: pop up from a mound for a few seconds, then sink</td>
+<td><img src="docs/images/life/observe.jpg" alt="Rover observing a crawler"><br><b>Observing</b>: a rover holds its distance while it watches a crawler</td>
+</tr>
+</table>
+
+To retake the pictures: start the sim with `AUTO_LAUNCH=1` and a vite pointed at it, then run `node scripts/biome-shots.mjs`, `node scripts/feature-shots.mjs` or `node scripts/life-shots.mjs` from `web/` (each explains its arguments at the top).
+
 ## The dashboard
 
 It is both the judges' window into what the rovers sense and decide, and the console of a crew member on the mission.
@@ -114,6 +158,7 @@ It is both the judges' window into what the rovers sense and decide, and the con
 - **Comms:** chat with the fleet or one rover. Ambiguous places are numbered on the map to pick from. Rover questions also appear as cards with the rover's camera view.
 - **Autonomous / Supervised:** who makes the judgement calls.
 - **Samples:** everything collected, by science value, and what is cached at the lander.
+- **Folding:** every panel folds and remembers it: the controls (Layers, Camera, Mission), the map key, the Hazards pill, the question cards (to an "N questions waiting" chip) and each sidebar section (with a one-line summary). The sidebar itself collapses to a thin rail that still shows each rover's state and any waiting questions. Events are one line each until clicked.
 
 ## Development
 
