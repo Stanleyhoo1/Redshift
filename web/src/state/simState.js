@@ -38,6 +38,10 @@ export function emptyState() {
     lifeforms: [], // ground truth creatures
     tracks: [], // what the fleet believes it is tracking
     fallen: {}, // spire id -> { x0, y0, x1, y1, t, hazard }: every spire seen falling since the last init
+    // v7 (older sims: phase 'running', config pieced together from init)
+    phase: 'running', // 'setup' while the sim waits for POST /api/launch
+    config: null, // the effective launch settings: { gravity_g, seed, num_rovers, map_size, ..., wear, sim_speed }
+    configDerived: true, // true when init had no `config` and it was pieced together from world, map and fleet
     limit: { current: null, initial: null, prev: null, changedAt: null },
     t: 0,
     terrain: null,
@@ -519,6 +523,25 @@ export function simTimeNow(s, now) {
   return s.t + Math.max(0, Math.min(0.5, now - s.lastMsgAt)) * speed
 }
 
+// v7 init `config`: the launch settings this world was built with (plain values only). An older sim sends
+// none: piece together what init does say.
+function configFrom(msg, s) {
+  if (isObj(msg.config)) {
+    const out = {}
+    for (const [k, v] of Object.entries(msg.config)) {
+      if (typeof v === 'boolean' || typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v))) out[k] = v
+    }
+    return { config: out, derived: false }
+  }
+  const out = {}
+  if (Number.isFinite(s.world?.seed)) out.seed = s.world.seed
+  if (Number.isFinite(s.world?.gravity_g)) out.gravity_g = s.world.gravity_g
+  out.map_size = Math.round((s.map.nx - 1) * s.map.res * 100) / 100
+  out.num_rovers = s.roverMeta.length
+  if (Number.isFinite(s.fleet?.sim_speed)) out.sim_speed = s.fleet.sim_speed
+  return { config: out, derived: true }
+}
+
 export function applyInit(prev, msg, now) {
   const s = emptyState()
   s.gen = (prev?.gen ?? 0) + 1
@@ -544,6 +567,10 @@ export function applyInit(prev, msg, now) {
   s.initSeq = keyed.seq
   s.fleet = msg.fleet && typeof msg.fleet === 'object' ? { ...msg.fleet } : {}
   s.limit = limitFromFleet(s.fleet, s.limit, now, false)
+  s.phase = msg.phase === 'setup' ? 'setup' : 'running'
+  const launched = configFrom(msg, s)
+  s.config = launched.config
+  s.configDerived = launched.derived
   s.hazards = sanitizeHazards(msg.hazards)
   s.t = num(msg.t, s.events[0]?.t ?? 0)
   s.chatSeq = prev?.chatSeq ?? 0 // keys keep growing across inits
