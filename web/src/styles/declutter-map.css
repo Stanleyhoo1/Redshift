@@ -100,3 +100,102 @@
   padding-bottom: 5px;
   font-size: 13px;
 }
+
+/* ---------------------------------------------------------------- map tags, second pass */
+
+/* Track tags: a small id chip by default. The full label ("possible lifeform", the herd
+   count, "last seen 10 s ago") opens on hover, close up, or for the track a question is
+   about. The wrapper is the part that slides down out from under a rover tag. */
+.track-tag-wrap {
+  transition: transform 0.25s ease;
+}
+
+.track-tag {
+  gap: 4px;
+  padding: 1px 3px;
+  font-size: 11px;
+  pointer-events: auto;
+}
+
+.track-tag-id {
+  font-size: 10.5px;
+  padding: 0 5px;
+}
+
+.track-tag-wrap:not([data-near]) .track-tag:not([data-full]):not(:hover) .track-tag-label,
+.track-tag-wrap:not([data-near]) .track-tag:not([data-full]):not(:hover) .track-tag-lost {
+  display: none;
+}
+
+.track-tag-wrap:not([data-near]) .track-tag:not([data-full]):not(:hover) .track-tag-more {
+  font-size: 10px;
+  padding-right: 2px;
+}
+
+.track-tag[data-full],
+.track-tag:hover,
+.track-tag-wrap[data-near] .track-tag {
+  padding-right: 8px;
+}
+
+.track-tag[data-full] {
+  border-color: var(--signal);
+  box-shadow: 0 0 10px rgba(79, 224, 239, 0.3);
+}
+
+/* Rover tags: a coloured dot with the rover's number, the "?" and fault badges kept. The
+   name opens on hover, keyboard focus or when the rover is selected. */
+.rover-tag {
+  gap: 3px;
+  padding: 2px;
+  font-size: 12px;
+}
+
+.rover-tag .rover-tag-num {
+  display: inline-grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  color: #0a0d12;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.rover-tag .rover-tag-name {
+  display: none;
+}
+
+.rover-tag:hover,
+.rover-tag:focus-visible,
+.rover-tag[data-selected] {
+  padding-right: 8px;
+}
+
+.rover-tag:hover .rover-tag-name,
+.rover-tag:focus-visible .rover-tag-name,
+.rover-tag[data-selected] .rover-tag-name {
+  display: inline;
+}
+
+.rover-tag[data-ask] .rover-tag-ask,
+.rover-tag .rover-tag-fault {
+  margin-right: 1px;
+}
+
+/* Lander tag: smaller, with the cache as a bare count until hovered. */
+.lander-tag {
+  padding: 1px 6px;
+  font-size: 11px;
+  pointer-events: auto;
+}
+
+.lander-tag:not(:hover) .lander-cache-word {
+  display: none;
+}
+
+.rover-tag,
+.lander-tag {
+  transition: transform 0.25s ease;
+}
