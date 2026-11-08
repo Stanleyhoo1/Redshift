@@ -1,8 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { appStore } from '../src/state/store.js'
+import { appStore, simStore } from '../src/state/store.js'
 import { DUR } from '../src/globe/viewMachine.js'
-import { globeShown, leaveGlobe, viewMode } from '../src/globe/viewMode.js'
+import { globeShown, installViewGuards, leaveGlobe, viewMode } from '../src/globe/viewMode.js'
 
 const reset = () => viewMode.request('plane', { instant: true })
 
@@ -54,5 +54,41 @@ test('asking for the planet cancels hazard placement', () => {
   appStore.patch({ placing: { type: 'rockfall', mode: 'point' } })
   viewMode.request('globe')
   assert.equal(appStore.get().placing, null)
+  reset()
+})
+
+const placeQuestion = (id) => ({ id, kind: 'choose_place', rover: 'r2', options: [{ id: 'p1', x: 1, y: 2 }, { id: 'p2', x: 5, y: 6 }] })
+
+test('a new place question or a placement started elsewhere brings the sector back', () => {
+  reset()
+  simStore.set({ ...simStore.get(), gen: 1, requests: [placeQuestion('q0')] })
+  const off = installViewGuards()
+  // A question open before the planet was asked for does not bounce the planet.
+  viewMode.request('globe', { instant: true })
+  simStore.set({ ...simStore.get(), requests: [placeQuestion('q0')] })
+  assert.equal(viewMode.get().view, 'globe')
+  // A plain question (no places) does not either.
+  simStore.set({ ...simStore.get(), requests: [placeQuestion('q0'), { id: 'q1', kind: 'confirm', options: [{ id: 'yes', label: 'Yes' }] }] })
+  assert.equal(viewMode.get().view, 'globe')
+  // A new place question does.
+  simStore.set({ ...simStore.get(), requests: [placeQuestion('q0'), placeQuestion('q2')] })
+  assert.equal(viewMode.get().view, 'plane')
+  // Placement started from anywhere while on the planet does too.
+  viewMode.request('globe', { instant: true })
+  appStore.patch({ placing: { type: 'sand', mode: 'point' } })
+  assert.equal(viewMode.get().view, 'plane')
+  appStore.patch({ placing: null })
+  // A new init (Reset sim, or a reconnect that re-sends the open questions with the same
+  // ids) bounces nothing by itself, even with a question this guard has not seen before.
+  viewMode.request('globe', { instant: true })
+  simStore.set({ ...simStore.get(), gen: 2, requests: [placeQuestion('q2'), placeQuestion('q4')] })
+  assert.equal(viewMode.get().view, 'globe')
+  // A place question that arrives after it does.
+  simStore.set({ ...simStore.get(), requests: [placeQuestion('q2'), placeQuestion('q4'), placeQuestion('q5')] })
+  assert.equal(viewMode.get().view, 'plane')
+  off()
+  viewMode.request('globe', { instant: true })
+  simStore.set({ ...simStore.get(), requests: [placeQuestion('q3')] })
+  assert.equal(viewMode.get().view, 'globe', 'no guard after uninstall')
   reset()
 })

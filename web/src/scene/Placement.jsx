@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { Html } from '../globe/PlaneHtml.jsx'
+import { viewMode } from '../globe/viewMode.js'
 import * as THREE from 'three'
 import { nowSeconds, roverPoses, simStore, useApp } from '../state/store.js'
 import { sampleGround } from '../state/simState.js'
@@ -220,6 +221,12 @@ export function Placement({ reality }) {
     }
     const onUp = (e) => {
       if (!down || e.button !== down.b) return
+      // v7: on the way down from the planet the sector is not drawn yet, so a click there
+      // is not aimed at anything on the map.
+      if (viewMode.get().render !== 'plane') {
+        down = null
+        return
+      }
       const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y)
       down = null
       if (moved > 5) return // that was an orbit drag, not a click

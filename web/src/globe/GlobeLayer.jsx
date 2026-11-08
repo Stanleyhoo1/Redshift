@@ -3,7 +3,7 @@ import { createPortal, useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import { VOID } from '../lib/theme.js'
 import { GLOBE_FOV } from './globeMath.js'
-import { viewMode } from './viewMode.js'
+import { installViewGuards, viewMode } from './viewMode.js'
 import { globeRefs } from './globeDebug.js'
 import { GlobeWorld } from './GlobeWorld.jsx'
 import { installGlobeKeys } from './globeKeys.js'
@@ -58,6 +58,9 @@ export function GlobeLayer({ onSelect }) {
 
   // G, and 0 on the planet (see globeKeys.js).
   useEffect(() => installGlobeKeys(), [])
+
+  // Place questions and placement started outside App bring the sector back.
+  useEffect(() => installViewGuards(), [])
 
   // Compile the planet's shaders when it is first asked for (during the rise), so the
   // first frame after the fade does not stall. A session that never opens it pays nothing.

@@ -1,5 +1,7 @@
 import { useSyncExternalStore } from 'react'
+import { appStore, simStore } from '../state/store.js'
 import { stopPlacing } from '../lib/placement.js'
+import { hasPlaces } from '../lib/answers.js'
 import { reducedMotion } from '../scene/sceneConstants.js'
 import { advance, frameHome as bumpHome, initialView, requestView } from './viewMachine.js'
 
@@ -52,4 +54,42 @@ export function leaveGlobe() {
   if (state.view !== 'globe' && state.render !== 'globe') return false
   viewMode.request('plane')
   return true
+}
+
+// Brings the sector back for things that do not go through App: a rover asking the
+// operator to pick a place (each such question once; one already open when the planet was
+// asked for does not bounce it), and hazard placement started from anywhere. Returns the
+// uninstall function. GlobeLayer installs it.
+export function installViewGuards() {
+  const seen = new Set()
+  // Every place question in this state counts as seen, so none of them bounces the view.
+  const noteAll = (s) => {
+    seen.clear()
+    for (const q of s.requests) if (hasPlaces(q)) seen.add(q.id)
+  }
+  let gen = simStore.get().gen
+  noteAll(simStore.get())
+  const offSim = simStore.subscribe(() => {
+    const s = simStore.get()
+    // A new init: Reset sim, or a reconnect, which re-sends the open questions with their
+    // old ids (applyInit bumps gen either way). What it carries counts as seen; only place
+    // questions that arrive after it bring the sector back.
+    if (s.gen !== gen) {
+      gen = s.gen
+      noteAll(s)
+      return
+    }
+    for (const q of s.requests) {
+      if (!hasPlaces(q) || seen.has(q.id)) continue
+      seen.add(q.id)
+      leaveGlobe()
+    }
+  })
+  const offApp = appStore.subscribe(() => {
+    if (appStore.get().placing) leaveGlobe()
+  })
+  return () => {
+    offSim()
+    offApp()
+  }
 }
