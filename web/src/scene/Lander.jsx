@@ -150,7 +150,9 @@ export function Lander() {
           <Html position={[0, 0.3, R + 1.1]} center zIndexRange={[11, 0]} style={{ pointerEvents: 'none' }}>
             <div className="lander-tag">
               Lander
-              {cached !== null && (
+              {/* An empty cache shows just "Lander" (an empty tube next to a 0 read as "0 0"); the
+                  sidebar's science score already says "Cache empty". */}
+              {cached !== null && cached > 0 && (
                 <span className="lander-cache" data-some={cached > 0 || undefined} title="Samples in the lander's cache">
                   <i aria-hidden="true" />
                   {cached} cached

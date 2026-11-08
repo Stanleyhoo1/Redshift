@@ -23,7 +23,7 @@ export function GlobeLegend({ reality = false }) {
       <ul className="legend-list">
         <li>
           <i className="sw sw-ring" style={{ '--c': SIGNAL }} />
-          Landing sector <span>not to scale</span>
+          Landing sector <span className="gl-note">(not to scale)</span>
         </li>
         {reality ? (
           <>
