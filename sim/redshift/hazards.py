@@ -846,6 +846,16 @@ class HazardManager:
                          if math.hypot(hd.centre()[0] - hx, hd.centre()[1] - hy) < 20.0), None)
 
         fresh = [hd for hd in free if counted(hd) is None] or free
+        if sim.cfg.life_variety:
+            # v7: which kind wanders in follows the biome weights at the spot (among the kinds this world has)
+            from . import v7_life
+            w = v7_life.weights_at(sim.terrain, spot[0], spot[1])
+            have = {hd.kind for hd in fresh}
+            w = {k: (v if k in have else 0.0) for k, v in w.items()}
+            if not any(w.values()):
+                w = {k: 1.0 for k in have}
+            kind = v7_life.pick_kind(lf.rng, w)
+            fresh = [hd for hd in fresh if hd.kind == kind] or fresh
         herd = min(fresh, key=lambda hd: math.hypot(hd.centre()[0] - spot[0], hd.centre()[1] - spot[1]))
         k = counted(herd)
         lf.move_herd(herd, spot[0], spot[1], face)
@@ -861,7 +871,13 @@ class HazardManager:
                 tr.done_until = -1e9
                 tr.ignored = False
         h = self._new("lifeform", t, rover=rover.id, x=spot[0], y=spot[1])
-        sim.fleet.log(t, "hazard", f"A herd of creatures wanders into view of {rover.name}.", None, at=spot)
+        if sim.cfg.life_variety:
+            from .v7_life import group_phrase
+            what = group_phrase(herd.kind, len(herd.members))
+            sim.fleet.log(t, "hazard", f"{what[0].upper()}{what[1:]} wanders into view of {rover.name}.", None,
+                          at=spot)
+        else:
+            sim.fleet.log(t, "hazard", f"A herd of creatures wanders into view of {rover.name}.", None, at=spot)
         return h
 
     def on_soft_zone(self, x: float, y: float, radius: float) -> None:

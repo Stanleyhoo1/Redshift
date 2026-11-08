@@ -683,10 +683,16 @@ def make_interpretation_request(ticket: int, rover_id: str, t: float, perception
                    image_b64=img, default=default, gravity_g=float(gravity_g))
 
 
+# v7 life variety: what each kind looks like, so the camera answer can name one (only sent when it is on)
+KIND_LOOKS = {"grazer": "teal, six legs", "skitterer": "small amber swarm", "drifter": "floating glowing bell",
+              "crawler": "big domed shell", "burrower": "head from a mound"}
+
+
 def make_description_request(ticket: int, rover_id: str, t: float, perception: dict, observation: dict,
                              image_jpeg: bytes | None, default: str = "observe", *,
-                             gravity_g: float = 2.0) -> Request:
-    """Something moving: what is it? observation: track numbers (distance, speed, size, ...)."""
+                             gravity_g: float = 2.0, kinds: tuple | None = None) -> Request:
+    """Something moving: what is it? observation: track numbers (distance, speed, size, ...). kinds (v7
+    life variety): kind names the label may use when the camera shows one (see KIND_LOOKS)."""
     if default not in DESCRIBE_ACTIONS:
         raise ValueError(f"default {default!r} not in {DESCRIBE_ACTIONS}")
     if image_jpeg is not None and not isinstance(image_jpeg, (bytes, bytearray, memoryview)):
@@ -694,6 +700,8 @@ def make_description_request(ticket: int, rover_id: str, t: float, perception: d
     payload = {"rover": str(rover_id), "sensors": compact(perception or {}) or {},
                "observation": compact(observation or {}) or {}, "options": list(DESCRIBE_ACTIONS),
                "classes": list(DESCRIBE_CLASSES)}
+    if kinds:
+        payload["kinds"] = [str(k) for k in kinds if k in KIND_LOOKS]
     img = base64.b64encode(bytes(image_jpeg)).decode("ascii") if image_jpeg else None
     rendered = render_readings(payload["sensors"]) + " " + render_readings(payload["observation"])
     return Request(ticket=ticket, kind="describe", rover_id=str(rover_id), t=float(t), payload=payload,
@@ -850,6 +858,8 @@ def build_prompt(req: Request) -> tuple:
                  "Classes: " + ", ".join(p["classes"]),
                  "Actions: " + ", ".join(o for o in p["options"] if o != "ask_operator"),
                  "Describe it and pick one action. Quote at least one reading above with its number and unit."]
+        if p.get("kinds"):
+            lines.insert(4, "Kinds (name one if seen): " + "; ".join(f"{k} {KIND_LOOKS[k]}" for k in p["kinds"]))
         return _with_gravity(SYSTEM_DESCRIBE, req.gravity_g), "\n".join(lines)
     an = dict(p["anomaly"])
     typ = str(an.pop("type", "anomaly"))
@@ -2089,6 +2099,17 @@ class FakeBackend(Backend):
         sp, size = ob.get("speed"), ob.get("size")
         num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)    # noqa: E731
         bits = [_fmt_reading(k, ob[k]) for k in ("speed", "size", "distance") if num(ob.get(k))]
+        if num(sp) and num(size) and sp >= 0.08 and 0.4 <= size <= 2.5 and req.payload.get("kinds"):
+            # v7 life variety: the fake guesses a kind from the track numbers alone (it has no eyes)
+            if size >= 1.5 and sp < 0.2 and "crawler" in req.payload["kinds"]:
+                label = f"possible crawler, slow and large, about {size:.1f} m"
+            elif size < 0.9 and sp >= 0.5 and "skitterer" in req.payload["kinds"]:
+                label = f"possible skitterer swarm, small and fast, about {size:.1f} m"
+            else:
+                label = f"possible lifeform, about {size:.1f} m, moving on its own"
+            return {"classification": "lifeform", "label": label,
+                    "reason": "Moves by itself and is animal sized: " + ", ".join(bits[:2]),
+                    "action": "approach", "confidence": 0.8}
         if num(sp) and num(size) and sp >= 0.08 and 0.4 <= size <= 2.5:
             return {"classification": "lifeform", "label": f"possible lifeform, about {size:.1f} m, moving on its own",
                     "reason": "Moves by itself and is animal sized: " + ", ".join(bits[:2]),
@@ -2350,14 +2371,15 @@ class GemmaPlanner:
         return self._enqueue(req)
 
     def submit_description(self, rover_id: str, t: float, perception: dict, observation: dict,
-                           image_jpeg: bytes | None, default: str = "observe", *, gravity_g: float = 2.0) -> int:
+                           image_jpeg: bytes | None, default: str = "observe", *, gravity_g: float = 2.0,
+                           kinds: tuple | None = None) -> int:
         """Ask Gemma what a moving LiDAR track is (lifeform or not, short label, action). observation:
         {"distance": m, "speed": m/s, "size": m, ...}. gravity_g: the world's gravity, stated in the
         prompt (v7). Returns a ticket. Never blocks, never raises."""
         ticket = next(self._tickets)
         try:
             req = make_description_request(ticket, rover_id, t, perception, observation, image_jpeg, default,
-                                           gravity_g=gravity_g)
+                                           gravity_g=gravity_g, kinds=kinds)
         except Exception as e:                # noqa: BLE001
             stub = Request(ticket, "describe", str(rover_id), float(t or 0.0), {}, [], default="observe")
             return self._resolve_now(stub, f"bad input: {e}")
