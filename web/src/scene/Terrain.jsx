@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
-import { simStore, useSim, nowSeconds, roverPoses } from '../state/store.js'
+import { simStore, useSim, useApp, nowSeconds, roverPoses } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { SIGNAL, SLOPE, REGOLITH, VOID } from '../lib/theme.js'
 import { reducedMotion } from './sceneConstants.js'
@@ -23,6 +23,22 @@ const display3 = (hex) => {
   return new THREE.Vector3(c.r, c.g, c.b)
 }
 const linear3 = (hex) => new THREE.Color(hex)
+const DUNE_SAND = '#c99a6c'
+const V7_LANDFORM_KEYS = ['mesas', 'pits', 'canyon', 'dunes']
+
+// v7 landform uniforms from features (on only when the sim sends any landform).
+function syncLandforms(u, features) {
+  const on = !!features && V7_LANDFORM_KEYS.some((k) => (Array.isArray(features[k]) ? features[k].length > 0 : !!features[k]))
+  u.uV7.value = on ? 1 : 0
+  let c = 0
+  const dunes = on && Array.isArray(features.dunes) ? features.dunes : []
+  for (const d of dunes) {
+    if (c >= 8 || !d || ![d.x, d.y, d.radius].every(Number.isFinite)) continue
+    u.uDunes.value[c].set(d.x, -d.y, d.radius, ((Number.isFinite(d.wind_deg) ? d.wind_deg : 0) * Math.PI) / 180)
+    c++
+  }
+  u.uDuneCount.value = c
+}
 
 const vertexCommon = /* glsl */ `
 attribute float aSlope;
@@ -77,6 +93,10 @@ uniform vec3 uBad;
 uniform vec3 uVoid;
 uniform vec2 uRovers[8];
 uniform int uRoverCount;
+uniform float uV7;
+uniform vec4 uDunes[8];
+uniform int uDuneCount;
+uniform vec3 uDuneSand;
 varying float vSlope;
 varying float vFlash;
 varying float vEdge;
@@ -141,6 +161,36 @@ const surface = /* glsl */ `
   float rockAmt = steep + max(-curv, 0.0) * 0.45 + (det.r - 0.5) * 0.35 + (macro - 0.5) * 0.3;
   float rockMask = smoothstep(0.42, 0.62, rockAmt);
   vec3 albedo = mix(dust, rock, rockMask);
+
+  // v7 landforms (only when the sim sends any): mesa and butte walls, canyon walls and pit
+  // rims in darker, boldly banded rock; dune fields in a warmer, lighter sand that fades out
+  // at the edge, with long crests across the wind.
+  float duneAmt = 0.0;
+  float duneCrest = 1.0;
+  if (uV7 > 0.5) {
+    float wall = smoothstep(0.82, 0.58, cosS); // about 35 to 55 deg
+    float wb = sin(vWorld.y * 2.4 + (mB.r - 0.5) * 2.5 + (det.r - 0.5) * 0.8);
+    vec3 wallCol = mix(uStrataA * 0.5, uStrataB * 0.82, smoothstep(-0.45, 0.5, wb));
+    wallCol *= 0.86 + 0.14 * sin(vWorld.y * 8.5 + (mA.r - 0.5) * 5.0);
+    albedo = mix(albedo, wallCol, wall * 0.85);
+    for (int i = 0; i < 8; i++) {
+      if (i >= uDuneCount) break;
+      vec4 dz = uDunes[i];
+      vec2 dd = wp - dz.xy;
+      float rr = length(dd) / max(dz.z, 1.0);
+      float a = 1.0 - smoothstep(0.5, 1.0, rr + (macro - 0.5) * 0.25);
+      if (a <= 0.0) continue;
+      vec2 wd = vec2(cos(dz.w), -sin(dz.w));
+      // Long crests across the wind: a gentle windward rise, a short darker slip face.
+      float ph = fract(dot(dd, wd) * 0.14 + sin(dot(dd, vec2(-wd.y, wd.x)) * 0.09) * 0.35);
+      float face = smoothstep(0.72, 0.8, ph) * (1.0 - smoothstep(0.9, 1.0, ph));
+      if (a > duneAmt) duneCrest = mix(1.04, 0.8, face) * (0.97 + 0.06 * ph);
+      duneAmt = max(duneAmt, a);
+    }
+    duneAmt *= 1.0 - wall;
+    vec3 sand = uDuneSand * (0.9 + 0.12 * det.r + 0.06 * macro) * mix(1.0, duneCrest, duneAmt);
+    albedo = mix(albedo, sand, duneAmt * 0.8);
+  }
 
   // Wet, darker ground along water the fleet has identified.
   vec2 suv = (vec2((wp.x - uShoreMap.x) * uShoreMap.z, (-wp.y - uShoreMap.y) * uShoreMap.z) + 0.5) / uShoreSize;
@@ -238,6 +288,10 @@ function createMaterial(high) {
     uVoid: { value: display3(VOID) },
     uRovers: { value: Array.from({ length: 8 }, () => new THREE.Vector2(1e5, 1e5)) },
     uRoverCount: { value: 0 },
+    uV7: { value: 0 },
+    uDunes: { value: Array.from({ length: 8 }, () => new THREE.Vector4(0, 0, 0, 0)) },
+    uDuneCount: { value: 0 },
+    uDuneSand: { value: linear3(DUNE_SAND) },
   }
   m.userData.uniforms = uniforms
   m.onBeforeCompile = (shader) => {
@@ -252,7 +306,7 @@ function createMaterial(high) {
       .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n  normal = normalize((viewMatrix * vec4(tNormalW, 0.0)).xyz);')
       .replace('#include <fog_fragment>', `#include <fog_fragment>\n${overlay}`)
   }
-  m.customProgramCacheKey = () => 'redshift-terrain-1'
+  m.customProgramCacheKey = () => 'redshift-terrain-2'
   return m
 }
 
@@ -468,7 +522,46 @@ class TerrainMesh {
   }
 }
 
-export function Terrain({ slopeColors }) {
+// v7, Reality on with landforms present: the true ground as a terrain of its own (all of it
+// known), drawn a little below the measured terrain, so mesas, the canyon, pits and dunes show
+// in 3D before the fleet has mapped them.
+function truthTerrain(truth) {
+  const { nx, ny, res, ox, oy, heights } = truth
+  const n = nx * ny
+  const slope = new Float32Array(n)
+  let minH = Infinity
+  let maxH = -Infinity
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i
+      const h = heights[k]
+      if (h < minH) minH = h
+      if (h > maxH) maxH = h
+      const hx = (heights[j * nx + Math.min(i + 1, nx - 1)] - heights[j * nx + Math.max(i - 1, 0)]) / (2 * res)
+      const hy = (heights[Math.min(j + 1, ny - 1) * nx + i] - heights[Math.max(j - 1, 0) * nx + i]) / (2 * res)
+      slope[k] = (Math.atan(Math.hypot(hx, hy)) * 180) / Math.PI
+    }
+  }
+  const width = (nx - 1) * res
+  const depth = (ny - 1) * res
+  return {
+    nx, ny, res, ox, oy, width, depth, cx: ox + width / 2, cy: oy + depth / 2, minH, maxH,
+    h: heights, slope, known: new Uint8Array(n).fill(1), revealAt: new Float32Array(n).fill(-1e6),
+    dirty: new Int32Array(1), dirtyFlag: new Uint8Array(n), dirtyCount: 0,
+  }
+}
+
+function TruthGround({ material }) {
+  const truth = useApp((a) => a.truth)
+  const gen = useSim((s) => s.gen)
+  const mesh = useMemo(() => (truth && truth.heights && truth.gen === gen ? new TerrainMesh(truthTerrain(truth)) : null), [truth, gen])
+  useEffect(() => () => mesh?.dispose(), [mesh])
+  if (!mesh) return null
+  return <mesh geometry={mesh.geometry} material={material} position={[0, -0.12, 0]} frustumCulled={false} renderOrder={0} receiveShadow />
+}
+
+export function Terrain({ slopeColors, reality = false }) {
+  const landforms = useSim((s) => !!s.features && V7_LANDFORM_KEYS.some((k) => (Array.isArray(s.features[k]) ? s.features[k].length > 0 : !!s.features[k])))
   const terrain = useSim((s) => s.terrain)
   const roverMeta = useSim((s) => s.roverMeta)
   const graphics = useGraphics()
@@ -503,6 +596,10 @@ export function Terrain({ slopeColors }) {
       c++
     }
     u.uRoverCount.value = c
+    if (material.userData.features !== s.features) {
+      material.userData.features = s.features
+      syncLandforms(u, s.features)
+    }
     // Wet shoreline from the water layer (identified water only).
     const w = waterShared
     if (w.shore && w.map && u.uShore.value !== w.shore) {
@@ -516,5 +613,10 @@ export function Terrain({ slopeColors }) {
   })
 
   if (!mesh) return null
-  return <mesh geometry={mesh.geometry} material={material} customDepthMaterial={depthMaterial} frustumCulled={false} renderOrder={0} castShadow receiveShadow />
+  return (
+    <>
+      <mesh geometry={mesh.geometry} material={material} customDepthMaterial={depthMaterial} frustumCulled={false} renderOrder={0} castShadow receiveShadow />
+      {reality && landforms && <TruthGround material={material} />}
+    </>
+  )
 }
