@@ -996,6 +996,11 @@ class Rover:
                 self._go_home(t, "battery")
 
         self._track(t)
+        if self.cfg.ice_sheets:
+            from . import v7_surface
+            if v7_surface.check_low_traction(self, t):      # v7: frozen ground (wheels, motors, IMU)
+                self._apply()
+                return
         if self.slip_since is not None and t - self.slip_since >= self.cfg.slip_time_s:
             if self._slip_on_ground() and self.bumper() is None:
                 self._on_soft_ground(t)
@@ -1945,6 +1950,9 @@ class Rover:
             self._sand_escape(t)
         elif self.rec_phase == "water":
             self._water_escape(t)
+        elif self.rec_phase == "ice":
+            from . import v7_surface
+            v7_surface.ice_escape(self, t)
         elif self.rec_phase == "reverse":
             self._set_cmd(-0.4, 0.0)
             if t >= self.rec_until:

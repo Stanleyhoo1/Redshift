@@ -461,8 +461,14 @@ export function sanitizeFeatures(f, prev) {
   // A resend after a spire fall changes only the spires: keep the water (and its meshes).
   const sameWater = prev && JSON.stringify(prev.water) === JSON.stringify(water)
   const sameSpires = prev && JSON.stringify(prev.spires) === JSON.stringify(spires)
-  if (sameWater && sameSpires) return prev
-  return { water: sameWater ? prev.water : water, spires: sameSpires ? prev.spires : spires }
+  // v7 ice sheets (optional `features.ice`): kept only when the sim sends them.
+  const ice = Array.isArray(f.ice) ? f.ice.filter((s) => isObj(s) && Number.isFinite(s.x) && Number.isFinite(s.y))
+    .map((s, i) => ({ id: s.id == null ? `ice${i + 1}` : String(s.id), x: s.x, y: s.y, radius: num(s.radius, 4) > 0.2 ? num(s.radius, 4) : 4 })) : null
+  const sameIce = prev && JSON.stringify(prev.ice ?? null) === JSON.stringify(ice)
+  if (sameWater && sameSpires && sameIce) return prev
+  const out = { water: sameWater ? prev.water : water, spires: sameSpires ? prev.spires : spires }
+  if (ice) out.ice = sameIce ? prev.ice : ice
+  return out
 }
 
 const LIFE_KINDS = new Set(['grazer'])
