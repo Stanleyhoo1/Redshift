@@ -23,6 +23,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import v7_biomes
+
 K_GEYSERS = 7106
 PLUME_R = 1.5            # steam column radius (m)
 VENT_R = 0.9             # vent cone footprint radius (m)
@@ -62,6 +64,7 @@ def plan_vents(cfg, ter) -> list:
     n = int(rng.integers(1, 4))
     if ter.area > 1.0:
         n = min(6, int(round(n * ter.area)))
+    n = min(8, v7_biomes.count(ter, "geysers", n))       # v7 biomes: unchanged when off
     lander_gap = min(20.0, 0.4 * cfg.map_size)
     vents: list = []
     for _ in range(600):

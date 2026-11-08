@@ -367,4 +367,21 @@ export function applyLook(planet, air, look) {
   u.uCapS.value = s.capS
   u.uRust.value = s.rust
   air.uniforms.uSun.value.copy(u.uSun.value)
+  // v7 biomes: the true planet in this world's primary ground and air (today's rust look without one).
+  const pal = look.palette
+  if (pal) {
+    const g = pal.ground
+    const b = pal.biome ? pal.ground : null
+    u.uDust.value.set(b ? g.dust : GLOBE.dust)
+    u.uDustLight.value.set(b ? g.dustLight : GLOBE.dustLight)
+    u.uRustCol.value.set(b ? pal.ground2.strataA : GLOBE.rust)
+    u.uMare.value.set(b ? g.soil : GLOBE.mare)
+    u.uMareDark.value.set(b ? g.strataB : GLOBE.mareDark)
+    u.uHaze.value.set(b ? pal.air.haze : GLOBE.haze)
+    u.uSunCol.value.set(b ? pal.air.sunLight : GLOBE.sunLight)
+    u.uTwilight.value.set(b ? pal.air.sunGlow : GLOBE.twilight)
+    air.uniforms.uLow.value.set(b ? pal.air.horizon : GLOBE.airLow)
+    air.uniforms.uHigh.value.set(b ? pal.air.sky : GLOBE.airHigh)
+    air.uniforms.uDusk.value.set(b ? pal.air.zenith : GLOBE.airDusk)
+  }
 }

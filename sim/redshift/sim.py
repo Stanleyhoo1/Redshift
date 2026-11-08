@@ -31,7 +31,7 @@ from .lifeforms import LifeformManager
 from .mapping import FleetMap
 from .rover import Rover
 from .terrain import Terrain
-from . import v7_landforms
+from . import v7_biomes, v7_landforms
 from .world import build_world, rover_spawn_height
 
 
@@ -236,10 +236,14 @@ class Simulation:
         truth = self.terrain.truth_nospire          # colour scale: terrain and rocks, not the tall spires
         evs = [Fleet.public_event(e) for e in self.fleet.events if e["_seq"] <= self._event_cursor][-50:]
         self._features_sent = self.hazards.features_version
+        world = {"name": cfg.world_name, "gravity": round(cfg.gravity, 2),
+                 "gravity_g": float(cfg.gravity_g), "seed": int(cfg.seed)}
+        biome = v7_biomes.world_msg(self.terrain)               # v7 biomes: only when on
+        if biome is not None:
+            world["biome"] = biome
         return {
             "type": "init",
-            "world": {"name": cfg.world_name, "gravity": round(cfg.gravity, 2),
-                      "gravity_g": float(cfg.gravity_g), "seed": int(cfg.seed)},
+            "world": world,
             "map": {"nx": cfg.nx, "ny": cfg.ny, "res": cfg.res,
                     "origin": [float(cfg.origin[0]), float(cfg.origin[1])],
                     "min_h": round(float(truth.min()), 2), "max_h": round(float(truth.max()), 2)},
@@ -297,6 +301,9 @@ class Simulation:
             out["geysers"] = self.geysers.to_msg(self.t)
         if self.flora is not None:
             out["flora"] = self.flora.features()
+        bmap = v7_biomes.biome_map(self.terrain)              # v7 biomes: only when on
+        if bmap is not None:
+            out["biome_map"] = bmap
         return out
 
     def _v7_surface_features(self) -> dict:

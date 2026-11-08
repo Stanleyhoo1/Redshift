@@ -7,6 +7,7 @@ import { SIGNAL, SLOPE, REGOLITH, VOID } from '../lib/theme.js'
 import { reducedMotion } from './sceneConstants.js'
 import { regolithTextures, blackTexture } from './proceduralTextures.js'
 import { waterShared } from './waterShared.js'
+import { biomeMapOf, worldPalette } from '../lib/biomes.js'
 
 // World (x, y, z-up) maps to three.js (x, z, -y) everywhere in the scene.
 // The terrain is one indexed grid mesh with nx * ny vertices and smooth normals, drawn with
@@ -24,6 +25,49 @@ const display3 = (hex) => {
 }
 const linear3 = (hex) => new THREE.Color(hex)
 const DUNE_SAND = '#c99a6c'
+// Ground palette uniforms: the primary biome's (A) and the secondary biome's (2), blended per pixel by
+// the secondary share from features.biome_map. Without a biome both are today's rust palette.
+const PALETTE_UNIFORMS = [
+  ['uDustA', 'dustLight'],
+  ['uDustB', 'dust'],
+  ['uSoil', 'soil'],
+  ['uRock', 'rock'],
+  ['uRockLight', 'rockLight'],
+  ['uStrataA', 'strataA'],
+  ['uStrataB', 'strataB'],
+  ['uPebble', 'pebble'],
+  ['uDuneSand', 'dune'],
+]
+
+// v7 biomes: palettes from init world.biome, the blend grid from features.biome_map (a small float
+// texture, linear filtered). Old sims, the mock and biomes off: today's look (uBiomeOn 0).
+function syncBiome(u, world, features) {
+  const pal = worldPalette(world)
+  for (const [name, key] of PALETTE_UNIFORMS) {
+    u[name].value.set(pal.ground[key])
+    u[name + '2'].value.set(pal.ground2[key])
+  }
+  const map = pal.biome ? biomeMapOf(features) : null
+  const old = u.uBiome.value
+  if (!map) {
+    u.uBiomeOn.value = 0
+    if (old && old !== blackTexture()) old.dispose()
+    u.uBiome.value = blackTexture()
+    return
+  }
+  // 8 bit (R8): linear filtering works everywhere, unlike float textures without OES_texture_float_linear
+  const bytes = new Uint8Array(map.w.length)
+  for (let k = 0; k < bytes.length; k++) bytes[k] = Math.round(map.w[k] * 255)
+  const tex = new THREE.DataTexture(bytes, map.nx, map.ny, THREE.RedFormat, THREE.UnsignedByteType)
+  tex.magFilter = THREE.LinearFilter
+  tex.minFilter = THREE.LinearFilter
+  tex.needsUpdate = true
+  if (old && old !== blackTexture()) old.dispose()
+  u.uBiome.value = tex
+  u.uBiomeMap.value.set(map.ox, map.oy, 1 / map.res, 0)
+  u.uBiomeSize.value.set(map.nx, map.ny)
+  u.uBiomeOn.value = 1
+}
 const V7_LANDFORM_KEYS = ['mesas', 'pits', 'canyon', 'dunes']
 
 // v7 landform uniforms from features (on only when the sim sends any landform).
@@ -82,6 +126,19 @@ uniform vec3 uRockLight;
 uniform vec3 uStrataA;
 uniform vec3 uStrataB;
 uniform vec3 uPebble;
+uniform vec3 uDustA2;
+uniform vec3 uDustB2;
+uniform vec3 uSoil2;
+uniform vec3 uRock2;
+uniform vec3 uRockLight2;
+uniform vec3 uStrataA2;
+uniform vec3 uStrataB2;
+uniform vec3 uPebble2;
+uniform vec3 uDuneSand2;
+uniform sampler2D uBiome;
+uniform vec4 uBiomeMap;
+uniform vec2 uBiomeSize;
+uniform float uBiomeOn;
 uniform float uTime;
 uniform float uMotion;
 uniform float uLimit;
@@ -122,6 +179,22 @@ const surface = /* glsl */ `
   float edgeRim = 1.0 - smoothstep(thr, thr + 0.045, vEdge);
 
   float macro = mA.a * 0.6 + mB.a * 0.4;
+
+  // v7 biomes: the secondary biome's share here, its border frayed a little by the macro noise.
+  float bW = 0.0;
+  if (uBiomeOn > 0.5) {
+    vec2 buv = (vec2((wp.x - uBiomeMap.x) * uBiomeMap.z, (-wp.y - uBiomeMap.y) * uBiomeMap.z) + 0.5) / uBiomeSize;
+    bW = smoothstep(0.2, 0.8, texture2D(uBiome, buv).r + (macro - 0.5) * 0.45);
+  }
+  vec3 cDustA = mix(uDustA, uDustA2, bW);
+  vec3 cDustB = mix(uDustB, uDustB2, bW);
+  vec3 cSoil = mix(uSoil, uSoil2, bW);
+  vec3 cRock = mix(uRock, uRock2, bW);
+  vec3 cRockLight = mix(uRockLight, uRockLight2, bW);
+  vec3 cStrataA = mix(uStrataA, uStrataA2, bW);
+  vec3 cStrataB = mix(uStrataB, uStrataB2, bW);
+  vec3 cPebble = mix(uPebble, uPebble2, bW);
+  vec3 cDuneSand = mix(uDuneSand, uDuneSand2, bW);
 #ifdef TERRAIN_HQ
   vec4 d1 = texture2D(uDetail, wp * 0.27);
   vec4 d2 = texture2D(uDetail, ROT2 * wp * 0.173 + vec2(0.57, 0.21));
@@ -138,24 +211,24 @@ const surface = /* glsl */ `
 
   // Dust on the flats, varied at several scales.
   float tone = det.r * 0.35 + macro * 0.65;
-  vec3 dust = mix(uDustB, uDustA, smoothstep(0.25, 0.8, tone));
+  vec3 dust = mix(cDustB, cDustA, smoothstep(0.25, 0.8, tone));
   // Large albedo features, as from orbit: dark basaltic sand sheets and redder, iron-rich
   // dust in places, greyer in others.
   float sheet = smoothstep(0.48, 0.7, mA.r * 0.65 + mB.g * 0.15 + (1.0 - mA.a) * 0.35) * (1.0 - smoothstep(0.0, 0.5, -curv));
-  dust = mix(dust, uSoil * (0.85 + 0.25 * det.r), sheet * 0.78);
+  dust = mix(dust, cSoil * (0.85 + 0.25 * det.r), sheet * 0.78);
   float hue = mB.r - 0.5;
   dust *= vec3(1.0 + hue * 0.16, 1.0 - hue * 0.02, 1.0 - hue * 0.14);
-  dust = mix(dust, uDustA * 1.06, smoothstep(0.1, 0.7, curv) * 0.4);
+  dust = mix(dust, cDustA * 1.06, smoothstep(0.1, 0.7, curv) * 0.4);
   float peb = det.g;
-  dust = mix(dust, mix(uPebble, uRock, step(0.8, fract(det.r * 9.0))), peb * 0.38);
+  dust = mix(dust, mix(cPebble, cRock, step(0.8, fract(det.r * 9.0))), peb * 0.38);
   // Dried crust with fine cracks, only in patches.
   float crust = smoothstep(0.56, 0.72, mB.a);
   dust *= 1.0 - det.b * 0.16 * crust;
 
   // Exposed rock on steep ground and ridges, banded on cliffs.
-  vec3 rock = mix(uRock, uRockLight, smoothstep(0.35, 0.8, det.r * 0.7 + mA.r * 0.3));
+  vec3 rock = mix(cRock, cRockLight, smoothstep(0.35, 0.8, det.r * 0.7 + mA.r * 0.3));
   float bands = sin(vWorld.y * 4.2 + (mB.r - 0.5) * 5.0 + (det.r - 0.5) * 1.4);
-  vec3 strata = mix(uStrataA, uStrataB, smoothstep(-0.35, 0.55, bands));
+  vec3 strata = mix(cStrataA, cStrataB, smoothstep(-0.35, 0.55, bands));
   strata *= 0.9 + 0.1 * sin(vWorld.y * 11.0 + (mA.r - 0.5) * 6.0);
   rock = mix(rock, strata, cliff * 0.75);
   float rockAmt = steep + max(-curv, 0.0) * 0.45 + (det.r - 0.5) * 0.35 + (macro - 0.5) * 0.3;
@@ -170,7 +243,7 @@ const surface = /* glsl */ `
   if (uV7 > 0.5) {
     float wall = smoothstep(0.82, 0.58, cosS); // about 35 to 55 deg
     float wb = sin(vWorld.y * 2.4 + (mB.r - 0.5) * 2.5 + (det.r - 0.5) * 0.8);
-    vec3 wallCol = mix(uStrataA * 0.5, uStrataB * 0.82, smoothstep(-0.45, 0.5, wb));
+    vec3 wallCol = mix(cStrataA * 0.5, cStrataB * 0.82, smoothstep(-0.45, 0.5, wb));
     wallCol *= 0.86 + 0.14 * sin(vWorld.y * 8.5 + (mA.r - 0.5) * 5.0);
     albedo = mix(albedo, wallCol, wall * 0.85);
     for (int i = 0; i < 8; i++) {
@@ -188,7 +261,7 @@ const surface = /* glsl */ `
       duneAmt = max(duneAmt, a);
     }
     duneAmt *= 1.0 - wall;
-    vec3 sand = uDuneSand * (0.9 + 0.12 * det.r + 0.06 * macro) * mix(1.0, duneCrest, duneAmt);
+    vec3 sand = cDuneSand * (0.9 + 0.12 * det.r + 0.06 * macro) * mix(1.0, duneCrest, duneAmt);
     albedo = mix(albedo, sand, duneAmt * 0.8);
   }
 
@@ -292,6 +365,19 @@ function createMaterial(high) {
     uDunes: { value: Array.from({ length: 8 }, () => new THREE.Vector4(0, 0, 0, 0)) },
     uDuneCount: { value: 0 },
     uDuneSand: { value: linear3(DUNE_SAND) },
+    uDustA2: { value: linear3(REGOLITH.dustLight) },
+    uDustB2: { value: linear3(REGOLITH.dust) },
+    uSoil2: { value: linear3(REGOLITH.soil) },
+    uRock2: { value: linear3(REGOLITH.rock) },
+    uRockLight2: { value: linear3(REGOLITH.rockLight) },
+    uStrataA2: { value: linear3(REGOLITH.strataA) },
+    uStrataB2: { value: linear3(REGOLITH.strataB) },
+    uPebble2: { value: linear3(REGOLITH.pebble) },
+    uDuneSand2: { value: linear3(DUNE_SAND) },
+    uBiome: { value: blackTexture() },
+    uBiomeMap: { value: new THREE.Vector4(0, 0, 1, 0) },
+    uBiomeSize: { value: new THREE.Vector2(1, 1) },
+    uBiomeOn: { value: 0 },
   }
   m.userData.uniforms = uniforms
   m.onBeforeCompile = (shader) => {
@@ -306,7 +392,7 @@ function createMaterial(high) {
       .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n  normal = normalize((viewMatrix * vec4(tNormalW, 0.0)).xyz);')
       .replace('#include <fog_fragment>', `#include <fog_fragment>\n${overlay}`)
   }
-  m.customProgramCacheKey = () => 'redshift-terrain-2'
+  m.customProgramCacheKey = () => 'redshift-terrain-3'
   return m
 }
 
@@ -596,9 +682,18 @@ export function Terrain({ slopeColors, reality = false }) {
       c++
     }
     u.uRoverCount.value = c
-    if (material.userData.features !== s.features) {
+    if (material.userData.features !== s.features || material.userData.world !== s.world) {
+      if (material.userData.features !== s.features) syncLandforms(u, s.features)
+      const was = material.userData.biomeKey
+      const bm = s.features?.biome_map
+      const key = `${s.world?.biome?.id}|${s.world?.biome?.secondary}|${bm ? bm.nx + ',' + bm.ny + ',' + bm.origin + ',' + bm.w?.length : ''}`
+      if (key !== was || (bm && material.userData.biomeMap !== bm)) {
+        syncBiome(u, s.world, s.features)
+        material.userData.biomeKey = key
+        material.userData.biomeMap = bm
+      }
       material.userData.features = s.features
-      syncLandforms(u, s.features)
+      material.userData.world = s.world
     }
     // Wet shoreline from the water layer (identified water only).
     const w = waterShared

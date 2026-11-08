@@ -400,6 +400,7 @@ A launch and a reset send every client a fresh `init` with phase `"running"`.
 | `map_size` | int (m) | 60 to 200, step 10 | `MAP_SIZE` (120) | width of the square sector |
 | `water`, `spires`, `lifeforms` | bool | | none (true) | the version 4 features |
 | `mesas`, `canyon`, `dunes`, `boulder_fields`, `pits`, `geysers`, `ice_sheets`, `flora`, `ground_detail` | bool | | `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` (1 each) | the version 7 world features; each is built in its own v7 step, until then its switch is only stored and echoed |
+| `biomes`, `life_variety` | bool | | `BIOMES`, `LIFE_VARIETY` (1 each) | version 7: each world's own ground, colours and terrain mix; more lifeform kinds (see Biomes below) |
 | `wear` | choice | `off`, `normal`, `harsh` | `WEAR` (normal) | how fast wheels and motors wear out (harsh: about 4 times sooner) |
 | `sim_speed` | float | 0.5 to 10, step 0.5 | `SIM_SPEED` (3.0) | sim seconds per real second |
 
@@ -530,6 +531,28 @@ Only when flora is on. All optional.
   sighting of each plant logs an event with `at`, for example
   "r1 sees possible plant life: fungal tree (camera 0.90, 6.6 m). Keeping 4 m away."
 
+### Biomes (`biomes` setting, `BIOMES`)
+
+Only when biomes are on. All optional for clients.
+
+```json
+"world": {"name": "Redshift-b", "gravity": 19.62, "gravity_g": 2.0, "seed": 7,
+          "biome": {"id": "verdigris", "name": "Verdigris lowlands", "secondary": "rust"}},
+"features": {"biome_map": {"nx": 31, "ny": 31, "origin": [-60.0, -60.0], "res": 4.0, "w": [0.0, 0.0, 0.12, ...]}}
+```
+
+- `world.biome` (init only): the primary biome `id` and `name`, and the `secondary` biome's id. Ids: `basalt`,
+  `verdigris`, `frost`, `ash`, `salt`, `obsidian`, `rust`. `rust` (today's look) is never the primary.
+- `features.biome_map`: the secondary biome's share of the ground, 0 to 1 rounded to 2 decimals, on a coarse
+  grid of about 4 m cells covering the map (`w` row major by j, `nx * ny` values, sample (i, j) at
+  `origin + (i, j) * res`). Sent with every `features`. A client blends the two biomes' colours with it.
+- The biome scales how many of each v7 feature are made (the feature settings stay the upper limits) and sets
+  the colours of the ground, rocks, sky and light in the camera. Rovers never read it.
+- `lifeforms` setting `life_variety` (`LIFE_VARIETY`): more lifeform kinds; `lifeforms[].kind` is then one of
+  `grazer`, `skitterer`, `drifter`, `crawler`, `burrower`.
+- Launch settings: `biomes` and `life_variety` are bools in group `features` (labels "Biomes" and "More
+  lifeforms"), on from the environment, off in a bare `Config()`.
+
 ## HTTP
 
 - `GET /api/health` -> `{"ok": true}`
@@ -562,6 +585,7 @@ Nothing required. The server must ignore any text the client sends.
 | `AUTO_RESET_S` | 0 | off by default (the sim only resets on `POST /api/reset`); if set, after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` |
 | `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase for `POST /api/launch`; 1 = start at once (`AUTO_RESET_S` above 0 also starts at once) |
 | `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features, 0 = leave it out (each is built in its own v7 step) |
+| `BIOMES`, `LIFE_VARIETY` | 1 | version 7 biomes (own ground, colours and terrain mix per seed) and more lifeform kinds, 0 = off |
 | `WEAR` | normal | `off`, `normal` or `harsh`: how fast wheels and motors wear out |
 
 ### Landforms (`MESAS`, `CANYON`, `PITS`, `BOULDER_FIELDS`)
