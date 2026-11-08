@@ -1072,13 +1072,16 @@ class HazardManager:
                     break
             if spot is None:
                 raise HazardError(f"no room for a herd at ({p[0]:g}, {p[1]:g}) (steep ground, rocks or water)")
-            if rover is None:
-                rover = min(sim.rovers, key=lambda r: math.hypot(r.x - spot[0], r.y - spot[1]))
+            if rover is None:                 # the herd is credited to the nearest rover that is free to watch it
+                free = [r for r in sim.rovers if not r.on_rescue() and r.state not in
+                        ("disabled", "wrecked", "towed", "towing", "rescuing", "repairing")] or sim.rovers
+                rover = min(free, key=lambda r: math.hypot(r.x - spot[0], r.y - spot[1]))
             face = math.atan2(spot[1] - rover.y, spot[0] - rover.x) + math.pi / 2
         else:
             pool = [rover] if rover is not None else sorted(
-                working, key=lambda r: (r.state != "exploring", r.state not in ("exploring", "investigating"),
-                                        r.state == "charging"))
+                [r for r in working if not r.on_rescue()] or working,   # helpers stay on their rescue
+                key=lambda r: (r.state != "exploring", r.state not in ("exploring", "investigating"),
+                               r.state == "charging"))
             for r in pool:
                 for dist in (6.5, 7.0, 6.0, 7.5):
                     for a in (0.0, 0.3, -0.3, 0.6, -0.6):
