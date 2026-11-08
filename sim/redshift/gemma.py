@@ -1349,8 +1349,11 @@ _RESCUE_RES = (
     ("tow", re.compile(r"\btow(?:s|ing|ed)?\b|\b(?:drag|haul)\s+" + _TREF + r"\s+(?:back|home)")),
     ("salvage", re.compile(r"\b(?:salvag\w*|scaveng\w*|cannibali[sz]\w*|strip)\b")),
     ("leave", re.compile(r"\b(?:leave|abandon|ditch)\s+" + _TREF + r"(?!\s+alone)\b|\bleave\s+the\s+wreck\b")),
-    ("help", re.compile(r"\b(?:help|rescue|assist|aid)\s+(?:out\s+)?" + _TREF + r"|\b(?:go|come|please)\s+(?:and\s+)?"
-                        r"(?:help|rescue)\b|\b(?:help|rescue)\s*[.!]*$|\bto\s+(?:help|rescue)\b")),
+    ("help", re.compile(r"\b(?:help|rescue|assist|aid|save|recover|fetch|retrieve|get)\s+(?:out\s+)?(?:"
+                        + _TREF + r"|you|u)\b|\b(?:go|come|please)\s+(?:and\s+)?(?:help|rescue|save)\b"
+                        r"|\b(?:help|rescue|save)\s*[.!?]*$|\bto\s+(?:help|rescue|save)\b"
+                        r"|\b(?:some|any|no)\s*(?:one|body)\b.*\b(?:save|help|rescue|get|fetch)\b"
+                        r"|\bpick\s+up\s+" + _TREF)),
 )
 
 
@@ -1548,6 +1551,11 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
     low = " ".join(str(text or "").lower().split())
     if not low:
         return _unclear(_HELP)
+    m_bare = re.fullmatch(r"(?:hey\s+|yo\s+|ok\s+)?(?:rover\s*(\d+)|r(\d+))\s*[?!.]*", low)
+    if m_bare:                                # just "rover 2?": how is it doing
+        rid = f"r{m_bare.group(1) or m_bare.group(2)}"
+        if any(r["id"] == rid for r in rovers) or not rovers:
+            return _ask(rid, "status", 0.8)
     q_pre, _t_pre = question_intent(low, rovers)
     if q_pre != "strong":
         rc = parse_rescue(low, rovers)                # v9: before the one-rover-at-a-time check
