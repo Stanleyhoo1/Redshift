@@ -5363,3 +5363,28 @@ kbd {
   color: var(--ink-3);
   font-size: 11.5px;
 }
+
+/* Readability pass (demo day): brighter secondary text and larger log and chat text. */
+:root {
+  --ink-2: #c6d1de;
+  --ink-3: #9eacbf;
+}
+.ev {
+  font-size: 15.5px;
+  line-height: 1.45;
+}
+.ev-time {
+  font-size: 13.5px;
+}
+.msg-bubble {
+  font-size: 15.5px;
+  line-height: 1.45;
+}
+.msg-head {
+  font-size: 13.5px;
+}
+@media (min-width: 1500px) {
+  :root {
+    --side-w: 430px;
+  }
+}

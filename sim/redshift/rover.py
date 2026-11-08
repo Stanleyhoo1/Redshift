@@ -2151,6 +2151,8 @@ class Rover:
             return False
         if self.state in ("returning", "charging", "fault", "idle") or self.degraded or self.survey is not None:
             return False
+        if self.on_rescue() or self.state in ("rescuing", "towing", "disabled", "towed", "wrecked", "repairing"):
+            return False                   # a rescue comes first: no curious detours
         if self.dir_bias is not None and t < self.dir_bias[2]:
             return False                   # the operator asked for a direction: that comes first
         if self.fleet.priority is not None:
@@ -2166,6 +2168,9 @@ class Rover:
                        for sx, sy, st in f.interest_spots)
 
     def _start_interest(self, t: float) -> bool:
+        if self.on_rescue():
+            self.pending_interest = None
+            return False
         pi, self.pending_interest = self.pending_interest, None
         if pi is None or t - pi["t"] > INTEREST_STALE_S or not self._interest_ok(t, pi["x"], pi["y"]):
             return False

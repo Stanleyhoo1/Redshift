@@ -277,7 +277,9 @@ class RescueManager:
                 h.goal, h.path = None, []
                 h.next_goal_try = t
             rec["exclude"].add(h.id)
-            self._log(t, "info", f"{h.id} stops helping {rec['rover']}: {why}.", h.id, at=(h.x, h.y))
+            self._log(t, "warn", f"{h.id} stops helping {rec['rover']}: {why}.", h.id, at=(h.x, h.y))
+            self._say(h.id, t, f"Stopping my rescue of {rec['rover']}: {why}."
+                      + (" Looking for another rover to help." if pick else ""), "info")
         rec["helper"] = None
         if rec["phase"] != "done":
             rec["phase"] = "en_route"
@@ -338,6 +340,8 @@ class RescueManager:
             if h.state in ("exploring", "investigating", "observing") and h.health.mobile() \
                     and not h._need_return(t) and h.op_goal is None and not h.held:
                 # side-tracked (a target, a creature, a curious detour): the stranded rover comes first
+                self._log(t, "info", f"{h.id} drops what it was doing ({h.state}): {rec['rover']} comes first.",
+                          h.id, at=(h.x, h.y))
                 h.release_all(t, "rescue", quiet=True)
                 h.state = "rescuing"
                 h.goal, h.path, h.plan_t = None, [], -1e9
