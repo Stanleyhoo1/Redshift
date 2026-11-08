@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { appStore, useSim } from '../state/store.js'
 import { getConfig, launch, resetSim } from '../net/connection.js'
 import { CloseButton, Modal } from './Modal.jsx'
-import { GROUP_TITLE, SEED_FIELD, diffSettings, fieldsByGroup, formatValue, gravityLook, metersPerSecond2, parseSeed, physicsAt, presetName, randomSeed, snap, summary } from '../lib/setup.js'
+import { GROUP_TITLE, SEED_FIELD, diffSettings, fieldsByGroup, formatValue, gravityLook, gravityText, metersPerSecond2, parseSeed, physicsAt, presetName, randomSeed, readableError, snap, summary } from '../lib/setup.js'
 import '../styles/setup.css'
 
 // The setup screen (v7, PROTOCOL.md "Version 7 additions"). Forced while the sim waits in its setup phase:
@@ -28,6 +28,8 @@ export function SetupScreen({ forced = false }) {
   const startGen = useRef(gen)
   const seedRef = useRef(liveSeed)
   seedRef.current = liveSeed
+  const bodyRef = useRef(null)
+  const [more, setMore] = useState(false) // the settings scroll and there is more below: fade the bottom edge
 
   useEffect(() => {
     let live = true
@@ -64,13 +66,33 @@ export function SetupScreen({ forced = false }) {
     return () => clearTimeout(id)
   }, [busy])
 
+  // On a short window (1366 x 768) the settings scroll: the bottom edge fades while more is below.
+  const scrolls = !!server && !server.legacy && !!values && !loadError
+  useEffect(() => {
+    const el = bodyRef.current
+    if (!scrolls || !el) return
+    const check = () => setMore(el.scrollHeight - el.scrollTop - el.clientHeight > 4)
+    check()
+    el.addEventListener('scroll', check, { passive: true })
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(check)
+    if (ro) {
+      ro.observe(el)
+      for (const child of el.children) ro.observe(child)
+    }
+    return () => {
+      el.removeEventListener('scroll', check)
+      ro?.disconnect()
+    }
+  }, [scrolls])
+
   const set = (key, v) => setValues((cur) => ({ ...cur, [key]: v }))
   const setAll = (fields, on) => setValues((cur) => ({ ...cur, ...Object.fromEntries(fields.map((f) => [f.key, on])) }))
   const seedField = server?.fields?.find((f) => f.key === 'seed') || SEED_FIELD
-  const seedOk = parseSeed(seedText, seedField) !== null
+  const keepSeed = server?.current?.seed // the held world's seed is fine as it is, even off the field's range
+  const seedOk = parseSeed(seedText, seedField, keepSeed) !== null
   const typeSeed = (text) => {
     setSeedText(text)
-    const n = parseSeed(text, seedField)
+    const n = parseSeed(text, seedField, keepSeed)
     if (n !== null) set('seed', n)
   }
 
@@ -84,7 +106,7 @@ export function SetupScreen({ forced = false }) {
       else await launch(diffSettings(values, server.current))
     } catch (err) {
       setBusy(false)
-      setError(err?.message || 'Launch refused')
+      setError(err?.own ? readableError(err.message, server.fields) : err?.message || 'Launch refused')
     }
   }
 
@@ -93,7 +115,7 @@ export function SetupScreen({ forced = false }) {
     ? 'The fleet waits on the lander pad. Nothing moves until you launch.'
     : 'Launching ends the current mission and lands the fleet on a new world with these settings.'
   const ready = !!server && !!values && !loadError
-  const seedInput = <SeedField field={seedField} text={seedText} onText={typeSeed} onNew={() => typeSeed(String(randomSeed()))} onEnter={go} />
+  const seedInput = <SeedField field={seedField} text={seedText} bad={!seedOk} onText={typeSeed} onNew={() => typeSeed(String(randomSeed()))} onEnter={go} />
 
   let body
   if (loadError) {
@@ -129,7 +151,7 @@ export function SetupScreen({ forced = false }) {
     const planetRest = (groups.planet || []).filter((f) => f.key !== 'gravity_g' && f.key !== 'seed')
     const field = (f) => <Field key={f.key} field={f} value={values[f.key]} onChange={(v) => set(f.key, v)} />
     body = (
-      <div className="su-body">
+      <div className="su-body" ref={bodyRef} data-more={more || undefined}>
         <div className="su-planet">
           {grav && <GravityHero field={grav} value={values.gravity_g} onChange={(v) => set('gravity_g', v)} presets={server.presets?.gravity_g} physics={server.physics} />}
           {seedInput}
@@ -310,7 +332,7 @@ function GravityHero({ field, value, onChange, presets, physics }) {
       </h3>
       <div className="su-g-read">
         <span className="su-g-num" style={{ fontStretch: `${look.stretch}%`, fontWeight: look.weight, color: look.color }}>
-          {value.toFixed(1)}
+          {gravityText(value)}
         </span>
         <span className="su-g-unit">g</span>
         <span className="su-g-side">
@@ -332,7 +354,7 @@ function GravityHero({ field, value, onChange, presets, physics }) {
         step={field.step}
         value={value}
         style={{ '--fill': fillOf(field, value) }}
-        aria-valuetext={`${value.toFixed(1)} g${name ? `, ${name}` : ''}`}
+        aria-valuetext={`${gravityText(value)} g${name ? `, ${name}` : ''}`}
         onChange={(e) => onChange(snap(field, e.target.value))}
       />
       {list.length > 0 && (
@@ -387,14 +409,13 @@ function SlopeFigure({ row }) {
           Steepest climb {climb.toFixed(1)}°{row.grip_limited ? ' (grip limits it here, not the motors)' : ''}
         </span>
         <span className="su-key su-key-tow">Towing a broken rover {tow.toFixed(1)}°</span>
-        <span className="su-fig-note">Predicted from motor torque and rover mass. The fleet still learns its real limit on the slopes it drives.</span>
+        <span className="su-fig-note">Predicted from motor torque and rover mass. The rovers are not told: the fleet starts optimistic and lowers its slope limit each time one stalls.</span>
       </figcaption>
     </figure>
   )
 }
 
-function SeedField({ field, text, onText, onNew, onEnter }) {
-  const bad = parseSeed(text, field) === null
+function SeedField({ field, text, bad, onText, onNew, onEnter }) {
   return (
     <div className="su-field su-seed">
       <label className="su-label" htmlFor="su-seed">

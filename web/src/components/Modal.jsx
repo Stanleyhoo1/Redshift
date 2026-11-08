@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useSim } from '../state/store.js'
 import '../styles/interaction.css'
 
@@ -12,9 +12,11 @@ export function Modal({ label, onClose, className = '', children, onKey }) {
   close.current = onClose
   const keyFn = useRef(onKey)
   keyFn.current = onKey
+  // Where focus was when the viewer opened, read while rendering: by the time an effect runs, App has made
+  // the page behind inert and the browser may have moved focus off that element already.
+  const [before] = useState(() => (typeof document === 'undefined' ? null : document.activeElement))
 
   useEffect(() => {
-    const before = document.activeElement
     box.current?.focus({ preventScroll: true })
     const onKeyDown = (e) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return
@@ -31,7 +33,7 @@ export function Modal({ label, onClose, className = '', children, onKey }) {
       window.removeEventListener('keydown', onKeyDown)
       if (before instanceof HTMLElement && before.isConnected) before.focus({ preventScroll: true })
     }
-  }, [])
+  }, [before])
 
   return (
     <div

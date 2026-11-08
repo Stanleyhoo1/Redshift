@@ -126,7 +126,7 @@ function ResetControl() {
         <button type="button" className="btn btn-wide" disabled={phase === 'pending'} onClick={() => setPhase('confirm')}>
           {phase === 'pending' ? 'Resetting...' : 'Reset sim'}
         </button>
-        <button type="button" className="btn btn-wide" title="Choose gravity, fleet, sector and features, then launch" onClick={() => appStore.patch({ modal: { kind: 'setup' } })}>
+        <button type="button" className="btn btn-wide" title="Choose gravity, fleet, sector and features, then launch" onClick={() => appStore.patch({ modal: { kind: 'setup', forced: simStore.get().phase === 'setup' } })}>
           New mission
         </button>
       </div>
@@ -169,7 +169,7 @@ export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
         <div className="hud-label" id="follow-label">
           Follow
         </div>
-        <div className="seg" role="group" aria-labelledby="follow-label">
+        <div className={`seg${meta.length > 3 ? ' seg-follow-many' : ''}`} role="group" aria-labelledby="follow-label">
           <button type="button" aria-pressed={!follow} onClick={onOverview} title="Overview (0)">
             Off
           </button>

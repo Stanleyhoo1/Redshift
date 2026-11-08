@@ -228,7 +228,7 @@ const clampTo = (key, v) => clamp(v, FIELD[key].min, FIELD[key].max)
 const WEAR_ENV = (process.env.WEAR || 'normal').trim().toLowerCase()
 const DEFAULT_SETTINGS = Object.freeze({
   gravity_g: clampTo('gravity_g', envNum('GRAVITY_G', 2)),
-  seed: Math.trunc(clampTo('seed', envNum('SEED', 42))),
+  seed: Math.max(0, Math.trunc(envNum('SEED', 42))), // like the sim: not clamped above (any seed works)
   num_rovers: Math.trunc(clampTo('num_rovers', envNum('NUM_ROVERS', 3))),
   map_size: clampTo('map_size', envNum('MAP_SIZE', 120)),
   water: true,
@@ -264,8 +264,14 @@ function physicsTable() {
 const configJson = () => ({ ok: true, phase, current: settingsJson(), defaults: { ...DEFAULT_SETTINGS }, fields: SETTING_FIELDS, presets: { gravity_g: GRAVITY_PRESETS }, physics: physicsTable() })
 
 const withUnit = (v, unit) => (unit === 'x' ? `${v}x` : unit ? `${v} ${unit}` : `${v}`)
-// The sim's Config.from_settings, with the same error texts: { changes } or { errors }.
-function parseSettings(body) {
+// A float on its step grid, give or take float noise (1.7000000000000002 is 1.7), or null when off it (2.04 g).
+function onStep(f, v) {
+  const n = (v - f.min) / f.step
+  return Math.abs(n - Math.round(n)) > 1e-6 ? null : Number((f.min + Math.round(n) * f.step).toFixed(6))
+}
+// The sim's Config.from_settings, with the same error texts: { changes } or { errors }. A number equal to the
+// current world's own value is no change and always passes (an env var may give one off the table's grid).
+function parseSettings(body, base = settings) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { errors: ['Body must be a JSON object like {"gravity_g": 1.5, "num_rovers": 4}'] }
   const changes = {}
   const errors = []
@@ -283,18 +289,21 @@ function parseSettings(body) {
       errors.push(`${key} must be a number`)
     } else if (!Number.isFinite(v)) {
       errors.push(`${key} must be a finite number`)
+    } else if (v === base[key]) {
+      changes[key] = v
     } else if (f.type === 'int' && !Number.isInteger(v)) {
       errors.push(`${key} must be a whole number`)
     } else if (v < f.min || v > f.max) {
       errors.push(`${key} must be between ${f.min} and ${withUnit(f.max, f.unit)}`)
-    } else if (f.type === 'int' && f.step > 1 && (v - f.min) % f.step) {
+    } else if ((f.type === 'int' && f.step > 1 && (v - f.min) % f.step) || (f.type === 'float' && onStep(f, v) === null)) {
       errors.push(`${key} must be in steps of ${withUnit(f.step, f.unit)}`)
     } else {
-      changes[key] = v
+      changes[key] = f.type === 'float' ? onStep(f, v) : v
     }
   }
   return errors.length ? { errors } : { changes }
 }
+const ALREADY_LAUNCHED = 'Another launch started the mission first. Use New mission to change its settings.'
 
 function makePerlin(rand) {
   const perm = Array.from({ length: 256 }, (_, i) => i)
@@ -4447,6 +4456,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/truth') return sendJson(res, 200, truthJson())
   if (req.method === 'GET' && url.pathname === '/api/config' && PROTOCOL >= 7) return sendJson(res, 200, configJson())
   if (req.method === 'POST' && url.pathname === '/api/launch' && PROTOCOL >= 7) {
+    const fromSetup = phase === 'setup' // what this request was made against, as the sim records it
     let body = ''
     req.on('data', (chunk) => {
       body += chunk
@@ -4461,6 +4471,12 @@ const server = http.createServer((req, res) => {
       }
       const out = parseSettings(parsed)
       if (out.errors) return sendJson(res, 400, { ok: false, error: out.errors.join('; '), errors: out.errors })
+      // Like the sim, a launch from the setup screen starts the mission once: if another launch (or a reset)
+      // got there first, land nothing new (200 when this one asked for the same settings, else 409).
+      if (fromSetup && phase !== 'setup') {
+        if (Object.entries(out.changes).every(([k, v]) => settings[k] === v)) return sendJson(res, 200, { ok: true, phase, config: settingsJson() })
+        return sendJson(res, 409, { ok: false, error: ALREADY_LAUNCHED })
+      }
       // The mock always builds a fresh world, even with nothing changed, so its wall-clock timers start now.
       reset(out.changes.seed ?? settings.seed, out.changes)
       sendJson(res, 200, { ok: true, phase, config: settingsJson() })
@@ -4483,14 +4499,19 @@ const server = http.createServer((req, res) => {
       }
       if (Number.isFinite(parsed?.seed)) seed = Math.trunc(parsed.seed)
       let changes = {}
+      let ignored = []
       if (PROTOCOL >= 7 && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const { seed: _seed, ...rest } = parsed // v7: launch settings ride along
-        const out = parseSettings({ ...rest, seed }) // the seed too: like the sim, 0 to 2147483647
+        // v7: launch settings ride along. As before (and like the sim), other keys are ignored and any seed
+        // of 0 or more works.
+        if (seed < 0) return sendJson(res, 400, { ok: false, error: 'seed must be 0 or more' })
+        const { seed: _seed, ...rest } = parsed
+        ignored = Object.keys(rest).filter((k) => !FIELD[k])
+        const out = parseSettings(Object.fromEntries(Object.entries(rest).filter(([k]) => FIELD[k])))
         if (out.errors) return sendJson(res, 400, { ok: false, error: out.errors.join('; '), errors: out.errors })
         changes = out.changes
       }
       reset(seed, changes)
-      sendJson(res, 200, { ok: true, seed, ...(PROTOCOL >= 7 && { config: settingsJson() }) })
+      sendJson(res, 200, { ok: true, seed, ...(PROTOCOL >= 7 && { config: settingsJson() }), ...(ignored.length && { ignored }) })
     })
     return
   }

@@ -38,7 +38,7 @@ Stop with Ctrl+C, then `docker compose down`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SEED` | 42 | terrain and target layout (0 to 2147483647) |
+| `SEED` | 42 | terrain and target layout (0 or more; the setup screen offers 0 to 2147483647) |
 | `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
 | `SIM_SPEED` | 3.0 | sim seconds per real second (0.5 to 10) |
 | `MAP_SIZE` | 120 | map width in metres (60 to 200) |

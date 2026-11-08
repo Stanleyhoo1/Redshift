@@ -191,13 +191,15 @@ learns them all). `node scripts/v6-check.mjs` (mock started with
 screenshot and clicks a marker.
 
 Version 7 in the mock (the default; `MOCK_PROTOCOL=6` for the previous behaviour): launch settings with
-the sim's table, presets and physics rows (`GET /api/config`), `POST /api/launch` and settings in
-`POST /api/reset` (same error texts as the sim), and init `phase` and `config`. `MOCK_PRELAUNCH=1` starts in
+the sim's table, presets and physics rows (`GET /api/config`), `POST /api/launch` (a second launch sent
+from the setup phase lands nothing new, as in the sim) and settings in `POST /api/reset` (same error texts as
+the sim; other keys are ignored and listed in `ignored`), and init `phase` and `config`. `MOCK_PRELAUNCH=1` starts in
 the setup phase like the sim's default `AUTO_LAUNCH=0` (frozen at t = 0, hazards, chat and answers get 409);
 without it the mock runs at once, so the older scripts are unaffected. The v7 world features are only stored
 and echoed. `node scripts/setup-unit.mjs` checks the setup helpers, the init fields and the HTTP helpers
 without a browser; `node scripts/setup-check.mjs [url] [outDir]` (mock started with `MOCK_PRELAUNCH=1`, or
-the sim with `AUTO_LAUNCH=0`) drives the setup screen, launches and saves 5 screenshots.
+the sim with `AUTO_LAUNCH=0`) drives the setup screen (also that neither Tab nor New mission gets past the
+forced screen), launches and saves 5 screenshots.
 `scripts/screenshot.mjs` launches a sim that waits in its setup phase (`POST /api/launch {}`) before its
 shots, so it works with the sim's default `AUTO_LAUNCH=0`; a running sim or an older one is left alone.
 

@@ -87,17 +87,43 @@ export function gravityLook(g, lo = 0.5, hi = 3) {
   return { stretch: Math.round(122 - t * 50), weight: Math.round(380 + t * 420), color: `rgb(${rgb.join(', ')})` }
 }
 
+// Gravity as the screen writes it: one decimal on the 0.1 g grid ("2.0"), more only for a world an env var
+// started off that grid (GRAVITY_G=2.04 reads "2.04", not "2.0").
+export function gravityText(g) {
+  const v = Number(g)
+  if (!Number.isFinite(v)) return ''
+  return Math.abs(v * 10 - Math.round(v * 10)) < 1e-6 ? v.toFixed(1) : String(Number(v.toFixed(3)))
+}
+
+// A refused launch, for people: the sim names settings by key ("gravity_g must be between 0.5 and 3 g"),
+// the screen by label ("Gravity must be between 0.5 and 3 g."). One sentence per problem.
+export function readableError(text, fields) {
+  const labels = new Map()
+  for (const f of Array.isArray(fields) ? fields : []) if (f && typeof f.key === 'string' && f.label) labels.set(f.key, f.label)
+  return String(text ?? '')
+    .split('; ')
+    .filter(Boolean)
+    .map((part) => {
+      const m = /^([a-z][a-z0-9_]*) (must .*)$/.exec(part)
+      const t = m && labels.has(m[1]) ? `${labels.get(m[1])} ${m[2]}` : part
+      return /[.!?]$/.test(t) ? t : `${t}.`
+    })
+    .join(' ')
+}
+
 export function formatValue(field, v) {
   if (!Number.isFinite(v)) return ''
-  if (field?.key === 'gravity_g') return `${v.toFixed(1)} g`
+  if (field?.key === 'gravity_g') return `${gravityText(v)} g`
   const unit = field?.unit || ''
   if (unit === 'x') return `${trim(v)}x real time`
   return unit ? `${trim(v)} ${unit}` : trim(v)
 }
 
-// A seed typed by hand: digits only, inside the field's range; null when it is not a valid seed.
-export function parseSeed(text, field = SEED_FIELD) {
+// A seed typed by hand: digits only, inside the field's range; null when it is not a valid seed. `keep` (the
+// seed of the world the sim holds) is valid as it is, even above the range: a reset or SEED may give one.
+export function parseSeed(text, field = SEED_FIELD, keep = null) {
   const s = String(text ?? '').trim()
+  if (Number.isSafeInteger(keep) && keep >= 0 && s === String(keep)) return keep
   if (!/^\d{1,10}$/.test(s)) return null
   const n = Number(s)
   return n >= field.min && n <= field.max ? n : null
@@ -111,7 +137,7 @@ export function summary(values, fields) {
   const list = Array.isArray(fields) ? fields : []
   if (!list.some((f) => f.key === 'gravity_g')) return Number.isFinite(values.seed) ? `Seed ${values.seed}.` : ''
   const n = Number(values.num_rovers) || 0
-  const parts = [`${n} rover${n === 1 ? ' lands' : 's land'} on a ${trim(values.map_size)} m sector at ${Number(values.gravity_g).toFixed(1)} g.`]
+  const parts = [`${n} rover${n === 1 ? ' lands' : 's land'} on a ${trim(values.map_size)} m sector at ${gravityText(values.gravity_g)} g.`]
   const feats = list.filter((f) => f.group === 'features' && f.type === 'bool')
   const tail = []
   if (feats.length) tail.push(`${feats.filter((f) => values[f.key]).length} of ${feats.length} features on`)

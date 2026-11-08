@@ -59,7 +59,7 @@
   display: flex;
   align-items: flex-start;
   gap: 16px;
-  padding: 22px 24px 16px;
+  padding: 18px 24px 14px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -90,6 +90,15 @@
   overflow: auto;
   display: grid;
   grid-template-columns: minmax(320px, 5fr) minmax(0, 7fr);
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+
+/* More settings below the fold (a short window): the bottom edge fades out, so the cut reads as "scroll",
+   not as a clipped screen. */
+.su-body[data-more] {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 64px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 64px), transparent);
 }
 
 .su-body.su-state {
@@ -108,16 +117,17 @@
 
 .su-planet {
   min-width: 0;
-  padding: 20px 24px 24px;
+  padding: 16px 24px 18px;
   border-right: 1px solid var(--line);
 }
 
+/* Vertical rhythm sized so the whole form fits a 1440 x 900 or 1600 x 900 window without scrolling. */
 .su-rest {
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 16px;
   min-width: 0;
-  padding: 20px 24px 24px;
+  padding: 16px 24px;
 }
 
 .su-trio {
@@ -149,6 +159,11 @@
 
 .su-field {
   margin-bottom: 14px;
+}
+
+.su-sec > .su-field:last-child,
+.su-planet > .su-field:last-child {
+  margin-bottom: 0;
 }
 
 .su-row {
@@ -584,7 +599,7 @@
   align-items: center;
   /* a row next to a taller one keeps its name and help together at the top */
   align-content: start;
-  padding: 9px 4px 10px;
+  padding: 6px 4px 7px;
   border: 0;
   border-bottom: 1px solid var(--line);
   background: none;
@@ -615,7 +630,7 @@
 .su-tile-help {
   grid-column: 2;
   font-size: 12.5px;
-  line-height: 1.4;
+  line-height: 1.38;
   color: var(--ink-3);
 }
 
@@ -635,7 +650,7 @@
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 14px 24px;
+  padding: 12px 24px;
   border-top: 1px solid var(--line);
 }
 

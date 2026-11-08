@@ -201,17 +201,18 @@ SYSTEM_ANSWER = (
 
 def _system_base(gravity_g: float = 2.0) -> str:
     """SYSTEM_BASE for one world's gravity (v7: the planner is shared across resets, so each request carries
-    its own). Exactly SYSTEM_BASE at 2 g; at 1 g and below the world is "an unknown planet"."""
+    its own). Exactly SYSTEM_BASE at 2 g; at 1 g and below the world is "an unknown planet". Any other
+    gravity is written as it is, to 3 decimals (2.04 g is "2.04 g", never rounded to "2 g")."""
     gv = float(gravity_g)
-    if round(gv, 1) == 2.0:
+    if gv == 2.0:
         return SYSTEM_BASE
     world = "super-Earth" if gv > 1.0 else "planet"
-    return SYSTEM_BASE.replace("super-Earth (gravity 2 g,", f"{world} (gravity {round(gv, 2):g} g,", 1)
+    return SYSTEM_BASE.replace("super-Earth (gravity 2 g,", f"{world} (gravity {round(gv, 3):g} g,", 1)
 
 
 def _with_gravity(system: str, gravity_g: float) -> str:
     """A system prompt built on SYSTEM_BASE, restated for this gravity (unchanged at 2 g)."""
-    if round(float(gravity_g), 1) == 2.0 or not system.startswith(SYSTEM_BASE):
+    if float(gravity_g) == 2.0 or not system.startswith(SYSTEM_BASE):
         return system
     return _system_base(gravity_g) + system[len(SYSTEM_BASE):]
 

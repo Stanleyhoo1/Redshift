@@ -356,7 +356,10 @@ normal.
 - **Rescuer choice (rules)**: the nearest rover that is not parked, not returning on low battery, not
   already towing, and passes: A* to a staging pose about 2 m in front of the casualty on mapped passable
   ground; A* from the casualty home under the tow slope limit `0.8 * asin(4*T/r / ((m_self+m_casualty)*g))`
-  (about 8 deg at 2 g); battery for the trip there plus twice the trip home plus the margin. The
+  (about 8 deg at 2 g; as built in step A, `Config.tow_limit_deg` caps the asin at the 30 deg grip limit of
+  a single rover, since a tow train never climbs steeper than one rover alone, so below about 0.73 g the
+  limit stays at 24 deg where the plain formula would give up to 37; read `cfg.tow_limit_deg`, never a copy
+  of the formula); battery for the trip there plus twice the trip home plus the margin. The
   announcement quotes these numbers. If no rover qualifies, a `tow` request asks mission control (options:
   "Leave it parked", "Try anyway") and the casualty stops counting toward exploration completion so the run
   can still finish.

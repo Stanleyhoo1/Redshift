@@ -1,6 +1,7 @@
 // Headless check of the v7 setup screen through the real UI. The sim must be in its setup phase (the real
 // sim with AUTO_LAUNCH=0, or the mock with MOCK_PRELAUNCH=1). Checks that the screen opens by itself, fills
-// the window and cannot be dismissed, that the world waits, picks Earth gravity and a 4th rover, switches one
+// the window and cannot be dismissed (not by Esc, the backdrop, Tab into the dashboard behind it or New
+// mission behind it), that the world waits, picks Earth gravity and a 4th rover, switches one
 // feature, checks the layout at phone width, launches (a new world with 4 rovers at 1 g that moves), then
 // reopens it from "New mission" (a centred dialog that starts from the launched settings and Esc closes).
 // Saves 5 screenshots.
@@ -73,6 +74,23 @@ await page.mouse.click(6, 6) // the backdrop
 await wait(400)
 check(await forced.isVisible(), 'Esc and a backdrop click leave the forced screen open')
 check((await forced.locator('.ix-close').count()) === 0, 'the forced screen has no close button')
+// The dashboard behind is inert: Tab never leaves the screen, so Reset sim and New mission cannot be reached.
+const behind = await page.evaluate(() => [document.querySelector('main.view')?.inert, document.querySelector('aside.side')?.inert])
+check(behind[0] === true && behind[1] === true, `the dashboard behind the forced screen is inert (${behind})`)
+await page.locator('#su-seed').focus()
+let strayed = ''
+for (let i = 0; i < 32 && !strayed; i++) {
+  await page.keyboard.press('Tab')
+  strayed = await page.evaluate(() => {
+    const a = document.activeElement
+    return a && a !== document.body && !a.closest('[role="dialog"]') ? (a.textContent || a.tagName).trim().slice(0, 30) : ''
+  })
+}
+check(!strayed, `Tab stays on the forced screen${strayed ? ` (reached ${strayed})` : ''}`)
+await page.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'New mission')?.click())
+await page.keyboard.press('Escape')
+await wait(400)
+check((await forced.isVisible()) && (await dialogs()) === 1, 'New mission and Esc during setup leave the forced screen as it is')
 const tA = (await st()).t
 await wait(1500)
 check((await st()).t === tA, `the world waits in the setup phase (t stays ${tA})`)

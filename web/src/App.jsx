@@ -111,14 +111,16 @@ export default function App() {
   useEffect(() => startConnection(), [])
 
   // v7: while the sim waits for a launch, the setup screen is open and cannot be dismissed. The launched
-  // world's init (phase "running") closes it. An older sim never sends phase "setup".
+  // world's init (phase "running") closes it. An older sim never sends phase "setup". The phase decides,
+  // not how the screen was opened: whatever replaces or closes the forced screen during setup (another
+  // viewer, New mission, Esc) is put back at once.
   const phase = useSim((s) => s.phase)
+  const setupForced = phase === 'setup'
   useEffect(() => {
-    const m = appStore.get().modal
-    const forcedOpen = m?.kind === 'setup' && !!m.forced
+    const forcedOpen = modal?.kind === 'setup' && !!modal.forced
     if (phase === 'setup' && !forcedOpen) appStore.patch({ modal: { kind: 'setup', forced: true } })
     else if (phase !== 'setup' && forcedOpen) appStore.patch({ modal: null })
-  }, [phase])
+  }, [phase, modal])
 
   // After a reset the followed or selected rover may no longer exist.
   useEffect(() => {
@@ -162,9 +164,12 @@ export default function App() {
   }, [goOverview, show, resumeFollow])
 
   const paused = !!follow && followPaused
+  // Under a viewer or the setup screen the dashboard is inert: Tab cannot reach it (nor Reset sim or New
+  // mission behind the forced setup screen), and screen readers skip it.
+  const behind = !!modal || setupForced
   return (
     <div className="app">
-      <main className="view" data-follow-paused={paused || undefined}>
+      <main className="view" data-follow-paused={paused || undefined} inert={behind}>
         {/* Pixel ratio capped at 1.5: crisp with MSAA, and spares laptop GPUs on retina screens. */}
         <Canvas flat linear dpr={[1, 1.5]} camera={{ position: [0, 68, 46], fov: 42, near: 0.5, far: 2000 }} gl={{ antialias: true, powerPreference: 'high-performance' }}>
           <Scene view={view} follow={follow} overview={overview} selected={selected} onSelect={show} focus={focus} />
@@ -185,10 +190,10 @@ export default function App() {
         {paused && <FollowPill roverId={follow} onResume={resumeFollow} />}
         <Waiting />
       </main>
-      <Sidebar follow={follow} selected={selected} onSelect={select} onFocusEvent={focusEvent} />
-      {modal?.kind === 'camera' && <CameraViewer key={`cam:${modal.rover}`} roverId={modal.rover} view={modal.view} />}
-      {modal?.kind === 'sensors' && <SensorDetail key={`sd:${modal.key}`} roverId={modal.rover} focus={modal.focus} />}
-      {modal?.kind === 'setup' && <SetupScreen key={modal.forced ? 'setup-forced' : 'setup'} forced={!!modal.forced} />}
+      <Sidebar follow={follow} selected={selected} onSelect={select} onFocusEvent={focusEvent} inert={behind} />
+      {!setupForced && modal?.kind === 'camera' && <CameraViewer key={`cam:${modal.rover}`} roverId={modal.rover} view={modal.view} />}
+      {!setupForced && modal?.kind === 'sensors' && <SensorDetail key={`sd:${modal.key}`} roverId={modal.rover} focus={modal.focus} />}
+      {(setupForced || modal?.kind === 'setup') && <SetupScreen key={setupForced ? 'setup-forced' : 'setup'} forced={setupForced} />}
     </div>
   )
 }
