@@ -9,6 +9,7 @@ import { PlannerPill } from './Planner.jsx'
 import { SamplesPanel } from './Samples.jsx'
 import { BIOMES, biomeOf } from '../lib/biomes.js'
 import { FoldButton, FoldSection, setFold, useFold } from './Fold.jsx'
+import { STATE_STYLE } from '../lib/theme.js'
 import '../styles/declutter-side.css'
 
 const WORD = 'Redshift'
@@ -209,13 +210,15 @@ function SideRail({ onOpen, onSelect, selected }) {
                 className="rail-rover"
                 data-state={st}
                 aria-pressed={selected === m.id}
-                style={{ '--rover': m.color }}
-                title={`${m.name}: ${st}`}
-                aria-label={`${m.name}, ${st}`}
+                style={{ '--rover': m.color, '--state': STATE_STYLE[st]?.color }}
+                title={`${m.name}: ${STATE_STYLE[st]?.label ?? st}`}
+                aria-label={`${m.name}, ${STATE_STYLE[st]?.label ?? st}`}
                 onClick={() => onSelect(m.id)}
               >
-                <i aria-hidden="true" />
-                <span>{st.slice(0, 4)}</span>
+                <span className="rail-num" aria-hidden="true">
+                  {m.name.match(/\d+/)?.[0] ?? m.name.slice(0, 1)}
+                </span>
+                <span className="rail-state" aria-hidden="true" />
               </button>
             </li>
           )
