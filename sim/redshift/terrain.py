@@ -194,6 +194,10 @@ class Terrain:
         if getattr(cfg, "geysers", False):
             from .v7_geysers import plan_vents
             self.geysers = plan_vents(cfg, self)
+        self.flora = []                    # v7 alien flora (own stream, placed last)
+        if getattr(cfg, "flora", False):
+            from . import v7_flora
+            self.flora = v7_flora.place(cfg, self)
 
     # ------------------------------------------------------------------ heights
     def _make_heights(self, rng: np.random.Generator) -> np.ndarray:

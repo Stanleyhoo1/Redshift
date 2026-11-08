@@ -510,6 +510,26 @@ starts or ends carries `features` again. `fleet.geyser_zones: [[x, y, r]]` holds
 fleet learned from plume returns; the key is present only when it is not empty. While a plume scatters
 the LiDAR, the rover `scan` also holds the short steam returns. They never enter `cells` or `tracks`.
 
+### Alien flora (`FLORA`)
+
+Only when flora is on. All optional.
+
+```json
+"features": {"flora": [{"id": 0, "kind": "tree", "x": 42.6, "y": 54.5, "height": 3.1, "radius": 1.8, "hue": 0.42},
+                       {"id": 20, "kind": "bush", "x": 40.1, "y": 50.2, "height": 0.5, "radius": 0.4, "hue": 0.1, "bulbs": 8}]},
+"fleet": {"flora_zones": [[42.51, 54.37, 6.2]], "flora_seen": 1}
+```
+
+- `features.flora` is ground truth (init, and with any later `features`). Trees have a stalk and a domed
+  cap; `hue` goes from 0 (violet) to 1 (teal). Bushes are lime bulbs; `bulbs` is how many.
+- `fleet.flora_zones` are keep-out circles `[x, y, radius]` of plants the fleet identified. The radius is
+  the assumed plant size (2.2 m tree, 0.6 m bush) plus 4 m. Planning treats them as impassable.
+  `flora_seen` counts identified plants. Both keys appear only once a plant is known.
+- A rover identifies a plant from its own sensors. LiDAR sees the stalk as an obstacle within 10 m, then
+  the mast camera takes a small segmentation frame (at most every 2 s per rover) and labels it. The first
+  sighting of each plant logs an event with `at`, for example
+  "r1 sees possible plant life: fungal tree (camera 0.90, 6.6 m). Keeping 4 m away."
+
 ## HTTP
 
 - `GET /api/health` -> `{"ok": true}`

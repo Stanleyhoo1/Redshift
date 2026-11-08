@@ -519,6 +519,9 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
                                          [(0.5, 0.45, 0.8, 0.18), (2.9, 0.5, 0.6, 0.16)], crystal_meshes))
 
     bodies += decor                 # what the targets look like to the camera (static, visual only)
+    if getattr(terrain, "flora", None):     # v7 alien flora: static proxies and decor
+        from . import v7_flora
+        geoms.append(v7_flora.geoms_xml(terrain.flora))
 
     # lifeforms (lifeforms.py moves them)
     life_names = []

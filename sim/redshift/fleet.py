@@ -747,6 +747,8 @@ class Fleet:
         gz = getattr(self, "geyser_zones", None)
         if gz:                              # v7: only when geysers are on and the fleet has seen one
             out["geyser_zones"] = [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in gz]
+        if getattr(self, "flora", None) is not None:
+            out.update(self.flora.stats())     # v7: only when flora is on and some is known
         return out
 
     def discovered_targets(self) -> list:

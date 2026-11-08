@@ -465,9 +465,15 @@ export function sanitizeFeatures(f, prev) {
   const ice = Array.isArray(f.ice) ? f.ice.filter((s) => isObj(s) && Number.isFinite(s.x) && Number.isFinite(s.y))
     .map((s, i) => ({ id: s.id == null ? `ice${i + 1}` : String(s.id), x: s.x, y: s.y, radius: num(s.radius, 4) > 0.2 ? num(s.radius, 4) : 4 })) : null
   const sameIce = prev && JSON.stringify(prev.ice ?? null) === JSON.stringify(ice)
-  if (sameWater && sameSpires && sameIce) return prev
+  // v7 alien flora (optional): kept only when the sim sends some.
+  const flora = (Array.isArray(f.flora) ? f.flora : [])
+    .filter((p) => isObj(p) && Number.isFinite(p.x) && Number.isFinite(p.y))
+    .map((p, i) => ({ id: p.id == null ? i : p.id, kind: p.kind === 'bush' ? 'bush' : 'tree', x: p.x, y: p.y, height: num(p.height, 3), radius: num(p.radius, 1), hue: num(p.hue, 0.5) }))
+  const sameFlora = prev && JSON.stringify(prev.flora ?? []) === JSON.stringify(flora)
+  if (sameWater && sameSpires && sameIce && sameFlora) return prev
   const out = { water: sameWater ? prev.water : water, spires: sameSpires ? prev.spires : spires }
   if (ice) out.ice = sameIce ? prev.ice : ice
+  if (flora.length) out.flora = sameFlora ? prev.flora : flora
   return out
 }
 
