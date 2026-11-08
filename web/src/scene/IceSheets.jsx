@@ -12,7 +12,7 @@ export function IceSheets({ reality }) {
   // The map is filled in place, so rerender only when the set of mapped sheets changes.
   const shown = useSim((s) => (s.features?.ice || []).filter((i) => knownAt(i.x, i.y)).map((i) => i.id).join(','))
   const mat = useMemo(() => new THREE.MeshStandardMaterial({
-    color: '#cfe8ff', roughness: 0.08, metalness: 0.1, transparent: true, opacity: 0.85,
+    color: '#a8d2ff', emissive: '#16324f', roughness: 0.06, metalness: 0.2, transparent: true, opacity: 0.85,
     polygonOffset: true, polygonOffsetFactor: -2,
   }), [])
   return (
