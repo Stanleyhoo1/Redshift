@@ -484,6 +484,110 @@ add('reduced-motion', async () => {
   }
 })
 
+// A rover key on the planet: back down with that rover's sensors open.
+add('rover-key', async (page) => {
+  await toGlobe(page)
+  await page.keyboard.press('2')
+  await settled(page, 'plane')
+  await page.waitForSelector('section.hud-sensors', { timeout: 15000 })
+})
+
+// A rover row in the planet's sector card does the same.
+add('card-rover', async (page) => {
+  await toGlobe(page)
+  await page.locator('.globe-card[data-settled] .gc-rover').first().click({ timeout: 15000 })
+  await settled(page, 'plane')
+  await page.waitForSelector('section.hud-sensors', { timeout: 15000 })
+})
+
+// A hazard button on the planet flies down first, then places as usual.
+add('hazard-button', async (page) => {
+  await toGlobe(page)
+  await page.locator('.hz-btn[data-type="rockfall"]').click({ timeout: 10000 })
+  await settled(page, 'plane')
+  if (!(await page.locator('.hz-btn[data-type="rockfall"][data-placing]').count())) fail('the rockfall button is not placing after the flight down')
+  await page.keyboard.press('Escape')
+})
+
+// Clicking an event with a place on the planet flies down to it.
+add('event-click', async (page) => {
+  await toGlobe(page)
+  const r = await api('/api/hazard', { type: 'rockfall', rover: 'r2' })
+  if (r.status !== 200) return fail(`could not start a rockfall (${r.status} ${r.error || ''})`)
+  await page.click('#tab-events')
+  const row = page.locator('li.ev.ev-link .ev-btn').first()
+  await row.waitFor({ timeout: 20000 })
+  await row.click()
+  await settled(page, 'plane')
+  await shot(page, 'event-from-planet')
+})
+
+// A rover asking to pick a place brings the sector back, with the candidates shown.
+add('place-question', async (page) => {
+  log(`reveal ${JSON.stringify(await api('/api/_mock/reveal', { water: true }))}`)
+  for (const id of ['r1', 'r2', 'r3']) await api('/api/_mock/battery', { rover: id, battery: 0.95 })
+  await toGlobe(page)
+  log(`chat ${JSON.stringify(await api('/api/chat', { text: 'go to the water source' }))}`)
+  await settled(page, 'plane', 45000)
+  await page.waitForFunction(() => document.querySelectorAll('.place-mark').length >= 2, null, { timeout: 30000 })
+  const q = (await page.evaluate(() => window.__redshift.state().requests)).find((x) => x.kind === 'choose_place')
+  if (!q) return fail('no choose_place request after the order')
+  await shot(page, 'place-from-planet')
+  await api('/api/answer', { id: q.id, option: q.options[0].id })
+  await page.waitForFunction((id) => !window.__redshift.state().requests.some((x) => x.id === id), q.id, { timeout: 20000 })
+})
+
+// After a trip to the planet and back, click-to-place still works end to end: a rockfall
+// placed by clicking the map (as v4-shots does) reaches the sim and shows up. A fresh
+// world first, so no earlier hazard is in the way.
+add('place-after-trip', async (page) => {
+  await api('/api/reset', { seed: 42 })
+  await page.waitForFunction(() => {
+    const s = window.__redshift.state()
+    return !!s.rovers.r2 && s.hazards.length === 0
+  }, null, { timeout: 30000 })
+  await page.waitForTimeout(3000)
+  await page.keyboard.press('g')
+  await settled(page, 'globe')
+  await page.keyboard.press('g')
+  await settled(page, 'plane')
+  await page.locator('.hz-btn[data-type="rockfall"]').click({ timeout: 10000 })
+  await page.waitForSelector('.hz-btn[data-type="rockfall"][data-placing]', { timeout: 10000 })
+  const s = await page.evaluate(() => window.__redshift.state())
+  const inPoly = (x, y, poly) => {
+    let inside = false
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const [xi, yi] = poly[i]
+      const [xj, yj] = poly[j]
+      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside
+    }
+    return inside
+  }
+  // The sim refuses water it has not identified too, so keep well clear of every lake.
+  const wet = (x, y) => (s.features?.water || []).some((w) => inPoly(x, y, w.outline) || w.outline.some(([px, py]) => Math.hypot(px - x, py - y) < 5))
+  let placed = null
+  for (let k = 0; k < 12 && !placed; k++) {
+    const x = s.lander.x + Math.cos((k / 12) * Math.PI * 2) * 9
+    const y = s.lander.y + Math.sin((k / 12) * Math.PI * 2) * 9
+    const rovers = await page.evaluate(() => window.__redshift.state().rovers)
+    if (wet(x, y) || Object.values(rovers).some((r) => Math.hypot(r.x - x, r.y - y) < 6)) continue
+    const p = await page.evaluate(([wx, wy]) => window.__redshift.screenOf(wx, wy), [x, y])
+    if (!p.visible || !(await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.tagName === 'CANVAS', [p.x, p.y]))) continue
+    await page.mouse.move(p.x, p.y, { steps: 3 })
+    await page.waitForTimeout(1200)
+    if (await page.locator('.ghost-tag[data-bad]').count()) continue
+    const resp = page.waitForResponse((r) => r.url().includes('/api/hazard'), { timeout: 15000 }).catch(() => null)
+    await page.mouse.click(p.x, p.y)
+    const r = await resp
+    log(`rockfall at (${x.toFixed(1)}, ${y.toFixed(1)}): HTTP ${r ? r.status() : 'no request'}`)
+    if (r?.status() === 200) placed = (await r.json()).hazard
+  }
+  if (!placed) return fail('no rockfall could be placed by clicking the map after a trip to the planet')
+  await page.waitForFunction((id) => window.__redshift.state().hazards.some((h) => h.id === id), placed.id, { timeout: 20000 })
+  await page.mouse.move(40, height - 40)
+  await shot(page, 'placed-after-trip')
+})
+
 // Run every check in order.
 await api('/api/reset', { seed: 42 })
 await api('/api/_mock/rearm', { armed: false })
