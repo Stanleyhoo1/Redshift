@@ -127,7 +127,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <PlaceCandidates />
       <Placement reality={view.reality} />
       <CameraRig follow={follow} overview={overview} focus={focus} />
-      <GlobeLayer onSelect={onSelect} />
+      <GlobeLayer onSelect={onSelect} reality={view.reality} />
       {DEBUG && <DebugHook />}
     </>
   )

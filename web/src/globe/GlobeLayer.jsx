@@ -31,7 +31,7 @@ function RenderSwitch({ scene, camera }) {
 // v7 planet view (spec section 5). One canvas: the sector scene stays mounted, and keeps
 // following the sim, while the planet scene and its own camera are drawn instead. The
 // planet scene is an r3f portal, so its objects get pointer events and its label the page.
-export function GlobeLayer({ onSelect }) {
+export function GlobeLayer({ onSelect, reality = false }) {
   const gl = useThree((s) => s.gl)
   const rootScene = useThree((s) => s.scene)
   const get = useThree((s) => s.get)
@@ -88,7 +88,7 @@ export function GlobeLayer({ onSelect }) {
     <>
       <ViewClock />
       <RenderSwitch scene={scene} camera={camera} />
-      {createPortal(<GlobeWorld onSelect={onSelect} />, scene, { camera })}
+      {createPortal(<GlobeWorld onSelect={onSelect} reality={reality} />, scene, { camera })}
     </>
   )
 }

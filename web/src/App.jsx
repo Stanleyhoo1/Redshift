@@ -199,7 +199,7 @@ export default function App() {
         </div>
         {/* v7: on the planet its own legend shows; an open sensor panel stays mounted but
             hidden, so it comes back as it was; no follow pill over the planet */}
-        {globe && <GlobeLegend />}
+        {globe && <GlobeLegend reality={view.reality} />}
         {selected ? (
           <div className="globe-keep" hidden={globe}>
             <SensorPanel roverId={selected} onClose={closePanel} />
