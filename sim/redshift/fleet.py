@@ -97,6 +97,7 @@ class Fleet:
         self.plan_slices = 0
         self._costs: dict = {}             # (limit, limit_version, unknown_cost) -> (grid, t)
         self.soft_zones: list = []         # [(x, y, radius, rover id, t)] soft ground found by wheel slip
+        self.ice_zones: list = []          # v7: [(x, y, radius, rover id, t)] frozen ground found by low traction
         self.orphan = None                 # (x, y, rover id, t): area a faulted rover had to drop
         self.hazards = None                # set by the sim; only told about soft zones (for the UI)
         self.water_zones: list = []        # [(x, y, radius, rover id, t)] liquid the fleet identified
@@ -740,6 +741,8 @@ class Fleet:
             "samples_cached": int(self.samples_cached),
             "samples_carried": int(sum(len(r.samples) for r in self.rovers)),
             "science_score": int(self.science_score),
+            **({"ice_zones": [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in self.ice_zones]}
+               if self.cfg.ice_sheets and self.ice_zones else {}),
         }
 
     def discovered_targets(self) -> list:

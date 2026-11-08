@@ -543,3 +543,18 @@ Optional `features` keys, sent only when the flag is on:
 - `canyon`: `{id, path: [[x, y]...], width, depth, ramps: [{x, y, heading, length}]}` or null.
 - `pits`: `[{id, kind, x, y, radius, depth}]`. `kind` is `sinkhole` or `skylight`.
 - `boulder_fields`: `[{id, x, y, radius, count}]`. The boulders are geoms `bfield_<i>` and are in the truth heights like rocks.
+
+### Dunes and ice sheets
+
+Both are on by default from the environment (`DUNES`, `ICE_SHEETS`) and off in `Config()`.
+
+- `features.dunes: [{id, x, y, radius, wind_deg}]` is sent only when dunes are on. Dune fields are shapes in the
+  height field: long ripples across the wind plus a few larger dunes. Wheel friction there is 0.5 (firm ground
+  0.8) with a little extra rolling resistance, so wheels slip more but rovers can still cross.
+- `features.ice: [{id, x, y, radius}]` is sent only when ice sheets are on. An ice sheet is level ground with
+  wheel friction 0.05.
+- A rover on ice sees high slip at low motor load on level ground. It records an anomaly with
+  `kind: "low_traction"` (fields `slip`, `load`, `at`), slows, backs out along its tracks and marks an ice zone.
+  This is not the soft ground rule and makes no soft zone.
+- `fleet.ice_zones: [[x, y, r]]` appears in `state.fleet` only when ice sheets are on and the fleet has learned
+  at least one zone. Ice zones are closed to planning (like an avoid area).

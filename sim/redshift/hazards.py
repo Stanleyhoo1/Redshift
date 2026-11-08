@@ -876,24 +876,33 @@ class HazardManager:
 
     def update_physics(self, t: float) -> None:
         """Once per decision cycle, before the physics substeps: sand contact properties."""
+        from . import v7_surface
         patches = self.patches
-        if not patches and not any(self._body_damped.values()):
+        surf = v7_surface.surface_of(self.sim)     # v7 region causes (dunes, ice), None when off
+        if not patches and not any(self._body_damped.values()) and surf is None:
             return
         m, d, cfg = self.sim.model, self.sim.data, self.cfg
         for r in self.sim.rovers:
             gids, dofs = self._wheels[r.id]
             freed = self.freed_until.get(r.id, -1.0) > t
             n_in = 0
+            regs = surf.state.setdefault(r.id, [0] * len(gids)) if surf is not None else None
             for k, gid in enumerate(gids):
                 inside = False
                 if patches and not freed:
                     wx, wy = d.geom_xpos[gid][0], d.geom_xpos[gid][1]
                     inside = any((wx - p.x) ** 2 + (wy - p.y) ** 2 <= p.radius ** 2 for p in patches)
+                reg_changed = False
+                if regs is not None:
+                    reg = surf.region_at(d.geom_xpos[gid][0], d.geom_xpos[gid][1])
+                    reg_changed, regs[k] = reg != regs[k], reg
                 n_in += inside
-                if inside != self._in_sand[r.id][k]:
+                if inside != self._in_sand[r.id][k] or reg_changed:
                     self._in_sand[r.id][k] = inside
-                    m.geom_friction[gid][0] = cfg.sand_friction if inside else self._base_fric[gid]
-                    m.dof_damping[dofs[k]] = self._base_wdamp[dofs[k]] + (cfg.sand_wheel_damping if inside else 0.0)
+                    fric, damp = v7_surface.compose_wheel(self._base_fric[gid], self._base_wdamp[dofs[k]], inside,
+                                                          regs[k] if regs is not None else 0, cfg)
+                    m.geom_friction[gid][0] = fric
+                    m.dof_damping[dofs[k]] = damp
             b = r.vadr
             if n_in:
                 weight = r.mass * cfg.gravity
