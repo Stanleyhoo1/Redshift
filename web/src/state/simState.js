@@ -470,12 +470,24 @@ export function sanitizeFeatures(f, prev) {
     .filter((p) => isObj(p) && Number.isFinite(p.x) && Number.isFinite(p.y))
     .map((p, i) => ({ id: p.id == null ? i : p.id, kind: p.kind === 'bush' ? 'bush' : 'tree', x: p.x, y: p.y, height: num(p.height, 3), radius: num(p.radius, 1), hue: num(p.hue, 0.5) }))
   const sameFlora = prev && JSON.stringify(prev.flora ?? []) === JSON.stringify(flora)
-  if (sameWater && sameSpires && sameIce && sameFlora) return prev
+  // Other v7 feature keys (optional, sent only when their feature is on): plain data, kept as sent.
+  const extra = {}
+  for (const k of EXTRA_FEATURE_KEYS) {
+    const v = f[k]
+    if (Array.isArray(v) ? v.length : isObj(v)) extra[k] = Array.isArray(v) ? v.filter(isObj) : v
+  }
+  const sameExtra = prev && EXTRA_FEATURE_KEYS.every((k) => JSON.stringify(prev[k] ?? null) === JSON.stringify(extra[k] ?? null))
+  if (sameWater && sameSpires && sameIce && sameFlora && sameExtra) return prev
   const out = { water: sameWater ? prev.water : water, spires: sameSpires ? prev.spires : spires }
   if (ice) out.ice = sameIce ? prev.ice : ice
   if (flora.length) out.flora = sameFlora ? prev.flora : flora
+  for (const k of EXTRA_FEATURE_KEYS) {
+    if (extra[k] !== undefined) out[k] = prev && JSON.stringify(prev[k] ?? null) === JSON.stringify(extra[k]) ? prev[k] : extra[k]
+  }
   return out
 }
+// v7: geysers (vents and eruption state), dunes, mesas, pits, canyon, boulder_fields.
+const EXTRA_FEATURE_KEYS = ['geysers', 'dunes', 'mesas', 'pits', 'canyon', 'boulder_fields']
 
 const LIFE_KINDS = new Set(['grazer'])
 function sanitizeLifeforms(list) {
