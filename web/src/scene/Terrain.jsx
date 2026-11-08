@@ -23,6 +23,22 @@ const display3 = (hex) => {
   return new THREE.Vector3(c.r, c.g, c.b)
 }
 const linear3 = (hex) => new THREE.Color(hex)
+const DUNE_SAND = '#c99a6c'
+const V7_LANDFORM_KEYS = ['mesas', 'pits', 'canyon', 'dunes']
+
+// v7 landform uniforms from features (on only when the sim sends any landform).
+function syncLandforms(u, features) {
+  const on = !!features && V7_LANDFORM_KEYS.some((k) => (Array.isArray(features[k]) ? features[k].length > 0 : !!features[k]))
+  u.uV7.value = on ? 1 : 0
+  let c = 0
+  const dunes = on && Array.isArray(features.dunes) ? features.dunes : []
+  for (const d of dunes) {
+    if (c >= 8 || !d || ![d.x, d.y, d.radius].every(Number.isFinite)) continue
+    u.uDunes.value[c].set(d.x, -d.y, d.radius, ((Number.isFinite(d.wind_deg) ? d.wind_deg : 0) * Math.PI) / 180)
+    c++
+  }
+  u.uDuneCount.value = c
+}
 
 const vertexCommon = /* glsl */ `
 attribute float aSlope;
@@ -77,6 +93,10 @@ uniform vec3 uBad;
 uniform vec3 uVoid;
 uniform vec2 uRovers[8];
 uniform int uRoverCount;
+uniform float uV7;
+uniform vec4 uDunes[8];
+uniform int uDuneCount;
+uniform vec3 uDuneSand;
 varying float vSlope;
 varying float vFlash;
 varying float vEdge;
@@ -141,6 +161,32 @@ const surface = /* glsl */ `
   float rockAmt = steep + max(-curv, 0.0) * 0.45 + (det.r - 0.5) * 0.35 + (macro - 0.5) * 0.3;
   float rockMask = smoothstep(0.42, 0.62, rockAmt);
   vec3 albedo = mix(dust, rock, rockMask);
+
+  // v7 landforms (only when the sim sends any): mesa and butte walls, canyon walls and pit
+  // rims in darker, boldly banded rock; dune fields in a warmer, lighter sand that fades out
+  // at the edge, with long crests across the wind.
+  float duneAmt = 0.0;
+  if (uV7 > 0.5) {
+    float wall = smoothstep(0.82, 0.58, cosS); // about 35 to 55 deg
+    float wb = sin(vWorld.y * 2.4 + (mB.r - 0.5) * 2.5 + (det.r - 0.5) * 0.8);
+    vec3 wallCol = mix(uStrataA * 0.5, uStrataB * 0.82, smoothstep(-0.45, 0.5, wb));
+    wallCol *= 0.86 + 0.14 * sin(vWorld.y * 8.5 + (mA.r - 0.5) * 5.0);
+    albedo = mix(albedo, wallCol, wall * 0.85);
+    for (int i = 0; i < 8; i++) {
+      if (i >= uDuneCount) break;
+      vec4 dz = uDunes[i];
+      vec2 dd = wp - dz.xy;
+      float rr = length(dd) / max(dz.z, 1.0);
+      float a = 1.0 - smoothstep(0.5, 1.0, rr + (macro - 0.5) * 0.25);
+      if (a <= 0.0) continue;
+      vec2 wd = vec2(cos(dz.w), -sin(dz.w));
+      float crest = sin(dot(dd, wd) * 0.9 + sin(dot(dd, vec2(-wd.y, wd.x)) * 0.12) * 2.0);
+      duneAmt = max(duneAmt, a * (0.9 + 0.1 * crest));
+    }
+    duneAmt *= 1.0 - wall;
+    vec3 sand = uDuneSand * (0.9 + 0.12 * det.r + 0.06 * macro);
+    albedo = mix(albedo, sand, duneAmt * 0.8);
+  }
 
   // Wet, darker ground along water the fleet has identified.
   vec2 suv = (vec2((wp.x - uShoreMap.x) * uShoreMap.z, (-wp.y - uShoreMap.y) * uShoreMap.z) + 0.5) / uShoreSize;
@@ -238,6 +284,10 @@ function createMaterial(high) {
     uVoid: { value: display3(VOID) },
     uRovers: { value: Array.from({ length: 8 }, () => new THREE.Vector2(1e5, 1e5)) },
     uRoverCount: { value: 0 },
+    uV7: { value: 0 },
+    uDunes: { value: Array.from({ length: 8 }, () => new THREE.Vector4(0, 0, 0, 0)) },
+    uDuneCount: { value: 0 },
+    uDuneSand: { value: linear3(DUNE_SAND) },
   }
   m.userData.uniforms = uniforms
   m.onBeforeCompile = (shader) => {
@@ -252,7 +302,7 @@ function createMaterial(high) {
       .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n  normal = normalize((viewMatrix * vec4(tNormalW, 0.0)).xyz);')
       .replace('#include <fog_fragment>', `#include <fog_fragment>\n${overlay}`)
   }
-  m.customProgramCacheKey = () => 'redshift-terrain-1'
+  m.customProgramCacheKey = () => 'redshift-terrain-2'
   return m
 }
 
@@ -503,6 +553,10 @@ export function Terrain({ slopeColors }) {
       c++
     }
     u.uRoverCount.value = c
+    if (material.userData.features !== s.features) {
+      material.userData.features = s.features
+      syncLandforms(u, s.features)
+    }
     // Wet shoreline from the water layer (identified water only).
     const w = waterShared
     if (w.shore && w.map && u.uShore.value !== w.shore) {
