@@ -406,8 +406,15 @@ class Rover:
             hit &= self.rng.uniform(size=self.nray) >= drop
             dist = dist + self.rng.normal(0.0, sigma, self.nray)
             hit &= (dist > 0.05) & (dist <= rng_max)
+        plume = None
+        gz = getattr(self.sim, "geysers", None)
+        if gz is not None:                 # v7: steam scatters the beam; plume returns stay out of map and tracker
+            hit, plume = gz.scatter(self, t, pnt, vec, dist, hit, rng_max)
         self.lidar_hits = int(hit.sum())
         returned = hit.copy()              # anything that echoed back (ground, rocks, markers, creatures)
+        if plume is not None:
+            self.lidar_hits += len(plume[0])
+            returned |= plume[1]
         tmap = self.sim.world.target_geom_ids
         self.spectro = None
         if tmap:
@@ -2241,6 +2248,9 @@ class Rover:
 
     def scan_msg(self) -> list:
         pts = self.scan_pts
+        pp = getattr(self, "plume_pts", None)
+        if pp is not None and len(pp):     # v7: the raw scan shows the steam returns too
+            pts = np.concatenate([pts, pp])
         n = len(pts)
         if n == 0:
             return []

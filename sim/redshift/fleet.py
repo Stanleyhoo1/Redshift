@@ -725,7 +725,7 @@ class Fleet:
     # ------------------------------------------------------------------ stats
     def stats(self) -> dict:
         found = sum(1 for ts in self.targets if ts.status is not None)
-        return {
+        out = {
             "explored_pct": round(self.map.explored_pct(), 1),
             "slope_limit_deg": round(self.slope_limit, 1),
             "slope_limit_initial_deg": round(float(self.cfg.slope_limit_initial_deg), 1),
@@ -741,6 +741,10 @@ class Fleet:
             "samples_carried": int(sum(len(r.samples) for r in self.rovers)),
             "science_score": int(self.science_score),
         }
+        gz = getattr(self, "geyser_zones", None)
+        if gz:                              # v7: only when geysers are on and the fleet has seen one
+            out["geyser_zones"] = [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in gz]
+        return out
 
     def discovered_targets(self) -> list:
         return [ts.to_msg() for ts in self.targets if ts.status is not None]

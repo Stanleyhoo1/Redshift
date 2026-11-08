@@ -501,6 +501,15 @@ their step: `gravity_g` 2.04 is refused (`gravity_g must be in steps of 0.1 g`),
   negative: as before version 7, `SEED=3000000000` builds that very world. The feature env vars are on when
   unset; set, they are on only for `1`, `true`, `yes` or `on`. An unknown `WEAR` gives normal.
 
+### Geysers (`geysers` setting)
+
+Only when the feature is on. `features.geysers` lists the vents: `[{id, x, y, radius, active, period_s,
+next_s, height}]`. `radius` is the steam column radius (m), `height` its height (m), `active` is true
+while the vent erupts and `next_s` is the sim time of the next start or end. The tick after an eruption
+starts or ends carries `features` again. `fleet.geyser_zones: [[x, y, r]]` holds the keep-out zones the
+fleet learned from plume returns; the key is present only when it is not empty. While a plume scatters
+the LiDAR, the rover `scan` also holds the short steam returns. They never enter `cells` or `tracks`.
+
 ## HTTP
 
 - `GET /api/health` -> `{"ok": true}`
