@@ -189,3 +189,14 @@
 .globe-keep[hidden] {
   display: none;
 }
+
+/* The scale note sits right after its entry, and the hint line wraps instead of setting the
+   legend's width. */
+.globe-legend {
+  max-width: 380px;
+}
+
+.globe-legend .legend-list li .gl-note {
+  margin-left: 0;
+  padding-left: 0;
+}

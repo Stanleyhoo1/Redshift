@@ -59,6 +59,7 @@ export default function App() {
   const followPaused = useApp((a) => a.followPaused)
   const modal = useApp((a) => a.modal)
   const globe = useViewMode(globeShown) // v7: the planet is drawn instead of the sector
+  const placing = useApp((a) => !!a.placing) // a hazard is being placed: the question cards fold to strips
   const selectedRef = useRef(selected)
   selectedRef.current = selected
   const followRef = useRef(follow)
@@ -66,6 +67,12 @@ export default function App() {
 
   // Panning away pauses the follow (CameraRig sets appStore.followPaused); this resumes.
   const resumeFollow = useCallback(() => appStore.patch({ followPaused: false }), [])
+
+  // A folded question strip was opened: stop placing a hazard, or fly back down from the planet.
+  const expandRequests = useCallback(() => {
+    stopPlacing()
+    leaveGlobe()
+  }, [])
 
   const goOverview = useCallback(() => {
     setFollow(null)
@@ -191,7 +198,7 @@ export default function App() {
         <div className="hud-top">
           <HazardPanel />
           <PlacementHint />
-          <RequestCards onSelect={show} />
+          <RequestCards onSelect={show} collapsed={globe || placing} onExpand={expandRequests} />
           <div className="banners">
             <ConnBanner />
             <DustBanner />

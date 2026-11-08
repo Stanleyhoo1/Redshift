@@ -5,6 +5,7 @@ import '../styles/scene.css'
 import { TerrainLegend } from './TerrainLegend.jsx'
 import { biomeOf, groundSwatch } from '../lib/biomes.js'
 import { KIND_LOOK, legendKinds } from '../scene/lifeKinds.js'
+import { LegendToggle, useLegendOpen } from './LegendToggle.jsx'
 
 export function Legend({ slopeColors, frontiers, life = true, reality = false }) {
   const limit = useSim((s) => s.limit)
@@ -19,8 +20,10 @@ export function Legend({ slopeColors, frontiers, life = true, reality = false })
   const kinds = kindList && kindList !== 'grazer' ? kindList.split(',') : []
   const lim = Number.isFinite(limit.current) ? limit.current : 30
   const caution = lim * 0.6
+  const open = useLegendOpen()
   return (
-    <div className="hud hud-legend" aria-label="Map legend">
+    <div className="hud hud-legend" aria-label="Map legend" data-collapsed={!open || undefined}>
+      <LegendToggle open={open} lim={lim} changedAt={limit.changedAt} />
       {slopeColors ? (
         <>
           <div className="legend-title" key={limit.changedAt ?? 'base'} data-flash={limit.changedAt !== null || undefined}>

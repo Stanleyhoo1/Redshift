@@ -236,7 +236,7 @@ export function HazardPanel() {
             ))}
           </div>
         </div>
-        <p className="hz-status" data-kind={status?.kind} key={status?.key ?? 'hint'} role={status?.kind === 'error' ? 'alert' : 'status'}>
+        <p className="hz-status" data-kind={status?.kind} key={status?.key ?? 'hint'} role={status?.kind === 'error' ? 'alert' : 'status'} title={status ? undefined : HINT}>
           {status ? status.text : HINT}
         </p>
       </div>
