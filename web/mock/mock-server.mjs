@@ -40,13 +40,18 @@
 // (stop, turn slowly through 360 deg for 30 sim s, then an info report with reply_to);
 // `kind` on every request; and requests that never expire (OPERATOR_TIMEOUT_S defaults
 // to 0, so `expires_in` is null and the rover holds until answered).
+// Version 7 additions: launch settings (`GET /api/config` with the same fields, presets and physics table as
+// the sim, `POST /api/launch`, settings in `POST /api/reset`, init `phase` and `config`); MOCK_PRELAUNCH=1
+// starts in the setup phase (frozen at t = 0, 409 for hazards, chat and answers) like the sim's AUTO_LAUNCH=0.
+// The v7 world features are only stored and echoed back.
 //
 // Run: node mock/mock-server.mjs
-// Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
+// Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, WEAR, MESAS, CANYON, DUNES, BOULDER_FIELDS,
+//      PITS, GEYSERS, ICE_SHEETS, FLORA, GROUND_DETAIL, BRAIN_BUDGET_MS,
 //      GEMMA_ENABLED, GEMMA_MODEL, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S,
 //      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
-//      MOCK_PROTOCOL (2 to 5 = an older sim without the later fields), MOCK_CAMERA (off),
-//      MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions)
+//      MOCK_PROTOCOL (2 to 6 = an older sim without the later fields), MOCK_PRELAUNCH (1 = start in setup),
+//      MOCK_CAMERA (off), MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions)
 // Mock-only test hooks (not part of the protocol): POST /api/_mock/planner {"state"},
 // POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"},
 // POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question),
@@ -58,10 +63,6 @@ import { WebSocketServer } from 'ws'
 
 const PORT = Number(process.env.PORT || 8000)
 const TICK_HZ = 5
-const SIM_SPEED = Number(process.env.SIM_SPEED || 3)
-const NUM_ROVERS = Math.max(1, Math.min(8, Number(process.env.NUM_ROVERS || 3) | 0))
-const MAP_SIZE = Number(process.env.MAP_SIZE || 120)
-const GRAVITY_G = Number(process.env.GRAVITY_G || 2)
 const RES = 0.5
 const SENSOR_RADIUS = 10
 const NUM_TARGETS = 8 // plus one organic trace per herd (v4b)
@@ -90,7 +91,7 @@ const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma4:e2b'
 const GEMMA_BUDGET_MS = Number(process.env.GEMMA_BUDGET_MS || 3000)
 const GEMMA_WARMUP_S = Number(process.env.MOCK_GEMMA_WARMUP_S || 10)
 const FIRST_QUESTION_S = Number(process.env.MOCK_FIRST_QUESTION_S || 40)
-const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 6) // 2 to 5 = behave like an older sim (no later fields or endpoints)
+const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 7) // 2 to 6 = behave like an older sim (no later fields or endpoints)
 // v6: 0 = requests never expire (the rover waits for the operator). Older protocols: 20 s.
 const OPERATOR_TIMEOUT_S = Math.max(0, Number(process.env.OPERATOR_TIMEOUT_S ?? (PROTOCOL >= 6 ? 0 : 20)) || 0)
 const requestDeadline = () => (OPERATOR_TIMEOUT_S > 0 ? wallNow() + OPERATOR_TIMEOUT_S : null)
@@ -174,6 +175,127 @@ const r1 = (v) => Math.round(v * 10) / 10
 const r2 = (v) => Math.round(v * 100) / 100
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a))
 
+// ---------------------------------------------------------------------------
+// Version 7: launch settings, the same table as sim/redshift/config.py SETTINGS. They replace the old
+// SIM_SPEED, NUM_ROVERS, MAP_SIZE and GRAVITY_G constants: `settings` is what the current world was built
+// with, and POST /api/launch or /api/reset changes it before the next world is built. The mock has none of
+// the v7 world features and always draws its v4 water, spires and herds: those flags are only stored.
+const FEATURE_KEYS = ['mesas', 'canyon', 'dunes', 'boulder_fields', 'pits', 'geysers', 'ice_sheets', 'flora', 'ground_detail']
+const SETTING_FIELDS = [
+  { key: 'gravity_g', type: 'float', label: 'Gravity', group: 'planet', help: 'Heavier gravity makes every slope harder: the rovers climb and tow less.', min: 0.5, max: 3, step: 0.1, unit: 'g' },
+  { key: 'seed', type: 'int', label: 'Seed', group: 'planet', help: 'Same seed, same terrain, targets and life.', min: 0, max: 2147483647, step: 1, unit: '' },
+  { key: 'num_rovers', type: 'int', label: 'Rovers', group: 'fleet', help: 'How many rovers land. More rovers map faster.', min: 1, max: 8, step: 1, unit: '' },
+  { key: 'map_size', type: 'int', label: 'Sector size', group: 'sector', help: 'Width of the square sector to explore.', min: 60, max: 200, step: 10, unit: 'm' },
+  { key: 'water', type: 'bool', label: 'Water', group: 'features', help: 'Lakes and a river. Liquid gives no LiDAR echo, so rovers must work it out.' },
+  { key: 'spires', type: 'bool', label: 'Crystal spires', group: 'features', help: 'Tall alien crystals that block routes and can topple across one.' },
+  { key: 'lifeforms', type: 'bool', label: 'Lifeforms', group: 'features', help: 'Herds of grazers. Rovers watch from 4 m or more and never touch them.' },
+  { key: 'mesas', type: 'bool', label: 'Mesas', group: 'features', help: 'Flat-topped hills with cliff walls no rover can climb.' },
+  { key: 'canyon', type: 'bool', label: 'Canyon', group: 'features', help: 'A winding trench with two ramps, the only ways across.' },
+  { key: 'dunes', type: 'bool', label: 'Dunes', group: 'features', help: 'Rippled loose sand where the wheels slip.' },
+  { key: 'boulder_fields', type: 'bool', label: 'Boulder fields', group: 'features', help: 'Dense patches of boulders to steer around.' },
+  { key: 'pits', type: 'bool', label: 'Pits', group: 'features', help: 'Sinkholes and lava-tube skylights: sheer drops in the ground.' },
+  { key: 'geysers', type: 'bool', label: 'Geysers', group: 'features', help: 'Vents that erupt on a schedule. Steam scatters the LiDAR.' },
+  { key: 'ice_sheets', type: 'bool', label: 'Ice sheets', group: 'features', help: 'Frozen ground with almost no grip.' },
+  { key: 'flora', type: 'bool', label: 'Alien flora', group: 'features', help: 'Fungal trees and glowing bushes. Rovers keep 4 m away.' },
+  { key: 'ground_detail', type: 'bool', label: 'Ground detail', group: 'features', help: 'Pebbles, hoodoos, rock bands and wind streaks. Looks only.' },
+  {
+    key: 'wear',
+    type: 'choice',
+    label: 'Wear',
+    group: 'wear',
+    help: 'How fast wheels and motors wear out. A worn-out rover breaks down and needs a tow.',
+    choices: [
+      { value: 'off', label: 'Off', help: 'Rovers never wear out.' },
+      { value: 'normal', label: 'Normal', help: 'A drivetrain lasts about 2 km of driving.' },
+      { value: 'harsh', label: 'Harsh', help: 'Parts wear out about 4 times sooner.' },
+    ],
+  },
+  { key: 'sim_speed', type: 'float', label: 'Speed', group: 'simulation', help: 'Sim seconds per real second.', min: 0.5, max: 10, step: 0.5, unit: 'x' },
+]
+const FIELD = Object.fromEntries(SETTING_FIELDS.map((f) => [f.key, f]))
+const GRAVITY_PRESETS = [
+  { label: 'Earth', value: 1 },
+  { label: 'Redshift-b', value: 2 },
+  { label: 'Heavy', value: 3 },
+]
+const envNum = (name, def) => {
+  const v = process.env[name] ? Number(process.env[name]) : def
+  return Number.isFinite(v) ? v : def
+}
+// Like the sim: an unset flag is on; a set one is on only for 1, true, yes or on.
+const envOn = (name) => process.env[name] == null || ['1', 'true', 'yes', 'on'].includes(process.env[name].trim().toLowerCase())
+const clampTo = (key, v) => clamp(v, FIELD[key].min, FIELD[key].max)
+const WEAR_ENV = (process.env.WEAR || 'normal').trim().toLowerCase()
+const DEFAULT_SETTINGS = Object.freeze({
+  gravity_g: clampTo('gravity_g', envNum('GRAVITY_G', 2)),
+  seed: Math.trunc(clampTo('seed', envNum('SEED', 42))),
+  num_rovers: Math.trunc(clampTo('num_rovers', envNum('NUM_ROVERS', 3))),
+  map_size: clampTo('map_size', envNum('MAP_SIZE', 120)),
+  water: true,
+  spires: true,
+  lifeforms: true,
+  ...Object.fromEntries(FEATURE_KEYS.map((k) => [k, envOn(k.toUpperCase())])),
+  wear: ['off', 'normal', 'harsh'].includes(WEAR_ENV) ? WEAR_ENV : 'normal',
+  sim_speed: clampTo('sim_speed', envNum('SIM_SPEED', 3)),
+})
+const settings = { ...DEFAULT_SETTINGS }
+
+// v7 setup phase. MOCK_PRELAUNCH=1 starts like the real sim with AUTO_LAUNCH=0: the world is built and frozen
+// at t = 0 (ticks still go out) until POST /api/launch or /api/reset.
+let phase = PROTOCOL >= 7 && process.env.MOCK_PRELAUNCH === '1' ? 'setup' : 'running'
+const NOT_LAUNCHED = 'The mission has not launched yet.'
+const settingsJson = () => ({ ...settings })
+
+// Predicted climb and tow limits per gravity step, from the sim's rover (22.5 kg, 7.2 N m per wheel, 0.18 m wheels).
+const ROVER_MASS = 22.5
+const MOTOR_TORQUE = 7.2
+const WHEEL_R = 0.18
+const CLIMB_CAP = 30
+const motorClimb = (g, m) => (Math.asin(Math.min(1, (4 * MOTOR_TORQUE) / WHEEL_R / (m * 9.81 * g))) * 180) / Math.PI
+function physicsTable() {
+  const rows = []
+  for (let k = 0; k <= 25; k++) {
+    const g = Math.round((0.5 + 0.1 * k) * 10) / 10
+    const motor = motorClimb(g, ROVER_MASS)
+    rows.push({ gravity_g: g, climb_deg: Math.round(Math.min(CLIMB_CAP, motor) * 10) / 10, tow_deg: Math.round(0.8 * Math.min(CLIMB_CAP, motorClimb(g, 2 * ROVER_MASS)) * 10) / 10, grip_limited: motor > CLIMB_CAP })
+  }
+  return rows
+}
+const configJson = () => ({ ok: true, phase, current: settingsJson(), defaults: { ...DEFAULT_SETTINGS }, fields: SETTING_FIELDS, presets: { gravity_g: GRAVITY_PRESETS }, physics: physicsTable() })
+
+const withUnit = (v, unit) => (unit === 'x' ? `${v}x` : unit ? `${v} ${unit}` : `${v}`)
+// The sim's Config.from_settings, with the same error texts: { changes } or { errors }.
+function parseSettings(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { errors: ['Body must be a JSON object like {"gravity_g": 1.5, "num_rovers": 4}'] }
+  const changes = {}
+  const errors = []
+  for (const [key, v] of Object.entries(body)) {
+    const f = FIELD[key]
+    if (!f) {
+      errors.push(`unknown setting '${key}' (use one of ${SETTING_FIELDS.map((x) => x.key).join(', ')})`)
+    } else if (f.type === 'bool') {
+      if (typeof v === 'boolean') changes[key] = v
+      else errors.push(`${key} must be true or false`)
+    } else if (f.type === 'choice') {
+      if (f.choices.some((c) => c.value === v)) changes[key] = v
+      else errors.push(`${key} must be one of ${f.choices.map((c) => c.value).join(', ')}`)
+    } else if (typeof v !== 'number') {
+      errors.push(`${key} must be a number`)
+    } else if (!Number.isFinite(v)) {
+      errors.push(`${key} must be a finite number`)
+    } else if (f.type === 'int' && !Number.isInteger(v)) {
+      errors.push(`${key} must be a whole number`)
+    } else if (v < f.min || v > f.max) {
+      errors.push(`${key} must be between ${f.min} and ${withUnit(f.max, f.unit)}`)
+    } else if (f.type === 'int' && f.step > 1 && (v - f.min) % f.step) {
+      errors.push(`${key} must be in steps of ${withUnit(f.step, f.unit)}`)
+    } else {
+      changes[key] = v
+    }
+  }
+  return errors.length ? { errors } : { changes }
+}
+
 function makePerlin(rand) {
   const perm = Array.from({ length: 256 }, (_, i) => i)
   for (let i = 255; i > 0; i--) {
@@ -246,9 +368,9 @@ const compass = (dx, dy) => ['east', 'north-east', 'north', 'north-west', 'west'
 
 function generateWorld(seed) {
   const rand = mulberry32(seed * 7919 + 17)
-  const n = Math.round(MAP_SIZE / RES) + 1
-  const ox = -MAP_SIZE / 2
-  const oy = -MAP_SIZE / 2
+  const n = Math.round(settings.map_size / RES) + 1
+  const ox = -settings.map_size / 2
+  const oy = -settings.map_size / 2
   const hills = makePerlin(rand)
   const ridges = makePerlin(rand)
   const detail = makePerlin(rand)
@@ -257,7 +379,7 @@ function generateWorld(seed) {
   const phase1 = rand() * Math.PI * 2
   const phase2 = rand() * Math.PI * 2
 
-  const half = MAP_SIZE / 2
+  const half = settings.map_size / 2
   const awayFromLander = (minR) => {
     for (;;) {
       const x = (rand() * 2 - 1) * (half - 6)
@@ -444,7 +566,7 @@ function generateWorld(seed) {
 
 // Carves the lakes and the river; returns [{ id, kind, level, outline }].
 function carveWater(rand, heights, n, ox, oy) {
-  const half = MAP_SIZE / 2
+  const half = settings.map_size / 2
   const orig = Float32Array.from(heights)
   const hAt = (x, y) => orig[clamp(Math.round((y - oy) / RES), 0, n - 1) * n + clamp(Math.round((x - ox) / RES), 0, n - 1)]
   const out = []
@@ -715,8 +837,8 @@ function newSim(seed) {
     featuresSent: 0,
   }
   for (const h of world.herds) spawnHerd(h.cx, h.cy, h.count)
-  for (let r = 0; r < NUM_ROVERS; r++) {
-    const a = (r / NUM_ROVERS) * Math.PI * 2 + Math.PI / 6
+  for (let r = 0; r < settings.num_rovers; r++) {
+    const a = (r / settings.num_rovers) * Math.PI * 2 + Math.PI / 6
     const x = LANDER.x + Math.cos(a) * 3.4
     const y = LANDER.y + Math.sin(a) * 3.4
     sim.rovers.push({
@@ -764,7 +886,7 @@ function newSim(seed) {
       goalWhy: null, // why it is going where it is going, in its own words
     })
   }
-  addEvent(null, 'info', `Survey started. ${NUM_ROVERS} rover${NUM_ROVERS === 1 ? '' : 's'} deployed from the lander.`)
+  addEvent(null, 'info', `Survey started. ${settings.num_rovers} rover${settings.num_rovers === 1 ? '' : 's'} deployed from the lander.`)
   for (const r of sim.rovers) sense(r)
   updateSensors(CYCLE_MS / 1000)
   computeFrontiers()
@@ -1358,7 +1480,7 @@ function drive(rover, dt, maxSpeed) {
       }
     }
   }
-  const lim = MAP_SIZE / 2 - 1
+  const lim = settings.map_size / 2 - 1
   rover.x = clamp(nx, -lim, lim)
   rover.y = clamp(ny, -lim, lim)
   return false
@@ -1689,7 +1811,7 @@ function stepRover(rover, dt) {
 // Lifeforms (v4): herds of grazers wander, graze, avoid water and keep clear of rovers.
 
 function lifeOk(x, y) {
-  const lim = MAP_SIZE / 2 - 4
+  const lim = settings.map_size / 2 - 4
   if (Math.abs(x) > lim || Math.abs(y) > lim) return false
   if (Math.hypot(x - LANDER.x, y - LANDER.y) < 9) return false
   if (waterAt(x, y) >= 0) return false
@@ -1843,7 +1965,7 @@ function stepTracks() {
     }
     // The camera takes a look; without Gemma the rules settle on a gait after a while.
     const g = gemmaCall('vision')
-    later(g.ok ? g.ms : 8000 / SIM_SPEED, () => {
+    later(g.ok ? g.ms : 8000 / settings.sim_speed, () => {
       k.label = g.ok ? `possible lifeform, six legs, about ${r1(life.size)} m` : `moving object, legged gait, about ${r1(life.size)} m`
       k.confirmed = true
       sim.lifeConfirmed.add(life.id)
@@ -2287,7 +2409,7 @@ function pointAhead(rover, dist) {
 }
 
 function validSpot(x, y, r) {
-  const lim = MAP_SIZE / 2 - r - 1
+  const lim = settings.map_size / 2 - r - 1
   if (Math.abs(x) > lim || Math.abs(y) > lim) return false
   if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + r + 0.8) return false
   if (PROTOCOL >= 4 && world.water.some((w) => pointInPoly(x, y, w.outline) || distToPoly(x, y, w.outline) < r)) return false
@@ -2311,7 +2433,7 @@ function routeCandidates(needRoute) {
 
 // v4: where the user clicked. Throws the 400 answers from the protocol.
 function checkPoint(type, [x, y]) {
-  const half = MAP_SIZE / 2
+  const half = settings.map_size / 2
   const at = `(${r1(x)}, ${r1(y)})`
   if (Math.abs(x) > half || Math.abs(y) > half) throw new HazardError(`${at} is off the map: it spans ${-half} to ${half} m on both axes.`)
   if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + 0.5) throw new HazardError(`${at} is on the lander. Pick a spot at least ${LANDER.radius + 0.5} m from its centre.`)
@@ -2358,7 +2480,7 @@ function routeNear(x, y, within, prefer = null) {
 function makeRocks(h, spot, radius) {
   h.rocks = []
   const count = 5 + Math.floor(sim.rand() * 3)
-  const lim = MAP_SIZE / 2 - 0.8
+  const lim = settings.map_size / 2 - 0.8
   for (let k = 0; k < count && h.rocks.length < count; k++) {
     for (let tries = 0; tries < 20; tries++) {
       const a = sim.rand() * Math.PI * 2
@@ -2408,7 +2530,7 @@ function createSpireFall(base, requested, at) {
   const prefer = requested != null ? pickRover(requested) : null
   if (prefer && prefer.state === 'fault' && !at) throw new HazardError(`${prefer.name} is parked with a motor fault. Pick another rover.`)
   const okFall = (x0, y0, x1, y1, r) => {
-    const lim = MAP_SIZE / 2 - 0.5
+    const lim = settings.map_size / 2 - 0.5
     if (Math.abs(x1) > lim || Math.abs(y1) > lim) return 'The spire would fall off the map.'
     if (segDist(LANDER.x, LANDER.y, x0, y0, x1, y1) < LANDER.radius + 0.4) return 'The spire would fall onto the lander.'
     const hit = sim.rovers.find((q) => segDist(q.x, q.y, x0, y0, x1, y1) < r + 1.1)
@@ -2945,8 +3067,8 @@ function goTo(rover, x, y, state, eventMsg, source) {
 function cmdGoTo(rover, x, y) {
   const busy = unavailable(rover)
   if (busy) return ['refuse', busy]
-  const lim = MAP_SIZE / 2 - 1
-  if (Math.abs(x) > lim || Math.abs(y) > lim) return ['refuse', `(${x}, ${y}) is outside the map: it spans ${-MAP_SIZE / 2} to ${MAP_SIZE / 2} m on both axes.`]
+  const lim = settings.map_size / 2 - 1
+  if (Math.abs(x) > lim || Math.abs(y) > lim) return ['refuse', `(${x}, ${y}) is outside the map: it spans ${-settings.map_size / 2} to ${settings.map_size / 2} m on both axes.`]
   const i = toI(x)
   const j = toJ(y)
   if (sim.known[idx(i, j)] && sim.mslope[idx(i, j)] >= sim.slopeLimit) {
@@ -3213,7 +3335,7 @@ function whyText(r) {
 
 function roverAnswer(r, topic) {
   const m2 = mappedM2(r)
-  const area = MAP_SIZE * MAP_SIZE
+  const area = settings.map_size * settings.map_size
   switch (topic) {
     case 'explored': {
       if (m2 < 1) return `I haven't mapped any new ground yet. I've driven ${fmtInt(r.st.distance)} m.`
@@ -3588,7 +3710,7 @@ function placeLabel(c, rover) {
 // A spot a rover may stop at: on the map, dry, off the lander, out of known soft ground,
 // boulders and spires, and not on ground the fleet measured too steep.
 function placeOk(x, y) {
-  const lim = MAP_SIZE / 2 - 1.5
+  const lim = settings.map_size / 2 - 1.5
   if (Math.abs(x) > lim || Math.abs(y) > lim || waterAt(x, y) >= 0) return false
   if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + 1) return false
   if (sim.softZones.some((z) => Math.hypot(z[0] - x, z[1] - y) < z[2] + 0.8)) return false
@@ -4108,7 +4230,7 @@ function fleetSummary() {
     slope_limit_initial_deg: INITIAL_SLOPE_LIMIT,
     targets_found: sim.discovered.size,
     targets_total: world.targets.length,
-    sim_speed: SIM_SPEED,
+    sim_speed: settings.sim_speed,
     budget_ms: BUDGET_MS,
     cycle_ms: CYCLE_MS,
     soft_zones: sim.softZones.map((z) => [r1(z[0]), r1(z[1]), r1(z[2])]),
@@ -4201,7 +4323,7 @@ function initMessage() {
   }
   return {
     type: 'init',
-    world: { name: 'Redshift-b', gravity: r2(GRAVITY_G * 9.81), gravity_g: GRAVITY_G, seed: world.seed },
+    world: { name: 'Redshift-b', gravity: r2(settings.gravity_g * 9.81), gravity_g: settings.gravity_g, seed: world.seed },
     map: { nx: n, ny: n, res: RES, origin: [world.ox, world.oy], min_h: r2(world.minH), max_h: r2(world.maxH) },
     lander: { ...LANDER },
     rovers: sim.rovers.map((r) => ({ id: r.id, name: r.name, color: r.color })),
@@ -4213,6 +4335,7 @@ function initMessage() {
     t: r1(sim.t),
     ...(PROTOCOL >= 3 && { planner: plannerJson(), chat: sim.chat.slice(-50), requests: sim.requests.map(publicRequest) }),
     ...(PROTOCOL >= 4 && { features: featuresJson(), lifeforms: sim.lifeforms.map(publicLifeform), tracks: sim.tracks.map(publicTrack) }),
+    ...(PROTOCOL >= 7 && { phase, config: settingsJson() }),
   }
 }
 
@@ -4231,8 +4354,8 @@ function truthJson() {
   return truthCache
 }
 
-function tick() {
-  const dtTotal = SIM_SPEED / TICK_HZ
+function advance() {
+  const dtTotal = settings.sim_speed / TICK_HZ
   const sub = 3
   for (let s = 0; s < sub; s++) {
     const dt = dtTotal / sub
@@ -4257,6 +4380,10 @@ function tick() {
   computeFrontiers()
   fleetEvents()
   stepRequests()
+}
+
+function tick() {
+  if (phase !== 'setup') advance() // v7: in the setup phase the world waits at t = 0; ticks still go out
   const msg = {
     type: 'tick',
     t: r1(sim.t),
@@ -4289,7 +4416,9 @@ function broadcast(text) {
   }
 }
 
-function reset(seed) {
+function reset(seed, changes = {}) {
+  Object.assign(settings, changes, { seed })
+  phase = 'running'
   truthCache = null
   newSim(seed)
   broadcast(JSON.stringify(initMessage()))
@@ -4297,7 +4426,7 @@ function reset(seed) {
   sim.pendingEvents = []
   sim.pendingCells = []
   sim.pendingChat = []
-  console.log(`[mock] reset, seed ${seed}`)
+  console.log(`[mock] new world: seed ${seed}, ${settings.num_rovers} rovers, ${settings.gravity_g} g, map ${settings.map_size} m`)
 }
 
 function sendJson(res, status, body) {
@@ -4316,6 +4445,28 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') return sendJson(res, 204, '')
   if (req.method === 'GET' && url.pathname === '/api/health') return sendJson(res, 200, { ok: true })
   if (req.method === 'GET' && url.pathname === '/api/truth') return sendJson(res, 200, truthJson())
+  if (req.method === 'GET' && url.pathname === '/api/config' && PROTOCOL >= 7) return sendJson(res, 200, configJson())
+  if (req.method === 'POST' && url.pathname === '/api/launch' && PROTOCOL >= 7) {
+    let body = ''
+    req.on('data', (chunk) => {
+      body += chunk
+      if (body.length > 1e5) req.destroy()
+    })
+    req.on('end', () => {
+      let parsed
+      try {
+        parsed = body ? JSON.parse(body) : {}
+      } catch {
+        return sendJson(res, 400, { ok: false, error: 'Body must be JSON like {"gravity_g": 1.5, "num_rovers": 4}' })
+      }
+      const out = parseSettings(parsed)
+      if (out.errors) return sendJson(res, 400, { ok: false, error: out.errors.join('; '), errors: out.errors })
+      // The mock always builds a fresh world, even with nothing changed, so its wall-clock timers start now.
+      reset(out.changes.seed ?? settings.seed, out.changes)
+      sendJson(res, 200, { ok: true, phase, config: settingsJson() })
+    })
+    return
+  }
   if (req.method === 'POST' && url.pathname === '/api/reset') {
     let body = ''
     req.on('data', (chunk) => {
@@ -4324,18 +4475,27 @@ const server = http.createServer((req, res) => {
     })
     req.on('end', () => {
       let seed = world.seed
+      let parsed
       try {
-        const parsed = body ? JSON.parse(body) : {}
-        if (Number.isFinite(parsed?.seed)) seed = Math.trunc(parsed.seed)
+        parsed = body ? JSON.parse(body) : {}
       } catch {
         return sendJson(res, 400, { ok: false, error: 'Body must be JSON like {"seed": 7}' })
       }
-      reset(seed)
-      sendJson(res, 200, { ok: true, seed })
+      if (Number.isFinite(parsed?.seed)) seed = Math.trunc(parsed.seed)
+      let changes = {}
+      if (PROTOCOL >= 7 && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const { seed: _seed, ...rest } = parsed // v7: launch settings ride along
+        const out = parseSettings({ ...rest, seed }) // the seed too: like the sim, 0 to 2147483647
+        if (out.errors) return sendJson(res, 400, { ok: false, error: out.errors.join('; '), errors: out.errors })
+        changes = out.changes
+      }
+      reset(seed, changes)
+      sendJson(res, 200, { ok: true, seed, ...(PROTOCOL >= 7 && { config: settingsJson() }) })
     })
     return
   }
   if (req.method === 'POST' && url.pathname === '/api/hazard') {
+    if (phase === 'setup') return sendJson(res, 409, { ok: false, error: NOT_LAUNCHED })
     let body = ''
     req.on('data', (chunk) => {
       body += chunk
@@ -4386,7 +4546,7 @@ const server = http.createServer((req, res) => {
     '/api/_mock/teleport': (b) => {
       const rover = sim.rovers.find((r) => r.id === b?.rover)
       if (!rover || !Number.isFinite(b?.x) || !Number.isFinite(b?.y)) throw new HttpError(400, 'Body: {"rover": "r1", "x": 10, "y": -5, "hold": false}')
-      if (Math.abs(b.x) > MAP_SIZE / 2 - 1 || Math.abs(b.y) > MAP_SIZE / 2 - 1 || waterAt(b.x, b.y) >= 0) throw new HttpError(400, 'That spot is off the map or in the water.')
+      if (Math.abs(b.x) > settings.map_size / 2 - 1 || Math.abs(b.y) > settings.map_size / 2 - 1 || waterAt(b.x, b.y) >= 0) throw new HttpError(400, 'That spot is off the map or in the water.')
       if (rover.state === 'observing') endObserve(rover, null)
       releaseTarget(rover)
       Object.assign(rover, { x: b.x, y: b.y, path: [], goal: null, speed: 0, hold: !!b.hold, holdUntil: null, timer: 1.5 })
@@ -4409,6 +4569,7 @@ const server = http.createServer((req, res) => {
     },
   }
   if (req.method === 'POST' && v3[url.pathname] && (PROTOCOL >= 3 || url.pathname.startsWith('/api/_mock/'))) {
+    if (phase === 'setup' && (url.pathname === '/api/chat' || url.pathname === '/api/answer')) return sendJson(res, 409, { ok: false, error: NOT_LAUNCHED })
     let body = ''
     req.on('data', (chunk) => {
       body += chunk
@@ -4446,7 +4607,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'GET' && url.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' })
-    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, /api/hazard, /api/chat, /api/answer, /api/camera/{id}.jpg.\n')
+    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/config, /api/launch, /api/reset, /api/hazard, /api/chat, /api/answer, /api/camera/{id}.jpg.\n')
   }
   sendJson(res, 404, { ok: false, error: 'Not found' })
 })
@@ -4466,8 +4627,8 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify(initMessage()))
 })
 
-newSim(Number(process.env.SEED || 42) | 0)
+newSim(settings.seed)
 setInterval(tick, 1000 / TICK_HZ)
 server.listen(PORT, () => {
-  console.log(`[mock] Redshift mock sim on http://localhost:${PORT} (WebSocket /ws), seed ${world.seed}, ${NUM_ROVERS} rovers, ${SIM_SPEED}x, Gemma ${plannerState()}`)
+  console.log(`[mock] Redshift mock sim on http://localhost:${PORT} (WebSocket /ws), seed ${world.seed}, ${settings.num_rovers} rovers, ${settings.sim_speed}x, Gemma ${plannerState()}${phase === 'setup' ? ', waiting for POST /api/launch' : ''}`)
 })

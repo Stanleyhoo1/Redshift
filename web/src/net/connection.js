@@ -209,12 +209,31 @@ export function postAnswer(id, option) {
   )
 }
 
-export async function resetSim(seed) {
-  const res = await fetch('/api/reset', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ seed }),
-  })
-  if (!res.ok) throw new Error(`Reset failed (HTTP ${res.status})`)
-  return res.json().catch(() => ({ ok: true, seed }))
+// GET /api/config (PROTOCOL.md, version 7): the launch settings. Resolves null for an older sim (404 or
+// 405): the setup screen then only offers the seed, through POST /api/reset.
+export async function getConfig() {
+  let res
+  try {
+    res = await fetch('/api/config', { cache: 'no-store' })
+  } catch {
+    throw Object.assign(new Error('Could not reach the sim'), { status: 0 })
+  }
+  if (res.status === 404 || res.status === 405) return null
+  const j = parseMessage(await res.text().catch(() => '')) || {}
+  if (!res.ok || j.ok === false || !Array.isArray(j.fields) || !j.current) {
+    throw Object.assign(new Error(j.error || `Could not read the settings (HTTP ${res.status})`), { status: res.status })
+  }
+  return j
+}
+
+// POST /api/launch: start the mission with these settings (only the ones that changed).
+export function launch(settings) {
+  return postJson('/api/launch', settings || {}, (status) =>
+    status === 404 || status === 405 ? 'This sim cannot launch with settings' : `Launch refused (HTTP ${status})`,
+  )
+}
+
+// POST /api/reset: a new world now, with this seed (and, version 7, any launch settings).
+export function resetSim(seed, settings = null) {
+  return postJson('/api/reset', { ...(settings || {}), seed }, (status) => `Reset failed (HTTP ${status})`)
 }
