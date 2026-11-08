@@ -4,8 +4,7 @@ import { Html } from '../globe/PlaneHtml.jsx'
 import * as THREE from 'three'
 import { appStore, simStore, useApp, useSim } from '../state/store.js'
 import { sampleGroundNear } from '../state/simState.js'
-import { instrumentStyle, kindStyle } from '../lib/theme.js'
-import { InstrumentIcon } from '../components/SampleBits.jsx'
+import { kindStyle } from '../lib/theme.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { FatPolyline } from './fatLine.js'
 import { glowTexture } from './textures.js'
@@ -26,11 +25,11 @@ const geo = {
 }
 const ARC = 64
 
-// v4b: while a rover samples this target, a ring fills around it and a chip names the
-// instrument. Progress comes from the rover (`sampling.progress`).
+// v4b: while a rover samples this target, a ring fills around it. Progress comes from the
+// rover (`sampling.progress`); the instrument and percentage show in the rover's own tag
+// (Rovers.jsx), so no second label piles up over it.
 function SamplingRing({ targetId, roverId, color }) {
   const size = useThree((s) => s.size)
-  const labelsReady = useThree((s) => !!s.events.connected)
   const arc = useMemo(() => new FatPolyline(ARC + 1, { color, width: 4, opacity: 0.98 }), [color])
   const xyz = useMemo(() => new Float32Array((ARC + 1) * 3), [])
   const trackMat = useMemo(() => new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.22, depthWrite: false }), [color])
@@ -55,29 +54,7 @@ function SamplingRing({ targetId, roverId, color }) {
     <group>
       <mesh geometry={geo.track} material={trackMat} position={[0, 0.1, 0]} renderOrder={3} />
       <primitive object={arc.object} renderOrder={4} />
-      {labelsReady && (
-        <Html position={[0, 5.2, 0]} center zIndexRange={[13, 0]} style={{ pointerEvents: 'none' }}>
-          <SampleChip targetId={targetId} roverId={roverId} color={color} />
-        </Html>
-      )}
     </group>
-  )
-}
-
-// Inside drei's own React root, so it subscribes to the store itself and stays in step.
-function SampleChip({ targetId, roverId, color }) {
-  const info = useSim((s) => {
-    const sm = s.rovers[roverId]?.sampling
-    return sm && sm.target === targetId ? `${sm.instrument ?? ''}|${Math.round(sm.progress * 100)}` : ''
-  })
-  if (!info) return null
-  const [instrument, pct] = info.split('|')
-  return (
-    <div className="sample-chip" style={{ '--c': color }}>
-      <InstrumentIcon kind={instrument} />
-      {instrumentStyle(instrument).label}
-      <b>{pct}%</b>
-    </div>
   )
 }
 
