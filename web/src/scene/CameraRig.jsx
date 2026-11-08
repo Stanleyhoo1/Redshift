@@ -1,8 +1,8 @@
-import { useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
-import { simStore, useSim, roverPoses, hudLayout } from '../state/store.js'
+import { appStore, simStore, useSim, roverPoses, hudLayout } from '../state/store.js'
 import { sampleGroundNear } from '../state/simState.js'
 
 const _d = new THREE.Vector3()
@@ -130,37 +130,106 @@ function applyShift(s, camera, size, free, dt) {
 // Orbit camera with four modes:
 //   auto   - overview that keeps the explored area in frame, easing out as it grows
 //   user   - someone moved the camera: hands off until "Off" (0 / Esc) or a sim reset
-//   follow - glides along with one rover; you can still orbit around it
+//   follow - glides along with one rover; you can still orbit and zoom around it
 //   fly    - glides to a spot (an event with a location), then hands over as "user"
+// Panning while following (anything that moves the orbit target), or clicking an event
+// that flies elsewhere, pauses the follow: the camera goes free where it is, the rover
+// stays selected, and appStore.followPaused tells App to show "Back to". Clearing that
+// flag glides back to the rover from wherever the camera is.
 export function CameraRig({ follow, overview = 0, focus = null }) {
   const map = useSim((s) => s.map)
   const gen = useSim((s) => s.gen)
   const camera = useThree((s) => s.camera)
   const size = useThree((s) => s.size)
+  const dom = useThree((s) => s.gl.domElement)
   const controls = useRef()
-  const st = useRef({ mode: 'auto', snapped: false, key: '', checkedAt: 0, goal: null, followId: null, zooming: false, overview, gen, focusKey: focus?.key ?? null, fly: null, shift: null })
+  const st = useRef({ mode: 'auto', snapped: false, key: '', checkedAt: 0, goal: null, followId: null, zooming: false, overview, gen, focusKey: focus?.key ?? null, fly: null, shift: null, last: new THREE.Vector3(), hasLast: false, panned: 0, panIntent: false })
+
+  // Which gesture is under way, the way OrbitControls maps them: right button (or a
+  // modifier with the left one) or two fingers pan. Only target motion from a pan
+  // gesture (including its damping tail) can detach the follow; a rotate or zoom
+  // never does, even while an earlier pan is still coasting.
+  useEffect(() => {
+    const touches = new Set()
+    const down = (e) => {
+      const s = st.current
+      if (e.pointerType === 'touch') {
+        touches.add(e.pointerId)
+        s.panIntent = touches.size >= 2
+      } else s.panIntent = e.button === 2 || (e.button === 0 && (e.ctrlKey || e.metaKey || e.shiftKey))
+    }
+    const up = (e) => touches.delete(e.pointerId)
+    dom.addEventListener('pointerdown', down)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+    return () => {
+      dom.removeEventListener('pointerdown', down)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+    }
+  }, [dom])
 
   useFrame((_, dt) => {
     const c = controls.current
     if (!c || !map) return
     const s = st.current
+    // Anything that moved the orbit target since our last frame was the user panning
+    // (OrbitControls updates before this frame; rotate and zoom leave the target alone).
+    const moved = s.hasLast ? c.target.distanceTo(s.last) : 0
+    step(c, s, dt, moved)
+    s.last.copy(c.target)
+    s.hasLast = true
+  })
+
+  function step(c, s, dt, moved) {
     const free = freeRect(size)
     applyShift(s, camera, size, free, dt)
     const wantOverview = overview !== s.overview
     const newRun = gen !== s.gen
     s.overview = overview
     s.gen = gen
+    const paused = !!follow && appStore.get().followPaused
     if (follow !== s.followId) {
       s.followId = follow
-      s.zooming = !!follow
-      s.mode = follow ? 'follow' : 'auto'
+      s.zooming = !!follow && !paused
+      s.mode = follow ? (paused ? 'user' : 'follow') : 'auto'
+      s.panned = 0
+      s.panIntent = false
     }
     if (!follow && (wantOverview || newRun)) s.mode = 'auto'
+    if (follow) {
+      if (paused && s.mode === 'follow') {
+        // Paused from outside (an event click): stay put.
+        s.mode = 'user'
+        s.zooming = false
+      } else if (!paused && (s.mode === 'user' || s.mode === 'fly' || s.mode === 'auto')) {
+        // "Back to": glide to the rover from here, keeping the angle. Only a camera
+        // left far out (or very close) also eases back to the usual distance.
+        const len = camera.position.distanceTo(c.target)
+        s.mode = 'follow'
+        s.panned = 0
+        s.panIntent = false
+        s.zooming = len > FOLLOW_DISTANCE * 2.2 || len < 8
+        // Drop any pan still coasting (damping), so it does not drift against the glide.
+        if (c._panOffset?.isVector3) c._panOffset.set(0, 0, 0)
+      } else if (s.mode === 'follow' && s.panIntent && moved > 1e-4) {
+        // A pan while following: past a small dead zone it detaches, right where the
+        // user dragged to (no pull back). Damping keeps the motion smooth.
+        s.panned += moved
+        const len = camera.position.distanceTo(c.target)
+        if (s.panned > Math.max(0.25, len * 0.01)) {
+          s.mode = 'user'
+          s.zooming = false
+          appStore.patch({ followPaused: true })
+          return
+        }
+      }
+    }
 
     // A clicked event with a location: fly there, keeping the current viewing angle.
     if (focus && focus.key !== s.focusKey) {
       s.focusKey = focus.key
-      if (!newRun && !follow) {
+      if (!newRun && (!follow || paused)) {
         const h = sampleGroundNear(simStore.get().terrain, focus.x, focus.y, 8) ?? (map.minH + map.maxH) / 2
         const target = new THREE.Vector3(focus.x, h, -focus.y)
         _o.copy(camera.position).sub(c.target)
@@ -224,7 +293,7 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
         camera.position.copy(c.target).add(_o)
       }
     }
-  })
+  }
 
   const span = map ? Math.max(map.width, map.depth) : 80
   return (
@@ -239,9 +308,11 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
       zoomSpeed={0.8}
       onStart={() => {
         // Someone grabbed the camera: stop auto framing, a fly-to (or the follow zoom).
+        // While following, orbit and zoom keep following; a pan detaches (see above).
         const s = st.current
         if (s.mode === 'auto' || s.mode === 'fly') s.mode = 'user'
         s.zooming = false
+        s.panned = 0
       }}
     />
   )

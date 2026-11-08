@@ -1,17 +1,41 @@
 import { useSyncExternalStore } from 'react'
 import { emptyState, reduce } from './simState.js'
+import { recordTelemetry } from './telemetry.js'
 
 export const nowSeconds = () => performance.now() / 1000
 
 function createStore(initial) {
   let state = initial
   const subs = new Set()
+  // Deferred notification (see setSoon): one macrotask later, so a burst of messages
+  // that queued up while the page was busy costs one React render instead of one each.
+  let due = false
+  let channel = null
+  const notify = () => {
+    due = false
+    subs.forEach((fn) => fn())
+  }
   return {
     get: () => state,
     set(next) {
       if (next === state) return
       state = next
+      due = false
       subs.forEach((fn) => fn())
+    },
+    // The new state is readable at once (the 3D view reads it every frame); React
+    // subscribers hear about it right after the current batch of queued events.
+    setSoon(next) {
+      if (next === state) return
+      state = next
+      if (due) return
+      due = true
+      if (typeof MessageChannel === 'undefined') return void setTimeout(() => due && notify(), 0)
+      if (!channel) {
+        channel = new MessageChannel()
+        channel.port1.onmessage = () => due && notify()
+      }
+      channel.port2.postMessage(0)
     },
     patch(partial) {
       this.set({ ...state, ...partial })
@@ -37,10 +61,19 @@ export const appStore = createStore({
   placing: null,
   // v4b: a target the user picked (Samples tab or its pin): its value tag stays up.
   pickedTarget: null,
+  // The user panned away from the followed rover: the camera is free, the rover stays
+  // selected, and "Back to" resumes. Set by the camera rig, cleared by App.
+  followPaused: false,
+  // A large viewer over everything: { kind: 'camera', rover, view } or
+  // { kind: 'sensors', rover, focus: 'lidar' | 'motion' | 'compute' }, or null.
+  modal: null,
 })
 
 export function dispatchSim(msg) {
-  simStore.set(reduce(simStore.get(), msg, nowSeconds()))
+  const now = nowSeconds()
+  const next = reduce(simStore.get(), msg, now)
+  if (msg && (msg.type === 'tick' || msg.type === 'init')) recordTelemetry(next, msg, now)
+  simStore.setSoon(next)
 }
 
 // Selectors must return values that keep their identity until they change.

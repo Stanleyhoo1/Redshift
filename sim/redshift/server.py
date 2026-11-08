@@ -582,6 +582,16 @@ def _run_viewer(server) -> bool:
                 handle.cam.distance = 0.75 * runner.cfg.map_size
                 handle.cam.elevation = -35.0
                 handle.cam.azimuth = 135.0
+                try:   # the look from visuals.py: sun shadows, sky, horizon haze; rovers, lander, liquid shown
+                    for g in (3, 4, 5):
+                        handle.opt.geomgroup[g] = 1
+                    flags = handle.user_scn.flags
+                    flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 1
+                    flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = 1
+                    flags[mujoco.mjtRndFlag.mjRND_HAZE] = 1
+                    flags[mujoco.mjtRndFlag.mjRND_FOG] = 0     # GL fog would also fog the skybox flat
+                except Exception as e:      # noqa: BLE001 (an older viewer: keep its defaults)
+                    _log(f"viewer render flags not set: {e}")
             while handle.is_running() and not server.should_exit and state.runner is runner:
                 with runner.locked():
                     handle.sync()

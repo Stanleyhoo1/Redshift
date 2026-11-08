@@ -1,127 +1,24 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
-import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js'
 import { nowSeconds, simStore, useSim } from '../state/store.js'
 import { simTimeNow } from '../state/simState.js'
-import { groundAt } from './ground.js'
 import { DUST, SAND } from '../lib/theme.js'
 import { FatPolyline } from './fatLine.js'
 import { glowTexture, hatchTexture } from './textures.js'
 import { reducedMotion } from './sceneConstants.js'
+import { mulberry } from './proceduralTextures.js'
+import { boulderVariants, rockMaterial } from './rocks.js'
+import { DrapedDisc, useDrape } from './drape.js'
 
 // ---------------------------------------------------------------- shared helpers
 
-function mulberry(seed) {
-  let a = seed >>> 0
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0
-    let t = a
-    t = Math.imul(t ^ (t >>> 15), t | 1)
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
 const hashStr = (s) => [...String(s)].reduce((h, ch) => (Math.imul(h, 31) + ch.charCodeAt(0)) >>> 0, 7)
-
-// A disc lying on the terrain: polar grid whose heights follow the ground.
-// UVs are in world metres / 0.9, so a hatch texture tiles evenly at any size.
-class DrapedDisc {
-  constructor(rings = 7, segs = 56) {
-    this.rings = rings
-    this.segs = segs
-    const n = 1 + rings * segs
-    this.pos = new Float32Array(n * 3)
-    this.uv = new Float32Array(n * 2)
-    const index = []
-    for (let s = 0; s < segs; s++) index.push(0, 1 + s, 1 + ((s + 1) % segs))
-    for (let r = 1; r < rings; r++) {
-      for (let s = 0; s < segs; s++) {
-        const a = 1 + (r - 1) * segs + s
-        const b = 1 + (r - 1) * segs + ((s + 1) % segs)
-        const c = 1 + r * segs + s
-        const d = 1 + r * segs + ((s + 1) % segs)
-        index.push(a, c, b, b, c, d)
-      }
-    }
-    this.geometry = new THREE.BufferGeometry()
-    this.geometry.setAttribute('position', new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage))
-    this.geometry.setAttribute('uv', new THREE.BufferAttribute(this.uv, 2))
-    this.geometry.setIndex(index)
-  }
-
-  // Also fills ring[] (outer edge, closed) for an outline.
-  update(cx, cy, radius, lift, ring) {
-    const { rings, segs, pos, uv } = this
-    const put = (k, x, y) => {
-      pos[k * 3] = x
-      pos[k * 3 + 1] = groundAt(x, y) + lift
-      pos[k * 3 + 2] = -y
-      uv[k * 2] = x / 0.9
-      uv[k * 2 + 1] = y / 0.9
-    }
-    put(0, cx, cy)
-    for (let r = 1; r <= rings; r++) {
-      const rr = (radius * r) / rings
-      for (let s = 0; s < segs; s++) {
-        const a = (s / segs) * Math.PI * 2
-        put(1 + (r - 1) * segs + s, cx + Math.cos(a) * rr, cy + Math.sin(a) * rr)
-      }
-    }
-    if (ring) {
-      const o = 1 + (rings - 1) * segs
-      for (let s = 0; s <= segs; s++) {
-        const k = o + (s % segs)
-        ring[s * 3] = pos[k * 3]
-        ring[s * 3 + 1] = pos[k * 3 + 1] + 0.03
-        ring[s * 3 + 2] = pos[k * 3 + 2]
-      }
-    }
-    this.geometry.attributes.position.needsUpdate = true
-    this.geometry.attributes.uv.needsUpdate = true
-    this.geometry.computeBoundingSphere()
-  }
-
-  dispose() {
-    this.geometry.dispose()
-  }
-}
-
-// Re-drape at most twice a second, and only when the known terrain changed.
-function useDrape(update, deps) {
-  const st = useRef({ version: -1, at: 0 })
-  useEffect(() => {
-    st.current.version = -1
-  }, deps) // eslint-disable-line react-hooks/exhaustive-deps
-  useFrame(() => {
-    const T = simStore.get().terrain
-    const v = T ? T.version : 0
-    const now = performance.now()
-    if (v === st.current.version || now - st.current.at < 500) return
-    st.current.version = v
-    st.current.at = now
-    update()
-  })
-}
 
 // ---------------------------------------------------------------- rockfall
 
-const ROCK_VARIANTS = Array.from({ length: 6 }, (_, v) => {
-  let g = new THREE.IcosahedronGeometry(1, 1)
-  g.deleteAttribute('normal')
-  g.deleteAttribute('uv')
-  g = mergeVertices(g)
-  const rand = mulberry(101 + v * 17)
-  const p = g.attributes.position
-  for (let i = 0; i < p.count; i++) {
-    const k = 0.8 + rand() * 0.34
-    p.setXYZ(i, p.getX(i) * k, p.getY(i) * k * 0.8, p.getZ(i) * k)
-  }
-  g.computeVertexNormals()
-  return g
-})
-const rockMat = new THREE.MeshStandardMaterial({ color: '#e2d5c2', roughness: 0.9, metalness: 0.04, flatShading: true, emissive: '#5a4636', emissiveIntensity: 0.5 })
+const ROCK_VARIANTS = boulderVariants()
+const rockMat = rockMaterial('boulder', { bump: 0.02, grain: 0.4 })
 const ringGeo = new THREE.RingGeometry(0.82, 1, 40).rotateX(-Math.PI / 2)
 const DROP_S = 0.9 // wall seconds for one boulder to fall
 const DROP_H = 16 // metres it falls from
@@ -200,7 +97,7 @@ function Rockfall({ hazard }) {
     <group>
       {rocks.map((rk, i) => (
         <group key={i}>
-          <mesh ref={(el) => (meshes.current[i] = el)} geometry={ROCK_VARIANTS[spin[i][3]]} material={rockMat} visible={false} />
+          <mesh ref={(el) => (meshes.current[i] = el)} geometry={ROCK_VARIANTS[spin[i][3]]} material={rockMat} visible={false} castShadow receiveShadow />
           <sprite ref={(el) => (puffs.current[i] = el)} material={mats[i].puff} visible={false} renderOrder={6} />
           <mesh ref={(el) => (rings.current[i] = el)} geometry={ringGeo} material={mats[i].ring} visible={false} renderOrder={6} />
         </group>

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useSim } from '../state/store.js'
+import { appStore, useSim } from '../state/store.js'
 import { fixed, mmss } from '../lib/format.js'
 import { FleetStats } from './FleetStats.jsx'
 import { RoverList } from './RoverList.jsx'
@@ -87,7 +87,7 @@ function useUnread(tab) {
 }
 
 // The lower part of the sidebar: the event log and the operator comms, as two tabs.
-function LowerTabs({ tab, setTab, onFocusEvent }) {
+function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
   const events = useSim((s) => s.events.length)
   const asking = useSim((s) => s.requests.length)
   // v4b: the Samples tab, when the sim collects samples.
@@ -103,7 +103,7 @@ function LowerTabs({ tab, setTab, onFocusEvent }) {
   // "/" jumps to the message box, like many chat tools.
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey || appStore.get().modal) return
       if (e.target instanceof Element && e.target.closest('input, textarea, select, [contenteditable="true"]')) return
       e.preventDefault()
       setTab('comms')
@@ -161,7 +161,7 @@ function LowerTabs({ tab, setTab, onFocusEvent }) {
         )}
       </div>
       <EventLog onFocusEvent={onFocusEvent} hidden={tab !== 'events'} />
-      <CommsPanel hidden={tab !== 'comms'} inputRef={input} />
+      <CommsPanel hidden={tab !== 'comms'} inputRef={input} selected={selected} />
       {hasSamples && <SamplesPanel hidden={tab !== 'samples'} onFocusEvent={onFocusEvent} />}
     </section>
   )
@@ -182,7 +182,7 @@ export function Sidebar({ follow, selected, onSelect, onFocusEvent }) {
       </header>
       <FleetStats />
       <RoverList follow={follow} selected={selected} onSelect={onSelect} />
-      <LowerTabs tab={tab} setTab={setTab} onFocusEvent={onFocusEvent} />
+      <LowerTabs tab={tab} setTab={setTab} onFocusEvent={onFocusEvent} selected={selected} />
     </aside>
   )
 }

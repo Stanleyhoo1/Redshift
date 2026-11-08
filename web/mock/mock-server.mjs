@@ -23,17 +23,26 @@
 // Version 4b additions: sample tubes (3 per rover), instruments by target kind (drill,
 // scoop, sniffer, swab) with progress, on-board analyses with a science value, organic
 // "trace" targets near herds, and deliveries to the lander's sample cache.
+// Version 5 additions: operator questions ("rover 2, what have you found?") answered with
+// chat kind "reply" and `reply_to`, grounded in the mock's own state (one rover, the
+// fleet, or each rover for "everyone, report battery"), after a short thinking delay;
+// `reply_to` on acks and refusals too; rover `stats` (distance, area mapped, finds,
+// samples, hazards met, lifeforms seen, replans); and a procedural camera image (PNG,
+// up to 1280 x 720) instead of 503: hazy sky, noisy ground in perspective, horizon tilted
+// by the rover's roll, the rover itself in the chase view. MOCK_CAMERA=off gives 503.
 //
 // Run: node mock/mock-server.mjs
 // Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
 //      GEMMA_ENABLED, GEMMA_MODEL, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S,
 //      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
-//      MOCK_PROTOCOL (2 or 3 = an older sim without the later fields)
+//      MOCK_PROTOCOL (2, 3 or 4 = an older sim without the later fields), MOCK_CAMERA (off),
+//      MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions)
 // Mock-only test hooks (not part of the protocol): POST /api/_mock/planner {"state"},
 // POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"},
 // POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question).
 
 import http from 'node:http'
+import zlib from 'node:zlib'
 import { WebSocketServer } from 'ws'
 
 const PORT = Number(process.env.PORT || 8000)
@@ -71,7 +80,9 @@ const GEMMA_BUDGET_MS = Number(process.env.GEMMA_BUDGET_MS || 3000)
 const GEMMA_WARMUP_S = Number(process.env.MOCK_GEMMA_WARMUP_S || 10)
 const OPERATOR_TIMEOUT_S = Number(process.env.OPERATOR_TIMEOUT_S || 20)
 const FIRST_QUESTION_S = Number(process.env.MOCK_FIRST_QUESTION_S || 40)
-const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 4) // 2 or 3 = behave like an older sim (no later fields or endpoints)
+const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 5) // 2, 3 or 4 = behave like an older sim (no later fields or endpoints)
+const CAMERA_ON = PROTOCOL >= 5 && process.env.MOCK_CAMERA !== 'off'
+const ANSWER_EXTRA_MS = Math.max(0, Number(process.env.MOCK_ANSWER_DELAY_MS || 0)) // mock only: slower answers, for screenshots
 const HAZARD_TYPES = ['rockfall', 'sand', 'dust_storm', 'rover_fault', ...(PROTOCOL >= 4 ? ['spire_fall', 'lifeform'] : [])]
 
 // Version 4: water, spires, lifeforms and tracks.
@@ -734,6 +745,9 @@ function newSim(seed) {
       // v4b
       samples: [],
       sampling: null, // { target, instrument, progress, total }
+      // v5 running totals (and what the rover remembers, for grounded answers)
+      st: { distance: 0, lastX: x, lastY: y, mapped: 0, sumX: 0, sumY: 0, samples: 0, hazards: [], hazardKeys: new Set(), herds: new Set(), sightings: [], replans: 0 },
+      goalWhy: null, // why it is going where it is going, in its own words
     })
   }
   addEvent(null, 'info', `Survey started. ${NUM_ROVERS} rover${NUM_ROVERS === 1 ? '' : 's'} deployed from the lander.`)
@@ -804,6 +818,9 @@ function sense(rover) {
       if (world.waterId[k] >= 0) continue // v4: no LiDAR returns from liquid
       sim.known[k] = 1
       sim.knownCount++
+      rover.st.mapped++
+      rover.st.sumX += world.ox + i * RES
+      rover.st.sumY += world.oy + j * RES
       const h = r2(world.heights[k] + gaussian(sim.rand) * 0.015)
       sim.measured[k] = h
       sim.mslope[k] = world.slopes[k]
@@ -864,6 +881,7 @@ function senseSpires(rover) {
     sim.spireSeen.add(key)
     markFootprint(sim.pendingCells, x0, y0, x1, y1, sp.radius)
     if (!sp.standing) {
+      noteHazard(rover, `spire:${sp.id}`, 'a fallen crystal spire', (x0 + x1) / 2, (y0 + y1) / 2)
       const dist = Math.round(segDist(rover.x, rover.y, x0, y0, x1, y1))
       const blocking = rover.path.length && pathNear(rover, (x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + 1)
       const changed = replanAround((x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + 1.2)
@@ -1117,6 +1135,9 @@ function planPath(sx, sy, gx, gy, self = null) {
 function setGoal(rover, gx, gy, state, why, source = null) {
   const path = planPath(rover.x, rover.y, gx, gy, rover)
   if (!path) return false
+  rover.st.replans++
+  if (why) rover.goalWhy = why
+  else if (state !== rover.state || !rover.goal || Math.hypot(rover.goal[0] - gx, rover.goal[1] - gy) > 1) rover.goalWhy = null
   rover.state = state
   rover.goal = [r1(gx), r1(gy)]
   rover.path = path
@@ -1354,6 +1375,8 @@ function startObserve(rover, track, mode) {
   }
   Object.assign(rover, { state: 'observing', trackId: track.id, observeMode: mode, observeUntil: sim.t + OBSERVE_S, observeReplanT: 0, path: [], goal: null })
   track.observer = rover.id
+  const herd = sim.lifeforms.find((l) => l.id === track.lifeId)?.herd
+  if (herd) rover.st.herds.add(herd.id)
 }
 
 function endObserve(rover, why) {
@@ -1390,6 +1413,7 @@ function stepObserve(rover, dt) {
         rover.path = path
         rover.goal = [r1(tx), r1(ty)]
         rover.replannedAt = sim.t
+        rover.st.replans++
       }
     }
     drive(rover, dt, 0.45)
@@ -1417,6 +1441,7 @@ function finishSample(rover, t) {
   t.carried_by = rover.id
   t.cached = false
   rover.samples.push(t.id)
+  rover.st.samples++
   const list = ANALYSES[t.kind] || ANALYSES.mineral
   const [value, analysis] = list[Math.floor(sim.rand() * list.length)]
   const g = gemmaCall('vision')
@@ -1789,6 +1814,8 @@ function stepTracks() {
       k.label = g.ok ? `possible lifeform, six legs, about ${r1(life.size)} m` : `moving object, legged gait, about ${r1(life.size)} m`
       k.confirmed = true
       sim.lifeConfirmed.add(life.id)
+      seer.st.herds.add(herd.id)
+      if (!seer.st.sightings.some((q) => q.herd === herd.id)) seer.st.sightings.push({ herd: herd.id, x: life.x, y: life.y, t: sim.t, label: k.label, track: k.id })
       if (sim.t - herd.confirmT > 30) {
         herd.confirmT = sim.t
         const n = sim.lifeforms.filter((l) => l.herd === herd).length
@@ -1907,6 +1934,7 @@ function markRocksSeen(rover, rocks) {
     const blocking = rover.path.length && list.some((rk) => pathNear(rover, rk.x, rk.y, rk.r + 0.8))
     const changed = replanAround(cx, cy, (hz?.radius ?? 3) + 1)
     rover.reactedAt = sim.t
+    noteHazard(rover, `rock:${hz?.id ?? `${Math.round(cx)},${Math.round(cy)}`}`, 'boulders from a rockfall', cx, cy)
     if (!hz.reported) {
       hz.reported = true
       const n = hz.rocks.length
@@ -1941,6 +1969,7 @@ function detectSoftGround(rover) {
   }
   const truth = trueSandAt(rover.x, rover.y)
   if (truth) truth.known = true
+  noteHazard(rover, `sand:${truth?.id ?? `${Math.round(ex / 4)},${Math.round(ey / 4)}`}`, 'soft sand', ex, ey)
   rover.sandT = -999 // one detection per visit
   rover.reactedAt = sim.t
   const changed = replanAround(ex, ey, 3.2, rover)
@@ -2616,8 +2645,9 @@ function stepHazards(dt) {
 // ---------------------------------------------------------------------------
 // Operator chat and clarification requests (v3)
 
-function addChat(from, to, text, kind, source = null, requestId = null) {
+function addChat(from, to, text, kind, source = null, requestId = null, replyTo = null) {
   const m = { id: `c${sim.nextChat++}`, t: r1(sim.t), from, to, text, kind, source, request_id: requestId }
+  if (PROTOCOL >= 5) m.reply_to = replyTo
   sim.pendingChat.push(m)
   sim.chat.push(m)
   if (sim.chat.length > 50) sim.chat.splice(0, sim.chat.length - 50)
@@ -2860,6 +2890,7 @@ function goTo(rover, x, y, state, eventMsg, source) {
   releaseTarget(rover)
   rover.hold = false
   if (!setGoal(rover, x, y, state)) return null
+  rover.goalWhy = eventMsg(0).replace(/\s*Route \d+ m\.?$/, '').replace(/,?\s*0 m\.?$/, '.')
   addEvent(rover.id, 'info', eventMsg(Math.round(remainingPath(rover))), [x, y], source)
   rover.lastGoalEventT = sim.t
   return Math.round(remainingPath(rover))
@@ -2947,13 +2978,21 @@ function handleChat(text, roverParam) {
   // Gemma turns the text into a command; when it is not ready the regex parser does.
   const g = gemmaCall('command')
   const source = g.ok ? 'gemma' : 'rules'
-  later(g.ok ? g.ms : 120 + Math.random() * 120, () => respond(parseCommand(raw.toLowerCase()), targets, to, raw, source))
+  const lower = raw.toLowerCase()
+  if (PROTOCOL >= 5 && isQuestion(lower)) {
+    // v5: a question gets an answer from the rover's fact sheet, after a moment's thought.
+    const g2 = g.ok ? gemmaCall('answer') : { ok: false, ms: 0 }
+    const src = g.ok && g2.ok ? 'gemma' : 'rules'
+    later((g.ok ? g.ms : 150) + (g2.ok ? g2.ms : 250) + Math.random() * 400 + ANSWER_EXTRA_MS, () => answerQuestion(lower, targets, to, msg.id, src))
+    return msg.id
+  }
+  later(g.ok ? g.ms : 120 + Math.random() * 120, () => respond(parseCommand(lower), targets, to, raw, source, msg.id))
   return msg.id
 }
 
-function respond(c, targets, to, raw, source) {
+function respond(c, targets, to, raw, source, replyTo = null) {
   const many = to === 'all' && targets.length > 1
-  const reply = (rover, [kind, text]) => addChat(rover.id, 'operator', text, kind, source)
+  const reply = (rover, [kind, text]) => addChat(rover.id, 'operator', text, kind, source, null, kind === 'question' ? null : replyTo)
   if (c.cmd === 'hold' || c.cmd === 'resume') {
     const hold = c.cmd === 'hold'
     const changed = []
@@ -2963,7 +3002,7 @@ function respond(c, targets, to, raw, source) {
       r.holdUntil = null
     }
     if (many) {
-      addChat('fleet', 'operator', hold ? `Holding all ${targets.length} rovers where they are. Say "resume all" to carry on.` : `Resuming: ${targets.length} rovers back to exploring.`, 'ack', source)
+      addChat('fleet', 'operator', hold ? `Holding all ${targets.length} rovers where they are. Say "resume all" to carry on.` : `Resuming: ${targets.length} rovers back to exploring.`, 'ack', source, null, replyTo)
       addEvent(null, 'info', hold ? 'Operator put the whole fleet on hold.' : 'Operator resumed the fleet.', null, 'operator')
       return
     }
@@ -3000,6 +3039,489 @@ function respond(c, targets, to, raw, source) {
       : `I could not parse "${short}". Try: return, hold, resume, explore north, or go to 10, -5.`
   if (many) addChat('fleet', 'operator', text, 'question', source)
   else reply(targets[0], ['question', text])
+}
+
+// ---------------------------------------------------------------------------
+// Version 5: questions answered from what each rover has sensed and done
+
+function noteHazard(rover, key, label, x, y) {
+  if (rover.st.hazardKeys.has(key)) return
+  rover.st.hazardKeys.add(key)
+  rover.st.hazards.push({ label, x, y, t: sim.t })
+}
+
+const ADDR = String.raw`^(?:(?:hey|ok|okay|so)[,\s]+)?(?:(?:rover\s*\d+|r\d+|everyone|everybody|all(?:\s+rovers)?|fleet|team)[,:]?\s+)?`
+const POLITE_RE = new RegExp(ADDR + String.raw`(?:can|could|would|will)\s+you\b`)
+const QWORD_RE = new RegExp(ADDR + String.raw`(?:what|what's|whats|where|where's|how|how's|hows|why|when|which|who|did|do|does|are|is|have|has|had|any|seen|tell me|give me)\b`)
+
+// What Gemma (or the rule-based parser) would call a question rather than an order:
+// question words, a trailing "?", "tell me", "report", "status". "Can you go to 10, 5?"
+// stays an order.
+function isQuestion(t) {
+  if ((POLITE_RE.test(t) || /^please\b/.test(t)) && parseCommand(t).cmd !== 'unclear') return false
+  return /\?\s*$/.test(t) || QWORD_RE.test(t) || /\b(tell me|report|status|update)\b/.test(t)
+}
+
+function questionTopic(t) {
+  if (/\b(life|lifeforms?|creatures?|aliens?|animals?|grazers?|herds?|living|organisms?)\b/.test(t)) return 'life'
+  if (/\b(battery|batteries|charge|charging|power|energy)\b/.test(t)) return 'battery'
+  if (/\b(problems?|issues?|trouble|wrong|hazards?|danger|stuck|faults?|damage|obstacles?)\b/.test(t)) return 'problems'
+  if (/\b(water|lakes?|rivers?|liquid|streams?)\b/.test(t)) return 'water'
+  if (/\b(samples?|tubes?|cache|cached|science)\b/.test(t)) return 'samples'
+  if (/\b(found|find|discover(?:ed|ies)?|targets?|minerals?|ice|vents?|interesting)\b/.test(t)) return 'finds'
+  if (/\b(why|reason)\b/.test(t) || /\b(going|heading|goal|plan|next)\b/.test(t)) return 'why'
+  if (/\b(explored?|mapped|map|area|covered|surveyed|distance|driven|been)\b/.test(t)) return 'explored'
+  if (/\b(where are you|location|position|where is|where's)\b/.test(t)) return 'location'
+  if (/\b(status|report|update|how are you|how's it going|doing)\b/.test(t)) return 'status'
+  return 'unknown'
+}
+
+const fmtInt = (v) => Math.round(v).toLocaleString('en-US')
+const pctOf = (v) => `${Math.round(v * 100)}%`
+const at = (x, y) => `(${Math.round(x)}, ${Math.round(y)})`
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+const agoText = (t) => {
+  const s = Math.max(0, sim.t - t)
+  return s < 90 ? `${Math.round(s)} s ago` : `${Math.round(s / 60)} min ago`
+}
+const fromLander = (x, y) => {
+  const d = Math.hypot(x - LANDER.x, y - LANDER.y)
+  return d < 4 ? 'at the lander' : `${Math.round(d)} m ${compass(x - LANDER.x, y - LANDER.y)} of the lander`
+}
+
+function mappedM2(r) {
+  return r.st.mapped * RES * RES
+}
+
+function foundBy(r) {
+  return [...sim.discovered.values()].filter((t) => t.found_by === r.id)
+}
+
+function rangeLeft(r) {
+  return Math.max(0, (r.battery - BATTERY_RESERVE) / ENERGY_PER_M)
+}
+
+function currentIssues(r) {
+  const out = []
+  if (r.state === 'fault') out.push(`motors rebooting after a fault (${Math.ceil(r.faultHazard?.remaining ?? 0)} s left)`)
+  if (r.battery < 0.25) out.push(`battery low at ${pctOf(r.battery)}`)
+  if ((r.sensors?.slip ?? 0) > 0.25) out.push(`wheel slip ${pctOf(r.sensors.slip)}`)
+  if (dustActive()) out.push(`a dust storm cutting my LiDAR to ${DUST_LIDAR_RANGE} m`)
+  if (r.request) out.push('waiting for your answer to my question')
+  if (r.hold) out.push('on hold, as you asked')
+  return out
+}
+
+function whyText(r) {
+  const d = r.goal ? Math.round(Math.hypot(r.goal[0] - r.x, r.goal[1] - r.y)) : 0
+  if (r.state === 'fault') return `My motors are rebooting after a fault (${Math.ceil(r.faultHazard?.remaining ?? 0)} s left), so I'm not going anywhere until they're back.`
+  if (r.state === 'charging') return `I'm docked at the lander, charging (${pctOf(r.battery)}). I'll head out again once the battery is high enough for a useful trip.`
+  if (r.hold) return `I'm holding at ${at(r.x, r.y)} because you asked me to. Say "resume" and I'll carry on.`
+  if (r.request) return "I've stopped to ask you something about what I sensed. I'll act on your answer, or take the safe option when the time runs out."
+  if (r.state === 'observing') {
+    const k = sim.tracks.find((q) => q.id === r.trackId)
+    return k ? `I'm watching ${k.id} (${k.label}) from about ${OBSERVE_DIST} m: I keep my distance and log how it moves.` : "I'm watching something that moves on its own, from a safe distance."
+  }
+  if (r.sampling) {
+    const t = sim.discovered.get(r.sampling.target)
+    return `I'm sampling the ${KIND_LABEL[t?.kind] || 'target'} ${r.sampling.target} with the ${r.sampling.instrument} (${pctOf(r.sampling.progress)} done). ${plural(TUBES - r.samples.length - 1, 'tube')} will be free after this.`
+  }
+  if (r.state === 'returning') {
+    if (r.samples.length >= TUBES) return `All ${TUBES} tubes are full, so I'm taking the samples to the lander's cache, ${d} m to go.`
+    return `Battery ${pctOf(r.battery)}: I'm heading back to the lander to charge, about ${d} m to go. Driving further would eat into my ${pctOf(BATTERY_RESERVE)} reserve.`
+  }
+  if (r.state === 'recovering') return "I'm backing away from ground I couldn't drive on, then I'll plan a new route around it."
+  if (r.state === 'investigating' && r.targetId) {
+    const t = sim.discovered.get(r.targetId)
+    const ins = INSTRUMENT_FOR[t?.kind] || 'drill'
+    return `I'm going to the ${KIND_LABEL[t?.kind] || 'target'} ${r.targetId} at ${at(t?.x ?? 0, t?.y ?? 0)}, ${d} m away, to sample it with the ${ins}. I have ${plural(TUBES - r.samples.length, 'free tube')} and ${pctOf(r.battery)} battery.`
+  }
+  if (r.goal) {
+    if (r.goalWhy && /^Operator/.test(r.goalWhy)) return `Because you asked me to: ${r.goalWhy.replace(/^Operator:\s*/, '')} ${d} m to go.`
+    const f = sim.frontiers.reduce((best, q) => (Math.hypot(q[0] - r.goal[0], q[1] - r.goal[1]) < (best ? Math.hypot(best[0] - r.goal[0], best[1] - r.goal[1]) : Infinity) ? q : best), null)
+    const cells = f && Math.hypot(f[0] - r.goal[0], f[1] - r.goal[1]) < 4 ? f[2] : null
+    return `I'm heading to the frontier at ${at(r.goal[0], r.goal[1])}, ${d} m away${cells ? `: ${cells} unknown cells at the edge of the map there` : ', the edge of what the fleet has mapped'}. The route stays under the ${sim.slopeLimit} deg slope limit${routeMaxSlope(r) ? ` (steepest ${routeMaxSlope(r)} deg)` : ''}.`
+  }
+  return "I'm between goals: picking the next frontier to explore."
+}
+
+function roverAnswer(r, topic) {
+  const m2 = mappedM2(r)
+  const area = MAP_SIZE * MAP_SIZE
+  switch (topic) {
+    case 'explored': {
+      if (m2 < 1) return `I haven't mapped any new ground yet. I've driven ${fmtInt(r.st.distance)} m.`
+      const cx = r.st.sumX / Math.max(1, r.st.mapped)
+      const cy = r.st.sumY / Math.max(1, r.st.mapped)
+      const where = Math.hypot(cx - LANDER.x, cy - LANDER.y) < 6 ? 'around the lander' : `mostly ${compass(cx - LANDER.x, cy - LANDER.y)} of the lander`
+      return `I've mapped about ${fmtInt(m2)} m2 (${((m2 / area) * 100).toFixed(m2 / area < 0.1 ? 1 : 0)}% of the region), ${where}, and driven ${fmtInt(r.st.distance)} m. The fleet has explored ${fleetSummary().explored_pct}% so far.`
+    }
+    case 'finds': {
+      const mine = foundBy(r)
+      if (!mine.length) return `I haven't found any targets yet. The fleet has found ${sim.discovered.size} of ${world.targets.length}.`
+      const list = mine.slice(0, 5).map((t) => `${t.id} ${t.kind}`).join(', ')
+      const sampled = r.st.samples
+      return `Found ${plural(mine.length, 'target')}: ${list}${mine.length > 5 ? ` and ${mine.length - 5} more` : ''}. ${sampled ? `Sampled ${sampled} so far` : 'Not sampled any yet'}${r.targetId ? `, and I'm on my way to ${r.targetId} now` : ''}.`
+    }
+    case 'samples': {
+      const carried = r.samples.map((id) => sim.discovered.get(id)).filter(Boolean)
+      if (!r.st.samples) return `I haven't taken any samples yet. ${plural(TUBES - r.samples.length, 'tube')} free.`
+      const list = carried.map((t) => `${t.id} ${t.kind}${Number.isFinite(t.value) ? `, value ${t.value}` : ', analysing'}`).join('; ')
+      return `I've taken ${plural(r.st.samples, 'sample')}. ${carried.length ? `Carrying ${carried.length} (${list}), ` : 'All delivered to the lander, '}${plural(TUBES - r.samples.length, 'tube')} free.`
+    }
+    case 'battery': {
+      const d = Math.round(Math.hypot(r.x - LANDER.x, r.y - LANDER.y))
+      if (r.state === 'charging') return `Charging at the lander, ${pctOf(r.battery)}.`
+      const range = Math.round(rangeLeft(r))
+      return `Battery ${pctOf(r.battery)}. That's about ${range} m of driving before my ${pctOf(BATTERY_RESERVE)} reserve, and the lander is ${d} m away${r.state === 'returning' ? ", so I'm heading back to charge now" : range < d * 1.6 ? ", so I'll head back soon" : ''}.`
+    }
+    case 'why':
+      return whyText(r)
+    case 'life': {
+      const s = r.st.sightings
+      const k = r.state === 'observing' ? sim.tracks.find((q) => q.id === r.trackId) : null
+      if (!s.length && !k) return `No lifeforms so far: my LiDAR hasn't picked up anything moving on its own. The fleet has confirmed ${sim.lifeConfirmed.size}.`
+      const first = s[0]
+      const parts = []
+      if (s.length) parts.push(`I've seen ${plural(s.length, 'herd')}. The first: ${first.track}, ${first.label}, near ${at(first.x, first.y)}, ${agoText(first.t)}.`)
+      if (k) parts.push(`I'm observing ${k.id} right now from about ${OBSERVE_DIST} m.`)
+      return parts.join(' ')
+    }
+    case 'problems': {
+      const now = currentIssues(r)
+      const past = r.st.hazards.slice(-3).map((h) => (h.x == null ? h.label : `${h.label} near ${at(h.x, h.y)}`))
+      const head = now.length ? `Right now: ${now.join(', ')}.` : `Nothing wrong right now: motors fine, slip ${pctOf(r.sensors?.slip ?? 0)}, battery ${pctOf(r.battery)}.`
+      return `${head} ${past.length ? `I've met ${plural(r.st.hazards.length, 'hazard')}: ${past.join('; ')}.` : "I haven't met any hazards."}`
+    }
+    case 'water': {
+      const n = sim.identified.size
+      if (!n) return "No water identified yet. A hole in the LiDAR map could be liquid; I'd have to get within 4.5 m of its edge to tell."
+      let best = null
+      for (const z of sim.waterZones) {
+        const d = Math.hypot(z[0] - r.x, z[1] - r.y) - z[2]
+        if (!best || d < best.d) best = { d, z }
+      }
+      return `The fleet has identified ${plural(n, 'body', 'bodies')} of water. The nearest edge is about ${Math.max(0, Math.round(best.d))} m ${compass(best.z[0] - r.x, best.z[1] - r.y)} of me. Every route stays out of it.`
+    }
+    case 'location':
+      return `I'm at ${at(r.x, r.y)}, ${fromLander(r.x, r.y)}, facing ${compass(Math.cos(r.yaw), Math.sin(r.yaw))}${r.goal ? `, heading for ${at(r.goal[0], r.goal[1])}` : ''}.`
+    case 'status':
+      return `${r.state[0].toUpperCase()}${r.state.slice(1)} at ${at(r.x, r.y)}, battery ${pctOf(r.battery)}. Mapped ${fmtInt(m2)} m2, found ${foundBy(r).length}, sampled ${r.st.samples}. ${whyText(r)}`
+    default:
+      return "I can only answer from what I've sensed and done, and I haven't sensed anything about that. Ask me what I've explored or found, my battery, why I'm going somewhere, or about life, water or problems."
+  }
+}
+
+function fleetAnswer(topic) {
+  const rs = sim.rovers
+  const names = (list) => list.map((r) => r.name).join(', ')
+  switch (topic) {
+    case 'explored': {
+      const parts = rs.filter((r) => r.st.mapped).map((r) => {
+        const cx = r.st.sumX / r.st.mapped
+        const cy = r.st.sumY / r.st.mapped
+        return `${r.name} ${fmtInt(mappedM2(r))} m2 ${Math.hypot(cx, cy) < 6 ? 'around the lander' : compass(cx - LANDER.x, cy - LANDER.y)}`
+      })
+      const total = rs.reduce((s, r) => s + mappedM2(r), 0)
+      const dist = rs.reduce((s, r) => s + r.st.distance, 0)
+      return `The fleet has explored ${fleetSummary().explored_pct}% of the region, about ${fmtInt(total)} m2. ${parts.length ? `${parts.join(', ')}.` : ''} ${fmtInt(dist)} m driven in total.`
+    }
+    case 'finds': {
+      const all = [...sim.discovered.values()]
+      if (!all.length) return `No targets found yet (${world.targets.length} expected in the region). The fleet has explored ${fleetSummary().explored_pct}%.`
+      const list = all.slice(0, 6).map((t) => `${t.id} ${t.kind} (${nameOf(t.found_by)})`).join(', ')
+      const sampled = all.filter((t) => t.status === 'sampled').length
+      return `Found ${all.length} of ${world.targets.length} targets: ${list}${all.length > 6 ? ` and ${all.length - 6} more` : ''}. ${sampled} sampled, ${all.filter((t) => t.cached).length} cached at the lander.`
+    }
+    case 'samples': {
+      const all = [...sim.discovered.values()].filter((t) => t.status === 'sampled')
+      if (!all.length) return 'No samples taken yet.'
+      return `${plural(all.length, 'sample')} taken: ${all.filter((t) => t.cached).length} cached at the lander, ${all.filter((t) => t.carried_by).length} on board. Science score ${scienceScore()}.`
+    }
+    case 'battery': {
+      const low = rs.reduce((a, b) => (b.battery < a.battery ? b : a))
+      return `Batteries: ${rs.map((r) => `${r.name} ${pctOf(r.battery)}${r.state === 'charging' ? ' (charging)' : r.state === 'returning' ? ' (heading back)' : ''}`).join(', ')}. Lowest is ${low.name}.`
+    }
+    case 'why':
+      return rs.map((r) => `${r.name}: ${whyText(r).replace(/^I'm /, '').replace(/^I /, '')}`).join(' ')
+    case 'life': {
+      const n = sim.lifeConfirmed.size
+      const watching = rs.filter((r) => r.state === 'observing')
+      if (!n && !watching.length) return "No lifeforms confirmed. Nothing has moved on its own in any rover's LiDAR yet."
+      const herds = new Set(rs.flatMap((r) => [...r.st.herds])).size
+      return `The fleet has confirmed ${plural(n, 'lifeform')} in ${plural(herds || 1, 'herd')}. ${watching.length ? `${names(watching)} ${watching.length === 1 ? 'is' : 'are'} observing now.` : 'Nobody is observing right now.'}`
+    }
+    case 'problems': {
+      const now = rs.map((r) => [r, currentIssues(r)]).filter(([, l]) => l.length)
+      const met = rs.reduce((s, r) => s + r.st.hazards.length, 0)
+      const head = now.length ? `Right now: ${now.map(([r, l]) => `${r.name} ${l.join(', ')}`).join('; ')}.` : 'Nothing wrong right now.'
+      const limit = sim.slopeLimit < INITIAL_SLOPE_LIMIT ? ` The slope limit is down to ${sim.slopeLimit} deg from ${INITIAL_SLOPE_LIMIT} after stalls.` : ''
+      return `${head} ${met ? `${plural(met, 'hazard')} met so far` : 'No hazards met so far'}${sim.softZones.length ? `, ${plural(sim.softZones.length, 'soft zone')} marked` : ''}.${limit}`
+    }
+    case 'water':
+      return sim.identified.size ? `${plural(sim.identified.size, 'body', 'bodies')} of water identified, covered by ${sim.waterZones.length} no-go zones on the shared map.` : 'No water identified yet.'
+    case 'location':
+      return rs.map((r) => `${r.name} at ${at(r.x, r.y)}, ${fromLander(r.x, r.y)}`).join('; ') + '.'
+    case 'status': {
+      const by = {}
+      for (const r of rs) by[r.state] = [...(by[r.state] || []), r.name]
+      return `${Object.entries(by).map(([k, v]) => `${v.join(' and ')} ${k}`).join(', ')}. Explored ${fleetSummary().explored_pct}%, ${sim.discovered.size} targets found, science score ${scienceScore()}.`
+    }
+    default:
+      return "The fleet can only answer from what its rovers have sensed. Ask what we've explored or found, about batteries, plans, life, water or problems."
+  }
+}
+
+// Answers an operator question: one rover, the fleet, or each rover for a per-rover
+// question to everyone ("everyone, report battery").
+function answerQuestion(t, targets, to, replyTo, source) {
+  const topic = questionTopic(t)
+  const perRover = /\b(everyone|everybody|each|every rover|all rovers|each of you|all of you)\b/.test(t) && !/\bfleet\b/.test(t)
+  if (to !== 'all' || (targets.length < sim.rovers.length && targets.length > 0)) {
+    targets.forEach((r, i) => later(i * 260, () => addChat(r.id, 'operator', roverAnswer(r, topic), 'reply', source, null, replyTo)))
+    return
+  }
+  if (perRover) {
+    sim.rovers.forEach((r, i) => later(i * 260, () => addChat(r.id, 'operator', roverAnswer(r, topic), 'reply', source, null, replyTo)))
+    return
+  }
+  addChat('fleet', 'operator', fleetAnswer(topic), 'reply', source, null, replyTo)
+}
+
+// ---------------------------------------------------------------------------
+// Version 5: a procedural camera image (the mock has no renderer). PNG, any size up to
+// 1280 x 720: a hazy sky, the ground as a noisy plane in perspective (it moves and turns
+// with the rover), the horizon tilted by roll and shifted by pitch, the rover in chase view.
+
+const CAM_MAX_W = 1280
+const CAM_MAX_H = 720
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256)
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    t[n] = c >>> 0
+  }
+  return t
+})()
+function crc32(buf) {
+  if (typeof zlib.crc32 === 'function') return zlib.crc32(buf) >>> 0
+  let c = 0xffffffff
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4)
+  len.writeUInt32BE(data.length)
+  const td = Buffer.concat([Buffer.from(type, 'ascii'), data])
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(td))
+  return Buffer.concat([len, td, crc])
+}
+function encodePng(w, h, raw) {
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(w, 0)
+  ihdr.writeUInt32BE(h, 4)
+  ihdr[8] = 8 // bit depth
+  ihdr[9] = 2 // RGB
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), pngChunk('IHDR', ihdr), pngChunk('IDAT', zlib.deflateSync(raw, { level: 3 })), pngChunk('IEND', Buffer.alloc(0))])
+}
+function hash2(i, j) {
+  let h = Math.imul(i, 374761393) + Math.imul(j, 668265263)
+  h = Math.imul(h ^ (h >>> 13), 1274126177)
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296
+}
+function vnoise(x, y) {
+  const i = Math.floor(x)
+  const j = Math.floor(y)
+  const fx = x - i
+  const fy = y - j
+  const u = fx * fx * (3 - 2 * fx)
+  const v = fy * fy * (3 - 2 * fy)
+  const a = hash2(i, j)
+  const b = hash2(i + 1, j)
+  const c = hash2(i, j + 1)
+  const d = hash2(i + 1, j + 1)
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v
+}
+
+const SKY_HORIZON = [222, 178, 140]
+const SKY_ZENITH = [62, 46, 60]
+const GROUND_A = [58, 44, 38]
+const GROUND_B = [164, 128, 96]
+const SUN_AZ = 0.9 // radians from +x, counter-clockwise
+const SUN_EL = 0.42
+
+// Ray against an axis-aligned box (slab test). Result in _box (no allocation per pixel):
+// t = entry distance along the ray, face = 1 (x), 2 (y) or 3 (z) it entered through.
+const _box = { t: 0, face: 0 }
+function boxHit(ox, oy, oz, dx, dy, dz, x0, x1, y0, y1, z0, z1) {
+  let t0 = 0
+  let t1 = 1e9
+  let face = 0
+  for (let axis = 1; axis <= 3; axis++) {
+    const o = axis === 1 ? ox : axis === 2 ? oy : oz
+    const d = axis === 1 ? dx : axis === 2 ? dy : dz
+    const a0 = axis === 1 ? x0 : axis === 2 ? y0 : z0
+    const a1 = axis === 1 ? x1 : axis === 2 ? y1 : z1
+    if (Math.abs(d) < 1e-9) {
+      if (o < a0 || o > a1) return false
+      continue
+    }
+    let a = (a0 - o) / d
+    let c = (a1 - o) / d
+    if (a > c) {
+      const tmp = a
+      a = c
+      c = tmp
+    }
+    if (a > t0) {
+      t0 = a
+      face = axis
+    }
+    if (c < t1) t1 = c
+    if (t0 > t1) return false
+  }
+  if (t0 <= 0) return false
+  _box.t = t0
+  _box.face = face
+  return true
+}
+
+// The rover in the chase view, in its own frame (x forward, y left, z up from the
+// ground): body, four wheels, mast and camera head. [x0, x1, y0, y1, z0, z1, painted]
+const ROVER_PARTS = [
+  [-0.56, 0.56, -0.38, 0.38, 0.26, 0.52, 1],
+  [0.24, 0.6, -0.6, -0.44, 0, 0.34, 0],
+  [0.24, 0.6, 0.44, 0.6, 0, 0.34, 0],
+  [-0.6, -0.24, -0.6, -0.44, 0, 0.34, 0],
+  [-0.6, -0.24, 0.44, 0.6, 0, 0.34, 0],
+  [0.26, 0.34, -0.04, 0.04, 0.52, 0.98, 0],
+  [0.22, 0.4, -0.11, 0.11, 0.96, 1.08, 0],
+]
+const ROVER_BOUNDS = [-0.62, 0.62, -0.62, 0.62, 0, 1.1]
+const PART_GREY = [52, 52, 58]
+
+function renderCamera(rover, view, w, h) {
+  const raw = Buffer.alloc((w * 3 + 1) * h)
+  const fpv = view !== 'chase'
+  const yaw = rover.yaw
+  const pitch = fpv ? ((rover.sensors?.pitch ?? 0) * Math.PI) / 180 : (-24 * Math.PI) / 180
+  const roll = fpv ? ((rover.sensors?.roll ?? 0) * Math.PI) / 180 : 0
+  const vfov = ((fpv ? 48 : 55) * Math.PI) / 180
+  const ty = Math.tan(vfov / 2)
+  const tx = (ty * w) / h
+  const g0 = groundAt(rover.x, rover.y)
+  const fX = Math.cos(yaw)
+  const fY = Math.sin(yaw)
+  const rX = Math.sin(yaw)
+  const rY = -Math.cos(yaw)
+  const camX = fpv ? rover.x + fX * 0.3 : rover.x - fX * 4.4
+  const camY = fpv ? rover.y + fY * 0.3 : rover.y - fY * 4.4
+  const camH = fpv ? MAST_H + 0.25 : 2.5 // above the ground plane at the rover
+  const cr = Math.cos(roll)
+  const sr = Math.sin(roll)
+  const cp = Math.cos(pitch)
+  const sp = Math.sin(pitch)
+  const sunX = Math.cos(SUN_AZ) * Math.cos(SUN_EL)
+  const sunY = Math.sin(SUN_AZ) * Math.cos(SUN_EL)
+  const sunZ = Math.sin(SUN_EL)
+  const dust = dustActive()
+  const fogK = dust ? 1 / 9 : 1 / 46
+  const color = rover.color || '#ff7a45'
+  const rc = [parseInt(color.slice(1, 3), 16), parseInt(color.slice(3, 5), 16), parseInt(color.slice(5, 7), 16)]
+  let o = 0
+  for (let v = 0; v < h; v++) {
+    raw[o++] = 0
+    const cy = (1 - (2 * (v + 0.5)) / h) * ty
+    for (let u = 0; u < w; u++) {
+      const cx = ((2 * (u + 0.5)) / w - 1) * tx
+      // camera ray: roll about forward, pitch about right, then yaw
+      const lat = cx * cr + cy * sr
+      const e = -cx * sr + cy * cr
+      const up = e * cp + sp
+      const fw = cp - e * sp
+      const dx = fw * fX + lat * rX
+      const dy = fw * fY + lat * rY
+      const dz = up
+      const len = Math.hypot(dx, dy, dz)
+      let r
+      let g
+      let b
+      let hit = false
+      if (!fpv) {
+        // ray against the rover's body (slab test in its frame)
+        const ox = (camX - rover.x) * fX + (camY - rover.y) * fY
+        const oy = -(camX - rover.x) * fY + (camY - rover.y) * fX
+        const lx = dx * fX + dy * fY
+        const ly = -dx * fY + dy * fX
+        const B = ROVER_BOUNDS
+        if (boxHit(ox, oy, camH, lx, ly, dz, B[0], B[1], B[2], B[3], B[4], B[5])) {
+          let best = Infinity
+          let face = 0
+          let painted = 1
+          for (let q = 0; q < ROVER_PARTS.length; q++) {
+            const P = ROVER_PARTS[q]
+            if (boxHit(ox, oy, camH, lx, ly, dz, P[0], P[1], P[2], P[3], P[4], P[5]) && _box.t < best) {
+              best = _box.t
+              face = _box.face
+              painted = P[6]
+            }
+          }
+          if (best < Infinity) {
+            hit = true
+            const k = face === 3 ? 1 : face === 1 ? 0.66 : 0.8
+            const tint = painted ? rc : PART_GREY
+            r = tint[0] * k
+            g = tint[1] * k
+            b = tint[2] * k
+          }
+        }
+      }
+      if (!hit && dz < -1e-4) {
+        const t = camH / -dz
+        const gx = camX + dx * t
+        const gy = camY + dy * t
+        const dist = t * len
+        const fine = Math.exp(-dist / 14)
+        let n = 0.55 * vnoise(gx * 0.32, gy * 0.32) + 0.3 * vnoise(gx * 1.4 + 7.1, gy * 1.4 - 3.3) * (0.4 + 0.6 * fine) + 0.15 * vnoise(gx * 5.2, gy * 5.2) * fine
+        const rock = vnoise(gx * 2.6 + 11, gy * 2.6 + 5) > 0.83 ? 0.55 : 1
+        const hgt = (groundAt(gx, gy) - g0) * 0.06
+        n = Math.max(0, Math.min(1, n + hgt)) * rock
+        r = GROUND_A[0] + (GROUND_B[0] - GROUND_A[0]) * n
+        g = GROUND_A[1] + (GROUND_B[1] - GROUND_A[1]) * n
+        b = GROUND_A[2] + (GROUND_B[2] - GROUND_A[2]) * n
+        const fog = 1 - Math.exp(-dist * fogK)
+        r += (SKY_HORIZON[0] - r) * fog
+        g += (SKY_HORIZON[1] - g) * fog
+        b += (SKY_HORIZON[2] - b) * fog
+      } else if (!hit) {
+        const el = Math.max(0, dz / len)
+        const k = Math.pow(el, 0.55)
+        r = SKY_HORIZON[0] + (SKY_ZENITH[0] - SKY_HORIZON[0]) * k
+        g = SKY_HORIZON[1] + (SKY_ZENITH[1] - SKY_HORIZON[1]) * k
+        b = SKY_HORIZON[2] + (SKY_ZENITH[2] - SKY_HORIZON[2]) * k
+        const sun = (dx * sunX + dy * sunY + dz * sunZ) / len
+        if (sun > 0.9) {
+          const s = Math.pow((sun - 0.9) / 0.1, 6)
+          r += (255 - r) * s
+          g += (240 - g) * s
+          b += (215 - b) * s
+        }
+      }
+      if (dust) {
+        r = r * 0.55 + 150 * 0.45
+        g = g * 0.55 + 110 * 0.45
+        b = b * 0.55 + 80 * 0.45
+      }
+      // a soft lens vignette
+      const vg = 1 - 0.28 * (cx * cx / (tx * tx) + cy * cy / (ty * ty)) * 0.5
+      raw[o++] = Math.max(0, Math.min(255, r * vg)) | 0
+      raw[o++] = Math.max(0, Math.min(255, g * vg)) | 0
+      raw[o++] = Math.max(0, Math.min(255, b * vg)) | 0
+    }
+  }
+  return encodePng(w, h, raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -3077,6 +3599,17 @@ function roverStates() {
     sensors: r.sensors,
     scan: r.scan,
     brain: brainSummary(r),
+    ...(PROTOCOL >= 5 && {
+      stats: {
+        distance_m: r1(r.st.distance),
+        mapped_m2: r1(mappedM2(r)),
+        targets_found: foundBy(r).length,
+        samples_taken: r.st.samples,
+        hazards_met: r.st.hazards.length,
+        lifeforms_seen: r.st.herds.size,
+        replans: r.st.replans,
+      },
+    }),
     ...(PROTOCOL >= 4 && {
       track_id: r.trackId,
       samples: [...r.samples],
@@ -3133,6 +3666,16 @@ function tick() {
     stepHazards(dt)
     for (const r of sim.rovers) stepRover(r, dt)
     if (PROTOCOL >= 4) stepLifeforms(dt)
+  }
+  // v5 running totals: distance driven (a jump of 6 m or more is a teleport, not driving),
+  // and a dust storm counts as a hazard met by every rover out in it.
+  const dust = sim.hazards.find((h) => h.type === 'dust_storm' && h.active)
+  for (const r of sim.rovers) {
+    const d = Math.hypot(r.x - r.st.lastX, r.y - r.st.lastY)
+    if (d < 6) r.st.distance += d
+    r.st.lastX = r.x
+    r.st.lastY = r.y
+    if (dust && r.state !== 'charging') noteHazard(r, `dust:${dust.id}`, 'a dust storm', null, null)
   }
   for (const r of sim.rovers) sense(r)
   updateSensors(dtTotal)
@@ -3315,9 +3858,16 @@ const server = http.createServer((req, res) => {
   const cam = /^\/api\/camera\/([^/]+)\.jpg$/.exec(url.pathname)
   if (req.method === 'GET' && cam) {
     const id = decodeURIComponent(cam[1])
-    if (!sim.rovers.some((r) => r.id === id)) return sendJson(res, 404, { ok: false, error: `Unknown rover ${id}` })
-    // No renderer in the mock: the UI must show its "Camera unavailable" state.
-    return sendJson(res, 503, { ok: false, error: 'Camera rendering is not available in the mock sim' })
+    const rover = sim.rovers.find((r) => r.id === id)
+    if (!rover) return sendJson(res, 404, { ok: false, error: `Unknown rover ${id}` })
+    // Before v5 (or MOCK_CAMERA=off) there is no renderer: the UI shows "Camera unavailable".
+    if (!CAMERA_ON) return sendJson(res, 503, { ok: false, error: 'Camera rendering is not available in the mock sim' })
+    const size = (v, def, max) => (Number.isFinite(Number(v)) && Number(v) > 0 ? clamp(Math.round(Number(v)), 16, max) : def)
+    const w = size(url.searchParams.get('w'), 320, CAM_MAX_W)
+    const h = size(url.searchParams.get('h'), 240, CAM_MAX_H)
+    const png = renderCamera(rover, url.searchParams.get('view') === 'chase' ? 'chase' : 'fpv', w, h)
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length, 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' })
+    return res.end(png)
   }
   if (req.method === 'GET' && url.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' })

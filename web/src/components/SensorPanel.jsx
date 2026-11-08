@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { simStore, useSim } from '../state/store.js'
+import { appStore, simStore, useApp, useSim } from '../state/store.js'
 import { sampleGround } from '../state/simState.js'
-import { camDown, fetchCameraFrame } from '../net/connection.js'
 import { fixed } from '../lib/format.js'
 import { HAZARD, SIGNAL, instrumentStyle, kindStyle } from '../lib/theme.js'
 import { useHudRect } from '../lib/useHudRect.js'
@@ -9,110 +8,49 @@ import { Battery, StatePill, brainLevel, fmtMs } from './RoverBits.jsx'
 import { InstrumentIcon, Tubes } from './SampleBits.jsx'
 import { PlannerRow } from './Planner.jsx'
 import { reducedMotion } from '../scene/sceneConstants.js'
+import { RETRY_DOWN, cameraProblem, useCameraStream } from './useCameraStream.js'
+import '../styles/interaction.css'
+
+export { cameraProblem }
+export const CAM_RETRY_DOWN = RETRY_DOWN
 
 const num = (v) => typeof v === 'number' && Number.isFinite(v)
 const CAM_W = 320
 const CAM_H = 240
 const CAM_PERIOD = 250 // ms between frame starts: about 4 per second
-const CAM_RETRY_NET = 4000 // no connection: try again soon
-export const CAM_RETRY_DOWN = 30000 // 503 / 404: rendering is off on that machine, rarely comes back
+
+// Small square button with corner arrows: opens a large view of a panel section.
+export function ExpandButton({ onClick, label, className = '' }) {
+  return (
+    <button type="button" className={`ix-expand ${className}`} onClick={onClick} title={label} aria-label={label}>
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M9.5 2.5h4v4M13.5 2.5 9 7M6.5 13.5h-4v-4M2.5 13.5 7 9" />
+      </svg>
+    </button>
+  )
+}
+
+export const openCameraViewer = (rover, view) => appStore.patch({ modal: { kind: 'camera', rover, view } })
+export const openSensorDetail = (rover, focus) => appStore.patch({ modal: { kind: 'sensors', rover, focus, key: performance.now() } })
 
 // ---------------------------------------------------------------- camera
 
-export function cameraProblem(err) {
-  if (err.status === 404) return { title: 'Camera unavailable', sub: 'This rover has no camera feed' }
-  if (err.status === 0) return { title: 'Camera unavailable', sub: 'No connection to the sim' }
-  if (err.status === 503) return { title: 'Camera unavailable', sub: err.message && !/^HTTP/.test(err.message) ? err.message : 'Rendering is off on this machine' }
-  return { title: 'Camera unavailable', sub: err.message || 'The sim did not send a picture' }
-}
-
-// Polls GET /api/camera/{id}.jpg while mounted (panel open, this rover only). A new
-// request starts only after the previous one finished, so slow renders never pile up.
-// Frames are decoded before they are swapped in, so the picture never flashes blank.
+// Polls the camera while the panel is open (this rover only), about 4 frames a second.
+// Paused while a large viewer covers the panel, so only the visible view is fetched.
+// Clicking the picture (or the expand icon) opens the large camera viewer.
 function CameraFeed({ roverId }) {
   const [view, setView] = useState('fpv')
-  const [frame, setFrame] = useState(null)
-  const [problem, setProblem] = useState(() => (Date.now() < camDown.until ? camDown.problem : null))
-  const [waiting, setWaiting] = useState(true)
-  const [attempt, setAttempt] = useState(0)
-  const current = useRef(null)
-
-  useEffect(() => {
-    let stopped = false
-    let timer = null
-    let ctrl = null
-    setWaiting(true)
-    const loop = async () => {
-      if (stopped) return
-      const down = camDown.until - Date.now()
-      if (down > 0) {
-        setProblem(camDown.problem)
-        setWaiting(false)
-        timer = setTimeout(loop, down)
-        return
-      }
-      const started = performance.now()
-      ctrl = new AbortController()
-      try {
-        const blob = await fetchCameraFrame(roverId, view, CAM_W, CAM_H, ctrl.signal)
-        const url = URL.createObjectURL(blob)
-        try {
-          const img = new Image()
-          img.src = url
-          await img.decode()
-        } catch {
-          URL.revokeObjectURL(url)
-          throw Object.assign(new Error('The picture could not be decoded'), { status: -1 })
-        }
-        if (stopped) {
-          URL.revokeObjectURL(url)
-          return
-        }
-        const old = current.current
-        current.current = url
-        setFrame(url)
-        setProblem(null)
-        setWaiting(false)
-        if (old) setTimeout(() => URL.revokeObjectURL(old), 500)
-        timer = setTimeout(loop, Math.max(0, CAM_PERIOD - (performance.now() - started)))
-      } catch (err) {
-        if (stopped || err?.name === 'AbortError') return
-        const p = cameraProblem(err)
-        setProblem(p)
-        setWaiting(false)
-        if (err.status === 503 || err.status === 404) {
-          camDown.until = Date.now() + CAM_RETRY_DOWN
-          camDown.problem = p
-        }
-        timer = setTimeout(loop, err.status === 503 || err.status === 404 ? CAM_RETRY_DOWN : CAM_RETRY_NET)
-      }
-    }
-    loop()
-    return () => {
-      stopped = true
-      clearTimeout(timer)
-      ctrl?.abort()
-    }
-  }, [roverId, view, attempt])
-
-  const retry = () => {
-    camDown.until = 0
-    setProblem(null)
-    setAttempt((n) => n + 1)
-  }
-
-  // Drop the last frame when the panel closes (the parent remounts this per rover).
-  useEffect(
-    () => () => {
-      if (current.current) URL.revokeObjectURL(current.current)
-      current.current = null
-    },
-    [],
-  )
+  const covered = useApp((a) => !!a.modal)
+  const { frame, problem, waiting, retry } = useCameraStream({ roverId, view, w: CAM_W, h: CAM_H, period: CAM_PERIOD, enabled: !covered })
   const live = frame && !problem
+  const open = () => openCameraViewer(roverId, view)
   return (
     <figure className="sp-cam" data-state={live ? 'live' : problem ? 'off' : 'wait'}>
-      {frame && <img src={frame} alt={`${view === 'fpv' ? 'Onboard' : 'Chase'} camera view`} width={CAM_W} height={CAM_H} />}
+      {frame && (
+        <button type="button" className="ix-cam-hit" onClick={open} title="Open the large camera view" aria-label="Open the large camera view">
+          <img src={frame} alt={`${view === 'fpv' ? 'Onboard' : 'Chase'} camera view`} width={CAM_W} height={CAM_H} />
+        </button>
+      )}
       {!live && (
         <div className="sp-cam-off">
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -130,17 +68,20 @@ function CameraFeed({ roverId }) {
         </div>
       )}
       <figcaption className="sp-cam-bar">
-        <span className="sp-cam-live" data-live={live || undefined}>
+        <span className="sp-cam-live" data-live={(live && !covered) || undefined}>
           <i aria-hidden="true" />
-          {live ? 'Live' : 'Camera'}
+          {live ? (covered ? 'Paused' : 'Live') : 'Camera'}
         </span>
-        <span className="seg seg-xs" role="group" aria-label="Camera view">
-          <button type="button" aria-pressed={view === 'fpv'} onClick={() => setView('fpv')} title="Onboard camera on the mast">
-            FPV
-          </button>
-          <button type="button" aria-pressed={view === 'chase'} onClick={() => setView('chase')} title="Behind and above the rover">
-            Chase
-          </button>
+        <span className="ix-cam-tools">
+          <span className="seg seg-xs" role="group" aria-label="Camera view">
+            <button type="button" aria-pressed={view === 'fpv'} onClick={() => setView('fpv')} title="Onboard camera on the mast">
+              FPV
+            </button>
+            <button type="button" aria-pressed={view === 'chase'} onClick={() => setView('chase')} title="Behind and above the rover">
+              Chase
+            </button>
+          </span>
+          <ExpandButton onClick={open} label="Enlarge the camera" className="ix-expand-cam" />
         </span>
       </figcaption>
     </figure>
@@ -164,9 +105,13 @@ const bandOf = (dz) => {
 // Top-down view of the latest sweep, rover at the centre facing up. The dashed ring is
 // the current effective range (sensors.lidar_range): it shrinks in a dust storm.
 // Also shown on a clarification card when the rover's camera is unavailable.
-export function LidarRadar({ roverId, size, showRange = true }) {
+// Large detail view: `viewRange` fixes the radius shown (m), `trails` keeps that many
+// earlier sweeps fading out (they are in world metres, so they stay put as the rover
+// moves), `labels` writes the distance on the rings.
+export function LidarRadar({ roverId, size, showRange = true, viewRange = null, trails = 1, labels = false }) {
   const canvas = useRef(null)
-  const st = useRef({ ring: null, nominal: 8, scan: null, prev: null, prevPose: null, pose: null, last: 0 })
+  const st = useRef({ ring: null, nominal: 8, scan: null, prev: null, hist: [], prevPose: null, pose: null, last: 0, viewRange })
+  st.current.viewRange = viewRange
 
   useEffect(() => {
     const cv = canvas.current
@@ -179,6 +124,7 @@ export function LidarRadar({ roverId, size, showRange = true }) {
     S.ring = null
     S.scan = null
     S.prev = null
+    S.hist = []
     let raf = 0
     const draw = (now) => {
       raf = requestAnimationFrame(draw)
@@ -190,6 +136,10 @@ export function LidarRadar({ roverId, size, showRange = true }) {
       const range = num(r?.sensors?.lidar_range) && r.sensors.lidar_range > 0 ? r.sensors.lidar_range : null
       if (range) S.nominal = Math.max(S.nominal, range)
       if (r && r.scan !== S.scan) {
+        if (S.scan) {
+          S.hist.push(S.scan)
+          if (S.hist.length > trails) S.hist.shift()
+        }
         S.prev = S.scan
         S.scan = r.scan
       }
@@ -199,7 +149,8 @@ export function LidarRadar({ roverId, size, showRange = true }) {
       const W = size
       const c = W / 2
       const R = W / 2 - 6
-      const scale = R / (S.nominal * 1.08)
+      const shown = S.viewRange ?? S.nominal * 1.08
+      const scale = R / shown
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       ctx.clearRect(0, 0, W, W)
 
@@ -224,10 +175,11 @@ export function LidarRadar({ roverId, size, showRange = true }) {
         ctx.fill()
       }
 
-      // Range rings every 2 m and the cross
+      // Range rings (every 2 m on the small scope) and the cross
       ctx.strokeStyle = 'rgba(120, 150, 190, 0.18)'
       ctx.lineWidth = 1
-      for (let m = 2; m < S.nominal * 1.08; m += 2) {
+      const step = shown <= 5 ? 1 : shown <= 13 ? 2 : 4
+      for (let m = step; m < shown; m += step) {
         ctx.beginPath()
         ctx.arc(c, c, m * scale, 0, Math.PI * 2)
         ctx.stroke()
@@ -278,8 +230,11 @@ export function LidarRadar({ roverId, size, showRange = true }) {
           }
           ctx.globalAlpha = 1
         }
-        plot(S.prev, 0.28, 2)
-        plot(S.scan, 0.95, 2.6)
+        const big = Math.max(1, Math.sqrt(size / 214))
+        if (trails > 1) {
+          for (let h = 0; h < S.hist.length; h++) plot(S.hist[h], 0.08 + (0.3 * (h + 1)) / S.hist.length, 2 * big)
+        } else plot(S.prev, 0.28, 2)
+        plot(S.scan, 0.95, 2.6 * big)
       }
 
       // Effective range ring (only with a reading: no fake ring from an older sim)
@@ -294,6 +249,19 @@ export function LidarRadar({ roverId, size, showRange = true }) {
         ctx.setLineDash([])
       }
       ctx.restore()
+
+      // Distances on the rings, along the right-hand axis (large view)
+      if (labels) {
+        ctx.font = '600 11px "Archivo Variable", system-ui, sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'top'
+        ctx.fillStyle = 'rgba(170, 183, 199, 0.75)'
+        for (let m = step; m < shown; m += step) {
+          const x = c + m * scale
+          if (x > c + R - 10) break
+          ctx.fillText(`${m} m`, x, c + 4)
+        }
+      }
 
       // Bezel and heading tick
       ctx.strokeStyle = 'rgba(120, 150, 190, 0.45)'
@@ -316,7 +284,7 @@ export function LidarRadar({ roverId, size, showRange = true }) {
       ctx.stroke()
       ctx.fill()
 
-      if (!hasData || !showRange) return
+      if (!hasData || !showRange || ringPx > R - 8) return
       // Range label on the ring
       ctx.font = '600 11px "Archivo Variable", system-ui, sans-serif'
       ctx.textAlign = 'left'
@@ -332,7 +300,7 @@ export function LidarRadar({ roverId, size, showRange = true }) {
     }
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
-  }, [roverId, size, showRange])
+  }, [roverId, size, showRange, trails, labels])
 
   return <canvas ref={canvas} className="sp-radar-canvas" style={{ width: size, height: size }} aria-hidden="true" />
 }
@@ -373,6 +341,7 @@ function RadarBlock({ rover, size }) {
           {range === null ? '--' : `${fixed(range, 1)} m`}
         </span>
         <span className="sp-v sp-dim">{hits === null ? '' : `${hits} hits`}</span>
+        <ExpandButton onClick={() => openSensorDetail(rover.id, 'lidar')} label="Enlarge the LiDAR scope and sensor history" className="ix-expand-radar" />
       </div>
     </div>
   )
@@ -462,7 +431,10 @@ function Readouts({ rover, limit }) {
       <div className="sp-imu">
         <Attitude pitch={pitch} roll={roll} />
         <dl className="sp-dl" data-level={tiltLevel}>
-          <div className="sp-dl-head">IMU</div>
+          <div className="sp-dl-head ix-dl-head">
+            IMU
+            <ExpandButton onClick={() => openSensorDetail(rover.id, 'motion')} label="Enlarge: speed, slip, load, pitch and roll over time" className="ix-expand-read" />
+          </div>
           <div>
             <dt>Pitch</dt>
             <dd>{num(pitch) ? `${fixed(pitch, 1)} deg` : '--'}</dd>
@@ -633,9 +605,10 @@ export function SensorPanel({ roverId, onClose }) {
             <RadarBlock key={`radar:${roverId}`} rover={rover} size={radarSize} />
             <Readouts rover={rover} limit={limit} />
           </div>
-          <div className="sp-brains">
+          <div className="sp-brains ix-brains">
             <BrainRow brain={rover.brain} budget={budget} cycle={cycle} />
             {planner && <PlannerRow planner={planner} />}
+            <ExpandButton onClick={() => openSensorDetail(roverId, 'compute')} label="Enlarge: brain and Gemma time over the last minutes" className="ix-expand-brain" />
           </div>
         </>
       ) : (

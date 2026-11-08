@@ -95,6 +95,7 @@ class FleetMap:
         self.blocked[:, :m] = True
         self.blocked[:, -m:] = True
         self.known_count = 0
+        self.last_new = None                          # flat indices first hit by the latest sweep
         self.version = 0
         self.xs = (self.ox + np.arange(self.nx) * self.res).astype(np.float32)
         self.ys = (self.oy + np.arange(self.ny) * self.res).astype(np.float32)
@@ -114,8 +115,10 @@ class FleetMap:
     # ------------------------------------------------------------------ integration
     def integrate(self, pts: np.ndarray, t: float = 0.0) -> int:
         """pts: (N, 3) world hit points on terrain or rocks (one LiDAR sweep).
-        Returns the number of samples overwritten because the ground changed."""
+        Returns the number of samples overwritten because the ground changed. self.last_new holds the
+        flat indices of the samples this sweep hit for the first time (rover memory, answers.py)."""
         self.scan_seq += 1
+        self.last_new = None
         if len(pts) == 0:
             return 0
         fi = (pts[:, 0] - self.ox) / self.res
@@ -166,6 +169,7 @@ class FleetMap:
             return 0
         f = flat[upd]
         newly = ~self.known.ravel()[f]
+        self.last_new = f[newly]
         self.hz.ravel()[f] = z[upd]
         self.hdx.ravel()[f] = dx[upd]
         self.hdy.ravel()[f] = dy[upd]

@@ -35,9 +35,9 @@ LEGACY = dict(map_size=MAP_SIZE, water=False, spires=False, lifeforms=False, dri
               sniffer_s=3.0, swab_s=3.0, sample_capacity=99, num_boulders=12)
 PLANNER_KEYS = {"model", "state", "online", "calls", "ok", "fallbacks", "avg_ms", "p95_ms", "last_ms", "budget_ms",
                 "over_budget"}
-CHAT_KEYS = {"id", "t", "from", "to", "text", "kind", "source", "request_id"}
+CHAT_KEYS = {"id", "t", "from", "to", "text", "kind", "source", "request_id", "reply_to"}    # reply_to: protocol v5
 REQUEST_KEYS = {"id", "rover", "t", "question", "options", "default", "expires_in", "image"}
-KINDS = {"command", "ack", "refuse", "question", "answer", "info"}
+KINDS = {"command", "ack", "refuse", "question", "answer", "info", "reply"}
 
 
 # ====================================================================== helpers

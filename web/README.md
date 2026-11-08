@@ -12,7 +12,7 @@ Vite + React + three.js (@react-three/fiber, drei). Node 22.
 npm install
 npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
                   #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, MOCK_GEMMA=offline, MOCK_PROTOCOL=2|3,
-                  #   MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE)
+                  #   MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE, MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off)
 npm run dev       # in a second terminal, then open http://localhost:5173
 ```
 
@@ -75,12 +75,39 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   placement, closes the sensor panel (then returns to the overview), `0` for the overview,
   `/` for the message box.
 - Reset sim asks for confirmation, then restarts the sim with a random seed.
+- Following: orbit (left drag) and zoom keep following the rover. A pan (right drag, or a
+  modifier with the left button, or two fingers) or a click on an event that flies the
+  camera elsewhere pauses the follow right where you put the camera: the rover stays
+  selected with its panel open, its Follow button turns dashed with a pause mark, and a
+  "Back to Rover 2" pill appears (click it, press `F`, click the rover or its Follow button)
+  to glide back. While paused, `F` resumes instead of toggling Frontiers.
+- Camera viewer: click the camera picture (or its expand icon) for a large view, about 80%
+  of the screen. It asks for frames sized to the viewer and the screen's pixel density (up
+  to 1280 x 720), about 3 a second, one at a time, and the panel's small feed pauses
+  meanwhile. FPV or Chase, rover buttons (`1` to `9`), scroll to zoom around the cursor,
+  drag to pan, double-click to reset, `V` switches view, `Esc` or a click outside closes.
+  A camera HUD shows rover, heading tape, pitch ladder (FPV), speed, position, state,
+  pitch and roll, battery, sim time, and whether the picture is live or how stale it is.
+- Sensor detail: the expand buttons on the LiDAR scope, the IMU section and the compute
+  rows open a large view: a big scope (scroll or the minus and plus buttons change the range
+  shown; earlier sweeps fade out), the rover's running totals (version 5 `stats`), and
+  charts of the last 1, 2 or 5 minutes: speed, wheel slip, motor load, pitch and roll,
+  brain time against its budget, Gemma latency against its budget, battery, LiDAR range.
+  The history is recorded in the browser from every tick for every rover (6 minutes,
+  fixed-size buffers), so switching rover shows its past straight away.
 - The overview keeps the explored area in frame, in the space the panels leave free.
   Dragging or zooming takes over the camera until you press Off (or the sim resets).
 - Gemma (top of the sidebar): the local model's state and average latency ("Gemma 4 E2B,
   Ready · 0.4 s"; amber while warming up, "rules only" when offline or off). Hover or click
   it for calls, fallbacks, p95 and the budget. The sensor panel's compute section has a
   second bar for it under the brain bar: average filled, p95 tick, budget line.
+- Asking the rovers (version 5): Comms has a row of question chips for the addressee (the
+  selected rover, else All): "What have you explored?", "What have you found?", "How's your
+  battery?", "Why are you going there?", "Seen any life?", "Any problems?", or type your own.
+  Until something answers, the question shows "Rover 2 is thinking" (dropped quietly after
+  15 s). Replies (`kind: "reply"`) quote the question they answer (`reply_to`; click to jump
+  to it, hover to light both), in the rover's colour or as the fleet; several rovers
+  answering the same question are tied together under the first.
 - Events and Comms (tabs under the rover cards): the event log tags decisions Gemma made
   ("Gemma") and ones the operator asked for ("Operator"). Comms is the chat with the fleet:
   pick All or a rover, type and press Enter (or `/` from anywhere to jump there; Up recalls
@@ -100,8 +127,8 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   from `init.map` (120 m by default now).
 
 The mock implements all of version 2 (sensors from a ray-marched LiDAR over its heightmap,
-brain timings, `POST /api/hazard` with plausible reactions). Its camera endpoint answers
-503 on purpose. `node scripts/v2-shots.mjs` (mock and preview running) clicks through every
+brain timings, `POST /api/hazard` with plausible reactions). With `MOCK_PROTOCOL=4` or
+lower (or `MOCK_CAMERA=off`) its camera endpoint answers 503 on purpose. `node scripts/v2-shots.mjs` (mock and preview running) clicks through every
 hazard and saves screenshots; set `WIDTH` and `HEIGHT` for other sizes.
 
 It also implements version 3: Gemma warms up for about 10 s, then answers in 300 to 900 ms;
@@ -113,6 +140,19 @@ ask after a rockfall or soft sand and once about 40 s in, with a 20 s countdown;
 version 2 sim. Test hooks, mock only: `POST /api/_mock/planner {"state": "offline"}`,
 `POST /api/_mock/ask {"rover": "r2"}`, `POST /api/_mock/battery {"rover": "r1", "battery": 0.3}`.
 `node scripts/v3-shots.mjs` drives all of it through the UI and saves screenshots.
+
+Version 5 in the mock (the default): questions are told apart from orders (question words,
+a trailing "?", "tell me", "report", "status"; "can you go to 10, 5?" stays an order) and
+answered after a short think with `kind: "reply"` and `reply_to`, from the mock's own state:
+explored area and where, finds, samples, battery and range, why it is going where it is,
+lifeforms, water, hazards met, location, status, and "I haven't sensed that" for anything
+else. One rover answers when addressed, the fleet answers otherwise, and every rover answers
+"everyone, report battery". Acks and refusals carry `reply_to` too. Rovers send `stats`. The
+camera answers a PNG drawn on the fly at the requested size (up to 1280 x 720): hazy sky,
+noisy ground in perspective that moves with the rover, horizon tilted by roll and pitch, the
+rover itself in the chase view. `MOCK_ANSWER_DELAY_MS` adds thinking time (for screenshots).
+`node scripts/v5-shots.mjs` (mock started with `MOCK_ANSWER_DELAY_MS=11000`, preview running)
+drives follow and pan, the camera viewer, the sensor view and Comms, and saves screenshots.
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

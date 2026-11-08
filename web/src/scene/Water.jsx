@@ -3,9 +3,13 @@ import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import { nowSeconds, simStore, useSim } from '../state/store.js'
 import { sampleGroundNear } from '../state/simState.js'
+import { useGraphics } from '../state/visualPrefs.js'
 import { WATER } from '../lib/theme.js'
 import { FatPolyline } from './fatLine.js'
-import { SUN_DIR, reducedMotion } from './sceneConstants.js'
+import { reducedMotion } from './sceneConstants.js'
+import { skyEnvironment } from './sky.js'
+import { pointInPoly } from './ground.js'
+import { waterShared } from './waterShared.js'
 
 // Liquid water (PROTOCOL.md version 4). The true bodies come from `features.water` (flat
 // surface at `level`, closed outline); the fleet's identified water from `fleet.water_zones`
@@ -15,149 +19,174 @@ import { SUN_DIR, reducedMotion } from './sceneConstants.js'
 // the whole true surface shows, the part the fleet has not identified a little fainter,
 // with a dashed outline.
 //
-// The surface is one cheap shader: no extra vertices, the waves are an animated normal
-// (a few travelling sines), plus a sun highlight, sparse twinkling glints and fresnel.
+// The surface is a physically based, nearly mirror-smooth liquid: it reflects the hazy sky
+// (fresnel, so it brightens towards grazing angles), with travelling waves and fine ripples
+// in the normal, deep and dark in the middle, lighter over the shallows near the shore,
+// and the sun's glints. Around identified water the terrain is wet and darker (shore mask,
+// shared with Terrain.jsx).
 
-const vertexShader = /* glsl */ `
-varying vec3 vWorld;
-void main() {
-  vec4 w = modelMatrix * vec4(position, 1.0);
-  vWorld = w.xyz;
-  gl_Position = projectionMatrix * viewMatrix * w;
-}
+const vertexCommon = /* glsl */ `
+varying vec3 vWorldW;
 `
-
-const fragmentShader = /* glsl */ `
+const fragmentCommon = /* glsl */ `
 uniform float uTime;
 uniform vec3 uDeep;
-uniform vec3 uMid;
+uniform vec3 uShallow;
 uniform vec3 uGlint;
-uniform vec3 uSunDir;
 uniform sampler2D uMask;
+uniform sampler2D uDepth;
 uniform vec4 uMaskMap; // ox, oy, 1 / res, unused
 uniform vec2 uMaskSize; // nx, ny
 uniform float uClip; // 1: only where the fleet identified water
-uniform float uUnknownAlpha; // opacity factor for unidentified water when not clipped
-uniform vec3 uFogColor;
-uniform float uFogNear;
-uniform float uFogFar;
-varying vec3 vWorld;
+uniform float uUnknownAlpha;
+uniform float uRipples;
+varying vec3 vWorldW;
 
-float hash(vec2 p) {
+float whash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
 }
 
-// A few travelling waves (world xz, metres): height in x, its gradient in yz.
-vec3 waves(vec2 p, float t) {
+// A few travelling waves (world xz, metres): height in x, its gradient in yz. Each train
+// fades out once a pixel (px metres) covers too much of its wavelength, so distant and
+// grazing water does not alias into a pattern.
+float waa(float f, float px) {
+  return 1.0 - smoothstep(0.12, 0.4, f * px * 0.159);
+}
+vec3 waves(vec2 p, float t, float px) {
   vec3 w = vec3(0.0);
   vec2 d = vec2(0.928, 0.371);
   float ph = dot(d, p) * 1.6 + t * 1.25;
-  w += vec3(sin(ph), d * 1.6 * cos(ph)) * 0.34;
+  w += vec3(sin(ph), d * 1.6 * cos(ph)) * 0.34 * waa(1.6, px);
   d = vec2(-0.514, 0.857);
   ph = dot(d, p) * 2.3 + t * 1.6;
-  w += vec3(sin(ph), d * 2.3 * cos(ph)) * 0.26;
+  w += vec3(sin(ph), d * 2.3 * cos(ph)) * 0.26 * waa(2.3, px);
   d = vec2(0.196, -0.981);
   ph = dot(d, p) * 3.7 + t * 2.1;
-  w += vec3(sin(ph), d * 3.7 * cos(ph)) * 0.18;
+  w += vec3(sin(ph), d * 3.7 * cos(ph)) * 0.18 * waa(3.7, px);
   d = vec2(-0.958, -0.287);
   ph = dot(d, p) * 5.9 + t * 2.9;
-  w += vec3(sin(ph), d * 5.9 * cos(ph)) * 0.12;
-  return w; // height about -0.9 to 0.9
+  w += vec3(sin(ph), d * 5.9 * cos(ph)) * 0.12 * waa(5.9, px);
+  return w;
 }
 
-void main() {
-  vec2 wxy = vec2(vWorld.x, -vWorld.z);
-  vec2 uv = (vec2((wxy.x - uMaskMap.x) * uMaskMap.z, (wxy.y - uMaskMap.y) * uMaskMap.z) + 0.5) / uMaskSize;
-  float mask = texture2D(uMask, uv).r;
-  if (uClip > 0.5 && mask < 0.03) discard;
-
-  vec2 p = vWorld.xz;
-  vec3 w = waves(p, uTime);
-  float hgt = w.x;
-  vec3 n = normalize(vec3(-w.y * 0.16, 1.0, -w.z * 0.16));
-  vec3 v = normalize(cameraPosition - vWorld);
-  vec3 h = normalize(uSunDir + v);
-  float ndh = max(dot(n, h), 0.0);
-  float fres = pow(1.0 - max(dot(n, v), 0.0), 3.0);
-
-  // Slow swirls of deeper and lighter water, lighter towards grazing angles.
-  float swirl = 0.5 + 0.5 * sin(p.x * 0.23 + uTime * 0.17) * sin(p.y * 0.19 - uTime * 0.13);
-  vec3 col = mix(uDeep, uMid, 0.3 + 0.28 * swirl + 0.4 * fres);
-  // The waves themselves, visible from above: lit crests, darker troughs.
-  col *= 0.78 + 0.42 * max(dot(n, uSunDir), 0.0);
-  // (patchy, so the crests do not line up into a regular lattice from afar)
-  float patchy = 0.35 + 0.65 * (0.5 + 0.5 * sin(p.x * 0.41 - uTime * 0.21) * sin(p.y * 0.37 + p.x * 0.11 + uTime * 0.16));
-  col = mix(col, uMid * 1.25, 0.28 * patchy * smoothstep(0.25, 0.95, hgt));
-  col *= 1.0 - 0.18 * smoothstep(0.2, 0.9, -hgt);
-  // Thin, wavy bright crest lines drifting across (one wave train bent by two slow ones).
-  float bend = 1.2 * sin(dot(p, vec2(-0.5, 0.87)) * 1.3 + uTime * 0.5) + 0.8 * sin(dot(p, vec2(0.9, 0.4)) * 0.7 - uTime * 0.3);
-  float rip = abs(sin(dot(p, vec2(0.8, 0.6)) * 2.4 + bend + uTime * 0.9));
-  col += uGlint * 0.07 * (1.0 - smoothstep(0.0, 0.13, rip));
-
-  // Sun highlight, and sparse glints that twinkle where the waves face the light.
-  float spec = pow(ndh, 90.0) * 1.1 + pow(ndh, 18.0) * 0.12;
-  vec2 q = p * 2.2;
-  vec2 id = floor(q);
-  vec2 f = fract(q) - 0.5;
-  float r = hash(id);
-  vec2 off = vec2(hash(id + 3.1), hash(id + 7.7)) - 0.5;
-  float tw = pow(max(0.0, sin(uTime * 2.4 + r * 40.0)), 18.0);
-  float glint = step(0.86, r) * tw * (1.0 - smoothstep(0.02, 0.09, length(f - off * 0.6))) * (0.35 + 0.65 * smoothstep(0.75, 0.98, ndh + 0.2));
-  col += uGlint * (spec + glint * 0.9);
-
-  // The edge of what the fleet has identified: a soft light rim.
-  float rim = uClip > 0.5 ? 1.0 - smoothstep(0.2, 0.75, mask) : 0.0;
-  col = mix(col, uGlint, rim * 0.28);
-
-  float known = uClip > 0.5 ? smoothstep(0.03, 0.5, mask) : mix(uUnknownAlpha, 1.0, smoothstep(0.03, 0.5, mask));
-  float alpha = (0.8 + 0.18 * fres) * known;
-
-  float fogF = clamp((length(vWorld - cameraPosition) - uFogNear) / max(uFogFar - uFogNear, 1e-3), 0.0, 1.0);
-  col = mix(col, uFogColor, fogF);
-  gl_FragColor = vec4(col, alpha);
+// Fine capillary ripples: short waves in many directions, patchy.
+vec2 ripples(vec2 p, float t) {
+  vec2 g = vec2(0.0);
+  for (int k = 0; k < 5; k++) {
+    float a = float(k) * 1.257 + 0.4;
+    vec2 d = vec2(cos(a), sin(a));
+    float f = 9.0 + float(k) * 3.7;
+    float ph = dot(d, p) * f + t * (3.0 + float(k) * 0.7);
+    g += d * f * cos(ph) * 0.004;
+  }
+  return g;
 }
 `
 
-// The shader writes straight to the screen (flat, linear canvas): sRGB values in.
-const display3 = (hex) => {
-  const c = new THREE.Color(hex).getRGB({ r: 0, g: 0, b: 0 }, THREE.SRGBColorSpace)
-  return new THREE.Vector3(c.r, c.g, c.b)
-}
+// Replaces <map_fragment>.
+const surface = /* glsl */ `
+  vec2 wxy = vec2(vWorldW.x, -vWorldW.z);
+  vec2 muv = (vec2((wxy.x - uMaskMap.x) * uMaskMap.z, (wxy.y - uMaskMap.y) * uMaskMap.z) + 0.5) / uMaskSize;
+  float mask = texture2D(uMask, muv).r;
+  if (uClip > 0.5 && mask < 0.03) discard;
+  float depth = texture2D(uDepth, muv).r;
+  vec2 wpw = vWorldW.xz;
+  // Fade the small waves out where a pixel covers more than they can show (no shimmer).
+  vec2 fw = fwidth(wpw);
+  float px = max(fw.x, fw.y);
+  float near = 1.0 - smoothstep(0.04, 0.22, px);
+  vec3 wv = waves(wpw, uTime, px);
+  vec2 grad = wv.yz * 0.05;
+  float patchy = 0.5 + 0.5 * sin(wpw.x * 0.41 - uTime * 0.21) * sin(wpw.y * 0.37 + wpw.x * 0.11 + uTime * 0.16);
+  grad += ripples(wpw, uTime) * uRipples * (0.3 + 0.7 * patchy) * near * near;
+  vec3 wN = normalize(vec3(-grad.x, 1.0, -grad.y));
+  // Deep water is dark; the shallows (near the shore) show a lighter, greener body colour.
+  vec3 body = mix(uShallow, uDeep, smoothstep(0.0, 0.85, depth));
+  float swirl = 0.5 + 0.5 * sin(wpw.x * 0.23 + uTime * 0.17) * sin(wpw.y * 0.19 - uTime * 0.13);
+  body *= 0.85 + 0.3 * swirl;
+  diffuseColor.rgb = body;
+  float known = uClip > 0.5 ? smoothstep(0.03, 0.5, mask) : mix(uUnknownAlpha, 1.0, smoothstep(0.03, 0.5, mask));
+  diffuseColor.a = known * mix(0.82, 0.96, smoothstep(0.0, 0.3, depth));
+  float wRim = uClip > 0.5 ? 1.0 - smoothstep(0.2, 0.75, mask) : 0.0;
+`
 
-function createMaterial(maskTex, map) {
-  return new THREE.ShaderMaterial({
-    vertexShader,
-    fragmentShader,
+const glints = /* glsl */ `
+  {
+    vec3 vdir = normalize(cameraPosition - vWorldW);
+    vec2 q = vWorldW.xz * 2.2;
+    vec2 id = floor(q);
+    vec2 f = fract(q) - 0.5;
+    float r = whash(id);
+    vec2 off = vec2(whash(id + 3.1), whash(id + 7.7)) - 0.5;
+    float tw = pow(max(0.0, sin(uTime * 2.4 + r * 40.0)), 18.0);
+    float glint = step(0.88, r) * tw * (1.0 - smoothstep(0.02, 0.08, length(f - off * 0.6)));
+    gl_FragColor.rgb += uGlint * glint * 0.4 * uRipples * (1.0 - smoothstep(0.05, 0.2, length(fwidth(vWorldW.xz))));
+    // The edge of what the fleet has identified: a soft light rim.
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, uGlint, wRim * 0.18);
+  }
+`
+
+function createMaterial(maskTex, depthTex, map) {
+  const m = new THREE.MeshStandardMaterial({
+    color: '#ffffff',
+    roughness: 0.05,
+    metalness: 0,
     transparent: true,
     depthWrite: true,
-    side: THREE.DoubleSide,
-    uniforms: {
-      uTime: { value: 0 },
-      uDeep: { value: display3(WATER.deep) },
-      uMid: { value: display3(WATER.mid) },
-      uGlint: { value: display3(WATER.glint) },
-      uSunDir: { value: new THREE.Vector3(...SUN_DIR).normalize() },
-      uMask: { value: maskTex },
-      uMaskMap: { value: new THREE.Vector4(map.ox, map.oy, 1 / map.res, 0) },
-      uMaskSize: { value: new THREE.Vector2(map.nx, map.ny) },
-      uClip: { value: 1 },
-      uUnknownAlpha: { value: 0.55 },
-      uFogColor: { value: new THREE.Color() },
-      uFogNear: { value: 1e5 },
-      uFogFar: { value: 1e6 },
-    },
+    envMap: skyEnvironment(),
+    envMapIntensity: 2.2,
   })
+  m.userData.realistic = true
+  const display3 = (hex) => new THREE.Color(hex)
+  const uniforms = {
+    uTime: { value: 0 },
+    uDeep: { value: display3('#0a2a3c') },
+    uShallow: { value: display3('#21606a') },
+    uGlint: { value: (() => {
+      const c = new THREE.Color(WATER.glint).getRGB({ r: 0, g: 0, b: 0 }, THREE.SRGBColorSpace)
+      return new THREE.Vector3(c.r, c.g, c.b)
+    })() },
+    uMask: { value: maskTex },
+    uDepth: { value: depthTex },
+    uMaskMap: { value: new THREE.Vector4(map.ox, map.oy, 1 / map.res, 0) },
+    uMaskSize: { value: new THREE.Vector2(map.nx, map.ny) },
+    uClip: { value: 1 },
+    uUnknownAlpha: { value: 0.55 },
+    uRipples: { value: 1 },
+  }
+  m.userData.uniforms = uniforms
+  m.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms)
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${vertexCommon}`)
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vWorldW = (modelMatrix * vec4(transformed, 1.0)).xyz;')
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${fragmentCommon}`)
+      .replace('#include <map_fragment>', surface)
+      .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n  normal = normalize((viewMatrix * vec4(wN, 0.0)).xyz);')
+      .replace('#include <fog_fragment>', `#include <fog_fragment>\n${glints}`)
+  }
+  m.customProgramCacheKey = () => 'redshift-water-1'
+  return m
 }
 
-// One texel per map sample: coverage of the identified discs (antialiased edges).
+// One texel per map sample: coverage of the identified discs (antialiased edges), and the
+// wet shore around it for the terrain.
 class ZoneMask {
   constructor(map) {
     this.map = map
-    this.data = new Uint8Array(map.nx * map.ny)
+    const n = map.nx * map.ny
+    this.data = new Uint8Array(n)
     this.texture = new THREE.DataTexture(this.data, map.nx, map.ny, THREE.RedFormat, THREE.UnsignedByteType)
     this.texture.magFilter = THREE.LinearFilter
     this.texture.minFilter = THREE.LinearFilter
     this.texture.needsUpdate = true
+    this.shoreData = new Uint8Array(n)
+    this.tmp = new Float32Array(n)
+    this.shore = new THREE.DataTexture(this.shoreData, map.nx, map.ny, THREE.RedFormat, THREE.UnsignedByteType)
+    this.shore.magFilter = THREE.LinearFilter
+    this.shore.minFilter = THREE.LinearFilter
+    this.shore.needsUpdate = true
   }
 
   // zones: [[x, y, r]], radius(k) gives the (possibly animated) radius of zone k.
@@ -188,9 +217,97 @@ class ZoneMask {
     this.texture.needsUpdate = true
   }
 
+  // Wet ground: the coverage spread out about 2.5 m with a falloff (separable max filter).
+  drawShore() {
+    const { nx, ny } = this.map
+    const R = 5
+    const src = this.data
+    const tmp = this.tmp
+    const out = this.shoreData
+    for (let j = 0; j < ny; j++) {
+      const row = j * nx
+      for (let i = 0; i < nx; i++) {
+        let m = 0
+        const a = Math.max(0, i - R)
+        const b = Math.min(nx - 1, i + R)
+        for (let q = a; q <= b; q++) {
+          const v = src[row + q]
+          if (!v) continue
+          const w = v * (1 - Math.abs(q - i) / (R + 1))
+          if (w > m) m = w
+        }
+        tmp[row + i] = m
+      }
+    }
+    for (let i = 0; i < nx; i++) {
+      for (let j = 0; j < ny; j++) {
+        let m = 0
+        const a = Math.max(0, j - R)
+        const b = Math.min(ny - 1, j + R)
+        for (let q = a; q <= b; q++) {
+          const v = tmp[q * nx + i]
+          if (!v) continue
+          const w = v * (1 - Math.abs(q - j) / (R + 1))
+          if (w > m) m = w
+        }
+        out[j * nx + i] = m
+      }
+    }
+    this.shore.needsUpdate = true
+  }
+
   dispose() {
     this.texture.dispose()
+    this.shore.dispose()
   }
+}
+
+// How far inside each true body a sample is (0 at the shore, 1 at 6 m and more): the
+// shallows are lighter. Ground truth, used only to colour water that is drawn anyway.
+function depthTexture(map, bodies) {
+  const { nx, ny, res, ox, oy } = map
+  const data = new Uint8Array(nx * ny)
+  for (const b of bodies) {
+    const poly = b.outline
+    let x0 = Infinity
+    let x1 = -Infinity
+    let y0 = Infinity
+    let y1 = -Infinity
+    for (const [x, y] of poly) {
+      x0 = Math.min(x0, x)
+      x1 = Math.max(x1, x)
+      y0 = Math.min(y0, y)
+      y1 = Math.max(y1, y)
+    }
+    const i0 = Math.max(0, Math.floor((x0 - ox) / res))
+    const i1 = Math.min(nx - 1, Math.ceil((x1 - ox) / res))
+    const j0 = Math.max(0, Math.floor((y0 - oy) / res))
+    const j1 = Math.min(ny - 1, Math.ceil((y1 - oy) / res))
+    for (let j = j0; j <= j1; j++) {
+      const y = oy + j * res
+      for (let i = i0; i <= i1; i++) {
+        const x = ox + i * res
+        if (!pointInPoly(x, y, poly)) continue
+        let best = Infinity
+        for (let a = 0, c = poly.length - 1; a < poly.length; c = a++) {
+          const [ax, ay] = poly[c]
+          const [bx, by] = poly[a]
+          const dx = bx - ax
+          const dy = by - ay
+          const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy || 1)))
+          const ex = ax + dx * t - x
+          const ey = ay + dy * t - y
+          best = Math.min(best, ex * ex + ey * ey)
+        }
+        data[j * nx + i] = Math.max(data[j * nx + i], Math.round(Math.min(1, Math.sqrt(best) / 6) * 255))
+      }
+    }
+  }
+  const tex = new THREE.DataTexture(data, nx, ny, THREE.RedFormat, THREE.UnsignedByteType)
+  tex.magFilter = THREE.LinearFilter
+  tex.minFilter = THREE.LinearFilter
+  tex.needsUpdate = true
+  return tex
 }
 
 function surfaceGeometry(body) {
@@ -243,19 +360,32 @@ export function Water({ reality }) {
   const gen = useSim((s) => s.gen)
   const bodies = useSim((s) => s.features.water)
   const zonesRaw = useSim((s) => s.fleet.water_zones)
-  const scene = useThree((s) => s.scene)
+  const graphics = useGraphics()
   const zones = useMemo(() => (Array.isArray(zonesRaw) ? zonesRaw.filter(okZone) : []), [zonesRaw])
   const keys = useMemo(() => zones.map((z) => `${z[0]},${z[1]},${z[2]}`), [zones])
   const mask = useMemo(() => (map ? new ZoneMask(map) : null), [map])
-  const material = useMemo(() => (mask ? createMaterial(mask.texture, map) : null), [mask, map])
+  const depth = useMemo(() => (map ? depthTexture(map, bodies) : null), [map, bodies])
+  const material = useMemo(() => (mask && depth ? createMaterial(mask.texture, depth, map) : null), [mask, depth, map])
   const geos = useMemo(() => bodies.map(surfaceGeometry), [bodies])
   useEffect(() => () => mask?.dispose(), [mask])
+  useEffect(() => () => depth?.dispose(), [depth])
   useEffect(() => () => material?.dispose(), [material])
   useEffect(() => () => geos.forEach((g) => g.dispose()), [geos])
+  useEffect(() => {
+    if (!mask) return
+    waterShared.shore = mask.shore
+    waterShared.map = map
+    return () => {
+      if (waterShared.shore === mask.shore) {
+        waterShared.shore = null
+        waterShared.map = null
+      }
+    }
+  }, [mask, map])
 
   // When each disc first appeared (zones there when the view opened do not animate).
   const born = useRef({ gen: -1, at: new Map(), opened: 0 })
-  const anim = useRef({ zones: null, animating: false })
+  const anim = useRef({ zones: null, animating: false, frame: 0 })
   if (born.current.gen !== gen) born.current = { gen, at: new Map(), opened: nowSeconds() }
 
   // Per disc, its grown radius right now (written into `radii`, read by the mask).
@@ -279,24 +409,20 @@ export function Water({ reality }) {
       if (age < 1) animating = true
       radii.current[k] = age >= 1 ? zones[k][2] : zones[k][2] * (1 - Math.pow(1 - Math.max(0, age), 3))
     }
-    // Redraw the mask only when the zones changed or a disc is still spreading.
-    if (anim.current.zones !== zones || animating || anim.current.animating) {
-      anim.current.zones = zones
-      anim.current.animating = animating
+    // Redraw the mask only when the zones changed or a disc is still spreading; the shore
+    // follows (a few times a second while spreading, then once when it settles).
+    const a = anim.current
+    const changed = a.zones !== zones
+    if (changed || animating || a.animating) {
       mask.draw(zones, radiusOf)
+      if (changed || !animating || a.frame++ % 6 === 0) mask.drawShore()
+      a.zones = zones
+      a.animating = animating
     }
-    const u = material.uniforms
+    const u = material.userData.uniforms
     u.uTime.value = reducedMotion ? 0 : now
     u.uClip.value = reality ? 0 : 1
-    const fog = scene.fog
-    if (fog && fog.isFog) {
-      u.uFogColor.value.copy(fog.color)
-      u.uFogNear.value = fog.near
-      u.uFogFar.value = fog.far
-    } else {
-      u.uFogNear.value = 1e5
-      u.uFogFar.value = 1e6
-    }
+    u.uRipples.value = graphics === 'high' ? 1 : 0
   })
 
   if (!material) return null
@@ -304,7 +430,7 @@ export function Water({ reality }) {
   return (
     <group>
       {bodies.map((b, k) => (
-        <mesh key={`${gen}:${b.id}`} geometry={geos[k]} material={material} renderOrder={1} frustumCulled={false} />
+        <mesh key={`${gen}:${b.id}`} geometry={geos[k]} material={material} renderOrder={1} frustumCulled={false} receiveShadow />
       ))}
       {reality && bodies.map((b) => <WaterOutline key={`${gen}:${b.id}:line`} body={b} />)}
     </group>

@@ -17,7 +17,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from redshift.config import Config  # noqa: E402
-from redshift.world import physics_options_xml, rover_actuator_xml, rover_body_xml, rover_spawn_height  # noqa: E402
+from redshift.world import (physics_options_xml, rover_actuator_xml, rover_body_xml,  # noqa: E402
+                            rover_materials_xml, rover_spawn_height)
 
 
 def ramp_model(cfg: Config, angle_deg: float, yaw: float = 0.0, start_x: float = -4.0, on_ramp: bool = False):
@@ -50,7 +51,7 @@ def ramp_model(cfg: Config, angle_deg: float, yaw: float = 0.0, start_x: float =
 <mujoco>
   <compiler angle="radian" autolimits="true"/>
   {physics_options_xml(cfg)}
-  <asset><hfield name="ramp" nrow="{ny}" ncol="{nx}" size="{hx} {hy} {rz} 0.5"/></asset>
+  <asset><hfield name="ramp" nrow="{ny}" ncol="{nx}" size="{hx} {hy} {rz} 0.5"/>{rover_materials_xml()}</asset>
   <worldbody>
     <geom type="hfield" hfield="ramp" pos="{-10 + hx} 0 {lo}" friction="{cfg.terrain_friction} 0.005 0.0001"/>
     {body}

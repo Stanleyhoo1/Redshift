@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import { appStore, nowSeconds, simStore, useSim } from '../state/store.js'
@@ -6,28 +6,33 @@ import { simTimeNow } from '../state/simState.js'
 import { SPIRE } from '../lib/theme.js'
 import { glowTexture } from './textures.js'
 import { groundAt, hashStr, knownAt } from './ground.js'
+import { mulberry } from './proceduralTextures.js'
 import { reducedMotion } from './sceneConstants.js'
+import { skyEnvironment } from './sky.js'
 
 // Alien crystal spires (PROTOCOL.md version 4, `features.spires`). One instanced crystal
-// per spire plus a few shards at its foot and a soft glow at the tip, so the whole field
-// is three draw calls. A spire shows once the fleet knows the ground under it (it grows
-// out of the ground as the terrain reveals) or with Reality on. A `spire_fall` hazard tips
-// it over from standing to lying between its base and tip in about 1.5 s, with a dust
-// puff along its length when it lands.
+// per spire plus a cluster of shards at its foot, a soft glow at the tip and a pool of its
+// light on the ground, so the whole field is a handful of draw calls. The crystal is
+// glassy: it reflects the hazy sky on its facets (brighter at grazing angles, fresnel) and
+// glows from inside, strongest towards the tip. A spire shows once the fleet knows the
+// ground under it (it grows out of the ground as the terrain reveals) or with Reality on.
+// A `spire_fall` hazard tips it over from standing to lying between its base and tip in
+// about 1.5 s, with a dust puff along its length when it lands.
 
 const MAX = 96
-const SHARDS = 3
+const SHARDS = 6
 const FALL_S = 1.5
 const GROW_S = 0.8
 
-// A faceted hexagonal crystal from y = 0 to 1, radius 1 at its foot.
+// A hexagonal crystal from y = 0 to 1, radius 1 at its foot: a slightly tapering prism
+// with a pointed termination.
 function crystalGeometry() {
   const pts = [
     [0.0, 0],
-    [1.0, 0],
-    [1.08, 0.1],
-    [0.78, 0.62],
-    [0.46, 0.86],
+    [0.92, 0],
+    [1.0, 0.03],
+    [0.86, 0.74],
+    [0.8, 0.79],
     [0.0, 1],
   ].map(([r, y]) => new THREE.Vector2(r, y))
   const g = new THREE.LatheGeometry(pts, 6)
@@ -37,8 +42,69 @@ function crystalGeometry() {
 
 export const crystalGeo = crystalGeometry()
 const geo = crystalGeo
-const bodyMat = new THREE.MeshStandardMaterial({ color: SPIRE.body, emissive: SPIRE.glow, emissiveIntensity: 0.55, roughness: 0.22, metalness: 0.08, flatShading: true })
-const shardMat = new THREE.MeshStandardMaterial({ color: SPIRE.body, emissive: SPIRE.glow, emissiveIntensity: 0.4, roughness: 0.3, metalness: 0.05, flatShading: true })
+
+const crystalV = /* glsl */ `
+varying float vLocalY;
+`
+const crystalF = /* glsl */ `
+uniform vec3 uGlow;
+uniform vec3 uRim;
+uniform float uGlowAmt;
+varying float vLocalY;
+`
+// Inner light (seen most where a facet faces you) and a fresnel rim, added as emission.
+const crystalEmit = /* glsl */ `
+  {
+    vec3 vd = normalize(vViewPosition);
+    float nv = clamp(abs(dot(normal, vd)), 0.0, 1.0);
+    // Light caught inside differs facet by facet, like a gem.
+    vec3 rf = reflect(-vd, normal);
+    float facet = 0.55 + 0.45 * sin(dot(rf, vec3(6.1, 3.7, 4.9)) + vLocalY * 3.0);
+    float inner = (0.12 + 0.88 * pow(clamp(vLocalY, 0.0, 1.0), 1.8)) * (0.25 + 0.75 * nv) * facet;
+    float rim = pow(1.0 - nv, 3.0);
+#if defined( USE_INSTANCING_COLOR ) || defined( USE_COLOR )
+    vec3 tint = vColor.rgb;
+#else
+    vec3 tint = vec3(1.0);
+#endif
+    totalEmissiveRadiance += uGlow * inner * uGlowAmt * tint + uRim * rim * 0.55;
+  }
+`
+
+function crystalMaterial(glowAmt) {
+  const m = new THREE.MeshStandardMaterial({
+    color: '#1d1238',
+    roughness: 0.08,
+    metalness: 0.15,
+    flatShading: true,
+    envMap: skyEnvironment(),
+    envMapIntensity: 2.4,
+    vertexColors: false,
+  })
+  m.userData.realistic = true
+  const uniforms = {
+    uGlow: { value: new THREE.Color(SPIRE.glow).multiplyScalar(0.9) },
+    uRim: { value: new THREE.Color(SPIRE.body) },
+    uGlowAmt: { value: glowAmt },
+  }
+  m.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms)
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${crystalV}`)
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vLocalY = position.y;')
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${crystalF}`)
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${crystalEmit}`)
+  }
+  m.customProgramCacheKey = () => 'redshift-crystal-1'
+  return m
+}
+
+// vColor is the instance colour (three defines it for instanced meshes with colours).
+const bodyMat = crystalMaterial(1)
+const shardMat = crystalMaterial(0.75)
+const poolGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2)
+const poolMat = new THREE.MeshBasicMaterial({ color: SPIRE.glow, map: glowTexture(), transparent: true, opacity: 0.38, depthWrite: false, blending: THREE.AdditiveBlending })
 
 const _m = new THREE.Matrix4()
 const _q = new THREE.Quaternion()
@@ -97,6 +163,7 @@ export function Spires({ reality }) {
   const list = useMemo(() => spireList(features, fallen), [features, fallen])
   const body = useRef()
   const shards = useRef()
+  const pools = useRef()
   const glowPos = useMemo(() => new Float32Array(MAX * 3), [])
   const glow = useMemo(() => {
     const g = new THREE.BufferGeometry()
@@ -106,28 +173,49 @@ export function Spires({ reality }) {
     return g
   }, [glowPos])
   const glowMat = useMemo(
-    () => new THREE.PointsMaterial({ map: glowTexture(), color: SPIRE.glow, size: 2.4, sizeAttenuation: true, transparent: true, opacity: 0.75, depthWrite: false, blending: THREE.AdditiveBlending }),
+    () => new THREE.PointsMaterial({ map: glowTexture(), color: SPIRE.glow, size: 1.7, sizeAttenuation: true, transparent: true, opacity: 0.7, depthWrite: false, blending: THREE.AdditiveBlending }),
     [],
   )
   useEffect(() => () => (glow.dispose(), glowMat.dispose()), [glow, glowMat])
   // Per spire: when it became visible, its yaw and shard layout. Reset on a new list.
   const st = useRef({ list: null, shown: new Map(), version: -1, reality: null, busy: true, openedAt: nowSeconds() })
+  // A cluster at the foot: shards of varied size leaning out at varied angles.
   const shardLayout = useMemo(
     () =>
       list.map((s) => {
-        const h = hashStr(s.id)
+        const rand = mulberry(hashStr(s.id))
+        const a0 = rand() * Math.PI * 2
         return Array.from({ length: SHARDS }, (_, k) => {
-          const a = ((h >> (k * 3)) % 628) / 100 + k * 2.1
-          return { a, tilt: 0.35 + ((h >> (k + 5)) % 30) / 100, scale: 0.18 + ((h >> (k + 9)) % 14) / 100 }
+          const big = k < 2
+          return {
+            a: a0 + (k / SHARDS) * Math.PI * 2 + (rand() - 0.5) * 0.8,
+            dist: big ? 1.05 + rand() * 0.3 : 1.2 + rand() * 0.9,
+            tilt: big ? 0.18 + rand() * 0.25 : 0.35 + rand() * 0.5,
+            scale: big ? 0.32 + rand() * 0.2 : 0.1 + rand() * 0.2,
+            width: big ? 0.55 + rand() * 0.15 : 0.3 + rand() * 0.25,
+          }
         })
       }),
     [list],
   )
+  // Instance colours (tint of the inner glow): set before the first frame, so the material
+  // compiles with them once.
+  useLayoutEffect(() => {
+    const c = new THREE.Color()
+    const rand = mulberry(5)
+    for (let k = 0; k < MAX; k++) {
+      body.current?.setColorAt(k, c.setHSL(0.72 + (rand() - 0.5) * 0.06, 0.6, 0.45 + rand() * 0.15).multiplyScalar(2))
+      pools.current?.setColorAt(k, c.set(1, 1, 1))
+    }
+    for (let k = 0; k < MAX * SHARDS; k++) shards.current?.setColorAt(k, c.setHSL(0.73 + (rand() - 0.5) * 0.08, 0.6, 0.38 + rand() * 0.2).multiplyScalar(2))
+    for (const m of [body.current, shards.current, pools.current]) if (m?.instanceColor) m.instanceColor.needsUpdate = true
+  }, [])
 
   useFrame(() => {
     const b = body.current
     const sh = shards.current
-    if (!b || !sh) return
+    const pl = pools.current
+    if (!b || !sh || !pl) return
     const now = nowSeconds()
     const s = st.current
     const T = simStore.get().terrain
@@ -156,6 +244,7 @@ export function Spires({ reality }) {
       const visible = reality || knownAt(sp.x, sp.y) || (lying && (knownAt(tx, ty) || knownAt((sp.x + tx) / 2, (sp.y + ty) / 2)))
       if (!visible) {
         b.setMatrixAt(k, HIDDEN)
+        pl.setMatrixAt(k, HIDDEN)
         for (let q = 0; q < SHARDS; q++) sh.setMatrixAt(k * SHARDS + q, HIDDEN)
         continue
       }
@@ -190,29 +279,39 @@ export function Spires({ reality }) {
       _s.set(sp.radius * (0.4 + 0.6 * g), sp.height * g, sp.radius * (0.4 + 0.6 * g))
       _m.compose(_p, _q, _s)
       b.setMatrixAt(k, _m)
-      // Glowing tip while standing.
+      // Glowing tip while standing, and the crystal's light pooled on the ground.
       if (!lying) {
         glowPos[glows * 3] = sp.x
-        glowPos[glows * 3 + 1] = gz + sp.height * g * 0.92
+        glowPos[glows * 3 + 1] = gz + sp.height * g * 0.9
         glowPos[glows * 3 + 2] = -sp.y
         glows++
       }
+      const pr = (sp.radius * 7 + sp.height * 0.6) * g * (lying ? 0.6 : 1)
+      _m.compose(_p.set(sp.x, gz + 0.06, -sp.y), ID, _s.set(pr, 1, pr))
+      pl.setMatrixAt(k, _m)
       // Shards at the foot stay put when the spire falls.
       const lay = shardLayout[k]
       for (let q = 0; q < SHARDS; q++) {
         const L = lay[q]
         _d.set(Math.cos(L.a), 0, Math.sin(L.a))
         _q2.setFromAxisAngle(_s.set(_d.z, 0, -_d.x), L.tilt) // lean outwards
-        _p.set(sp.x + _d.x * sp.radius * 1.3, gz - 0.05, -sp.y + _d.z * sp.radius * 1.3)
+        _qy.setFromAxisAngle(UP, L.a * 3.1)
+        _q2.multiply(_qy)
+        const rx = sp.x + _d.x * sp.radius * L.dist
+        const ry = sp.y - _d.z * sp.radius * L.dist
+        _p.set(rx, groundAt(rx, ry, gz) - 0.06, -ry)
         const hs = sp.height * L.scale * g
-        _m.compose(_p, _q2, _s.set(sp.radius * 0.55 * g, hs, sp.radius * 0.55 * g))
+        const ws = sp.radius * L.width * g
+        _m.compose(_p, _q2, _s.set(ws, hs, ws))
         sh.setMatrixAt(k * SHARDS + q, _m)
       }
     }
     b.count = list.length
     sh.count = list.length * SHARDS
+    pl.count = list.length
     b.instanceMatrix.needsUpdate = true
     sh.instanceMatrix.needsUpdate = true
+    pl.instanceMatrix.needsUpdate = true
     glow.setDrawRange(0, glows)
     glow.attributes.position.needsUpdate = true
     s.busy = busy
@@ -220,8 +319,9 @@ export function Spires({ reality }) {
 
   return (
     <group>
-      <instancedMesh ref={body} args={[geo, bodyMat, MAX]} frustumCulled={false} count={0} />
-      <instancedMesh ref={shards} args={[geo, shardMat, MAX * SHARDS]} frustumCulled={false} count={0} />
+      <instancedMesh ref={pools} args={[poolGeo, poolMat, MAX]} frustumCulled={false} count={0} renderOrder={2} />
+      <instancedMesh ref={body} args={[geo, bodyMat, MAX]} frustumCulled={false} count={0} castShadow receiveShadow />
+      <instancedMesh ref={shards} args={[geo, shardMat, MAX * SHARDS]} frustumCulled={false} count={0} castShadow receiveShadow />
       <points geometry={glow} material={glowMat} frustumCulled={false} renderOrder={4} />
       {Object.entries(fallen).map(([id, f]) => (
         <FallDust key={`${gen}:${id}:${f.hazard}`} id={id} fall={f} gen={gen} />

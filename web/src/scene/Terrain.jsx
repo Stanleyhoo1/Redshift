@@ -1,165 +1,274 @@
 import { useEffect, useMemo } from 'react'
-import { useFrame, useThree } from '@react-three/fiber'
+import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import { simStore, useSim, nowSeconds, roverPoses } from '../state/store.js'
-import { SIGNAL, SLOPE, GROUND_RAMP } from '../lib/theme.js'
-import { SUN_DIR, reducedMotion } from './sceneConstants.js'
+import { useGraphics } from '../state/visualPrefs.js'
+import { SIGNAL, SLOPE, REGOLITH, VOID } from '../lib/theme.js'
+import { reducedMotion } from './sceneConstants.js'
+import { regolithTextures, blackTexture } from './proceduralTextures.js'
+import { waterShared } from './waterShared.js'
 
 // World (x, y, z-up) maps to three.js (x, z, -y) everywhere in the scene.
-// The terrain is one indexed grid mesh with nx * ny vertices. Unknown samples are
-// discarded in the fragment shader (the dark survey grid below shows through), and
-// newly known samples rise into place with a short cyan flash.
+// The terrain is one indexed grid mesh with nx * ny vertices and smooth normals, drawn with
+// a physically based material whose surface is generated in the shader: procedural regolith
+// (multi-scale albedo, pebbles, a crack network, a detail normal map, roughness), rockier
+// and darker on steep ground and ridges with hints of strata on cliffs, fine dust settled
+// in hollows, wet dark ground along identified water. Unknown ground is discarded (the dark
+// floor below shows through); the explored edge wobbles and fades softly into the dark.
+// On top, in display colours (the HUD layer): the optional slope tint with contour lines,
+// sensor pulses round each rover, the reveal flash and a faint scan rim on the edge.
 
-const vertexShader = /* glsl */ `
-attribute float aSlope;
-attribute float aKnown;
-attribute float aReveal;
-uniform float uTime;
-uniform float uMotion;
-varying float vSlope;
-varying float vKnown;
-varying float vFlash;
-varying float vH;
-varying vec3 vNormal;
-varying vec3 vPos;
-
-void main() {
-  float age = uTime - aReveal;
-  float rise = aKnown > 0.5 ? smoothstep(0.0, 0.7, age) : 1.0;
-  vec3 p = position;
-  p.y -= (1.0 - rise) * 1.1 * uMotion;
-  vSlope = aSlope;
-  vKnown = aKnown;
-  vFlash = aKnown > 0.5 ? exp(-max(age, 0.0) * 1.3) : 0.0;
-  vH = position.y;
-  vNormal = normal;
-  vPos = p;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
-}
-`
-
-const fragmentShader = /* glsl */ `
-uniform float uTime;
-uniform float uLimit;
-uniform float uMode;
-uniform float uMinH;
-uniform float uMaxH;
-uniform float uMotion;
-uniform vec3 uSunDir;
-uniform vec3 uSignal;
-uniform vec3 uOk;
-uniform vec3 uCaution;
-uniform vec3 uBad;
-uniform vec3 uRamp[5];
-uniform vec2 uRovers[8];
-uniform int uRoverCount;
-uniform vec3 uFogColor;
-uniform float uFogNear;
-uniform float uFogFar;
-varying float vSlope;
-varying float vKnown;
-varying float vFlash;
-varying float vH;
-varying vec3 vNormal;
-varying vec3 vPos;
-
-vec3 ramp(float t) {
-  t = clamp(t, 0.0, 1.0) * 4.0;
-  if (t < 1.0) return mix(uRamp[0], uRamp[1], t);
-  if (t < 2.0) return mix(uRamp[1], uRamp[2], t - 1.0);
-  if (t < 3.0) return mix(uRamp[2], uRamp[3], t - 2.0);
-  return mix(uRamp[3], uRamp[4], t - 3.0);
-}
-
-void main() {
-  if (vKnown < 0.5) discard;
-  vec3 n = normalize(vNormal);
-  float ht = clamp((vH - uMinH) / max(uMaxH - uMinH, 0.1), 0.0, 1.0);
-
-  // Slope relative to the fleet's current limit: comfortable below 60 %, caution
-  // from 60 % up to the limit, impassable at or above it. The antialiasing band
-  // sits just below each threshold, so a sample at the limit is always red.
-  float r = vSlope / max(uLimit, 1.0);
-  float aa = clamp(fwidth(r), 1e-4, 0.04);
-  vec3 slopeCol = mix(uOk, uCaution, smoothstep(0.6 - aa, 0.6, r));
-  slopeCol = mix(slopeCol, uBad, smoothstep(1.0 - aa, 1.0, r));
-  vec3 base = uMode > 0.5 ? slopeCol * (0.84 + 0.3 * ht) : ramp(ht);
-
-  float ndl = max(dot(n, uSunDir), 0.0);
-  vec3 col = base * (0.42 + 0.68 * ndl);
-
-  // Contour lines: thin every 1 m, stronger every 5 m, faded where they would crowd.
-  float w = max(fwidth(vH), 1e-4);
-  float d1 = abs(fract(vH + 0.5) - 0.5);
-  float d5 = abs(fract(vH / 5.0 + 0.5) - 0.5) * 5.0;
-  float crowd = 1.0 - smoothstep(0.1, 0.32, w);
-  float lines = max((1.0 - smoothstep(0.0, 1.2 * w, d1)) * 0.2, (1.0 - smoothstep(0.0, 1.6 * w, d5)) * 0.38) * crowd;
-  col *= 1.0 - lines;
-
-  // Sensor pulses spreading from each rover.
-  float pulse = 0.0;
-  for (int i = 0; i < 8; i++) {
-    if (i >= uRoverCount) break;
-    float dist = length(vPos.xz - uRovers[i]);
-    float ph = fract(uTime * 0.4 + float(i) * 0.37);
-    float rad = ph * 10.0;
-    float fall = 1.0 - ph;
-    pulse += exp(-pow((dist - rad) / 0.3, 2.0)) * fall * fall;
-  }
-  col = mix(col, uSignal, clamp(pulse * uMotion, 0.0, 1.0) * 0.4);
-
-  // Reveal flash, and a bright rim along the edge of what the fleet knows.
-  col = mix(col, uSignal, clamp(vFlash, 0.0, 1.0) * 0.75);
-  float rim = 1.0 - smoothstep(0.5, 0.85, vKnown);
-  col = mix(col, uSignal, rim * 0.9);
-
-  // Dust storm haze (scene.fog, see DustStorm.jsx): linear with distance from the camera.
-  float fogF = clamp((length(vPos - cameraPosition) - uFogNear) / max(uFogFar - uFogNear, 1e-3), 0.0, 1.0);
-  col = mix(col, uFogColor, fogF);
-
-  gl_FragColor = vec4(col, 1.0);
-}
-`
-
-// Linear working-space colour, like every other three.js material in the scene.
-const toVec3 = (hex) => {
-  const c = new THREE.Color(hex)
-  return new THREE.Vector3(c.r, c.g, c.b)
-}
-
-// The shader writes its colour straight to the screen (no output encoding), so the
-// palette goes in as sRGB values: the terrain then shows exactly the theme colours,
-// the same ones the legend swatches use.
 const display3 = (hex) => {
   const c = new THREE.Color(hex).getRGB({ r: 0, g: 0, b: 0 }, THREE.SRGBColorSpace)
   return new THREE.Vector3(c.r, c.g, c.b)
 }
+const linear3 = (hex) => new THREE.Color(hex)
 
-function createMaterial() {
-  return new THREE.ShaderMaterial({
-    vertexShader,
-    fragmentShader,
-    side: THREE.DoubleSide,
-    uniforms: {
-      uTime: { value: 0 },
-      uLimit: { value: 30 },
-      uMode: { value: 1 },
-      uMinH: { value: -3 },
-      uMaxH: { value: 8 },
-      uMotion: { value: 1 },
-      uSunDir: { value: new THREE.Vector3(...SUN_DIR).normalize() },
-      uSignal: { value: toVec3(SIGNAL) },
-      uOk: { value: display3(SLOPE.ok) },
-      uCaution: { value: display3(SLOPE.caution) },
-      uBad: { value: display3(SLOPE.bad) },
-      uRamp: { value: GROUND_RAMP.map(display3) },
-      uRovers: { value: Array.from({ length: 8 }, () => new THREE.Vector2(1e5, 1e5)) },
-      uRoverCount: { value: 0 },
-      uFogColor: { value: new THREE.Color() },
-      uFogNear: { value: 1e5 },
-      uFogFar: { value: 1e6 },
-    },
-  })
+const vertexCommon = /* glsl */ `
+attribute float aSlope;
+attribute float aKnown;
+attribute float aReveal;
+attribute float aEdge;
+attribute float aCurv;
+uniform float uTime;
+uniform float uMotion;
+varying float vSlope;
+varying float vFlash;
+varying float vEdge;
+varying float vCurv;
+varying vec3 vWorld;
+varying vec3 vGeoN;
+`
+
+const vertexBody = /* glsl */ `
+  float tAge = uTime - aReveal;
+  float tRise = aKnown > 0.5 ? smoothstep(0.0, 0.7, tAge) : 1.0;
+  transformed.y -= (1.0 - tRise) * 1.1 * uMotion;
+  vSlope = aSlope;
+  vEdge = aEdge;
+  vCurv = aCurv;
+  vFlash = aKnown > 0.5 ? exp(-max(tAge, 0.0) * 1.3) : 0.0;
+  vWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
+  vGeoN = normalize(mat3(modelMatrix) * objectNormal);
+`
+
+const fragmentCommon = /* glsl */ `
+uniform sampler2D uDetail;
+uniform sampler2D uDetailN;
+uniform sampler2D uShore;
+uniform vec4 uShoreMap;
+uniform vec2 uShoreSize;
+uniform vec3 uDustA;
+uniform vec3 uDustB;
+uniform vec3 uSoil;
+uniform vec3 uRock;
+uniform vec3 uRockLight;
+uniform vec3 uStrataA;
+uniform vec3 uStrataB;
+uniform vec3 uPebble;
+uniform float uTime;
+uniform float uMotion;
+uniform float uLimit;
+uniform float uSlopeMode;
+uniform vec3 uSignal;
+uniform vec3 uOk;
+uniform vec3 uCaution;
+uniform vec3 uBad;
+uniform vec3 uVoid;
+uniform vec2 uRovers[8];
+uniform int uRoverCount;
+varying float vSlope;
+varying float vFlash;
+varying float vEdge;
+varying float vCurv;
+varying vec3 vWorld;
+varying vec3 vGeoN;
+const mat2 ROT1 = mat2(0.8, -0.6, 0.6, 0.8);
+const mat2 ROT2 = mat2(-0.28, 0.96, -0.96, -0.28);
+`
+
+// Replaces <map_fragment>: everything about the surface, computed once.
+const surface = /* glsl */ `
+  if (vEdge < 0.26) discard; // unknown ground: out before any texture work
+  vec2 wp = vWorld.xz;
+  vec4 mA = texture2D(uDetail, wp * 0.0131 + vec2(0.13, 0.71));
+  vec4 mB = texture2D(uDetail, ROT1 * wp * 0.0417 + vec2(0.31, 0.07));
+
+  // The edge of the known area, wobbled over a metre or two so it never shows the grid.
+  float edgeN = mB.a * 0.55 + texture2D(uDetail, wp * 0.19).a * 0.45;
+  float thr = mix(0.26, 0.8, smoothstep(0.32, 0.68, edgeN));
+  if (vEdge < thr) discard;
+  float edgeFade = smoothstep(thr, thr + 0.3, vEdge);
+  float edgeRim = 1.0 - smoothstep(thr, thr + 0.045, vEdge);
+
+  float macro = mA.a * 0.6 + mB.a * 0.4;
+#ifdef TERRAIN_HQ
+  vec4 d1 = texture2D(uDetail, wp * 0.27);
+  vec4 d2 = texture2D(uDetail, ROT2 * wp * 0.173 + vec2(0.57, 0.21));
+  float bw = smoothstep(0.38, 0.62, mB.r);
+  vec4 det = mix(d1, d2, bw);
+#else
+  vec4 det = texture2D(uDetail, wp * 0.27);
+#endif
+  vec3 Ng = normalize(vGeoN);
+  float cosS = Ng.y;
+  float curv = clamp(vCurv * 25.0, -1.0, 1.0); // + hollow, - ridge
+  float steep = smoothstep(0.95, 0.8, cosS); // about 18 to 37 deg
+  float cliff = smoothstep(0.85, 0.66, cosS); // about 32 to 49 deg
+
+  // Dust on the flats, varied at several scales.
+  float tone = det.r * 0.35 + macro * 0.65;
+  vec3 dust = mix(uDustB, uDustA, smoothstep(0.25, 0.8, tone));
+  // Large albedo features, as from orbit: dark basaltic sand sheets and redder, iron-rich
+  // dust in places, greyer in others.
+  float sheet = smoothstep(0.48, 0.7, mA.r * 0.65 + mB.g * 0.15 + (1.0 - mA.a) * 0.35) * (1.0 - smoothstep(0.0, 0.5, -curv));
+  dust = mix(dust, uSoil * (0.85 + 0.25 * det.r), sheet * 0.78);
+  float hue = mB.r - 0.5;
+  dust *= vec3(1.0 + hue * 0.16, 1.0 - hue * 0.02, 1.0 - hue * 0.14);
+  dust = mix(dust, uDustA * 1.06, smoothstep(0.1, 0.7, curv) * 0.4);
+  float peb = det.g;
+  dust = mix(dust, mix(uPebble, uRock, step(0.8, fract(det.r * 9.0))), peb * 0.38);
+  // Dried crust with fine cracks, only in patches.
+  float crust = smoothstep(0.56, 0.72, mB.a);
+  dust *= 1.0 - det.b * 0.16 * crust;
+
+  // Exposed rock on steep ground and ridges, banded on cliffs.
+  vec3 rock = mix(uRock, uRockLight, smoothstep(0.35, 0.8, det.r * 0.7 + mA.r * 0.3));
+  float bands = sin(vWorld.y * 4.2 + (mB.r - 0.5) * 5.0 + (det.r - 0.5) * 1.4);
+  vec3 strata = mix(uStrataA, uStrataB, smoothstep(-0.35, 0.55, bands));
+  strata *= 0.9 + 0.1 * sin(vWorld.y * 11.0 + (mA.r - 0.5) * 6.0);
+  rock = mix(rock, strata, cliff * 0.75);
+  float rockAmt = steep + max(-curv, 0.0) * 0.45 + (det.r - 0.5) * 0.35 + (macro - 0.5) * 0.3;
+  float rockMask = smoothstep(0.42, 0.62, rockAmt);
+  vec3 albedo = mix(dust, rock, rockMask);
+
+  // Wet, darker ground along water the fleet has identified.
+  vec2 suv = (vec2((wp.x - uShoreMap.x) * uShoreMap.z, (-wp.y - uShoreMap.y) * uShoreMap.z) + 0.5) / uShoreSize;
+  float wet = texture2D(uShore, suv).r;
+
+  float tRough = mix(0.96, 0.85, rockMask) - peb * 0.08;
+#ifdef TERRAIN_HQ
+  vec4 nA = texture2D(uDetailN, wp * 0.27);
+  vec4 nB = texture2D(uDetailN, ROT2 * wp * 0.173 + vec2(0.57, 0.21));
+  vec4 nF = texture2D(uDetailN, ROT1 * wp * 1.13 + vec2(0.4, 0.9));
+  vec2 gA = (nA.xy - 0.5) * 2.0;
+  vec2 gB = ((nB.xy - 0.5) * 2.0) * ROT2;
+  vec2 gF = ((nF.xy - 0.5) * 2.0) * ROT1;
+  vec2 dn = mix(gA, gB, bw) * 0.7 + gF * 0.35;
+  // Wind ripples in the sand sheets.
+  vec2 wdir = vec2(0.83, 0.56);
+  float rph = dot(wp, wdir) * 9.5 + (mB.r - 0.5) * 9.0 + (det.r - 0.5) * 2.0;
+  dn += wdir * cos(rph) * 0.22 * sheet * (1.0 - rockMask);
+  dn *= mix(0.7, 1.2, rockMask) * (1.0 - 0.6 * wet);
+  float cav = mix(nA.z, nB.z, bw);
+  albedo *= mix(1.0, 0.8 + 0.2 * cav, crust);
+  vec3 tNormalW = normalize(vec3(Ng.x + dn.x, Ng.y, Ng.z + dn.y));
+#else
+  vec3 tNormalW = Ng;
+#endif
+  albedo *= mix(1.0, 0.48, wet);
+  tRough = mix(tRough, 0.38, wet);
+  diffuseColor.rgb = albedo;
+`
+
+// After <fog_fragment>: the HUD layer, in display colours.
+const overlay = /* glsl */ `
+  gl_FragColor.rgb = mix(uVoid, gl_FragColor.rgb, 0.1 + 0.9 * edgeFade);
+  if (uSlopeMode > 0.5) {
+    // Slope relative to the fleet's current limit: comfortable below 60 %, caution from
+    // 60 % up to the limit, impassable at or above it (antialiased just below each step).
+    float r = vSlope / max(uLimit, 1.0);
+    float aa = clamp(fwidth(r), 1e-4, 0.04);
+    vec3 sc = mix(uOk, uCaution, smoothstep(0.6 - aa, 0.6, r));
+    sc = mix(sc, uBad, smoothstep(1.0 - aa, 1.0, r));
+    float lum = dot(gl_FragColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+    vec3 tint = sc * clamp(0.62 + lum * 1.25, 0.6, 1.3);
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, tint, 0.68 * edgeFade);
+    // Contour lines: thin every 1 m, stronger every 5 m, faded where they would crowd.
+    float hgt = vWorld.y;
+    float w = max(fwidth(hgt), 1e-4);
+    float c1 = abs(fract(hgt + 0.5) - 0.5);
+    float c5 = abs(fract(hgt / 5.0 + 0.5) - 0.5) * 5.0;
+    float crowd = 1.0 - smoothstep(0.1, 0.32, w);
+    float lines = max((1.0 - smoothstep(0.0, 1.2 * w, c1)) * 0.16, (1.0 - smoothstep(0.0, 1.6 * w, c5)) * 0.3) * crowd;
+    gl_FragColor.rgb *= 1.0 - lines;
+  }
+  // Sensor pulses spreading from each rover.
+  float pulse = 0.0;
+  for (int i = 0; i < 8; i++) {
+    if (i >= uRoverCount) break;
+    float dist = length(vWorld.xz - uRovers[i]);
+    float ph = fract(uTime * 0.4 + float(i) * 0.37);
+    float rad = ph * 10.0;
+    float fall = 1.0 - ph;
+    pulse += exp(-pow((dist - rad) / 0.22, 2.0)) * fall * fall;
+  }
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, uSignal, clamp(pulse * uMotion, 0.0, 1.0) * 0.28);
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, uSignal, clamp(vFlash, 0.0, 1.0) * 0.5);
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, uSignal, edgeRim * 0.4);
+`
+
+function createMaterial(high) {
+  const tex = regolithTextures()
+  const m = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.95, metalness: 0 })
+  m.userData.realistic = true
+  m.defines = high ? { TERRAIN_HQ: '' } : {}
+  const uniforms = {
+    uDetail: { value: tex.detail },
+    uDetailN: { value: tex.normal },
+    uShore: { value: blackTexture() },
+    uShoreMap: { value: new THREE.Vector4(0, 0, 1, 0) },
+    uShoreSize: { value: new THREE.Vector2(1, 1) },
+    uDustA: { value: linear3(REGOLITH.dustLight) },
+    uDustB: { value: linear3(REGOLITH.dust) },
+    uSoil: { value: linear3(REGOLITH.soil) },
+    uRock: { value: linear3(REGOLITH.rock) },
+    uRockLight: { value: linear3(REGOLITH.rockLight) },
+    uStrataA: { value: linear3(REGOLITH.strataA) },
+    uStrataB: { value: linear3(REGOLITH.strataB) },
+    uPebble: { value: linear3(REGOLITH.pebble) },
+    uTime: { value: 0 },
+    uMotion: { value: 1 },
+    uLimit: { value: 30 },
+    uSlopeMode: { value: 0 },
+    uSignal: { value: display3(SIGNAL) },
+    uOk: { value: display3(SLOPE.ok) },
+    uCaution: { value: display3(SLOPE.caution) },
+    uBad: { value: display3(SLOPE.bad) },
+    uVoid: { value: display3(VOID) },
+    uRovers: { value: Array.from({ length: 8 }, () => new THREE.Vector2(1e5, 1e5)) },
+    uRoverCount: { value: 0 },
+  }
+  m.userData.uniforms = uniforms
+  m.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms)
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${vertexCommon}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n${vertexBody}`)
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${fragmentCommon}`)
+      .replace('#include <map_fragment>', surface)
+      .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = tRough;')
+      .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n  normal = normalize((viewMatrix * vec4(tNormalW, 0.0)).xyz);')
+      .replace('#include <fog_fragment>', `#include <fog_fragment>\n${overlay}`)
+  }
+  m.customProgramCacheKey = () => 'redshift-terrain-1'
+  return m
+}
+
+// Shadow pass: only the ground that is drawn casts (no walls down to the unknown floor).
+function createDepthMaterial() {
+  const m = new THREE.MeshDepthMaterial()
+  m.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aEdge;\nvarying float vEdge;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vEdge = aEdge;')
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vEdge;')
+      .replace('void main() {', 'void main() {\n  if (vEdge < 0.5) discard;')
+  }
+  m.customProgramCacheKey = () => 'redshift-terrain-depth-1'
+  return m
 }
 
 // Owns the geometry for one terrain (one init) and keeps it in sync with the
@@ -175,6 +284,8 @@ class TerrainMesh {
     this.slope = new Float32Array(n)
     this.known = new Float32Array(n)
     this.reveal = new Float32Array(n)
+    this.edge = new Float32Array(n)
+    this.curv = new Float32Array(n)
     this.stamp = new Uint32Array(n)
     this.touched = new Int32Array(n)
     this.frame = 0
@@ -212,6 +323,8 @@ class TerrainMesh {
       aSlope: dyn(this.slope, 1),
       aKnown: dyn(this.known, 1),
       aReveal: dyn(this.reveal, 1),
+      aEdge: dyn(this.edge, 1),
+      aCurv: dyn(this.curv, 1),
     }
     for (const [name, attr] of Object.entries(this.attrs)) geo.setAttribute(name, attr)
     geo.setIndex(new THREE.BufferAttribute(index, 1))
@@ -245,6 +358,7 @@ class TerrainMesh {
     return count ? sum / count : this.fogY
   }
 
+  // Normal and curvature (discrete Laplacian of height: + in hollows, - on ridges).
   normalAt(k) {
     const { nx, ny, res } = this.T
     const i = k % nx
@@ -261,6 +375,31 @@ class TerrainMesh {
     this.nor[k * 3] = -hx / len
     this.nor[k * 3 + 1] = 1 / len
     this.nor[k * 3 + 2] = hy / len
+    const h0 = p[k * 3 + 1]
+    this.curv[k] = this.known[k] ? (p[il * 3 + 1] + p[ir * 3 + 1] + p[jd * 3 + 1] + p[ju * 3 + 1] - 4 * h0) : 0
+  }
+
+  // How surrounded by known ground a sample is (5 x 5 neighbourhood), 0 when unknown: the
+  // shader cuts and fades the edge on this, so it is soft instead of following the grid.
+  edgeAt(k) {
+    const { nx, ny, known } = this.T
+    if (!known[k]) {
+      this.edge[k] = 0
+      return
+    }
+    const i = k % nx
+    const j = (k / nx) | 0
+    let s = 0
+    for (let dj = -2; dj <= 2; dj++) {
+      const jj = j + dj
+      if (jj < 0 || jj >= ny) continue
+      const row = jj * nx
+      for (let di = -2; di <= 2; di++) {
+        const ii = i + di
+        if (ii >= 0 && ii < nx && known[row + ii]) s++
+      }
+    }
+    this.edge[k] = s / 25
   }
 
   writeKnown(k) {
@@ -281,6 +420,7 @@ class TerrainMesh {
     for (let k = 0; k < n; k++) if (T.known[k]) this.writeKnown(k)
     for (let k = 0; k < n; k++) if (!T.known[k]) this.pos[k * 3 + 1] = this.provisional(k)
     for (let k = 0; k < n; k++) this.normalAt(k)
+    for (let k = 0; k < n; k++) this.edgeAt(k)
     for (let q = 0; q < T.dirtyCount; q++) T.dirtyFlag[T.dirty[q]] = 0
     T.dirtyCount = 0
     this.flagAll()
@@ -315,7 +455,10 @@ class TerrainMesh {
       }
     }
     T.dirtyCount = 0
-    for (let t = 0; t < tc; t++) this.normalAt(this.touched[t])
+    for (let t = 0; t < tc; t++) {
+      this.normalAt(this.touched[t])
+      this.edgeAt(this.touched[t])
+    }
     this.flagAll()
     return true
   }
@@ -328,28 +471,29 @@ class TerrainMesh {
 export function Terrain({ slopeColors }) {
   const terrain = useSim((s) => s.terrain)
   const roverMeta = useSim((s) => s.roverMeta)
-  const material = useMemo(createMaterial, [])
+  const graphics = useGraphics()
+  const material = useMemo(() => createMaterial(graphics === 'high'), []) // eslint-disable-line react-hooks/exhaustive-deps
+  const depthMaterial = useMemo(createDepthMaterial, [])
   const mesh = useMemo(() => (terrain ? new TerrainMesh(terrain) : null), [terrain])
-  const scene = useThree((s) => s.scene)
 
   useEffect(() => () => mesh?.dispose(), [mesh])
-  useEffect(() => () => material.dispose(), [material])
-
+  useEffect(() => () => (material.dispose(), depthMaterial.dispose()), [material, depthMaterial])
   useEffect(() => {
-    if (!terrain) return
-    material.uniforms.uMinH.value = terrain.minH
-    material.uniforms.uMaxH.value = terrain.maxH
-  }, [terrain, material])
+    const hq = graphics === 'high'
+    if (('TERRAIN_HQ' in material.defines) === hq) return
+    material.defines = hq ? { TERRAIN_HQ: '' } : {}
+    material.needsUpdate = true
+  }, [graphics, material])
 
   useFrame(() => {
     if (!mesh) return
     const s = simStore.get()
     if (s.terrain !== mesh.T) return
     mesh.drain()
-    const u = material.uniforms
+    const u = material.userData.uniforms
     u.uTime.value = nowSeconds()
     u.uLimit.value = s.limit.current ?? 30
-    u.uMode.value = slopeColors ? 1 : 0
+    u.uSlopeMode.value = slopeColors ? 1 : 0
     u.uMotion.value = reducedMotion ? 0 : 1
     let c = 0
     for (const m of roverMeta) {
@@ -359,17 +503,18 @@ export function Terrain({ slopeColors }) {
       c++
     }
     u.uRoverCount.value = c
-    const fog = scene.fog
-    if (fog && fog.isFog) {
-      u.uFogColor.value.copy(fog.color)
-      u.uFogNear.value = fog.near
-      u.uFogFar.value = fog.far
-    } else {
-      u.uFogNear.value = 1e5
-      u.uFogFar.value = 1e6
+    // Wet shoreline from the water layer (identified water only).
+    const w = waterShared
+    if (w.shore && w.map && u.uShore.value !== w.shore) {
+      u.uShore.value = w.shore
+      u.uShoreMap.value.set(w.map.ox, w.map.oy, 1 / w.map.res, 0)
+      u.uShoreSize.value.set(w.map.nx, w.map.ny)
+    } else if (!w.shore && u.uShore.value !== blackTexture()) {
+      u.uShore.value = blackTexture()
+      u.uShoreSize.value.set(1, 1)
     }
   })
 
   if (!mesh) return null
-  return <mesh geometry={mesh.geometry} material={material} frustumCulled={false} renderOrder={0} />
+  return <mesh geometry={mesh.geometry} material={material} customDepthMaterial={depthMaterial} frustumCulled={false} renderOrder={0} castShadow receiveShadow />
 }
