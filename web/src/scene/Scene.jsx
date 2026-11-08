@@ -17,6 +17,7 @@ import { FocusMarker } from './FocusMarker.jsx'
 import { Water } from './Water.jsx'
 import { Spires, fallDebug } from './Spires.jsx'
 import { IceSheets } from './IceSheets.jsx'
+import { IceZones } from './IceZones.jsx'
 import { Flora } from './Flora.jsx'
 import { Geysers } from './Geysers.jsx'
 import { GroundDetail } from './GroundDetail.jsx'
@@ -111,6 +112,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <HazardVisuals reality={view.reality} />
       <Spires reality={view.reality} />
       <IceSheets reality={view.reality} />
+      <IceZones />
       <Flora reality={view.reality} />
       <Geysers reality={view.reality} />
       <GroundDetail reality={view.reality} />
