@@ -335,9 +335,17 @@ class RescueManager:
                 self._pick_helper(rec, t, quiet=False)
             return
         if h.state not in ("rescuing", "towing"):
-            # the helper was taken off the job (low battery, a fault, an operator order)
-            self._release_helper(rec, t, f"it is {h.state} now")
-            return
+            if h.state in ("exploring", "investigating", "observing") and h.health.mobile() \
+                    and not h._need_return(t) and h.op_goal is None and not h.held:
+                # side-tracked (a target, a creature, a curious detour): the stranded rover comes first
+                h.release_all(t, "rescue", quiet=True)
+                h.state = "rescuing"
+                h.goal, h.path, h.plan_t = None, [], -1e9
+                rec["goal"] = None
+            else:
+                # the helper was taken off the job (low battery, a fault, an operator order)
+                self._release_helper(rec, t, f"it is {h.state} now")
+                return
         ph = rec["phase"]
         if ph == "en_route":
             self._en_route(rec, rover, h, t)
@@ -1153,7 +1161,10 @@ class RescueManager:
             if plan == "help":
                 return True, None
         elif plan == "help":
-            return False, f"{rec['helper']} is already helping {target} ({rec['phase'].replace('_', ' ')})."
+            hh = self._rover(rec["helper"])
+            far = f", {_d(hh.x, hh.y, *rec['at']):.0f} m to go" if hh is not None and rec["phase"] == "en_route" else ""
+            return True, (f"{rec['helper']}: already on it, {rec['phase'].replace('_', ' ')} to {target}{far}. "
+                          f"{target} comes first.")
         # tow or salvage
         if rec["phase"] == "diagnosing" and rec.get("opts") is not None and not rec.get("decided"):
             why = self.apply_plan(rec, plan, t, by="operator", reply_to=reply_to)

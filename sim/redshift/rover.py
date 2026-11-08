@@ -1667,8 +1667,13 @@ class Rover:
                     f"for a better find")
         return None
 
+    def on_rescue(self) -> bool:
+        """True while this rover is the helper of a rescue: the stranded rover comes first, no side trips."""
+        rm = getattr(self.fleet, "rescue", None)
+        return rm is not None and rm.by_helper(self.id) is not None
+
     def can_investigate(self, t: float, ts) -> bool:
-        if self.state != "exploring" or self.target_idx is not None:
+        if self.state != "exploring" or self.target_idx is not None or self.on_rescue():
             return False
         if self.tube_verdict(ts) is not None:
             return False
@@ -1687,6 +1692,8 @@ class Rover:
                 "swab": cfg.swab_s}.get(inst, cfg.investigate_dwell_s)
 
     def start_investigation(self, t: float, tidx: int) -> None:
+        if self.on_rescue():
+            return                         # on a rescue: no side trips (the target stays for later)
         ts = self.fleet.targets[tidx]
         self.state = "investigating"
         self.target_idx = tidx
@@ -2232,6 +2239,8 @@ class Rover:
         injected demo herd may also interrupt a trip to a target (investigating)."""
         if self.state not in (("exploring", "investigating") if busy_ok else ("exploring",)) or self.held or self.op_goal is not None or self.degraded:
             return False
+        if self.on_rescue():
+            return False                   # on a rescue: the stranded rover comes first
         if self.dir_bias is not None and t < self.dir_bias[2]:
             return False
         px, py = tr.predict(t)
@@ -2242,6 +2251,8 @@ class Rover:
         return self.battery >= max(0.4, home + self.battery_margin + 0.15)
 
     def start_observing(self, t: float, tr) -> None:
+        if self.on_rescue():
+            return                         # on a rescue: keep going to the stranded rover
         from .fleet import compass
         px, py = tr.predict(t)
         d = math.hypot(px - self.x, py - self.y)
