@@ -4,7 +4,7 @@ import { viewMode } from './viewMode.js'
 
 // Test aid (?debug only; Scene.jsx merges it into window.__redshift). The planet view's
 // objects register in globeRefs when they mount.
-export const globeRefs = { camera: null, gl: null, spin: null, site: null, rig: null, info: null, planet: null }
+export const globeRefs = { camera: null, gl: null, spin: null, site: null, rig: null, info: null, planet: null, sectorMap: null }
 
 const _p = new THREE.Vector3()
 const _n = new THREE.Vector3()
@@ -29,7 +29,7 @@ export function globeDebug() {
     },
     // The planet camera and what the planet shows.
     globeState() {
-      const { camera, spin, rig, info, planet } = globeRefs
+      const { camera, spin, rig, info, planet, sectorMap } = globeRefs
       const v = viewMode.get()
       const d = camera ? camera.position.length() : 0
       const dir = camera && d ? camera.position.toArray().map((x) => x / d) : null
@@ -50,6 +50,8 @@ export function globeDebug() {
         lit: under && info ? under[0] * info.sun[0] + under[1] * info.sun[1] + under[2] * info.sun[2] : null,
         gliding: !!rig?.glide,
         hq: !!planet && 'GLOBE_HQ' in planet.defines,
+        reveal: planet ? planet.uniforms.uReveal.value : null, // 0 unsurveyed, 1 the true planet
+        mapPixels: sectorMap ? sectorMap.opaque : null, // mapped cells on the planet's sector map
       }
     },
   }

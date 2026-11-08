@@ -7,8 +7,9 @@ import { formatKm, formatLatLon, planetLook } from './globeMath.js'
 import '../styles/scene.css'
 import '../styles/globe.css'
 
-// The short legend on the planet view, in the map legend's place and style.
-export function GlobeLegend() {
+// The short legend on the planet view, in the map legend's place and style. With Reality
+// off the planet is unsurveyed (only the fleet's map shows); with it on, the true planet.
+export function GlobeLegend({ reality = false }) {
   const world = useSim((s) => s.world)
   const p = useMemo(() => planetLook(world), [world])
   return (
@@ -24,17 +25,38 @@ export function GlobeLegend() {
           <i className="sw sw-ring" style={{ '--c': SIGNAL }} />
           Landing sector <span>not to scale</span>
         </li>
-        <li>
-          <i className="sw" style={{ background: GLOBE.ice }} />
-          Polar ice
-        </li>
-        <li>
-          <i className="sw" style={{ background: GLOBE.mare }} />
-          Dark plains
-        </li>
+        {reality ? (
+          <>
+            <li>
+              <i className="sw" style={{ background: GLOBE.ice }} />
+              Polar ice
+            </li>
+            <li>
+              <i className="sw" style={{ background: GLOBE.mare }} />
+              Dark plains
+            </li>
+          </>
+        ) : (
+          <>
+            <li title="The ground the rovers have mapped, live">
+              <i className="sw sw-ground" />
+              Mapped ground
+            </li>
+            <li title="Not surveyed yet">
+              <i className="sw" style={{ background: GLOBE.blank, border: '1px solid #3a3e45' }} />
+              Unsurveyed
+            </li>
+          </>
+        )}
       </ul>
       <div className="legend-hint">
         Drag to turn, scroll to zoom. <kbd>0</kbd> frames the site, <kbd>G</kbd> flies down.
+        {!reality && (
+          <>
+            {' '}
+            <kbd>R</kbd> shows the true planet.
+          </>
+        )}
       </div>
     </div>
   )

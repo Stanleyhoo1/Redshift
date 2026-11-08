@@ -42,7 +42,8 @@
 .globe-card {
   position: relative;
   width: 228px;
-  transform: translate(58px, -50%); /* clear of the ring, so the leader line shows */
+  /* clear of the ring, so the leader line shows (SiteMarker sets --ring-gap every frame) */
+  transform: translate(var(--ring-gap, 58px), -50%);
   padding: 11px 12px 12px;
   background: rgba(8, 12, 19, 0.84);
   -webkit-backdrop-filter: blur(8px);

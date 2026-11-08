@@ -18,6 +18,8 @@ export const LOOK = {
   night: 1.4, // starlight on the night side
   airH: 0.016, // air scale height, planet radii (a thick, hazy atmosphere)
   airI: 1.1, // brightness of the glow on the limb
+  gridI: 0.06, // the unsurveyed planet's graticule
+  revealS: 0.6, // seconds to fade between the unsurveyed and the true planet
 }
 export const AIR_R = 1.06 // the air shell's radius
 
@@ -153,6 +155,10 @@ uniform vec3 uSunCol;
 uniform vec3 uTwilight;
 uniform vec3 uHaze;
 uniform vec3 uNight;
+uniform float uReveal;
+uniform vec3 uBlank;
+uniform vec3 uGrid;
+uniform float uGridI;
 varying vec3 vPos;
 varying vec3 vCam;
 
@@ -163,9 +169,8 @@ varying vec3 vCam;
 #endif
 #define FREQ 2.2
 ${NOISE}
-void main() {
-  vec3 n0 = normalize(vPos);
-
+// The surveyed (true) planet: the full procedural surface, lit.
+vec3 revealed(vec3 n0, vec3 L, vec3 V) {
   // Continents: a slow noise sets the dark plains (maria) and where rust stains the dust.
   vec4 low = fbmd(n0 * 1.1 + uOffset * 0.37, 3);
   float mare = smoothstep(uMaria, uMaria + 0.12, low.x);
@@ -202,8 +207,6 @@ void main() {
   g *= 1.0 - 0.75 * cap;
 
   // Light. The bumped normal shades the relief; the geometric day side sets the terminator.
-  vec3 L = normalize(uSun);
-  vec3 V = normalize(vCam - n0);
   vec3 N = normalize(n0 - (g - dot(g, n0) * n0));
   float geo = dot(n0, L);
   float mu0 = max(dot(N, L), 0.0);
@@ -221,6 +224,38 @@ void main() {
   // A faint glint on the ice.
   vec3 H = normalize(L + V);
   col += uSunCol * (0.1 * cap * day * pow(max(dot(N, H), 0.0), 36.0));
+  return col;
+}
+
+void main() {
+  vec3 n0 = normalize(vPos);
+  vec3 L = normalize(uSun);
+  vec3 V = normalize(vCam - n0);
+
+  // Unsurveyed (Reality off): no surface detail, only a very dark, smooth grey ball with a
+  // soft terminator, the air's haze on the day limb, and a faint graticule every 15 degrees.
+  float geo = dot(n0, L);
+  float day = smoothstep(-0.10, 0.22, geo);
+  float mu0 = max(geo, 0.0);
+  float mu = max(dot(n0, V), 0.02);
+  float brdf = mix(mu0, 2.0 * mu0 / (mu0 + mu), uLommel);
+  vec3 blank = uBlank * uSunCol * (uSunI * brdf * day) + uBlank * uNight * uNightI;
+  float limb = pow(1.0 - max(dot(n0, V), 0.0), 3.0);
+  blank += uHaze * (uHazeI * 0.3 * limb * smoothstep(-0.2, 0.4, geo));
+  float lat = asin(clamp(n0.y, -1.0, 1.0)) * (12.0 / 3.14159265); // in 15 degree steps
+  float lon = atan(n0.x, n0.z) * (12.0 / 3.14159265);
+  float gLat = abs(fract(lat + 0.5) - 0.5) / max(fwidth(lat), 1e-4);
+  // fwidth jumps where atan wraps (on a meridian anyway): fall back to the latitude's.
+  float wLon = fwidth(lon);
+  wLon = wLon > 6.0 ? fwidth(lat) / max(sqrt(1.0 - n0.y * n0.y), 0.05) : wLon;
+  float gLon = abs(fract(lon + 0.5) - 0.5) / max(wLon, 1e-4);
+  float lineLat = 1.0 - smoothstep(0.4, 1.3, gLat);
+  float lineLon = (1.0 - smoothstep(0.4, 1.3, gLon)) * (1.0 - smoothstep(0.86, 0.97, abs(n0.y)));
+  float grid = max(lineLat, lineLon) * (0.45 + 0.55 * day) * (1.0 - 0.7 * limb);
+  blank += uGrid * (uGridI * grid);
+
+  vec3 col = blank;
+  if (uReveal > 0.001) col = mix(blank, revealed(n0, L, V), uReveal);
 
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>
@@ -292,6 +327,10 @@ export function makePlanetMaterial(high) {
       uTwilight: { value: col(GLOBE.twilight) },
       uHaze: { value: col(GLOBE.haze) },
       uNight: { value: col(GLOBE.night) },
+      uReveal: { value: 0 }, // 0 unsurveyed (the fleet's view), 1 the true planet (Reality)
+      uBlank: { value: col(GLOBE.blank) },
+      uGrid: { value: col(GLOBE.grid) },
+      uGridI: { value: LOOK.gridI },
     },
   })
 }
