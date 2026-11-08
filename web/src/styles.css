@@ -2292,9 +2292,15 @@ code {
     --cam-w: 184px;
     --cam-h: 138px;
     --read-w: 228px;
+    padding-left: 10px;
+    padding-right: 10px;
   }
   .hud-sensors .sp-body {
-    gap: 10px;
+    gap: 9px;
+  }
+  .hud-sensors .sp-cam-bar .seg-xs button {
+    padding-left: 6px;
+    padding-right: 6px;
   }
   .hud-sensors .sp-brain-budget-text {
     display: none;
@@ -4734,4 +4740,25 @@ kbd {
 .tab-ask {
   min-width: 18px;
   text-align: center;
+}
+
+/* Sampling progress inside the rover's tag (replaces the separate chip over the target). */
+.rover-tag-samp {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+  padding-left: 7px;
+  border-left: 1px solid var(--line-2);
+  color: var(--ink-2);
+  font-weight: 560;
+}
+
+.rover-tag-samp .instr-icon,
+.rover-tag-samp b {
+  color: var(--c);
+}
+
+.rover-tag-samp b {
+  font-weight: 700;
 }
