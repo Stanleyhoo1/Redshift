@@ -10,9 +10,10 @@ Vite + React + three.js (@react-three/fiber, drei). Node 22.
 
 ```sh
 npm install
-npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
-                  #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, MOCK_GEMMA=offline, MOCK_PROTOCOL=2|3,
-                  #   MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE, MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off)
+npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, WEAR, MESAS ... FLORA,
+                  #   BRAIN_BUDGET_MS, GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, MOCK_GEMMA=offline,
+                  #   MOCK_PROTOCOL=2..7, MOCK_PRELAUNCH=1, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
+                  #   MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off)
 npm run dev       # in a second terminal, then open http://localhost:5173
 ```
 
@@ -74,7 +75,13 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
 - Keys: `R` `F` `P` `S` `L` `B` toggle layers, `1` to `9` select a rover, `Esc` cancels
   placement, closes the sensor panel (then returns to the overview), `0` for the overview,
   `/` for the message box.
-- Reset sim asks for confirmation, then restarts the sim with a random seed.
+- Reset sim asks for confirmation, then restarts the sim with a random seed and the same settings. New
+  mission opens the setup screen.
+- Setup screen (version 7 sims): opens by itself while the sim waits for a launch (it cannot be closed
+  then) and from New mission. Gravity (slider and presets; the big numeral narrows, gets heavier and redder
+  as gravity grows, and a figure shows the predicted steepest climb and towing slope), seed, rovers, sector
+  size, speed, the world features and wear, all drawn from `GET /api/config`. Launch sends only what
+  changed. An older sim gets a seed-only form that resets.
 - Following: orbit (left drag) and zoom keep following the rover. A pan (right drag, or a
   modifier with the left button, or two fingers) or a click on an event that flies the
   camera elsewhere pauses the follow right where you put the camera: the rover stays
@@ -182,6 +189,17 @@ countdown). Test hook: `POST /api/_mock/reveal {"water"?, "targets"?, "spires"?}
 learns them all). `node scripts/v6-check.mjs` (mock started with
 `MOCK_FIRST_QUESTION_S=99999`, preview running) sends an ambiguous order, saves one
 screenshot and clicks a marker.
+
+Version 7 in the mock (the default; `MOCK_PROTOCOL=6` for the previous behaviour): launch settings with
+the sim's table, presets and physics rows (`GET /api/config`), `POST /api/launch` and settings in
+`POST /api/reset` (same error texts as the sim), and init `phase` and `config`. `MOCK_PRELAUNCH=1` starts in
+the setup phase like the sim's default `AUTO_LAUNCH=0` (frozen at t = 0, hazards, chat and answers get 409);
+without it the mock runs at once, so the older scripts are unaffected. The v7 world features are only stored
+and echoed. `node scripts/setup-unit.mjs` checks the setup helpers, the init fields and the HTTP helpers
+without a browser; `node scripts/setup-check.mjs [url] [outDir]` (mock started with `MOCK_PRELAUNCH=1`, or
+the sim with `AUTO_LAUNCH=0`) drives the setup screen, launches and saves 5 screenshots.
+`scripts/screenshot.mjs` launches a sim that waits in its setup phase (`POST /api/launch {}`) before its
+shots, so it works with the sim's default `AUTO_LAUNCH=0`; a running sim or an older one is left alone.
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

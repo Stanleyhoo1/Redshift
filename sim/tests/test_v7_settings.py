@@ -706,3 +706,23 @@ def test_server_start_waits_in_the_setup_phase(monkeypatch):
             assert server.state.runner.started
     finally:
         planner.close()
+
+
+# ====================================================================== no em dash in anything step A touched
+V7_TOUCHED = (
+    "sim/redshift/config.py", "sim/redshift/server.py", "sim/redshift/gemma.py", "sim/redshift/advisor.py",
+    "sim/redshift/terrain.py", "sim/redshift/hazards.py", "sim/redshift/fleet.py", "sim/redshift/rover.py",
+    "sim/tests/test_v7_settings.py", "sim/README.md", "PROTOCOL.md", "README.md", "docker-compose.yml",
+    "web/README.md", "web/src/components/SetupScreen.jsx", "web/src/lib/setup.js", "web/src/styles/setup.css",
+    "web/src/App.jsx", "web/src/components/ViewControls.jsx", "web/src/styles.css", "web/src/scene/Scene.jsx",
+    "web/src/net/connection.js", "web/src/state/simState.js", "web/mock/mock-server.mjs",
+    "web/scripts/setup-unit.mjs", "web/scripts/setup-check.mjs", "web/scripts/screenshot.mjs",
+)
+
+
+def test_no_em_dash_in_v7_files():
+    repo = ROOT.parent
+    missing = [p for p in V7_TOUCHED if not (repo / p).is_file()]
+    assert not missing, f"missing: {missing}"
+    bad = [p for p in V7_TOUCHED if EM_DASH in (repo / p).read_text(encoding="utf-8")]
+    assert not bad, f"em dash in {bad}"

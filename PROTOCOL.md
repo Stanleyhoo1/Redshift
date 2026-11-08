@@ -7,7 +7,7 @@ Both sides must follow it exactly. Do not use em dash characters anywhere in thi
 
 | What | Where |
 |---|---|
-| Sim server (FastAPI) | port 8000: `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `WS /ws` |
+| Sim server (FastAPI) | port 8000: `GET /api/health`, `GET /api/truth`, `GET /api/config`, `POST /api/launch`, `POST /api/reset`, `WS /ws` |
 | Web UI in Docker | nginx on port 80 inside the container (published as 8080), proxies `/ws` and `/api` to `sim:8000` |
 | Web UI dev | Vite on 5173, proxies `/ws` and `/api` to `http://localhost:8000` |
 | Mock server (web dev only) | `node web/mock/mock-server.mjs` on port 8000, same protocol as the real sim |
@@ -368,12 +368,130 @@ Live image rendered by MuJoCo from the rover's point of view, at the current sim
 Query: `view=fpv` (onboard camera on the mast, looking forward, default) or `view=chase` (behind and above the rover, showing the rover itself), `w` and `h` (pixels, default 320 x 240, max 640 x 480).
 Returns `image/jpeg`. 404 for an unknown rover, 503 with a JSON error if rendering is unavailable on this machine. The UI polls it a few times a second for the selected rover only.
 
+## Version 7 additions (launch settings and the setup phase)
+
+All optional for clients. A client that knows none of this still works: an older client sees a sim that
+starts when someone launches it (or at once with `AUTO_LAUNCH=1`), and `POST /api/reset {"seed": n}` behaves
+as before.
+
+### Server phase
+
+With `AUTO_LAUNCH=0` (the default) the sim builds the world from its env vars at start and waits in the
+**setup phase**: the world is frozen at t = 0 (the fleet stands on the lander pad), `POST /api/hazard`,
+`POST /api/chat` and `POST /api/answer` answer 409 `{"ok": false, "error": "The mission has not launched yet."}`,
+while `GET /api/truth`, `GET /api/config` and the camera work. `POST /api/launch` or `POST /api/reset` starts
+the mission. `AUTO_LAUNCH=1`, or `AUTO_RESET_S` above 0 (the unattended demo loop), starts at once as before.
+
+### `init` additions
+
+- `phase`: `"setup"` or `"running"`. Missing (older sims) means running.
+- `config`: the launch settings this world was built with, keyed like the table below, for example
+  `{"gravity_g": 2.0, "seed": 42, "num_rovers": 3, "map_size": 120, "water": true, "spires": true, "lifeforms": true, "mesas": true, ..., "wear": "normal", "sim_speed": 3.0}`.
+
+A launch and a reset send every client a fresh `init` with phase `"running"`.
+
+### Launch settings
+
+| Key | Type | Range | Env var (default) | Meaning |
+|---|---|---|---|---|
+| `gravity_g` | float | 0.5 to 3, step 0.1 | `GRAVITY_G` (2.0) | gravity in Earth g; the climb and tow limits and the slope thresholds follow it (Sim notes below) |
+| `seed` | int | 0 to 2147483647 | `SEED` (42) | same seed, same terrain, targets and life |
+| `num_rovers` | int | 1 to 8 | `NUM_ROVERS` (3) | rovers that land |
+| `map_size` | int (m) | 60 to 200, step 10 | `MAP_SIZE` (120) | width of the square sector |
+| `water`, `spires`, `lifeforms` | bool | | none (true) | the version 4 features |
+| `mesas`, `canyon`, `dunes`, `boulder_fields`, `pits`, `geysers`, `ice_sheets`, `flora`, `ground_detail` | bool | | `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` (1 each) | the version 7 world features; each is built in its own v7 step, until then its switch is only stored and echoed |
+| `wear` | choice | `off`, `normal`, `harsh` | `WEAR` (normal) | how fast wheels and motors wear out (harsh: about 4 times sooner) |
+| `sim_speed` | float | 0.5 to 10, step 0.5 | `SIM_SPEED` (3.0) | sim seconds per real second |
+
+### `GET /api/config`
+
+```json
+{"ok": true, "phase": "setup",
+ "current": {"gravity_g": 2.0, "seed": 42, "num_rovers": 3, "map_size": 120, "water": true, "wear": "normal", "sim_speed": 3.0},
+ "defaults": {"gravity_g": 2.0, "seed": 42, "num_rovers": 3, "map_size": 120, "water": true, "wear": "normal", "sim_speed": 3.0},
+ "fields": [{"key": "gravity_g", "type": "float", "label": "Gravity", "group": "planet",
+             "help": "Heavier gravity makes every slope harder: the rovers climb and tow less.",
+             "min": 0.5, "max": 3.0, "step": 0.1, "unit": "g"},
+            {"key": "wear", "type": "choice", "label": "Wear", "group": "wear",
+             "help": "How fast wheels and motors wear out. A worn-out rover breaks down and needs a tow.",
+             "choices": [{"value": "off", "label": "Off", "help": "Rovers never wear out."}]}],
+ "presets": {"gravity_g": [{"label": "Earth", "value": 1.0}, {"label": "Redshift-b", "value": 2.0}, {"label": "Heavy", "value": 3.0}]},
+ "physics": [{"gravity_g": 0.5, "climb_deg": 30.0, "tow_deg": 24.0, "grip_limited": true},
+             {"gravity_g": 2.0, "climb_deg": 21.3, "tow_deg": 8.4, "grip_limited": false}]}
+```
+
+(Shortened: `current` and `defaults` carry every key of the table, `fields` every row, `physics` 26 rows.
+Values have the table's type: `int` settings are JSON integers (`"map_size": 120`), except that an env
+value off the 10 m grid, e.g. `MAP_SIZE=95.5`, is reported as it is (`95.5`).)
+
+- `current`: the settings of the world the sim holds now (built and waiting, or running). `defaults`: what
+  the env vars give.
+- `fields`: the table above as data, in order, so a client can draw the form from it (a setting added later
+  shows up without a client change): `key`, `type` (`int`, `float`, `bool`, `choice`), `label`, `group`
+  (`planet`, `fleet`, `sector`, `features`, `wear`, `simulation`), `help` (one line), plus `min`, `max`,
+  `step`, `unit` for numbers and `choices` (`value`, `label`, `help`) for a choice.
+- `presets.gravity_g`: named gravities for quick picks.
+- `physics`: the predicted steepest climb and towing limit (deg) at each gravity step from 0.5 to 3 g for the
+  rover this sim builds; `grip_limited` where the motors could climb more than the 30 deg grip cap.
+
+### `POST /api/launch`
+
+Body: any launch settings, for example `{"gravity_g": 1.0, "num_rovers": 4}`. Keys left out keep the values
+of the world the sim holds; `{}` launches it as built.
+
+- From the setup phase with nothing changed, the built world starts. Otherwise (changed settings, or a
+  launch while running, which starts a new mission) a new world is built first, then the old one stops.
+- `200 {"ok": true, "phase": "running", "config": {...}}`; every client gets a fresh `init`.
+- `400 {"ok": false, "error": "gravity_g must be between 0.5 and 3 g; water must be true or false", "errors": ["gravity_g must be between 0.5 and 3 g", "water must be true or false"]}`:
+  every problem found, and nothing changes. The texts: `unknown setting 'warp' (use one of gravity_g, seed, ...)`,
+  `<key> must be true or false`, `<key> must be one of off, normal, harsh`, `<key> must be a number`,
+  `<key> must be a finite number`, `<key> must be a whole number`, `<key> must be between <min> and <max> <unit>`,
+  `<key> must be in steps of <step> <unit>`, `Body must be a JSON object like {"gravity_g": 1.5, "num_rovers": 4}`.
+- `500 {"ok": false, "error": "Could not build the new world: ..."}`: the world the sim held is untouched
+  (and keeps running if it was). `503` before the sim has a world.
+
+### `POST /api/reset` additions
+
+- Takes any launch setting next to `seed`, for example `{"seed": 7, "gravity_g": 1.5}`. Keys left out keep
+  the current world's values (so "Reset sim" keeps gravity, fleet and features and only changes the seed).
+- `seed` keeps its old leniency (`"8"` and `7.9` work, an empty body keeps the seed, a body that is not an
+  object is ignored) but must be 0 to 2147483647: otherwise 400 (`seed must be between 0 and 2147483647`,
+  `seed must be an integer`). Bad settings give 400 as for `POST /api/launch`; a failed build gives 500 and
+  the old world keeps running.
+- Works from the setup phase too: the mission starts at once.
+- Returns `{"ok": true, "seed": 7, "config": {...}}`.
+
+### Sim notes
+
+- The slope thresholds tuned for 2 g follow the launch gravity. The predicted climb limit is
+  `asin(4 T / r / (m g))` with T = 7.2 N m per wheel motor, r = 0.18 m and m = 22.5 kg, capped at 30 deg
+  where grip and tipping take over: 21.3 deg at 2 g, 14.0 at 3 g, 30 at 1 g. From it: target paths at most
+  `min(15, climb - 2)` deg, the lake and river no-trap flood `min(18, climb - 1)`, hazard placement
+  `min(20, climb - 1)`, the floor of the learned slope limit `min(12, climb - 2)`, the sand wheel load
+  `0.2 * min(1, g / 2)`, and the towing limit `0.8 * min(30, climb for twice the mass)`. At 2 g every one is
+  exactly its old value.
+- The towing limit is `Config.tow_limit_deg`, the one place it is computed: the formula of the wear and
+  towing design, `0.8 * asin(4 T / r / ((m1 + m2) g))`, with the asin capped at the same 30 deg grip limit as
+  a single rover (a tow train never climbs steeper than one rover alone). The two agree from about 0.73 g up
+  (8.4 deg at 2 g, 17.0 at 1 g); below that the cap holds it at 24 deg. Later steps (canyon ramps, tow paths
+  and their announcements) read `cfg.tow_limit_deg` rather than computing their own, so the setup screen,
+  `physics` and the rovers always quote the same number.
+- Gemma's prompts state each request's gravity: at 2 g the text is byte for byte as before ("super-Earth
+  (gravity 2 g, ..."); at 1 g and below the world is "an unknown planet (gravity 1 g, ...". Operator commands
+  and chat answers name the world without a number ("a super-Earth", at 1 g and below "a planet"), since
+  they may only quote their own inputs.
+- `Config.from_env` clamps `SEED`, `NUM_ROVERS`, `SIM_SPEED`, `MAP_SIZE` and `GRAVITY_G` to the table's
+  ranges. The feature env vars are on when unset; set, they are on only for `1`, `true`, `yes` or `on`. An
+  unknown `WEAR` gives normal.
+
 ## HTTP
 
 - `GET /api/health` -> `{"ok": true}`
 - `GET /api/truth` -> ground truth for the "reality" toggle (not what the rovers know):
   `{"nx": 161, "ny": 161, "res": 0.5, "origin": [-40, -40], "heights": [...nx*ny floats, row major by j...], "targets": [{"id": "t1", "x": 1.0, "y": 2.0, "kind": "mineral"}]}`
-- `POST /api/reset` with optional JSON body `{"seed": 7}` -> restarts the sim (new terrain if a new seed), then broadcasts a fresh `init`. Returns `{"ok": true, "seed": 7}`.
+- `POST /api/reset` with optional JSON body `{"seed": 7}` -> restarts the sim (new terrain if a new seed), then broadcasts a fresh `init`. Returns `{"ok": true, "seed": 7}` (version 7: plus `config`, and it takes launch settings too).
+- `GET /api/config` -> the launch settings, their table, presets and predicted limits (version 7).
+- `POST /api/launch` with optional JSON body of launch settings -> starts the mission (version 7).
 
 ## Client -> server
 
@@ -383,11 +501,11 @@ Nothing required. The server must ignore any text the client sends.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SEED` | 42 | terrain and target layout |
-| `NUM_ROVERS` | 3 | rovers in the fleet |
-| `SIM_SPEED` | 3.0 | sim seconds per wall second |
-| `MAP_SIZE` | 120 | map width in metres |
-| `GRAVITY_G` | 2.0 | gravity in Earth g |
+| `SEED` | 42 | terrain and target layout (0 to 2147483647) |
+| `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
+| `SIM_SPEED` | 3.0 | sim seconds per wall second (0.5 to 10) |
+| `MAP_SIZE` | 120 | map width in metres (60 to 200) |
+| `GRAVITY_G` | 2.0 | gravity in Earth g (0.5 to 3); out of range values are clamped |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer (only when running outside Docker) |
 | `BRAIN_BUDGET_MS` | 40 | stated compute budget per rover per decision cycle |
 | `GEMMA_ENABLED` | 1 | 0 = rules only |
@@ -396,3 +514,6 @@ Nothing required. The server must ignore any text the client sends.
 | `GEMMA_FAKE` | 0 | 1 = deterministic fake model (demo and tests without Ollama) |
 | `OPERATOR_TIMEOUT_S` | 0 | 0 = operator requests never expire (the rover waits); above 0 = wall seconds before the rover takes the safe default |
 | `AUTO_RESET_S` | 0 | off by default (the sim only resets on `POST /api/reset`); if set, after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` |
+| `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase for `POST /api/launch`; 1 = start at once (`AUTO_RESET_S` above 0 also starts at once) |
+| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features, 0 = leave it out (each is built in its own v7 step) |
+| `WEAR` | normal | `off`, `normal` or `harsh`: how fast wheels and motors wear out |
