@@ -92,6 +92,7 @@ def make_ice(terrain, cfg, avoid: list) -> list:
     out = []
     placed = [(a["x"], a["y"], a["radius"]) for a in avoid]
     for k in range(_count(rng, terrain.area)):
+        best = None                                                  # flattest spot seen, for a fallback
         for _ in range(200):
             r = float(rng.uniform(3.0, 7.0))
             x, y = (float(v) for v in rng.uniform(-half, half, 2))
@@ -100,10 +101,18 @@ def make_ice(terrain, cfg, avoid: list) -> list:
             d = np.hypot(X - x, Y - y)
             disc = d <= r + 3.0
             h0 = float(H[d <= r].mean())
-            if float(np.abs(H[disc] - h0).max()) < 0.25:             # gentle: under about 3 deg
+            dev = float(np.abs(H[disc] - h0).max())
+            if dev < 0.25:                                           # gentle: under about 3 deg
                 break
+            if best is None or dev < best[0]:
+                best = (dev, r, x, y, h0)
         else:
-            continue
+            # Rough worlds (mesas, canyon, dunes) rarely have such flat ground: take the flattest spot
+            # if levelling it keeps the blend ring passable (under 0.9 m over 3 m).
+            if best is None or best[0] >= 0.9:
+                continue
+            _, r, x, y, h0 = best
+            d = np.hypot(X - x, Y - y)
         w = 1.0 - _smooth(r, r + 3.0, d)
         H[:] = H * (1.0 - w) + h0 * w                                # level ice, blended into the ground
         placed.append((x, y, r))
