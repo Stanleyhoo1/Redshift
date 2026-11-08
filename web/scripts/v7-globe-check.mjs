@@ -8,6 +8,7 @@
 import { chromium } from 'playwright-core'
 import fs from 'node:fs'
 import path from 'node:path'
+import { IDLE_SWAY } from '../src/globe/globeMath.js'
 
 const url = process.argv[2] || 'http://localhost:5182'
 const outDir = process.argv[3] || 'screenshots'
@@ -302,6 +303,185 @@ add('sensors-kept', async (page) => {
   await panel.waitFor({ timeout: 15000 })
   const pressed = (await panel.locator('[aria-label="Camera view"] button[aria-pressed="true"]').innerText()).trim()
   if (pressed !== 'Chase') fail(`the camera view came back as ${pressed}, not Chase`)
+})
+
+// Arriving, the planet camera starts low over the site and eases out to the home view.
+add('arrival', async (page) => {
+  await startPhaseLog(page)
+  await page.keyboard.press('g')
+  await settled(page, 'globe')
+  const rec = await phaseLog(page)
+  const home = await page.evaluate(() => window.__redshift.globeState())
+  const closest = rec.minDist.in ?? Infinity
+  log(`arrival: closest ${closest.toFixed(2)} radii while easing out, home ${home.dist.toFixed(2)}`)
+  if (!(closest < home.dist - 1)) fail('the planet camera did not start close over the site')
+  if (!(await page.evaluate(() => window.__redshift.globeSiteScreen()))?.visible) fail('the landing site is not in view at home')
+})
+
+// Leaving, it dives back towards the site before the fade.
+add('dive', async (page) => {
+  await toGlobe(page)
+  const home = await page.evaluate(() => window.__redshift.globeState())
+  await startPhaseLog(page)
+  await page.keyboard.press('g')
+  await settled(page, 'plane')
+  const rec = await phaseLog(page)
+  const low = Math.min(rec.minDist.out ?? Infinity, rec.minDist.fade ?? Infinity)
+  log(`dive: ${home.dist.toFixed(2)} -> ${low.toFixed(2)} radii before the fade`)
+  if (!(low < home.dist - 1)) fail('the planet camera did not dive towards the site')
+  await shot(page, 'back-down')
+})
+
+// The sector camera comes back to the view it left (a user view here, so it flies back).
+add('round-trip', async (page) => {
+  await page.evaluate(() => window.__redshift.view(10, -6, 30, 50, 40))
+  await page.waitForTimeout(1500)
+  const before = await page.evaluate(() => window.__redshift.screenOf(0, 0))
+  await toGlobe(page)
+  await toPlane(page)
+  await page
+    .waitForFunction(
+      (b) => {
+        const p = window.__redshift.screenOf(0, 0)
+        return Math.hypot(p.x - b.x, p.y - b.y) < 3
+      },
+      before,
+      { timeout: 20000 },
+    )
+    .catch(() => {})
+  const after = await page.evaluate(() => window.__redshift.screenOf(0, 0))
+  const off = Math.hypot(after.x - before.x, after.y - before.y)
+  log(`round trip: the lander is ${off.toFixed(1)} px from where it was`)
+  if (off > 3) fail('the sector camera did not come back to the view it left')
+})
+
+// Drag turns the planet, scroll zooms, 0 glides back to the home view.
+add('orbit-home', async (page) => {
+  await toGlobe(page)
+  const home = await page.evaluate(() => window.__redshift.globeState())
+  const p = await freePoint(page, 0.55, 0.86)
+  if (!p) return fail('no free spot on the planet view to drag')
+  await page.mouse.move(p.x, p.y)
+  await page.mouse.down()
+  await page.mouse.move(p.x + 240, p.y - 30, { steps: 10 })
+  await page.mouse.up()
+  try {
+    await page.waitForFunction((h) => {
+      const d = window.__redshift.globeState().dir
+      return d[0] * h[0] + d[1] * h[1] + d[2] * h[2] < 0.995
+    }, home.dir, { timeout: 20000 })
+  } catch {
+    fail('dragging did not turn the planet')
+  }
+  const before = await page.evaluate(() => window.__redshift.globeState().dist)
+  await page.mouse.move(p.x, p.y)
+  await page.mouse.wheel(0, -600)
+  try {
+    await page.waitForFunction((d0) => window.__redshift.globeState().dist < d0 - 0.1, before, { timeout: 20000 })
+  } catch {
+    fail('scrolling did not zoom in')
+  }
+  await page.keyboard.press('0')
+  try {
+    await page.waitForFunction((h) => {
+      const g = window.__redshift.globeState()
+      const d = g.dir
+      return !g.gliding && d[0] * h.dir[0] + d[1] * h.dir[1] + d[2] * h.dir[2] > 0.9995 && Math.abs(g.dist - h.dist) < 0.02 && Math.abs(g.spin) < 0.01
+    }, home, { timeout: 20000 })
+  } catch {
+    fail('0 did not glide back to the home view')
+  }
+  const g = await page.evaluate(() => window.__redshift.globeState())
+  log(`after 0: dot ${dot(g.dir, home.dir).toFixed(5)}, dist ${g.dist.toFixed(2)}`)
+})
+
+// Left alone, the planet turns slowly (the sway starts 8 s after the last input, from rest).
+add('idle-spin', async (page) => {
+  await toGlobe(page)
+  const a = await page.evaluate(() => window.__redshift.globeState().spin)
+  await page.waitForTimeout(20000)
+  const b = await page.evaluate(() => window.__redshift.globeState().spin)
+  log(`idle spin ${a.toFixed(4)} -> ${b.toFixed(4)} rad`)
+  if (!(Math.abs(b - a) > 0.003)) fail('the planet did not turn when left alone')
+  await shot(page, 'planet-turned')
+})
+
+// Left alone for over a minute it only sways towards the sun and back: the middle of the
+// disc stays in daylight, and the site and its card stay in view the whole time.
+add('idle-long', async (page) => {
+  await toGlobe(page)
+  await page.waitForSelector('.globe-card[data-settled]', { timeout: 15000 })
+  const bad = new Set()
+  let peak = 0
+  for (let k = 1; k <= 18; k++) {
+    await page.waitForTimeout(4000)
+    const g = await page.evaluate(() => window.__redshift.globeState())
+    const m = await page.evaluate(() => window.__redshift.globeSiteScreen())
+    const away = await page.locator('.globe-card[data-away]').count()
+    peak = Math.max(peak, g.spin)
+    if (g.spin < -0.01 || g.spin > IDLE_SWAY + 0.01) bad.add(`it turned ${g.spin.toFixed(3)} rad, past the sway`)
+    if (!(g.lit > 0.2)) bad.add(`the sun stood at ${Number(g.lit).toFixed(2)} over the middle of the disc`)
+    if (!m?.visible) bad.add('the landing site went out of view')
+    if (away) bad.add('the sector card hid')
+  }
+  log(`72 s alone: turned at most ${peak.toFixed(3)} rad`)
+  for (const b of bad) fail(`left alone: ${b}`)
+  if (!(peak > 0.02)) fail('the planet did not turn when left alone for a minute')
+  await shot(page, 'planet-idle-long')
+})
+
+// A new world while on the planet (Reset sim stays in the controls): the camera glides to
+// the new landing site and frames it where it framed the old one; then back to seed 42,
+// which the later checks expect.
+add('reset-on-planet', async (page) => {
+  await toGlobe(page)
+  await page.waitForSelector('.globe-card[data-settled]', { timeout: 15000 })
+  const before = await page.evaluate(() => window.__redshift.globeSiteScreen())
+  // Sites from siteFromSeed (globeMath.js): seed 7 lands about 40 degrees from seed 42.
+  for (const [seed, site] of [
+    [7, { lat: -19.9, lon: 10.5 }],
+    [42, { lat: 4.4, lon: 44.9 }],
+  ]) {
+    await api('/api/reset', { seed })
+    try {
+      await page.waitForFunction(
+        ([want, b]) => {
+          const g = window.__redshift.globeState()
+          const m = window.__redshift.globeSiteScreen()
+          return g.site?.lat === want.lat && g.site?.lon === want.lon && !g.gliding && m?.visible && Math.hypot(m.x - b.x, m.y - b.y) < 40
+        },
+        [site, before],
+        { timeout: 30000 },
+      )
+    } catch {
+      const m = await page.evaluate(() => window.__redshift.globeSiteScreen())
+      fail(`after a reset to seed ${seed} the site is at ${JSON.stringify(m)}, not framed where the old one was ${JSON.stringify(before)}`)
+    }
+    if (await page.locator('.globe-card[data-away]').count()) fail(`the sector card is hidden after a reset to seed ${seed}`)
+  }
+  await page.waitForFunction(() => window.__redshift.state().rovers.r2, null, { timeout: 30000 })
+})
+
+// Reduced motion: the switch is instant both ways, and the planet stays still.
+add('reduced-motion', async () => {
+  const { context, page } = await openPage({ reducedMotion: 'reduce' })
+  try {
+    await startPhaseLog(page)
+    await page.keyboard.press('g')
+    const s = await viewOf(page)
+    if (s.render !== 'globe' || s.phase !== 'idle') fail(`with reduced motion G should switch at once, got ${JSON.stringify(s)}`)
+    await page.waitForTimeout(10000)
+    const g = await page.evaluate(() => window.__redshift.globeState())
+    if (Math.abs(g.spin) > 1e-6) fail('the planet turns with reduced motion')
+    await shot(page, 'planet-reduced-motion')
+    await page.keyboard.press('g')
+    const s2 = await viewOf(page)
+    if (s2.render !== 'plane' || s2.phase !== 'idle') fail(`with reduced motion G should come back at once, got ${JSON.stringify(s2)}`)
+    const log2 = await phaseLog(page)
+    if (log2.phases.some((k) => k.endsWith('/out') || k.endsWith('/fade'))) fail(`reduced motion went through ${log2.phases.join(' > ')}`)
+  } finally {
+    await context.close()
+  }
 })
 
 // Run every check in order.
