@@ -126,6 +126,7 @@ class EventSpec:
     hazard: str | None = None
     damage: str | None = None
     peer: str | None = None
+    state: str | None = None      # FSM state the trace was raised in (newer than the robot's last agent_state)
 
     @property
     def key(self) -> tuple:
@@ -150,12 +151,13 @@ def event_for_trace(trace, robots, recovery_rover: str | None = None) -> EventSp
     if not isinstance(robot, str) or robot not in robots or not isinstance(kind, str):
         return None
     text = _short(trace.get('input'), INPUT_MAX)
+    fsm = trace.get('state') if isinstance(trace.get('state'), str) and trace.get('state') else None
     if kind in HAZARD_KINDS:
-        return EventSpec('novel_hazard', robot, kind, text, hazard=text or None)
+        return EventSpec('novel_hazard', robot, kind, text, hazard=text or None, state=fsm)
     if kind in LOW_CONFIDENCE_KINDS:
-        return EventSpec('low_confidence', robot, kind, text)
+        return EventSpec('low_confidence', robot, kind, text, state=fsm)
     if kind == 'critical_damage':
-        return EventSpec('critical_damage', robot, kind, text, damage=text or None)
+        return EventSpec('critical_damage', robot, kind, text, damage=text or None, state=fsm)
     if kind == 'sos' and trace.get('status', 'active') == 'active':
         if not recovery_rover or recovery_rover == robot or recovery_rover not in robots:
             return None
@@ -570,6 +572,12 @@ class BrainHub:
     def context(self, spec: EventSpec, operator_text: str | None = None) -> dict:
         now = self.clock()
         states = {r: self.states.get(r, now, STATE_FRESH_S) for r in self.robots}
+        if spec.state:
+            # the trace is newer than the robot's last agent_state: reason about the state it was raised in
+            st = dict(states.get(spec.robot) or {}, state=spec.state)
+            if spec.state in HOLD_STATES:
+                st['speed'] = 0.0
+            states[spec.robot] = st
         st = states.get(spec.robot) or {}
         v_max = self.rover_v_max if spec.robot.startswith('rover') else st.get('v_limit')
         return build_context(spec.robot, states=states, edge=self.edges.get(spec.robot, now, STATE_FRESH_S),

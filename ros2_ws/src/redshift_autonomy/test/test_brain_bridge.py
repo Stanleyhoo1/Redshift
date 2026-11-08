@@ -48,7 +48,7 @@ def decision(**kw):
 def test_hazard_traces_are_novel_hazards(kind):
     spec = event_for_trace(trace(kind, input='Boulder field 6.8 m ahead'), ROBOTS, 'rover_1')
     assert spec == EventSpec('novel_hazard', 'rover_0', kind, 'Boulder field 6.8 m ahead',
-                             hazard='Boulder field 6.8 m ahead')
+                             hazard='Boulder field 6.8 m ahead', state='EXPLORING')
 
 
 def test_caution_enter_is_low_confidence_and_critical_damage_targets_the_damaged_rover():
@@ -835,3 +835,21 @@ def test_drop_guard_for_the_planner_callbacks():                                
     def bad_warn(_):
         raise RuntimeError('logger gone')
     assert bb.DropGuard(bad_warn).call('x', float, BIG) is None          # a failing logger does not raise either
+
+
+def test_an_event_uses_the_fsm_state_its_trace_was_raised_in():
+    """agent_state arrives at its own rate: the critical_damage trace is already in SAFE_HOLD while the latest
+    agent_state still says EXPLORING at speed. The brain must reason about the held robot (limit 0), not the stale
+    moving one."""
+    spec = bb.event_for_trace({'robot': 'rover_0', 'kind': 'critical_damage', 'state': 'SAFE_HOLD',
+                               'input': 'Health 10%'}, ROBOTS, 'rover_1')
+    assert spec.state == 'SAFE_HOLD'
+    sos = bb.event_for_trace({'robot': 'rover_0', 'kind': 'sos', 'state': 'AWAIT_RESCUE', 'input': 'SOS'},
+                             ROBOTS, 'rover_1')
+    assert sos.robot == 'rover_1' and sos.state is None        # the SOS event is about the rescuer: its own state
+    hub, _, _ = make_hub()
+    ctx = hub.context(spec)
+    assert ctx['state'] == 'SAFE_HOLD' and ctx['speed_limit_mps'] == 0.0 and ctx['speed_mps'] == 0.0
+    moving = hub.context(bb.EventSpec('novel_hazard', 'rover_0', 'path_blocked', 'x', state='REPLANNING'))
+    assert moving['state'] == 'REPLANNING' and moving['speed_limit_mps'] == pytest.approx(0.94)
+    assert hub.context(bb.EventSpec('novel_hazard', 'rover_0', 'path_blocked', 'x'))['state'] == 'EXPLORING'
