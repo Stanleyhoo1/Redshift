@@ -60,8 +60,9 @@ def make_dunes(terrain, cfg) -> list:
     half = cfg.map_size / 2.0
     X, Y, H = terrain.X, terrain.Y, terrain.heights
     out, placed = [], []
+    tries = 60 if v7_biomes.weight(terrain, "dunes") <= 1.0 else 200     # v7 biomes: dune worlds look harder
     for k in range(v7_biomes.count(terrain, "dunes", _count(rng, terrain.area))):
-        for _ in range(60):
+        for _ in range(tries):
             r = float(rng.uniform(7.5, 12.5))
             x, y = (float(v) for v in rng.uniform(-half, half, 2))
             if _clear(x, y, r, placed, cfg, half, terrain):
