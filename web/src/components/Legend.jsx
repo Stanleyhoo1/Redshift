@@ -16,6 +16,10 @@ export function Legend({ slopeColors, frontiers, life = true, reality = false })
   const hasTrace = useSim((s) => s.v4 || s.targets.some((t) => t.kind === 'trace'))
   // v7 kinds of lifeform: one entry per kind the fleet has noticed (all present with Reality on),
   // only once a kind other than grazers is about
+  // Only the target kinds, lifeforms and tracks actually on the map now get a key entry.
+  const targetKinds = useSim((s) => [...new Set(s.targets.map((t) => t.kind))].sort().join(','))
+  const hasLife = useSim((s) => (s.lifeforms?.length ?? 0) > 0)
+  const hasTracks = useSim((s) => (s.tracks?.length ?? 0) > 0)
   const kindList = useSim((s) => legendKinds(s.lifeforms, s.tracks, reality).join(','))
   const kinds = kindList && kindList !== 'grazer' ? kindList.split(',') : []
   const lim = Number.isFinite(limit.current) ? limit.current : 30
@@ -87,14 +91,18 @@ export function Legend({ slopeColors, frontiers, life = true, reality = false })
           </li>
           {life && (
             <>
-              <li title="A creature the fleet is tracking">
-                <i className="sw sw-life" style={{ '--c': LIFE }} />
-                Lifeform
-              </li>
-              <li title="A fleet track: what the rovers believe is moving there">
-                <i className="sw sw-track" style={{ '--c': LIFE }} />
-                Track
-              </li>
+              {hasLife && (
+                <li title="A creature the fleet is tracking">
+                  <i className="sw sw-life" style={{ '--c': LIFE }} />
+                  Lifeform
+                </li>
+              )}
+              {hasTracks && (
+                <li title="A fleet track: what the rovers believe is moving there">
+                  <i className="sw sw-track" style={{ '--c': LIFE }} />
+                  Track
+                </li>
+              )}
             </>
           )}
         </ul>
@@ -112,7 +120,7 @@ export function Legend({ slopeColors, frontiers, life = true, reality = false })
       <TerrainLegend />
       <ul className="legend-list legend-row">
         {Object.entries(KIND_STYLE)
-          .filter(([k]) => k !== 'trace' || hasTrace)
+          .filter(([k]) => (k !== 'trace' || hasTrace) && (!targetKinds || targetKinds.split(',').includes(k)))
           .map(([k, v]) => (
             <li key={k}>
               <i className="sw sw-diamond" style={{ '--c': v.color }} />
