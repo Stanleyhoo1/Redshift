@@ -220,6 +220,24 @@ add('hud-fit', async (page) => {
   await page.keyboard.press('s') // slope colours off again
 })
 
+// Graphics Low compiles the planet without GLOBE_HQ (fewer octaves, one crater size).
+add('graphics-low', async (page) => {
+  const gfx = page.locator('[aria-labelledby="gfx-label"]')
+  await toGlobe(page)
+  if (!(await page.evaluate(() => window.__redshift.globeState().hq))) fail('Graphics High is not using the detailed planet shader')
+  await gfx.locator('button', { hasText: 'Low' }).click({ timeout: 10000 })
+  try {
+    await page.waitForFunction(() => window.__redshift.globeState().hq === false, null, { timeout: 15000 })
+    await page.waitForTimeout(1500)
+    await shot(page, 'planet-low')
+  } catch {
+    fail('Graphics Low did not switch the planet to the cheaper shader')
+  } finally {
+    await gfx.locator('button', { hasText: 'High' }).click()
+    await toPlane(page)
+  }
+})
+
 // Run every check in order.
 await api('/api/reset', { seed: 42 })
 await api('/api/_mock/rearm', { armed: false })
