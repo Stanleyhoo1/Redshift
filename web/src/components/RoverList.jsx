@@ -2,20 +2,28 @@ import { memo, useEffect, useState } from 'react'
 import { useSim } from '../state/store.js'
 import { fixed } from '../lib/format.js'
 import { kindStyle } from '../lib/theme.js'
+import { focusStatus, focusTitle } from '../lib/focus.js'
 import { Battery, BrainChip, StatePill } from './RoverBits.jsx'
 import { SamplingLine, Tubes } from './SampleBits.jsx'
 
-function goalText(rover, targets, lander, tracks) {
+// v7: the card shows the focus line unless something more specific is going on.
+const FOCUS_HIDDEN = new Set(['observing', 'returning', 'recovering', 'charging', 'fault'])
+const showsFocus = (rover) => !!rover?.focus && !rover.sampling && !FOCUS_HIDDEN.has(rover.state)
+
+function goalText(rover, targets, lander, tracks, askingLife) {
   if (!rover) return 'Waiting for telemetry'
   const dist = (p) => Math.hypot(p[0] - rover.x, p[1] - rover.y)
   if (rover.state === 'charging') return 'Charging at the lander'
   if (rover.state === 'fault') return 'Motors off, rebooting'
-  // v4: watching a lifeform track.
+  // v4: watching a lifeform track. v7: it follows at a safe distance while it asks you.
   if (rover.state === 'observing') {
     const k = rover.track_id ? tracks.find((q) => q.id === rover.track_id) : null
+    if (askingLife) return k ? `Following ${k.id} at a safe distance, waiting for you` : 'Following at a safe distance, waiting for you'
     if (!k) return 'Watching something move'
     return `Watching ${k.id}, ${k.label || 'a moving object'}, ${Math.round(dist([k.x, k.y]))} m`
   }
+  // v7: concentrating on an area (the operator's, or its own curiosity).
+  if (showsFocus(rover)) return focusStatus(rover.focus)
   if (rover.state === 'returning' && Number.isFinite(rover.capacity) && rover.samples?.length >= rover.capacity) return 'Tubes full, taking the samples to the lander'
   // Kept short: the state pill already says what kind of goal this is.
   if (rover.target_id) {
@@ -37,7 +45,7 @@ function goalText(rover, targets, lander, tracks) {
   return 'No goal'
 }
 
-const RoverCard = memo(function RoverCard({ meta, rover, targets, lander, hazards, budget, tracks, selected, following, onSelect }) {
+const RoverCard = memo(function RoverCard({ meta, rover, targets, lander, hazards, budget, tracks, askingLife, selected, following, onSelect }) {
   const toggle = () => onSelect(meta.id)
   const lit = selected || following
   return (
@@ -75,8 +83,8 @@ const RoverCard = memo(function RoverCard({ meta, rover, targets, lander, hazard
             <span>{rover ? `${fixed(rover.speed, 1)} m/s` : '--'}</span>
           </span>
         </div>
-        <div className="rover-goal">
-          {rover?.sampling ? <SamplingLine sampling={rover.sampling} target={targets.find((t) => t.id === rover.sampling.target)} /> : goalText(rover, targets, lander, tracks)}
+        <div className="rover-goal" data-focus={showsFocus(rover) ? rover.focus.reason : undefined} title={showsFocus(rover) ? focusTitle(rover.focus) : undefined}>
+          {rover?.sampling ? <SamplingLine sampling={rover.sampling} target={targets.find((t) => t.id === rover.sampling.target)} /> : goalText(rover, targets, lander, tracks, askingLife)}
         </div>
       </div>
     </li>
@@ -103,6 +111,8 @@ export function RoverList({ follow, selected, onSelect }) {
   const hazards = useSim((s) => s.hazards)
   const budget = useSim((s) => s.fleet.budget_ms)
   const tracks = useSim((s) => s.tracks)
+  // v7: rovers with an open lifeform question (they follow the herd while they wait).
+  const askingLife = useSim((s) => s.requests.filter((q) => q.kind === 'lifeform').map((q) => q.rover).join(','))
   // Two-row cards on shorter screens or bigger fleets, so the event log keeps its room.
   const short = useMediaQuery('(max-height: 960px)')
   const compact = short || meta.length > 3
@@ -119,6 +129,7 @@ export function RoverList({ follow, selected, onSelect }) {
             hazards={hazards}
             budget={budget}
             tracks={tracks}
+            askingLife={askingLife.split(',').includes(m.id)}
             selected={selected === m.id}
             following={follow === m.id}
             onSelect={onSelect}

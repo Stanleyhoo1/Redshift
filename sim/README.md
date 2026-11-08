@@ -38,6 +38,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `redshift/places.py` | Commands that name a place (protocol v6): finds the known places of a kind from fleet knowledge only (water bodies, found targets, mapped spires, herds, hazard sites, the lander), applies qualifiers (nearest, biggest, north, the second one, near rover 2), finds a safe goal next to a place, writes short labels and reads which option a chat answer picks. |
 | `redshift/gemma.py` | Talks to the local Gemma model (Ollama), or a fake model for demos and tests: prompts, answer checks, timeouts, a keyword parser for typed commands. |
 | `redshift/advisor.py` | Tier 2: asks Gemma at the right moments, applies its advice when it is safe, runs the operator chat (commands and questions) and the questions to the operator. |
+| `redshift/chatmem.py` | Chat memory (protocol v7): the last messages and what they talked about (places, targets, candidate lists, the rover, the last command, survey and focus reports), so "go back there", "the second one", "that lake" and "do that again" resolve. |
 | `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
 | `scripts/climb_test.py` | Drives a rover up ramps of known angle to check how steep it can climb. |
 | `scripts/gemma_bench.py` | Measures Gemma's speed and answers against a real Ollama. |
@@ -50,10 +51,12 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `tests/test_v4.py` | Water (a hole in the map, identified, avoided, the water sensor failsafe), spire fall and replan, motion tracks, observing a lifeform at a safe distance, the first-sighting question, point-and-click hazards and every 400, sampling, tubes and the cache, and the v4 message fields. |
 | `tests/test_v5.py` | Questions: intent (questions vs commands), Gemma's answer checks (a bad number or id falls back to the rules), grounded rule answers for every topic, fleet vs per-rover replies, `reply_to`, `stats`, camera sizes up to 1280 x 720. |
 | `tests/test_v6.py` | Place commands: polite orders vs questions, place parsing (keyword parser and checked Gemma answers), the resolver and its qualifiers, "nothing known", the closest free rover, `choose_place` answered by `POST /api/answer` and by chat, the survey and its report, requests that never expire by default (and the countdown when `OPERATOR_TIMEOUT_S` is above 0). |
+| `tests/test_v7.py` | Area focus (frontier choice inside the circle, claims, the stay and its report, "explore north of the lander", survey then focus), curiosity (triggers, cooldown, limits), chat references (keyword parser and fake Gemma), following a new herd while asking, and leaving for the lander when waiting would drain the battery. |
 
 `test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
 numbers) written for the old 80 m world, so they run with `MAP_SIZE` 80 and the v4 features (water,
-spires, lifeforms, slower instruments, tube limit) switched off; `test_smoke.py` and `test_v4.py`
+spires, lifeforms, slower instruments, tube limit) switched off (`test_hazards.py` also switches off the
+v7 curiosity, which changes where the rovers are when a hazard is placed); `test_smoke.py` and `test_v4.py`
 run on the 120 m default.
 
 ## How to run
@@ -130,7 +133,7 @@ GEMMA_FAKE=1 python -m redshift.sim --gemma --seconds 200 --hazard rockfall@60 \
        --say "30:rover 2, go check out the area north of the lander" --say "45:r1 go to 10, -5"
 ```
 
-Tests (about 4 minutes):
+Tests (about 5 minutes):
 
 ```bash
 python -m pytest -q tests/        # add -s to see the event log
@@ -256,10 +259,16 @@ every message for rendering.
   average speed 0.3 m/s. Resuming exploration." `fleet.lifeforms_seen` counts confirmed lifeforms
   (by herd: the most individuals seen at the same time, so a creature that is lost and found again
   is not counted twice).
-- **The operator decides the first time.** The first sighting after start or reset asks: "Possible
-  lifeform 8 m north (...). Follow it or keep exploring?" with Follow it / Observe from here (the
-  default: it never gets closer) / Keep exploring. Later sightings only ask when Gemma is unsure.
-  With tier 2 switched off the rules follow carefully.
+- **The operator decides, while the rover follows (protocol v7).** A herd nobody asked about yet:
+  the rover starts following at about 6 m at once (the creatures may wander off) and asks in the same
+  moment: "Possible lifeform 8 m north (...). I'm following at about 6 m (never closer than 4 m) while
+  I wait, in case it wanders off. Keep following, observe from here, or keep exploring?" It does not
+  hold still for this question and the 75 s limit waits for the answer (the 25 m leash still holds: it
+  watches from the edge). Gemma's look adds its label to the question. Each herd is asked about once
+  (track ids and re-sightings nearby); "keep exploring" also leaves it alone when it is seen again.
+  Soft ground, new rocks, liquid, dust, a fault or a low battery end the follow, close the question and
+  say why in the chat. Herds asked about before: Gemma decides. With tier 2 switched off the rules
+  follow carefully.
 - Any other rover that finds a tracked creature within 3.5 m ahead stops and waits, and the planner
   routes around tracks.
 
@@ -354,9 +363,33 @@ Where Gemma helps:
    "the second one", "p2", "the one near the lander" or "the lake". Nothing known: the fleet says so and
    lists what it knows.
 
+8. **Areas, curiosity and chat memory (protocol v7).** "explore around the lake", "go to the vent and look
+   around", "explore there", "explore north of the lander" (a circle 20 m that way), "explore around 10,
+   -5", and "investigate X" (the 30 s survey first): the rover gets a `focus`, a 15 m circle (bigger for a
+   big lake). Its frontier choice takes unclaimed unknown ground inside the circle first (then the
+   frontiers nearest its edge); frontiers another rover is heading for stay theirs, and the other rovers
+   leave the inside of someone's circle alone. It stays about 2 min from reaching the circle, or until
+   nothing unknown is left nearby (or it maps nothing new for 30 s), then reports in chat what it mapped
+   there (m2, how much of the circle is now mapped), what it found (targets, samples, water, spires,
+   herds) and how long, from its own memory: "Explored around the pond's shore for 118 s: mapped 640 m2 of
+   new ground; the area within 15 m is now 94% mapped. Found t4 (ice deposit). Back to normal
+   exploration." Curiosity: when a rover finds something new (a target, a new body of water, a cluster of
+   spires, a herd it finished watching, or ground whose median slope or height suddenly differs from what
+   it has been driving through) it sticks around for about 60 s ("r2 found water here. Sticking around for
+   about 60 s to look for more."), only where at least 20% of a 10 m circle is unknown, ending early when
+   less than 8% is left or nothing new is mapped for 15 s; never while returning, on a low battery, during
+   another focus, or where another rover's focus covers the spot, and then not again for 150 s nor within
+   15 m of an earlier spot. The chat remembers the last 8 messages and what they named, so "go back there",
+   "what did you find there?", "the second one", "that lake", "the vent you mentioned", "investigate it",
+   "do that again" and "same for rover 3" resolve (an unclear reference gets a short question); Gemma gets
+   a few lines of that context.
+
 **Hold** shows as state `idle` with goal `null` and a chat note ("r1: holding at (12, -4), say resume
 to continue"). A held rover still watches its battery: if it would not get home otherwise, it leaves
-the hold and says so.
+the hold and says so; held on the lander pad it keeps charging. Any rover waiting for an answer keeps
+the same battery check as when driving: when it must go home it closes its open questions ("Battery
+21%, I can't wait any longer: heading back to the lander. I'll ask again if it still matters."),
+drops a focus or a follow and leaves at once.
 
 **Demo a question:** start the sim (with Ollama, or `GEMMA_FAKE=1`), wait until the rovers are
 driving, then trigger a rockfall (UI hazard button, or
@@ -410,7 +443,8 @@ expansions instead (3 us each, measured here), which makes runs repeat exactly; 
 ## How the rovers decide
 
 - **Seeing.** Each rover's LiDAR hits go into one shared map of heights and slopes. Rocks show up
-  as steep spots. If mapped ground changes (a rockfall), the map notices and updates.
+  as steep spots. If mapped ground changes (a rockfall), the map notices and updates (hits closer than
+  3 m only fill in around a change seen from further away: up close the beams graze rock faces).
 - **Where to go.** A frontier is the edge between known, drivable ground and the unknown. Each
   rover scores the frontiers: big and close is good, turning around is bad, and a frontier another
   rover is already heading for is much worse. So the rovers spread out. It also checks it has

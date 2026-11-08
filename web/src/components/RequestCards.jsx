@@ -314,8 +314,11 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
   const places = hasPlaces(q)
   const nums = places ? placeNumbers(q) : null
   const color = meta?.color || '#8d99aa'
+  // v7: a rover that sights a herd follows it at a safe distance while it asks.
+  const following = useSim((s) => q.kind === 'lifeform' && s.rovers[q.rover]?.state === 'observing')
   let hint
-  if (waiting && places) hint = `${name} holds position until you choose. Click a numbered marker on the map, a choice here, or reply in Comms ("the second one").`
+  if (following) hint = `Following at a safe distance while waiting for you${auto ? `. With no answer it takes the safe default: ${def.toLowerCase()}.` : '.'}`
+  else if (waiting && places) hint = `${name} holds position until you choose. Click a numbered marker on the map, a choice here, or reply in Comms ("the second one").`
   else if (waiting) hint = `${name} holds position until you answer.`
   else if (auto) hint = `Moving cautiously until you answer. With no answer it takes the safe default: ${def.toLowerCase()}.`
   else hint = 'Moving cautiously until you answer.'
@@ -337,7 +340,7 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
             </span>
           )}
           {!kind && waiting && (
-            <span className="rq-wait" title="No time limit: the rover waits for your answer">
+            <span className="rq-wait" title={following ? 'No time limit: the rover keeps following until you answer' : 'No time limit: the rover waits for your answer'}>
               <i aria-hidden="true" />
               Waiting for you
             </span>

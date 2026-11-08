@@ -19,6 +19,7 @@ import { Spires, fallDebug } from './Spires.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
 import { PlaceCandidates } from './PlaceCandidates.jsx'
+import { FocusAreas } from './FocusAreas.jsx'
 import { CameraRig } from './CameraRig.jsx'
 import { Atmosphere } from './Atmosphere.jsx'
 import { Gravel } from './Gravel.jsx'
@@ -96,6 +97,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <Spires reality={view.reality} />
       <Lander />
       {view.frontiers && <Frontiers />}
+      <FocusAreas />
       <Targets />
       <Rovers showPaths={view.paths} selected={selected} onSelect={onSelect} />
       {view.lidar && <Lidar />}

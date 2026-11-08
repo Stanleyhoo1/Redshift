@@ -53,6 +53,8 @@ function resolution(m, chat, answers, waited, byMsgId) {
 
 function InlineQuestion({ m, req, answer, res, now }) {
   const hover = usePlaceHover()
+  // v7: a rover that sighted a herd follows it while it waits for the answer.
+  const following = useSim((s) => req?.kind === 'lifeform' && s.rovers[req.rover]?.state === 'observing')
   if (!req) {
     return (
       <p className="msg-res" data-kind={res.kind}>
@@ -105,6 +107,8 @@ function InlineQuestion({ m, req, answer, res, now }) {
           auto ? `${left} s left, then the safe default` : `${left} s left`
         ) : anyPlace ? (
           'Waiting for you: pick one here, click its marker on the map, or type "the second one"'
+        ) : following ? (
+          'Waiting for you: following at a safe distance meanwhile'
         ) : (
           'Waiting for you: the rover holds until you answer'
         )}

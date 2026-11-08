@@ -14,6 +14,7 @@ scans of the map or the event log):
   lifeforms    things it saw moving, and the herds it observed (individuals, how long, speed)
   events       the last few notable log lines about this rover (fed by Fleet.log)
   goal         where it is going and why (rules, Gemma's pick or the operator)
+  focus        areas it concentrated on (protocol v7): how long, what it mapped and found there
 
 All lists are bounded. The fact sheets and the rule-based answers built from this live in
 answers.py.
@@ -33,6 +34,7 @@ MAX_HAZARDS = 12
 MAX_LIFE = 6
 MAX_EVENTS = 8
 MAX_WATER = 6
+MAX_FOCUS = 6
 
 # hazard kinds: how a rover describes meeting one and what it did about it (first person)
 HAZARD_TEXT = {
@@ -96,6 +98,7 @@ class RoverMemory:
         self.replans = 0
         self.charges = 0
         self.goal_note = None                               # (t, source, text): why the current goal
+        self.focus: deque = deque(maxlen=MAX_FOCUS)         # protocol v7: areas it explored (rover.focus_summary)
 
     # ------------------------------------------------------------------ updates (cheap)
     def on_mapped(self, fmap, new_flat, n_new: int) -> None:
@@ -167,6 +170,17 @@ class RoverMemory:
 
     def on_goal(self, t: float, source: str, text: str) -> None:
         self.goal_note = (round(float(t), 1), source, text)
+
+    def on_focus(self, summary: dict) -> None:
+        """An area focus ended (protocol v7): where, how long, what it mapped and found there."""
+        self.focus.append(dict(summary))
+
+    def focus_near(self, x: float, y: float, radius: float = 12.0):
+        """The newest area this rover explored near (x, y), or None."""
+        for s in reversed(self.focus):
+            if math.hypot(s["x"] - x, s["y"] - y) <= radius:
+                return s
+        return None
 
     # ------------------------------------------------------------------ reading
     def mapped_m2(self) -> float:

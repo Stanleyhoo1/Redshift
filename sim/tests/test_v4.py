@@ -293,6 +293,8 @@ def test_observer_keeps_its_distance_and_gives_up_in_time():
 
 
 def test_first_sighting_asks_the_operator():
+    """Protocol v7: a herd nobody asked about yet is followed at once while the operator is asked (keep
+    following, observe from here, keep exploring); each herd is asked about once."""
     p = fake_planner()
     sim = make(planner=p, operator_timeout_s=60.0)
     try:
@@ -306,30 +308,40 @@ def test_first_sighting_asks_the_operator():
                 q = reqs[0]
                 break
         assert q is not None, [e["msg"] for e in sim.fleet.events][-10:]
-        assert q["rover"] == "r1" and q["question"].startswith("Possible lifeform")
-        assert q["question"].endswith("Follow it or keep exploring?")
+        assert q["rover"] == "r1" and q["kind"] == "lifeform" and q["question"].startswith("Possible lifeform")
+        assert "I'm following at about 6 m (never closer than 4 m) while I wait" in q["question"]
+        assert q["question"].endswith("Keep following, observe from here, or keep exploring?")
         assert [o["id"] for o in q["options"]] == ["follow", "observe_here", "keep_exploring"]
+        assert [o["label"] for o in q["options"]][0] == "Keep following"
         assert q["default"] == "observe_here"
-        assert r.state == "observing" and r.obs["mode"] == "here"
+        assert r.state == "observing" and r.obs["mode"] == "follow" and r.obs["asking"] == q["id"]
+        assert not r.question_hold                       # a lifeform question never holds the rover still
         tick = sim.tick_message()
         assert tick["rovers"][0]["track_id"] == r.obs["track"]
         tr = sim.fleet.tracker.get(r.obs["track"])
         assert tr.label.startswith("possible lifeform")
+        assert "Gemma thinks: possible lifeform" in sim.advisor.requests_msg()[0]["question"]
         assert any(e.get("source") == "gemma" and "possible lifeform" in e["msg"] for e in sim.fleet.events)
         assert sim.advisor.answer(q["id"], "follow") == "ok"
-        assert r.obs["mode"] == "follow"
+        assert r.obs["mode"] == "follow" and r.obs["asking"] is None
         assert sim.fleet.lifeforms_seen >= 1
-        # later sightings only ask when Gemma is unsure: the fake is sure (0.8), so no new question
+        # the same herd seen again is not asked about again (track ids and nearby re-acquisitions)
+        rec = sim.advisor.asked_herds[0]
+        assert sim.advisor._herd_record(tr, *tr.predict(sim.t)) is rec
         n_req = sim.advisor.req_seq
         for _ in range(int(10 / 0.2)):
             sim.step()
+        assert sim.advisor.req_seq == n_req
+        # a different herd gets its own question (once)
         try:
             sim.hazards.trigger("lifeform", "r2")
         except HazardError:
-            pass
+            return
         for _ in range(int(10 / 0.2)):
             sim.step()
-        assert sim.advisor.req_seq == n_req
+        assert sim.advisor.req_seq <= n_req + 1          # at most one question for the new herd
+        if sim.advisor.req_seq == n_req + 1:
+            assert len(sim.advisor.asked_herds) == 2
     finally:
         p.close()
         sim.close()

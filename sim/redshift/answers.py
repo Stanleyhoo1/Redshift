@@ -167,6 +167,10 @@ def doing_text(rover) -> str:
     if rover.op_goal is not None:
         gx, gy = rover.op_goal
         return f"driving to {_xy(gx, gy)} for the operator, {math.hypot(gx - rover.x, gy - rover.y):.0f} m away{extra}"
+    fc = getattr(rover, "focus", None)
+    if fc is not None:                    # protocol v7: an area it concentrates on
+        left = rover.focus_msg()["ends_in"]
+        return f"exploring around {fc['label']} ({left:.0f} s left){extra}"
     if rover.goal is not None:
         gx, gy = rover.goal
         d = math.hypot(gx - rover.x, gy - rover.y)
@@ -220,6 +224,11 @@ def why_text(rover) -> str:
         return "I'm heading home"
     if rover.op_goal is not None:
         return "the operator sent me there; I'll explore again on arrival"
+    fc = getattr(rover, "focus", None)
+    if fc is not None:
+        if fc["reason"] == "operator":
+            return f"the operator asked me to explore around {fc['label']}"
+        return f"I found {fc.get('what') or 'something new'} there, so I'm looking around it for more"
     b = rover.dir_bias
     if b is not None and t < b[2]:
         dirn = compass(b[0], b[1])

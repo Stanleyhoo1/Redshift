@@ -362,6 +362,34 @@ Sim notes (clarifications):
 - The rover state stays `"exploring"` during a survey (goal null). Chat for a place command: one `ack` (or `refuse`, `question`), an `info` on arrival, and with investigate the survey `info`; all carry `reply_to` the command, and `request_id` when they follow a `choose_place` answer.
 - "go to the lander" without investigate means return home (the closest free rover when none is named).
 
+## Version 7 additions (exploring an area, curiosity, chat memory, following lifeforms)
+
+All optional for clients.
+
+### Rover addition: `focus` (present only while a rover concentrates on an area)
+
+```json
+"focus": {"x": 12.0, "y": -30.0, "r": 15.0, "reason": "operator", "label": "the pond's shore", "ends_in": 64.0}
+```
+
+- While focused, the rover explores the unknown ground within `r` of the centre first (frontiers inside the circle win, then the nearest edge of the circle), and stays until `ends_in` (sim seconds) runs out or nothing unknown is left nearby. Then it reports in chat (`kind: "info"`) what it mapped and found there and goes back to normal exploration.
+- `reason: "operator"`: "explore around the lake", "go to the vent and look around", "explore there", "explore north of the lander", and "investigate ..." (survey first, then the focus). About 120 sim s. A plain "go to" still just goes.
+- `reason: "interest"`: the rover's own curiosity. When it finds something new (a science target, water, a cluster of spires, a herd it finished watching, or ground that looks different), it sticks around for about 60 sim s to look for more, and says so in the event log ("r2 found water here. Sticking around for about 60 s to look for more."). Never while returning, on low battery, during an operator focus, or where another rover already has a focus.
+
+### Chat memory
+
+The sim keeps a short conversation context: the last 8 or so messages, plus the places, targets, candidates and rovers most recently mentioned by the operator or the rovers. References resolve against it: "go back there", "what did you find there?", "the second one", "do that again", "same for rover 3", "that lake", "the vent you mentioned". Unclear references get a short question or a `choose_place` request as usual. Answers and acks may mention what was resolved ("Back to the pond's shore at (15.7, 1.7), 22 m.").
+
+### Lifeform sightings
+
+When a rover sees a herd it has not asked about before, it starts following at the observation standoff (never closer than the planetary protection distance) at once, because the creatures may wander off, and asks the operator in the same moment (request `kind: "lifeform"`, options: keep following, observe from here, keep exploring). It keeps following until the operator answers (no expiry by default). Each herd is asked about once. Safety still wins: low battery, hazards and water end the follow, and the rover says so.
+
+Sim notes (clarifications):
+- `focus.ends_in` counts from when the rover reaches the circle (within `r` plus about 4 m); until then it shows the full duration. An area the rover cannot get into within about 180 sim s is given up (reported).
+- An operator focus reports in chat with `reply_to` the command (and `request_id` after a `choose_place` answer). An interest focus reports in the event log only: it is the rover's own initiative, so the chat stays the operator's conversation.
+- Lifeform option ids stay `follow`, `observe_here`, `keep_exploring` (labels "Keep following", "Observe from here", "Keep exploring"); `default` stays `observe_here`. When the follow ends for safety before an answer, the request is closed (it leaves `requests`, `POST /api/answer` gets 409) with a chat `info` carrying its `request_id`.
+- Any rover waiting for the operator (any request kind) keeps its normal battery check; when it must go home it closes its open requests the same way ("Battery 21%, I can't wait any longer: heading back to the lander. ..."), drops a focus or a follow, and leaves at once. A rover held on the lander pad keeps charging.
+
 ### `GET /api/camera/{rover_id}.jpg`
 
 Live image rendered by MuJoCo from the rover's point of view, at the current sim state.

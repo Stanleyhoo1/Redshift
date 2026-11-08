@@ -119,13 +119,15 @@ DESCRIBE_CLASSES = ("lifeform", "rock", "other_rover", "dust", "unknown")
 DESCRIBE_ACTIONS = ("approach", "observe", "ignore", "ask_operator")
 MAX_LABEL_WORDS = 10
 COMMANDS = ("go_to", "go_to_place", "explore_direction", "sample_target", "return_home", "hold", "resume",
-            "avoid_area", "question", "unclear")
+            "avoid_area", "repeat", "question", "unclear")
 TOPICS = ("status", "history", "exploration", "finds", "samples", "battery", "hazards", "lifeforms", "water",
           "location", "why", "unknown")
 DIRECTIONS = ("north", "south", "east", "west", "north-east", "north-west", "south-east", "south-west")
-# protocol v6: commands that name a place the fleet knows ("go to the water source")
-PLACES = ("water", "spire", "mineral", "ice", "vent", "trace", "target", "lifeform", "hazard", "lander")
-QUALIFIERS = ("nearest", "farthest", "biggest", "smallest", "newest") + DIRECTIONS + ("near_rover", "ordinal", "none")
+# protocol v6: commands that name a place the fleet knows ("go to the water source"); v7: "there" is the place
+# the chat talked about last (resolved by the advisor's chat memory), "mentioned" picks the one the chat named
+PLACES = ("water", "spire", "mineral", "ice", "vent", "trace", "target", "lifeform", "hazard", "lander", "there")
+QUALIFIERS = ("nearest", "farthest", "biggest", "smallest", "newest") + DIRECTIONS + ("near_rover", "ordinal",
+                                                                                      "mentioned", "none")
 
 MAX_REASON_WORDS = 25
 MAX_CANDIDATES = 6
@@ -142,6 +144,10 @@ MAX_ANSWER_CHARS = 360
 MAX_ANSWER_SENTENCES = 3
 MAX_FACT_LINES = 8
 DEFAULT_AVOID_RADIUS = 3.0
+MAX_CHAT_LINES = 3     # protocol v7: recent chat lines in a command prompt ...
+MAX_CHAT_LINE = 90     # ... each cut to this many characters
+MAX_CHAT_REFS = 200    # ... plus one line of resolved references (last place, last list, last rover)
+MAX_CONTEXT_LINES = 2  # context lines in an answer prompt (what "there" or "it" means)
 
 SYSTEM_BASE = (
     "You advise an autonomous rover exploring an unknown super-Earth (gravity 2 g, no link to Earth). "
@@ -167,15 +173,17 @@ SYSTEM_INTERPRET = SYSTEM_BASE + (
     'Example reason: "slip 52% while ground speed 0.05 m/s: the wheels spin in soft ground."'
 )
 SYSTEM_COMMAND = (
-    "Turn a human operator's message into one command for a fleet of rovers on a super-Earth. "
-    "Commands: go_to (x, y); go_to_place (place, target_id, qualifier, ordinal, near_rover, investigate): a "
-    "place named without coordinates, like the water, a vent, the herd, t7; explore_direction (direction); "
-    "sample_target (target_id); return_home, hold, resume; avoid_area (x, y, radius m); question (topic): asks for "
-    "information; unclear (ask one short question). Polite requests to act (can we, could you, let's, please) "
-    "are commands. rover: an id, all, or none if no rover is named ('rover 2' is r2, 'the orange one' the orange "
-    "rover). investigate is true for investigate, survey, look around, look for or signs of life. A direction "
-    "or area without coordinates or place means explore_direction. Use only numbers and ids from the message "
-    "or the lists, never a rover's own position; 0 or none if unused. ack: one short sentence. JSON only."
+    "Turn an operator message into one command for a rover fleet. "
+    "Commands: go_to (x, y); go_to_place (place, target_id, qualifier, ordinal, near_rover, investigate, explore): "
+    "a known place, like the water, a vent, the herd, t7; explore_direction (direction); sample_target (target_id); "
+    "return_home, hold, resume; avoid_area (x, y, radius); repeat: the last command again (do that again, same "
+    "for rover 3); question (topic): asks for information; unclear (ask one short question). Polite requests to "
+    "act are commands. rover: an id, all, or none if not named (rover 2 is r2, the orange one the orange rover). "
+    "investigate: investigate, survey, look for life. explore: stay and map around it (explore around, look "
+    "around). place there: the place talked about last (there, it, the second one); qualifier mentioned: that "
+    "lake, the vent you mentioned. A direction without place or coordinates is explore_direction. Use only "
+    "numbers and ids from the message or lists, never a rover position; 0 or none if unused. ack: one short "
+    "sentence. JSON only."
 )
 
 SYSTEM_DESCRIBE = SYSTEM_BASE + (
@@ -471,7 +479,8 @@ def render_readings(d: dict) -> str:
 # a number not glued to a letter, digit, underscore or dot on its left: "f2", "r1", "t3" are ids
 _NUM_RE = re.compile(r"(?<![A-Za-z0-9_.])[-+]?\d+(?:\.\d+)?")
 # keys whose numbers are not inputs a reason may cite or a coordinate may use (ids, the map edges)
-_NO_NUMBERS_KEYS = {"rover", "id", "kind", "options", "classes", "type", "name", "colour", "color", "bounds"}
+_NO_NUMBERS_KEYS = {"rover", "id", "kind", "options", "classes", "type", "name", "colour", "color", "bounds",
+                    "lines"}     # lines: recent chat text (v7); only the context's place coordinates count
 
 
 def numbers_in_text(text: str) -> list:
@@ -714,6 +723,13 @@ def _fleet_context(ctx: dict) -> dict:
     elif isinstance(out.get("map_size"), (int, float)):
         h = out["map_size"] / 2.0
         out["bounds"] = [compact(-h), compact(-h), compact(h), compact(h)]
+    chat = ctx.get("chat")           # protocol v7: a few lines of chat memory (advisor.ChatMemory.context)
+    if isinstance(chat, dict):
+        lines = [" ".join(str(x).replace(EM_DASH, ",").split())[:MAX_CHAT_LINE]
+                 for x in list(chat.get("lines") or [])[-MAX_CHAT_LINES:] if str(x).strip()]
+        refs = " ".join(str(chat.get("refs") or "").replace(EM_DASH, ",").split())[:MAX_CHAT_REFS]
+        if lines or refs:
+            out["chat"] = {"lines": lines, "refs": refs}
     return out
 
 
@@ -735,9 +751,11 @@ _ID_RE = re.compile(r"\b([rtkqwsh])(\d+)\b")
 
 
 def make_answer_request(ticket: int, speaker: str, t: float, question: str, topic: str, facts: list,
-                        default: str, timeout_s: float | None = None) -> Request:
+                        default: str, timeout_s: float | None = None, context: list | None = None) -> Request:
     """An operator question to answer from fact lines (answers.fact_lines). speaker: a rover id, or
-    "fleet". default: the rule-based answer, returned in a fallback."""
+    "fleet". default: the rule-based answer, returned in a fallback. context (protocol v7): up to two short
+    lines from the chat memory saying what a reference in the question means ("there" is the pond's shore);
+    the facts must still hold every number the answer uses."""
     q = " ".join(str(question or "").split())[:MAX_TEXT]
     if not q:
         raise ValueError("empty question")
@@ -748,6 +766,9 @@ def make_answer_request(ticket: int, speaker: str, t: float, question: str, topi
     for ln in lines:
         ids.update(m.group(0) for m in _ID_RE.finditer(ln))
     payload = {"speaker": str(speaker), "question": q, "topic": topic, "facts": lines}
+    ctx = [" ".join(str(x).replace(EM_DASH, ",").split())[:MAX_STR] for x in (context or []) if str(x).strip()]
+    if ctx:
+        payload["context"] = ctx[:MAX_CONTEXT_LINES]
     return Request(ticket=ticket, kind="answer", rover_id=str(speaker), t=float(t), payload=payload,
                    inputs=[v for ln in lines for _, v in numbers_in_text(_strip_thousands(ln))], text=q,
                    default=str(default or ""), num_predict=ANSWER_NUM_PREDICT, timeout_s=timeout_s,
@@ -758,7 +779,9 @@ def _answer_prompt(req: Request) -> str:
     p = req.payload
     who = ("You speak for the whole rover fleet." if p["speaker"] == "fleet" else f"You are rover {p['speaker']}.")
     facts = "\n".join(f"- {ln}" for ln in p["facts"]) or "- (no facts)"
-    return f"{who}\nOperator asks: {json.dumps(p['question'], ensure_ascii=False)}\nFacts:\n{facts}\nAnswer the question."
+    ctx = "".join(f"Chat context: {ln}\n" for ln in p.get("context") or [])
+    return (f"{who}\nOperator asks: {json.dumps(p['question'], ensure_ascii=False)}\n{ctx}Facts:\n{facts}\n"
+            f"Answer the question.")
 
 
 def _command_prompt(req: Request) -> str:
@@ -797,6 +820,12 @@ def _command_prompt(req: Request) -> str:
             where.append(f"Map x {x0:g} to {x1:g} m, y {y0:g} to {y1:g} m, +x east, +y north.")
     if where:
         lines.append(" ".join(where))
+    ch = ctx.get("chat")
+    if ch:
+        if ch.get("lines"):
+            lines.append("Recent chat: " + " | ".join(ch["lines"]))
+        if ch.get("refs"):
+            lines.append("Context: " + ch["refs"])
     lines.append("Give one command.")
     return "\n".join(lines)
 
@@ -863,6 +892,7 @@ def build_schema(req: Request) -> dict:
                  "ordinal": {"type": "number"},
                  "near_rover": near,
                  "investigate": {"type": "boolean"},
+                 "explore": {"type": "boolean"},
                  "direction": {"type": "string", "enum": list(DIRECTIONS) + ["none"]},
                  "x": {"type": "number"}, "y": {"type": "number"}, "radius": {"type": "number"},
                  "target_id": target,
@@ -1016,9 +1046,37 @@ _PLACE_VERB_RE = re.compile(r"\b(?:go|goes|going|head\w*|drive|move|navigate|tra
                             r"come back|get back|back to|investigat\w*|check\w*|look\w*|inspect\w*|survey\w*|scan\w*|"
                             r"search\w*|explor\w*|examin\w*|stud(?:y|ies)|observ\w*|watch\w*|approach\w*|send|"
                             r"swing by|stop by|take|get (?:to|over|closer)|bring|reach|find)\b")
-_INVESTIGATE_RE = re.compile(r"\b(?:investigat\w*|survey\w*|look(?:ing)? around|look(?:ing)? for|have a look around|"
-                             r"search\w*|scan\w*|examin\w*|explor\w* (?:around|near)|check(?:ing)? (?:for|around)|"
+_INVESTIGATE_RE = re.compile(r"\b(?:investigat\w*|survey\w*|look(?:ing)? for|"
+                             r"search\w*|scan\w*|examin\w*|check(?:ing)? (?:for|around)|"
                              r"stud(?:y|ying)|observ\w*|watch\w*|signs? of|traces? of|evidence of)\b")
+# protocol v7: stay and explore an area ("explore around the lake", "go to the vent and look around")
+_EXPLORE_AREA_RE = re.compile(r"\b(?:explor\w*|look(?:ing)? around|have a look around|stick around|"
+                              r"map (?:out )?(?:the area )?around)\b")
+_EXPLORE_SIDE_RE = re.compile(r"\bexplor\w*\s+(?:the\s+(?:area|ground|region|land|terrain)\s+)?(?:to\s+the\s+)?"
+                              r"(north|south)[\s-]?(east|west)(?:ern)?\s+(?:side\s+)?of\b"
+                              r"|\bexplor\w*\s+(?:the\s+(?:area|ground|region|land|terrain)\s+)?(?:to\s+the\s+)?"
+                              r"(north|south|east|west)(?:ern)?\s+(?:side\s+)?of\b")
+# chat references: the place talked about last ("go back there", "investigate it", "that spot")
+_THERE_RE = re.compile(r"\b(?:over\s+)?there\b(?!\s+(?:is|are|was|were|be)\b)"
+                       r"|\bthat\s+(?:place|spot|area|location|site|one)\b"
+                       r"|\b(?:the\s+)?same\s+(?:place|spot|area|location|site)\b"
+                       r"|\bwhere\s+you\s+(?:were|went|just\s+were)\b"
+                       r"|\b(?:to|at|around|near|investigat\w*|survey\w*|explor\w*|check(?:\s+out)?|look\s+at|"
+                       r"inspect\w*|visit|revisit|approach|sample|study|watch|observe|follow)\s+it\b")
+_LIST_PICK_RE = re.compile(r"\b(?:the\s+)?(first|second|third|fourth|fifth|sixth|1st|2nd|3rd|4th|5th|6th|last)\s+"
+                           r"(?:one|option|place|spot|target|site)\b")
+_MENTIONED_AFTER_RE = re.compile(r"^\s*(?:that\s+|which\s+)?(?:you|we|r\d+|rover\s*\w+)\s+(?:just\s+)?(?:mentioned|found|saw|"
+                                 r"spotted|reported|told me about|talked about|were talking about|flagged|marked|"
+                                 r"listed|noted)\b")
+_MENTIONED_BEFORE_RE = re.compile(r"\b(?:that|this|the\s+same|those|these)\s+(?:\w+\s+)?$")
+_REPEAT_RE = re.compile(r"^(?:(?:can|could|would|will)\s+(?:you|we|u)\s+)?(?:please\s+)?(?:"
+                        r"(?:do|try)\s+(?:that|it|this|the\s+same)(?:\s+thing)?(?:\s+again)?"
+                        r"|(?:and\s+)?(?:the\s+)?same\s*(?:thing\s*)?(?:again|for|with|goes\s+for|here|please)?"
+                        r"(?:\s+(?:you|him|her|them|that\s+one))?"
+                        r"|repeat(?:\s+(?:that|it|this|the\s+last(?:\s+(?:command|order|one))?))?"
+                        r"|again|one\s+more\s+time|ditto|you\s+too|too|as\s+well|also"
+                        r"|(?:you\s+)?do\s+(?:it|that|the\s+same)\s+too)"
+                        r"(?:\s+(?:too|as\s+well|again|please))*\s*[.!?]*$")
 _SIGNS_RE = re.compile(r"\b(?:for\s+)?(?:any\s+|some\s+)?(?:signs?|traces?|evidence|hints?|indications?)\s+of\s+"
                        r"(?:any\s+)?(\w+(?: forms?)?)")
 _LOOKFOR_RE = re.compile(r"\b(?:look|looking|search|searching|check|checking|scan|scanning|hunt|hunting)\s+"
@@ -1114,28 +1172,57 @@ def parse_place(low: str, rest: str, rover, target, rovers: list, polite: bool =
     near, span = near_reference(low, rovers)
     if span is not None:
         text = _blank(text, [(a, b) for a, b in [span] if b <= len(text)])
+    side = _EXPLORE_SIDE_RE.search(text)          # v7: "explore north of the lander": an area on that side
+    side_dir = None
+    if side:
+        side_dir = f"{side.group(1)}-{side.group(2)}" if side.group(1) else side.group(3)
     place, pspan = _place_words(text)
     if place is None and target:
         place = "target"
     if place is None and life:
         place = "lifeform"
+    pick = None
+    if place is None:                             # v7: a chat reference ("go back there", "the second one")
+        pick = _LIST_PICK_RE.search(text)
+        if pick is not None or _THERE_RE.search(text):
+            place = "there"
     if place is None:
         return None
-    if place == "lander":
-        if _DIR_RE.search(text) or (_RETURN_RE.search(text) and not inv):
+    explore = bool(_EXPLORE_AREA_RE.search(text)) or side is not None
+    if place == "lander" and side is None:
+        if _DIR_RE.search(text) or (_RETURN_RE.search(text) and not inv and not explore):
             return None                   # "north of the lander" (explore), "back to the lander" (return home)
-    if not (inv or polite or _PLACE_VERB_RE.search(text)):
+    mentioned = place != "there" and pspan is not None and bool(
+        _MENTIONED_AFTER_RE.match(text[pspan[1]:]) or _MENTIONED_BEFORE_RE.search(text[:pspan[0]]))
+    if not (inv or polite or explore or pick is not None or mentioned or _PLACE_VERB_RE.search(text)
+            or (place == "there" and _SAMPLE_WORD_RE.search(text))):
         return None
     qtext = _blank(text, [pspan]) if pspan else text
-    qual, ordinal = _qualifier(qtext)
+    if side is not None:
+        qtext = _blank(qtext, [side.span()])      # the direction names the side, not which one
+    if place == "there":
+        if pick is not None:
+            w = pick.group(1)
+            qual, ordinal = "ordinal", (-1 if w == "last" else _ORDINALS[w])
+        else:
+            qual, ordinal = "none", None
+    elif mentioned:
+        qual, ordinal = "mentioned", None         # "that lake", "the vent you mentioned"
+    else:
+        qual, ordinal = _qualifier(qtext)
     if qual == "none" and near is not None:
         qual = "near_rover"
     if target and place in ("mineral", "ice", "vent", "trace", "target"):
         qual, ordinal = "none", None
-    return {"type": "go_to_place", "rover": rover, "place": place,
-            "target_id": target if place in ("mineral", "ice", "vent", "trace", "target") else None,
-            "qualifier": qual, "ordinal": ordinal, "near_rover": near if qual == "near_rover" else None,
-            "investigate": inv}
+    out = {"type": "go_to_place", "rover": rover, "place": place,
+           "target_id": target if place in ("mineral", "ice", "vent", "trace", "target") else None,
+           "qualifier": qual, "ordinal": ordinal, "near_rover": near if qual == "near_rover" else None,
+           "investigate": inv}
+    if explore:
+        out["explore"] = True
+    if side_dir:
+        out["direction"] = side_dir
+    return out
 
 
 def _ask(rover, topic: str, conf: float) -> dict:
@@ -1219,15 +1306,22 @@ def command_ack(cmd: dict) -> str:
     typ, rover = cmd.get("type"), cmd.get("rover")
     who = "All rovers" if rover == "all" else rover
     if typ == "go_to":
-        return f"{who} going to {_fmt_xy(cmd['x'], cmd['y'])}." if who else f"Going to {_fmt_xy(cmd['x'], cmd['y'])}."
+        verb = "exploring around" if cmd.get("explore") else "going to"
+        return (f"{who} {verb} {_fmt_xy(cmd['x'], cmd['y'])}." if who
+                else f"{verb[:1].upper() + verb[1:]} {_fmt_xy(cmd['x'], cmd['y'])}.")
     if typ == "explore_direction":
         return f"{who} exploring {cmd['direction']}." if who else f"Exploring {cmd['direction']}."
     if typ == "sample_target":
         return f"{who} going to sample {cmd['target_id']}." if who else f"Going to sample {cmd['target_id']}."
     if typ == "go_to_place":
-        what = cmd.get("target_id") or {"lifeform": "herd", "hazard": "hazard site"}.get(cmd["place"], cmd["place"])
-        verb = "investigating" if cmd.get("investigate") else "going to"
+        what = cmd.get("target_id") or {"lifeform": "herd", "hazard": "hazard site", "there": "place we talked about"}.get(
+            cmd["place"], cmd["place"])
+        if cmd.get("direction") and cmd.get("explore"):
+            what = f"area {cmd['direction']} of the {what}"
+        verb = "investigating" if cmd.get("investigate") else ("exploring around" if cmd.get("explore") else "going to")
         return f"{who} {verb} the {what}." if who else f"{verb[:1].upper() + verb[1:]} the {what}."
+    if typ == "repeat":
+        return f"{who} doing the same." if who else "Repeating the last command."
     if typ == "return_home":
         return f"{who} returning to the lander." if who else "Returning to the lander."
     if typ == "hold":
@@ -1262,6 +1356,11 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
         {"type": "question", "rover", "topic"}        the operator asks for information (TOPICS)
         {"type": "go_to_place", "rover", "place", "target_id", "qualifier", "ordinal", "near_rover", "investigate"}
                                                       a place the fleet knows (PLACES, QUALIFIERS; protocol v6)
+        {"type": "repeat", "rover"}                   the last command again ("do that again", "same for rover 3")
+    Protocol v7: go_to and go_to_place carry "explore": True to stay and explore around the place ("explore
+    around the lake", "go to 10, -5 and look around"), and "direction" for an area on that side of it ("explore
+    north of the lander"). place "there" is the place the chat talked about last (qualifier "ordinal": an entry
+    of the last list, -1 the last one); qualifier "mentioned" picks the one the chat named ("that lake").
     fleet_context: {"rovers": [{"id", "name", "color", "x", "y"}], "targets": [{"id", ...}], ...}
     (raw or already compacted)."""
     ctx = _fleet_context(fleet_context)       # idempotent: raw or already compacted
@@ -1273,6 +1372,8 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
     rover, rest, question = _resolve_rover(low, rovers)
     if question:
         return _unclear(question)
+    if _REPEAT_RE.match(_LEAD_RE.sub("", " ".join(rest.split())).strip(" ,;:")):
+        return _done({"type": "repeat", "rover": rover})       # v7: "do that again", "same for rover 3"
     q_strength, q_topic = question_intent(low, rovers)
     if q_strength == "strong":
         return _ask(rover, q_topic, 0.9)
@@ -1313,15 +1414,18 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
         return _done({"type": "resume", "rover": rover})
     if _HOLD_RE.search(rest):
         return _done({"type": "hold", "rover": rover})
+    explore = bool(_EXPLORE_AREA_RE.search(rest))           # v7: "explore around 10, -5"
     if pair is not None:
-        return _done({"type": "go_to", "rover": rover, "x": pair[0], "y": pair[1]})
+        return _done(dict({"type": "go_to", "rover": rover, "x": pair[0], "y": pair[1]},
+                          **({"explore": True} if explore else {})))
     if dm:
         return _done({"type": "explore_direction", "rover": rover, "direction": _norm_direction(dm)})
     if _EXPLORE_RE.search(rest):
         return _done({"type": "resume", "rover": rover})
     nums = [v for _, v in numbers_in_text(rest)]
-    if len(nums) == 2 and _GO_RE.search(rest):
-        return _done({"type": "go_to", "rover": rover, "x": nums[0], "y": nums[1]})
+    if len(nums) == 2 and (_GO_RE.search(rest) or explore):
+        return _done(dict({"type": "go_to", "rover": rover, "x": nums[0], "y": nums[1]},
+                          **({"explore": True} if explore else {})))
     if q_strength == "weak" or (q_strength is None and q_topic != "unknown"):    # "battery?", "any water"
         return _ask(rover, q_topic, 0.7)
     return _unclear(_HELP)
@@ -1471,6 +1575,8 @@ def _place_command(req: Request, data: dict, rv) -> dict:
     qual = _QUAL_SYNONYMS.get(qual, qual).replace(" ", "-") if qual not in ("near rover",) else "near_rover"
     if qual not in QUALIFIERS:
         raise ValueError(f"qualifier {data.get('qualifier')!r} not in {list(QUALIFIERS)}")
+    if place == "there" and qual != "ordinal":
+        qual = "none"                         # the place talked about last: nothing to choose between
     ordinal = None
     if qual == "ordinal":
         try:
@@ -1488,10 +1594,16 @@ def _place_command(req: Request, data: dict, rv) -> dict:
         raise ValueError(f"near_rover {data.get('near_rover')!r} is not a rover id or lander")
     if qual == "near_rover" and near is None:
         qual = "none"
-    inv = data.get("investigate")
-    inv = inv.strip().lower() in ("true", "yes", "1") if isinstance(inv, str) else bool(inv)
-    return {"type": "go_to_place", "rover": rv, "place": place, "target_id": tid, "qualifier": qual,
-            "ordinal": ordinal, "near_rover": near if qual == "near_rover" else None, "investigate": inv}
+    inv = _flag(data.get("investigate"))
+    out = {"type": "go_to_place", "rover": rv, "place": place, "target_id": tid, "qualifier": qual,
+           "ordinal": ordinal, "near_rover": near if qual == "near_rover" else None, "investigate": inv}
+    if _flag(data.get("explore")):
+        out["explore"] = True
+    return out
+
+
+def _flag(v) -> bool:
+    return v.strip().lower() in ("true", "yes", "1") if isinstance(v, str) else bool(v)
 
 
 def _fix_place(req: Request, cmd: dict) -> dict:
@@ -1502,6 +1614,9 @@ def _fix_place(req: Request, cmd: dict) -> dict:
     parser saw. Explicit coordinates always mean go_to."""
     p = (req.parsed or {}).get("command") or {}
     typ = cmd.get("type")
+    if p.get("type") == "go_to_place" and p.get("place") == "there" and typ != "go_to_place" and \
+            not ((req.payload.get("fleet") or {}).get("chat") or {}).get("refs"):
+        return cmd                        # "go there" with nothing in the chat to refer to: the model's reading
     if p.get("type") == "go_to_place":
         if typ == "go_to_place":
             out = dict(cmd, place=p["place"])
@@ -1509,15 +1624,41 @@ def _fix_place(req: Request, cmd: dict) -> dict:
                 out["target_id"] = p["target_id"]
             if out.get("place") not in ("mineral", "ice", "vent", "trace", "target"):
                 out["target_id"] = None
-            if cmd.get("qualifier") in (None, "none") and p.get("qualifier") not in (None, "none"):
+            if (cmd.get("qualifier") in (None, "none") and p.get("qualifier") not in (None, "none")) or \
+                    p["place"] == "there" or p.get("qualifier") == "mentioned":
                 out.update(qualifier=p["qualifier"], ordinal=p.get("ordinal"), near_rover=p.get("near_rover"))
             out["investigate"] = bool(cmd.get("investigate")) or bool(p.get("investigate"))
+            # v7: the operator's words decide whether it stays to explore and on which side
+            out.pop("explore", None)
+            out.pop("direction", None)
+            if p.get("explore"):
+                out["explore"] = True
+            if p.get("direction"):
+                out["direction"] = p["direction"]
             return out
-        if typ in ("go_to", "explore_direction", "unclear", "return_home", "sample_target", "resume") and \
-                not _explicit_xy(req):
+        if typ in ("go_to", "explore_direction", "unclear", "return_home", "sample_target", "resume", "hold",
+                   "repeat") and not _explicit_xy(req):
             return dict(p)
         return cmd
     if typ == "go_to_place" and p.get("type") == "go_to" and _explicit_xy(req):
+        return dict(p)
+    if typ == "go_to" and p.get("type") == "go_to":
+        out = {k: v for k, v in cmd.items() if k != "explore"}
+        if p.get("explore"):
+            out["explore"] = True
+        return out
+    return cmd
+
+
+def _fix_refs(req: Request, cmd: dict) -> dict:
+    """Post-check 'repeat' (protocol v7) with the keyword parser: "do that again" and "same for rover 3" are a
+    repeat whatever the model made of them; a model's repeat for a message that names a concrete order is that
+    order."""
+    p = (req.parsed or {}).get("command") or {}
+    typ = cmd.get("type")
+    if p.get("type") == "repeat" and typ != "repeat":
+        return dict(p)
+    if typ == "repeat" and p.get("type") not in (None, "repeat", "unclear", "question"):
         return dict(p)
     return cmd
 
@@ -1625,6 +1766,8 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             if not (_coord_ok(x, req.coords) and _coord_ok(y, req.coords)):
                 return bad(f"coordinates ({x:g}, {y:g}) are not in the message or the fleet data")
             cmd = {"type": typ, "rover": rv, "x": x, "y": y}
+            if _flag(data.get("explore")):
+                cmd["explore"] = True
         elif typ == "avoid_area":
             x, y = _number(data, "x"), _number(data, "y")
             if not (_coord_ok(x, req.coords) and _coord_ok(y, req.coords)):
@@ -1653,7 +1796,7 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             if not req.target_ids and not re.fullmatch(r"t\d+", tid):
                 return bad(f"target {tid!r} is not a target id")
             cmd = {"type": typ, "rover": rv, "target_id": tid}
-        elif typ in ("return_home", "hold", "resume"):
+        elif typ in ("return_home", "hold", "resume", "repeat"):
             cmd = {"type": typ, "rover": rv}
         elif typ == "go_to_place":
             cmd = _place_command(req, data, rv)
@@ -1667,6 +1810,7 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
         return bad(str(e))
     cmd = _fix_go_to(req, cmd, data)
     cmd = _fix_place(req, cmd)
+    cmd = _fix_refs(req, cmd)
     cmd = _fix_intent(req, cmd)
     if cmd["type"] == "unclear":
         cmd["question"] = _strip_label(cmd["question"]) or _HELP
@@ -2073,7 +2217,7 @@ class FakeBackend(Backend):
         return {"command": c["type"], "rover": c.get("rover") or "none", "place": c.get("place") or "none",
                 "qualifier": c.get("qualifier") or "none", "ordinal": c.get("ordinal") or 0,
                 "near_rover": c.get("near_rover") or "none", "investigate": bool(c.get("investigate")),
-                "direction": c.get("direction", "none"),
+                "explore": bool(c.get("explore")), "direction": c.get("direction", "none"),
                 "x": c.get("x", 0), "y": c.get("y", 0), "radius": c.get("radius", 0),
                 "target_id": c.get("target_id") or "none", "topic": c.get("topic", "none"),
                 "question": c.get("question", ""), "ack": p["ack"], "confidence": 0.85}
@@ -2347,14 +2491,15 @@ class GemmaPlanner:
         return self._enqueue(req)
 
     def submit_answer(self, speaker: str, t: float, question: str, topic: str, facts: list,
-                      default: str, timeout_s: float | None = None) -> int:
+                      default: str, timeout_s: float | None = None, context: list | None = None) -> int:
         """Ask Gemma to answer an operator question from fact lines (answers.fact_lines). speaker: a
         rover id or "fleet". default: the rule-based answer (Result.answer in a fallback). timeout_s:
-        latency limit for this call (default the budget, GEMMA_BUDGET_MS). Never blocks, never raises."""
+        latency limit for this call (default the budget, GEMMA_BUDGET_MS). context: chat memory lines (what
+        "there" means; protocol v7). Never blocks, never raises."""
         ticket = next(self._tickets)
         lim = timeout_s if timeout_s is not None else self.cfg.budget_ms / 1000.0
         try:
-            req = make_answer_request(ticket, speaker, t, question, topic, facts, default, lim)
+            req = make_answer_request(ticket, speaker, t, question, topic, facts, default, lim, context)
         except Exception as e:                # noqa: BLE001
             stub = Request(ticket, "answer", str(speaker), float(t or 0.0), {}, [], default=str(default or ""),
                            text=str(question)[:MAX_TEXT])

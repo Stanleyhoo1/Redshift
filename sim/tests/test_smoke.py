@@ -196,7 +196,11 @@ def test_messages_match_protocol():
         assert m["type"] == "tick" and math.isfinite(m["t"])
         assert len(m["rovers"]) == cfg.num_rovers
         for r in m["rovers"]:
-            assert ROVER_KEYS <= set(r) <= ROVER_KEYS | {"sampling", "stats"}, set(r) ^ ROVER_KEYS   # stats: v5
+            # stats: v5; focus: v7 (only while a rover concentrates on an area)
+            assert ROVER_KEYS <= set(r) <= ROVER_KEYS | {"sampling", "stats", "focus"}, set(r) ^ ROVER_KEYS
+            if "focus" in r:
+                assert set(r["focus"]) == {"x", "y", "r", "reason", "label", "ends_in"}, r["focus"]
+                assert r["focus"]["reason"] in ("operator", "interest") and r["focus"]["ends_in"] >= 0.0
             assert r["state"] in STATES, r["state"]
             assert 0.0 <= r["battery"] <= 1.0
             assert r["goal"] is None or (len(r["goal"]) == 2 and all(math.isfinite(v) for v in r["goal"]))

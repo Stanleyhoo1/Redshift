@@ -6,6 +6,7 @@ import { HAZARD, SIGNAL, instrumentStyle, kindStyle } from '../lib/theme.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { Battery, StatePill, brainLevel, fmtMs } from './RoverBits.jsx'
 import { InstrumentIcon, Tubes } from './SampleBits.jsx'
+import { focusStatus, focusTitle } from '../lib/focus.js'
 import { PlannerRow } from './Planner.jsx'
 import { reducedMotion } from '../scene/sceneConstants.js'
 import { RETRY_DOWN, cameraProblem, useCameraStream } from './useCameraStream.js'
@@ -591,7 +592,14 @@ export function SensorPanel({ roverId, onClose }) {
         <StatePill rover={rover} hazards={hazards} />
         <Battery value={rover?.battery} charging={rover?.state === 'charging'} />
         {rover?.capacity && <Tubes samples={rover.samples} capacity={rover.capacity} targets={targets} />}
-        <span className="sp-title">Live sensors</span>
+        {rover?.focus ? (
+          <span className="sp-title sp-focus" data-reason={rover.focus.reason} title={focusTitle(rover.focus)}>
+            <i aria-hidden="true" />
+            <span>{focusStatus(rover.focus)}</span>
+          </span>
+        ) : (
+          <span className="sp-title">Live sensors</span>
+        )}
         <button type="button" className="sp-close" onClick={onClose} title="Close (Esc)" aria-label="Close the sensor panel">
           <svg viewBox="0 0 12 12" aria-hidden="true">
             <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />

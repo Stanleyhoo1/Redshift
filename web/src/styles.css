@@ -4650,3 +4650,75 @@ kbd {
   cursor: default;
 }
 
+
+/* ---------------------------------------------------------------- v7: rover focus */
+
+/* The tag on the edge of a rover's focus circle on the map (opacity set by the scene). */
+.focus-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 2px 8px 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--c) 38%, transparent);
+  border-radius: 999px;
+  background: rgba(6, 9, 14, 0.7);
+  color: var(--ink-2);
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 560;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.focus-tag > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.focus-tag[data-reason='operator'] {
+  border-color: color-mix(in srgb, var(--c) 65%, transparent);
+  background: rgba(6, 9, 14, 0.8);
+  color: var(--ink);
+}
+
+.focus-tag-ring,
+.sp-focus i,
+.rover-goal[data-focus]::before {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border: 1.5px dashed var(--c, var(--rover));
+  border-radius: 50%;
+}
+
+.focus-tag[data-reason='interest'] .focus-tag-ring,
+.sp-focus[data-reason='interest'] i,
+.rover-goal[data-focus='interest']::before {
+  border-style: dotted;
+  opacity: 0.85;
+}
+
+/* Rover card status line and sensor panel header while a rover is focused. */
+.rover-goal[data-focus]::before {
+  content: '';
+  display: inline-block;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+
+.sp-focus {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.sp-focus > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

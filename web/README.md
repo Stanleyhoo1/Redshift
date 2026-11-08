@@ -132,6 +132,11 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   with "Back to"), and goes back afterwards if you did not touch it. A request with
   `expires_in` null shows "Waiting for you" (no countdown, no safe default): the rover
   holds until you answer. Older sims with a countdown work as before.
+- Focus (version 7): while a rover concentrates on an area (you asked, "explore around the
+  lake", or its own curiosity after a find) a dashed circle in its colour lies on the map
+  (softer for curiosity) with a tag like "Exploring the pond's shore · 64 s"; its card and
+  sensor panel say "Exploring an area (64 s left)" or "Curious: sticking around (40 s left)".
+  A rover that sights a herd follows it while its lifeform question waits for you.
 - Lost tracks (version 4): a faded, frozen copy of the creature stays where the fleet last
   saw it, and the tag says "last seen 12 s ago", until the sim forgets the track.
 - Every version 2, 3 and 4 field is optional: with an older sim the panel shows dashes, the
@@ -182,6 +187,12 @@ countdown). Test hook: `POST /api/_mock/reveal {"water"?, "targets"?, "spires"?}
 learns them all). `node scripts/v6-check.mjs` (mock started with
 `MOCK_FIRST_QUESTION_S=99999`, preview running) sends an ambiguous order, saves one
 screenshot and clicks a marker.
+
+Version 7 in the mock (the default; `MOCK_PROTOCOL=6` for the previous behaviour): `focus` for
+"explore around the lake", "go to the vent and look around", "explore around 10, -5", "explore
+north of the lander", "explore here/there" and "investigate ..." (survey, then focus), about
+120 sim s; curiosity focuses (about 60 s) now and then after a find; a chat report when a focus
+ends; and every new herd is followed at once while the rover asks about it.
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

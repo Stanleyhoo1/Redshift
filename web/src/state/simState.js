@@ -430,6 +430,23 @@ function sanitizeRover(r, prev) {
     sampling: isObj(r.sampling) && r.sampling.target != null ? { target: String(r.sampling.target), instrument: r.sampling.instrument == null ? null : String(r.sampling.instrument), progress: Math.max(0, Math.min(1, num(r.sampling.progress, 0))) } : null,
     // v5 running totals (null when the sim does not send them)
     stats: sanitizeStats(r.stats, prev?.stats),
+    // v7: the area the rover concentrates on (present only while it does), else null
+    focus: sanitizeFocus(r.focus),
+  }
+}
+
+// v7 rover focus: { x, y, r, reason: 'operator' | 'interest', label, ends_in } or null.
+// `ends_in` is sim seconds left as of the tick (null when the sim gives none).
+function sanitizeFocus(f) {
+  if (!isObj(f) || !Number.isFinite(f.x) || !Number.isFinite(f.y)) return null
+  const r = num(f.r, 0)
+  return {
+    x: f.x,
+    y: f.y,
+    r: r > 0.5 ? r : 10,
+    reason: f.reason === 'interest' ? 'interest' : 'operator',
+    label: typeof f.label === 'string' && f.label.trim() ? f.label.trim() : null,
+    ends_in: Number.isFinite(f.ends_in) ? Math.max(0, f.ends_in) : null,
   }
 }
 

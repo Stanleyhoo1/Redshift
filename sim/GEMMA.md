@@ -80,7 +80,9 @@ about 0.9 m tall). Gemma thinks: rock (confidence 0.80). What should I do?
 
 While it waits the rover holds position. It only moves if staying put is the danger: backing out of
 soft ground or liquid, heading home on a low battery, or making room for a creature that came closer
-than the planetary protection distance. Your answer is applied ("r2: going around, thanks."). By default
+than the planetary protection distance. A battery that says go home ends the wait at once: the question
+closes with "Battery 21%, I can't wait any longer: heading back to the lander." Your answer is applied
+("r2: going around, thanks."). By default
 the question waits for you (`OPERATOR_TIMEOUT_S` 0, `expires_in` null). With `OPERATOR_TIMEOUT_S` above 0
 the rover takes the safest option after that many wall seconds and says so ("r2: no reply in 20 s, taking
 the safe option: go around."). A new command for that rover also settles its question. If Gemma is offline the rules still ask about the first
@@ -95,17 +97,20 @@ first anomaly asks again. To make every anomaly ask, set `OPERATOR_ASK_BELOW=1.0
 
 ### Lifeform questions
 
-The first lifeform sighting after start or reset always asks (and later ones only when Gemma's
-confidence is under 0.75):
+Protocol v7: every herd nobody asked about yet gets one question, at the moment it is seen, and the
+rover follows it at about 6 m (never closer than 4 m) while it waits instead of holding still. Gemma's
+look arrives a moment later and only adds its guess to the question:
 
 ```
 r3: Possible lifeform 8 m north (LiDAR track k2, 0.3 m/s, about 1.2 m). Gemma thinks: possible
-lifeform, six legs, about 1.2 m (confidence 0.80). Follow it or keep exploring?
-[Follow it]  [Observe from here] (default)  [Keep exploring]
+lifeform, six legs, about 1.2 m (confidence 0.80). I'm following at about 6 m (never closer than 4 m)
+while I wait, in case it wanders off. Keep following, observe from here, or keep exploring?
+[Keep following]  [Observe from here] (default)  [Keep exploring]
 ```
 
-While it waits, the rover watches from where it is. "Observe from here" is the safe default: the
-rover never gets closer. With `OPERATOR_TIMEOUT_S` above 0 it takes that when the time is up. Demo: `curl -X POST
+"Observe from here" stays the safe default (taken only with `OPERATOR_TIMEOUT_S` above 0). Hazards,
+liquid, a fault or a low battery end the follow and close the question with a chat line. A herd that was
+asked about before is not asked again: Gemma's answer decides (approach, observe, ignore). Demo: `curl -X POST
 localhost:8000/api/hazard -d '{"type": "lifeform"}'` (or click a spot with x and y).
 
 ### Goal choice with samples
@@ -157,6 +162,9 @@ most relevant facts, so its answers are grounded too.
 | explore north (or any of 8 directions) | for 3 minutes that rover prefers frontiers that way (and only picks up targets that way) |
 | sample t4 | checks the target is known and free and the battery is enough, then goes to sample it |
 | go to the water source, investigate the lake for signs of life, survey the spires, take a look at t7 | `go_to_place` (protocol v6): the place is resolved from fleet knowledge only; one match (or nearest, biggest, north, the second one, near rover 2): a safe spot next to it through the go to checks, and with investigate a 30 s survey and a report; several: a `choose_place` request; none: what the fleet knows |
+| explore around the lake, go to the vent and look around, explore there, explore north of the lander, explore around 10, -5 | protocol v7 area focus: `go_to_place` (or `go_to`) with `explore` true (and `direction` for a side): the rover goes there and explores the unknown ground within about 15 m for about 2 min, then reports what it mapped and found. "investigate X" surveys first, then explores |
+| go back there, the second one, that lake, the vent you mentioned, investigate it | place `there` (the place the chat talked about last, or `ordinal` into the last list) or qualifier `mentioned`; the advisor resolves it from the chat memory, or asks back |
+| do that again, same for rover 3 | `repeat`: the last command again, for the rover named |
 | return home | goes back to the lander and charges (a rover backing out of trouble finishes that first) |
 | hold | parks where it is: state `idle`, goal `null`, chat note "say resume to continue". Not allowed while it is returning on low battery. A held rover leaves the hold by itself if its battery would not get it home otherwise |
 | resume | back to full autonomy (cancels holds, trips, directions and operator returns) |
@@ -307,8 +315,27 @@ other_rover, crater_edge, clear, unknown), `res.action`, `res.model_action`. Des
 rock, other_rover, dust, unknown), `res.label`, `res.action` (approach, observe, ignore, or
 ask_operator when unsure). Commands:
 `res.command` (`go_to`, `go_to_place` with place, target_id, qualifier, ordinal, near_rover, investigate, `explore_direction`, `sample_target`, `return_home`, `hold`, `resume`,
-`avoid_area`, `question` with `topic`, `unclear` with `question`). Answers: `res.answer` (Gemma's
-checked text, or the caller's rule answer in a fallback).
+`avoid_area`, `repeat`, `question` with `topic`, `unclear` with `question`; `go_to` and `go_to_place` may carry
+`explore` and `direction`). Answers: `res.answer` (Gemma's checked text, or the caller's rule answer in a
+fallback). `submit_answer(..., context=[...])` adds what a reference means.
+
+### Chat context (protocol v7)
+
+The command prompt gets up to three recent chat lines and one line of references when there are any
+(about 70 tokens; without chat it stays under 400 tokens):
+
+```
+Recent chat: operator: rover 2, go to the pond | r2: Heading to the pond's shore at (15.7, 1.7), 22 m. ...
+Context: there = the pond's shore at (15.7, 1.7); last list: 1 pond ..., 2 lake ...; last rover r2; last command: 'rover 2, go to the pond' (r2)
+```
+
+The schema adds `repeat`, place `there`, qualifier `mentioned` and an `explore` flag. Checks: the keyword
+parser's reading of a reference ("there", "the second one", "that lake", "do that again") wins over the
+model's, and so do the operator's words for `explore` and the side ("a plain go to still just goes");
+coordinates from the context's references count as known numbers. "go there" with nothing in the chat to
+refer to stays the model's reading. An answer to a question that refers back ("what did you find there?")
+gets a fact line about that place (what this rover mapped and found there, targets, water and herds known
+around it) and a context line saying what "there" means; every number must still come from the facts.
 
 ## Files
 
@@ -318,8 +345,10 @@ checked text, or the caller's rule answer in a fallback).
 | `redshift/advisor.py` | tier 2 wiring: goal choice, anomaly checks with the camera, operator questions, chat commands and answers |
 | `redshift/memory.py`, `redshift/answers.py` | each rover's mission memory; fact sheets, the facts for Gemma, rule-based answers |
 | `redshift/places.py` | place commands: known places from fleet knowledge, qualifiers, safe goals, labels, chat picks |
+| `redshift/chatmem.py` | chat memory: recent messages, the places, lists and rover they named, the last command, reports |
 | `tests/test_gemma.py` | gemma.py against a stub Ollama server on port 8400 |
 | `tests/test_brain.py` | tier 2 in the running sim with the fake model and the keyword parser |
 | `tests/test_v5.py` | questions: intent, answer checks, grounded rule answers, routing, `reply_to` |
 | `tests/test_v6.py` | place commands: polite orders, place parsing and Gemma's checked answers, resolver, `choose_place`, survey report, no expiry |
+| `tests/test_v7.py` | area focus and its report, curiosity, references (keyword parser and fake Gemma), following a herd while asking, battery while waiting |
 | `scripts/gemma_bench.py` | latency and quality bench against a real Ollama |

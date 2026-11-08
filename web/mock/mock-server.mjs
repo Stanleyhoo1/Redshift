@@ -40,16 +40,24 @@
 // (stop, turn slowly through 360 deg for 30 sim s, then an info report with reply_to);
 // `kind` on every request; and requests that never expire (OPERATOR_TIMEOUT_S defaults
 // to 0, so `expires_in` is null and the rover holds until answered).
+// Version 7 additions: rover `focus` (an area a rover concentrates on): operator orders
+// "explore around the lake", "go to the vent and look around", "explore around 10, -5",
+// "explore north of the lander", "explore here/there", and "investigate ..." (survey
+// first, then the focus), about 120 sim s; and the rovers' own curiosity after a find
+// (a target, water, a cluster of spires, a herd they finished watching), about 60 sim s.
+// Frontiers inside the circle win; a chat report (`info`) when the focus ends. A herd
+// sighting starts a follow at the observation distance at once and asks in the same
+// moment (`lifeform` request, once per herd); the rover keeps following until answered.
 //
 // Run: node mock/mock-server.mjs
 // Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
 //      GEMMA_ENABLED, GEMMA_MODEL, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S,
 //      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
-//      MOCK_PROTOCOL (2 to 5 = an older sim without the later fields), MOCK_CAMERA (off),
+//      MOCK_PROTOCOL (2 to 6 = an older sim without the later fields), MOCK_CAMERA (off),
 //      MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions)
 // Mock-only test hooks (not part of the protocol): POST /api/_mock/planner {"state"},
 // POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"},
-// POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question),
+// POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question; v7: every herd's),
 // POST /api/_mock/reveal {"water"?, "targets"?, "spires"?} (the fleet learns all of them at once, for testing place commands).
 
 import http from 'node:http'
@@ -90,7 +98,7 @@ const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma4:e2b'
 const GEMMA_BUDGET_MS = Number(process.env.GEMMA_BUDGET_MS || 3000)
 const GEMMA_WARMUP_S = Number(process.env.MOCK_GEMMA_WARMUP_S || 10)
 const FIRST_QUESTION_S = Number(process.env.MOCK_FIRST_QUESTION_S || 40)
-const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 6) // 2 to 5 = behave like an older sim (no later fields or endpoints)
+const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 7) // 2 to 6 = behave like an older sim (no later fields or endpoints)
 // v6: 0 = requests never expire (the rover waits for the operator). Older protocols: 20 s.
 const OPERATOR_TIMEOUT_S = Math.max(0, Number(process.env.OPERATOR_TIMEOUT_S ?? (PROTOCOL >= 6 ? 0 : 20)) || 0)
 const requestDeadline = () => (OPERATOR_TIMEOUT_S > 0 ? wallNow() + OPERATOR_TIMEOUT_S : null)
@@ -713,6 +721,7 @@ function newSim(seed) {
     nextSpire: world.spires.length + 1,
     featuresVersion: 0, // bumped when a spire falls or appears: the next tick resends `features`
     featuresSent: 0,
+    lastPlace: null, // v7: the place most recently named or visited by anyone ("explore there")
   }
   for (const h of world.herds) spawnHerd(h.cx, h.cy, h.count)
   for (let r = 0; r < NUM_ROVERS; r++) {
@@ -762,6 +771,10 @@ function newSim(seed) {
       // v5 running totals (and what the rover remembers, for grounded answers)
       st: { distance: 0, lastX: x, lastY: y, mapped: 0, sumX: 0, sumY: 0, samples: 0, hazards: [], hazardKeys: new Set(), herds: new Set(), sightings: [], replans: 0 },
       goalWhy: null, // why it is going where it is going, in its own words
+      // v7
+      focus: null, // { x, y, r, reason, label, start, until, ... } while it concentrates on an area
+      focusCooldownT: 0, // no curiosity focus before this sim time
+      lastPlace: null, // { x, y, name }: the place it last went to or explored, for "explore there"
     })
   }
   addEvent(null, 'info', `Survey started. ${NUM_ROVERS} rover${NUM_ROVERS === 1 ? '' : 's'} deployed from the lander.`)
@@ -851,6 +864,7 @@ function sense(rover) {
     sim.discovered.set(t.id, { ...t, status: 'found', found_by: rover.id, found_t: r1(sim.t), assigned: null })
     const label = KIND_LABEL[t.kind]
     addEvent(rover.id, 'discovery', `Found ${/^[aeiou]/.test(label) ? 'an' : 'a'} ${label} at (${t.x.toFixed(1)}, ${t.y.toFixed(1)}).`)
+    maybeCurious(rover, t.x, t.y, `Found ${/^[aeiou]/.test(label) ? 'an' : 'a'} ${label} here.`, `the ${label} ${t.id}`)
   }
 }
 
@@ -894,6 +908,15 @@ function senseSpires(rover) {
     if (sim.spireSeen.has(key) || segDist(rover.x, rover.y, x0, y0, x1, y1) > range) continue
     sim.spireSeen.add(key)
     markFootprint(sim.pendingCells, x0, y0, x1, y1, sp.radius)
+    if (sp.standing && PROTOCOL >= 7) {
+      // v7: the third standing spire seen close together makes a cluster worth a look.
+      const near = world.spires.filter((q) => q.standing && sim.spireSeen.has(`${q.id}:up`) && Math.hypot(q.x - sp.x, q.y - sp.y) < 9)
+      if (near.length === 3) {
+        const cx = near.reduce((a, q) => a + q.x, 0) / 3
+        const cy = near.reduce((a, q) => a + q.y, 0) / 3
+        maybeCurious(rover, cx, cy, 'Found a cluster of crystal spires here.', 'the spire cluster')
+      }
+    }
     if (!sp.standing) {
       noteHazard(rover, `spire:${sp.id}`, 'a fallen crystal spire', (x0 + x1) / 2, (y0 + y1) / 2)
       const dist = Math.round(segDist(rover.x, rover.y, x0, y0, x1, y1))
@@ -939,6 +962,8 @@ function senseWater(rover) {
         addEvent(rover.id, 'discovery', `No LiDAR returns over a patch about ${across} m across, edges all at the same height: treating it as liquid (${what}). Marked impassable.`, at)
       }
       if (changed.some((r) => r !== rover)) addEvent(null, 'info', `${changed.filter((r) => r !== rover).map((r) => r.id).join(' and ')} replanned around the water.`, at)
+      const shore = w.kind === 'river' ? "the stream's banks" : `the ${across < 11 ? 'pond' : 'lake'}'s shore`
+      maybeCurious(rover, at[0], at[1], 'Found water here.', shore)
       return
     }
     revealCover(wi, rover, SENSOR_RADIUS)
@@ -1190,8 +1215,10 @@ function chooseExplorationGoal(rover) {
     startReturn(rover, `All ${TUBES} tubes full. Heading to the lander to cache the samples.`)
     return true
   }
-  // v4b: traces (highest expected value) first, then the closest.
-  const open = [...sim.discovered.values()].filter((t) => t.status !== 'sampled' && !t.assigned && Math.hypot(t.x - rover.x, t.y - rover.y) < 30)
+  // v4b: traces (highest expected value) first, then the closest. v7: while focused,
+  // only targets inside the focus circle.
+  const fz = rover.focus
+  const open = [...sim.discovered.values()].filter((t) => t.status !== 'sampled' && !t.assigned && (fz ? Math.hypot(t.x - fz.x, t.y - fz.y) < fz.r + 2 : Math.hypot(t.x - rover.x, t.y - rover.y) < 30))
   open.sort((a, b) => (b.kind === 'trace') - (a.kind === 'trace') || Math.hypot(a.x - rover.x, a.y - rover.y) - Math.hypot(b.x - rover.x, b.y - rover.y))
   if (PROTOCOL >= 4 && open.length > 1 && rover.battery > 0.45 && free > 0 && sim.t - rover.lastGoalEventT > 20) {
     const [a, b] = open
@@ -1216,6 +1243,22 @@ function chooseExplorationGoal(rover) {
   }
   const others = sim.rovers.filter((r) => r !== rover && r.goal)
   const avoid = knownObstacles(rover)
+  // v7: while focused, frontiers inside the circle win (the closest, bigger ones a little
+  // more); none left means nothing unknown nearby, and the focus ends.
+  if (rover.focus) {
+    const f = rover.focus
+    const inside = focusFrontiers(f)
+      .filter((q) => Math.hypot(q[0] - rover.x, q[1] - rover.y) >= 3 && !avoid.some((o) => Math.hypot(q[0] - o[0], q[1] - o[1]) < o[2] + 0.5))
+      .map((q) => ({ q, score: Math.pow(q[2], 0.4) / (Math.hypot(q[0] - rover.x, q[1] - rover.y) + 4) }))
+      .sort((a, b) => b.score - a.score)
+    for (const { q } of inside.slice(0, 4)) {
+      if (setGoal(rover, q[0], q[1], 'exploring', `${f.reason === 'operator' ? 'Exploring' : 'Looking around'} ${f.label}: frontier at (${q[0].toFixed(0)}, ${q[1].toFixed(0)}).`, f.reason === 'operator' ? 'operator' : null)) {
+        rover.targetId = null
+        return true
+      }
+    }
+    endFocus(rover, inside.length ? 'blocked' : 'done')
+  }
   let best = null
   let bestScore = -Infinity
   for (const f of sim.frontiers) {
@@ -1301,7 +1344,8 @@ function drive(rover, dt, maxSpeed) {
   if (trueSandAt(rover.x, rover.y)) maxSpeed = Math.min(maxSpeed, 0.12) // bogged down
   // v3: asked the operator (crawl or hold until answered), answered "approach slowly",
   // or told to hold.
-  if (rover.request) maxSpeed = Math.min(maxSpeed, rover.request.hold ? 0 : 0.15)
+  // v7: a rover that asks about a herd keeps following it at the usual pace.
+  if (rover.request && !rover.request.follow) maxSpeed = Math.min(maxSpeed, rover.request.hold ? 0 : 0.15)
   if (rover.slowUntil > sim.t) maxSpeed = Math.min(maxSpeed, 0.2)
   if (rover.hold) {
     rover.speed = Math.max(0, rover.speed - dt * 1.5)
@@ -1402,9 +1446,20 @@ function endObserve(rover, why) {
   const id = rover.trackId
   Object.assign(rover, { trackId: null, observeMode: null, state: 'idle', timer: 1, path: [], goal: null })
   rover.lastGoalEventT = sim.t
+  // v7: safety ended a follow while the rover was still asking about the herd: withdraw
+  // the question and say why.
+  const q = rover.request
+  if (q && q.follow && (why === 'lost' || why === 'battery')) {
+    if (q.pending) rover.request = null
+    else resolveRequest(q, 'cancelled')
+    addChat(rover.id, 'operator', why === 'lost' ? `Lost sight of ${id}, so there is nothing to follow any more. Back to exploring; the track stays on the shared map.` : `Battery at ${Math.round(rover.battery * 100)}%, so I stopped following ${id} and I'm heading back to charge. Ask me again later.`, 'info', 'rules', q.pending ? null : q.id)
+  }
   if (why === 'lost') addEvent(rover.id, 'info', `Lost sight of ${id}: no moving returns for ${TRACK_LOST_S} s. Back to exploring.`)
   else if (why === 'battery') addEvent(rover.id, 'info', `Battery at ${Math.round(rover.battery * 100)}%. Stopped observing ${id} to save power.`)
-  else if (why === 'done') addEvent(rover.id, 'info', `Observed ${id} for ${OBSERVE_S} s: gait, size and grazing logged. Back to exploring.`)
+  else if (why === 'done') {
+    addEvent(rover.id, 'info', `Observed ${id} for ${OBSERVE_S} s: gait, size and grazing logged. Back to exploring.`)
+    if (k) maybeCurious(rover, k.x, k.y, `Finished watching ${id} here.`, 'where the herd grazed')
+  }
 }
 
 function stepObserve(rover, dt) {
@@ -1419,7 +1474,7 @@ function stepObserve(rover, dt) {
   const dx = rover.x - life.x
   const dy = rover.y - life.y
   const d = Math.hypot(dx, dy) || 1
-  const follow = rover.observeMode === 'follow' && !rover.request && !rover.hold
+  const follow = rover.observeMode === 'follow' && (!rover.request || rover.request.follow) && !rover.hold
   if (follow && (d > OBSERVE_DIST + 1.3 || d < OBSERVE_DIST - 1.6)) {
     const tx = life.x + (dx / d) * OBSERVE_DIST
     const ty = life.y + (dy / d) * OBSERVE_DIST
@@ -1509,12 +1564,18 @@ function stepRover(rover, dt) {
 
   // v6: a survey ends when anything else takes over the rover.
   if (rover.survey && rover.state !== 'investigating') rover.survey = null
+  // v7: a focus ends when its time is up, or when the rover has to head home.
+  if (rover.focus) {
+    if (rover.state === 'returning' || rover.state === 'charging') endFocus(rover, 'return')
+    else if (sim.t >= rover.focus.until) endFocus(rover, 'time')
+  }
   // v6: a rover waiting for an answer still moves when staying is the danger: a low
   // battery withdraws the question and sends it home.
   const q = rover.request
   if (q && !q.pending && q.deadline === null && rover.state !== 'charging' && rover.state !== 'fault' && lowBattery(rover, 0.2)) {
     resolveRequest(q, 'cancelled')
-    addChat(rover.id, 'operator', `Battery at ${Math.round(rover.battery * 100)}%, so I can't wait for your answer any longer. Heading back to charge; ask me again later.`, 'info', 'rules', q.id)
+    addChat(rover.id, 'operator', q.follow ? `Battery at ${Math.round(rover.battery * 100)}%, so I stopped following and I'm heading back to charge. Ask me again later.` : `Battery at ${Math.round(rover.battery * 100)}%, so I can't wait for your answer any longer. Heading back to charge; ask me again later.`, 'info', 'rules', q.id)
+    if (rover.state === 'observing') endObserve(rover, null) // v7: it was following the herd while it asked
     if (rover.state !== 'returning') startReturn(rover)
   }
 
@@ -1697,7 +1758,7 @@ function lifeOk(x, y) {
 }
 
 function spawnHerd(cx, cy, count) {
-  const herd = { id: sim.herds.length + 1, cx, cy, heading: sim.rand() * Math.PI * 2, speed: 0.14 + sim.rand() * 0.1, pause: 0, seenT: -999, confirmT: -999 }
+  const herd = { id: sim.herds.length + 1, cx, cy, heading: sim.rand() * Math.PI * 2, speed: 0.14 + sim.rand() * 0.1, pause: 0, seenT: -999, confirmT: -999, asked: false }
   sim.herds.push(herd)
   for (let k = 0; k < count && sim.lifeforms.length < MAX_LIFEFORMS; k++) {
     const a = (k / count) * Math.PI * 2 + sim.rand()
@@ -1867,8 +1928,13 @@ function stepTracks() {
     // (Asking is fine for a rover the operator put on hold; following on its own is not.)
     const free = ['exploring', 'idle', 'investigating'].includes(seer.state) && !seer.sampling && !seer.request && seer.battery > 0.4
     const watched = sim.rovers.some((r) => r.state === 'observing' && sim.tracks.some((q) => q.id === r.trackId && sim.lifeforms.find((l) => l.id === q.lifeId)?.herd === herd))
-    if (!free || watched || (seer.hold && (sim.firstLifeAsked || PROTOCOL < 3))) continue
-    if (!sim.firstLifeAsked && PROTOCOL >= 3) {
+    const askNow = PROTOCOL >= 7 ? !herd.asked : !sim.firstLifeAsked && PROTOCOL >= 3
+    if (!free || watched || (seer.hold && !askNow)) continue
+    if (askNow && PROTOCOL >= 7) {
+      // v7: follow at once (the creatures may wander off) and ask in the same moment.
+      startObserve(seer, k, 'follow')
+      herd.asked = askAbout(seer, 'life', { dist, dir, at: [life.x, life.y] })
+    } else if (askNow) {
       startObserve(seer, k, 'watch')
       sim.firstLifeAsked = askAbout(seer, 'life', { dist, dir, at: [life.x, life.y] })
     } else {
@@ -2705,7 +2771,7 @@ const OPTION_SETS = {
   ],
 }
 OPTION_SETS.life = [
-  { id: 'follow', label: 'Follow it' },
+  { id: 'follow', label: PROTOCOL >= 7 ? 'Keep following' : 'Follow it' },
   { id: 'observe_here', label: 'Observe from here' },
   { id: 'keep_exploring', label: 'Keep exploring' },
 ]
@@ -2716,8 +2782,10 @@ const SAFE_DEFAULT = { rockfall: 'reroute', unknown: 'reroute', sand: 'back_out'
 function askAbout(rover, kind, info) {
   if (PROTOCOL < 3 || rover.request || rover.state === 'fault') return false
   // v6: with no timeout the rover holds position until the operator answers.
-  const hold = kind === 'sand' || kind === 'life' || OPERATOR_TIMEOUT_S <= 0
-  rover.request = { pending: true, hold } // act cautiously while the model looks at the image
+  // v7: a herd sighting is asked about while the rover keeps following it.
+  const follow = PROTOCOL >= 7 && kind === 'life'
+  const hold = !follow && (kind === 'sand' || kind === 'life' || OPERATOR_TIMEOUT_S <= 0)
+  rover.request = { pending: true, hold, follow } // act cautiously while the model looks at the image
   const g = gemmaCall('vision')
   later(g.ok ? g.ms : 120, () => {
     if (!rover.request?.pending) return
@@ -2733,6 +2801,9 @@ function askAbout(rover, kind, info) {
     if (kind === 'rockfall') {
       question = `LiDAR shows ${info.n} objects up to ${info.tall} m tall, ${info.dist} m ahead, that were not on my map. ${g.ok ? `From the camera I can't tell rocks from a slope edge (${conf}% confidence).` : 'My rules cannot tell rocks from a slope edge.'} What should I do?`
       note = `Unsure about ${info.n} new objects ${info.dist} m ahead${g.ok ? ` (camera ${conf}% confident)` : ''}. ${caution} and asking the operator.`
+    } else if (kind === 'life' && follow) {
+      question = `Possible lifeform ${info.dist} m ${info.dir}. I'm following it at a safe distance (${OBSERVE_DIST} m, never closer) so it doesn't wander off. Keep following, observe from here, or keep exploring?`
+      note = `Something is moving ${info.dist} m ${info.dir}${g.ok ? `: the camera sees legs (${conf + 30}% confident)` : ''}. Following at ${OBSERVE_DIST} m and asking the operator.`
     } else if (kind === 'life') {
       question = `Possible lifeform ${info.dist} m ${info.dir}. Follow it or keep exploring?`
       note = `Something is moving ${info.dist} m ${info.dir}${g.ok ? `: the camera sees legs (${conf + 30}% confident)` : ''}. Watching it from here and asking the operator.`
@@ -2753,6 +2824,7 @@ function askAbout(rover, kind, info) {
       deadline: requestDeadline(),
       kind,
       hold,
+      follow,
       at: info.at || [rover.x, rover.y],
     }
     rover.request = q
@@ -2796,7 +2868,8 @@ function applyOption(rover, q, option) {
     rover.hold = false // the operator just said what to do
     rover.holdUntil = null
     rover.observeReplanT = 0
-    return option === 'follow' ? `Following ${k.id} at ${OBSERVE_DIST} m, never closer, for up to ${OBSERVE_S} s.` : `Watching ${k.id} from here for up to ${OBSERVE_S} s.`
+    if (option === 'follow' && q.follow) return `Still following ${k.id} at ${OBSERVE_DIST} m, never closer, for up to ${OBSERVE_S} s more.`
+    return option === 'follow' ? `Following ${k.id} at ${OBSERVE_DIST} m, never closer, for up to ${OBSERVE_S} s.` : `Stopping here and watching ${k.id} for up to ${OBSERVE_S} s.`
   }
   if (option === 'reroute') {
     rover.hold = false
@@ -2932,6 +3005,7 @@ function unavailable(rover) {
 
 function goTo(rover, x, y, state, eventMsg, source) {
   releaseTarget(rover)
+  if (rover.focus) endFocus(rover, 'replaced') // v7: a new order replaces the focus
   rover.hold = false
   rover.survey = null
   rover.placeTask = null
@@ -2958,6 +3032,7 @@ function cmdGoTo(rover, x, y) {
   if (low) return ['refuse', low]
   const len = goTo(rover, x, y, 'exploring', (l) => `Operator: go to (${x}, ${y}). Route ${l} m.`, 'operator')
   if (len === null) return ['refuse', `No safe route to (${x}, ${y}) on what I know: the way is blocked by slopes over ${sim.slopeLimit} deg.`]
+  rememberPlace(rover, x, y, `(${x}, ${y})`)
   return ['ack', `Heading to (${x}, ${y}), ${len} m. Max slope on the way ${routeMaxSlope(rover)} deg.`]
 }
 
@@ -3035,6 +3110,12 @@ function handleChat(text, roverParam) {
         if (sim.requests.includes(open)) resolveRequest(open, 'answered', option, { id: msg.id, source })
         else addChat(open.rover, 'operator', 'That question was already closed.', 'refuse', source, open.id, msg.id)
       })
+      return msg.id
+    }
+    // v7: "explore around 10, -5", "explore north of the lander", "explore there".
+    const spot = PROTOCOL >= 7 ? parseFocusSpot(lower) : null
+    if (spot) {
+      later(g.ok ? g.ms : 120 + Math.random() * 120, () => respondFocusSpot(spot, targets, to, source, msg.id))
       return msg.id
     }
     // v6: commands that name a place ("go to the water source").
@@ -3182,6 +3263,7 @@ function whyText(r) {
   if (r.state === 'fault') return `My motors are rebooting after a fault (${Math.ceil(r.faultHazard?.remaining ?? 0)} s left), so I'm not going anywhere until they're back.`
   if (r.state === 'charging') return `I'm docked at the lander, charging (${pctOf(r.battery)}). I'll head out again once the battery is high enough for a useful trip.`
   if (r.hold) return `I'm holding at ${at(r.x, r.y)} because you asked me to. Say "resume" and I'll carry on.`
+  if (r.request?.follow && r.state === 'observing') return `I'm following a possible lifeform at a safe distance (${OBSERVE_DIST} m, never closer) so it doesn't wander off, while I wait for your answer: keep following, observe from here, or keep exploring.`
   if (r.request) return OPERATOR_TIMEOUT_S > 0 ? "I've stopped to ask you something about what I sensed. I'll act on your answer, or take the safe option when the time runs out." : "I've stopped to ask you something, and I'm holding here until you answer."
   if (r.survey) return `I'm surveying ${r.survey.name} because you asked: turning slowly on the spot while the camera and LiDAR watch for movement, ${Math.max(0, Math.round(r.survey.until - sim.t))} s to go.`
   if (r.state === 'observing') {
@@ -3201,6 +3283,12 @@ function whyText(r) {
     const t = sim.discovered.get(r.targetId)
     const ins = INSTRUMENT_FOR[t?.kind] || 'drill'
     return `I'm going to the ${KIND_LABEL[t?.kind] || 'target'} ${r.targetId} at ${at(t?.x ?? 0, t?.y ?? 0)}, ${d} m away, to sample it with the ${ins}. I have ${plural(TUBES - r.samples.length, 'free tube')} and ${pctOf(r.battery)} battery.`
+  }
+  if (r.focus) {
+    const left = Math.max(0, Math.round(r.focus.until - sim.t))
+    return r.focus.reason === 'operator'
+      ? `You asked me to explore ${r.focus.label}: I'm mapping the unknown ground within ${Math.round(r.focus.r)} m of it first, ${left} s to go, then back to normal exploration.`
+      : `I found something around ${r.focus.label}, so I'm sticking around for another ${left} s to look for more: unknown ground within ${Math.round(r.focus.r)} m first.`
   }
   if (r.goal) {
     if (r.goalWhy && /^Operator/.test(r.goalWhy)) return `Because you asked me to: ${r.goalWhy.replace(/^Operator:\s*/, '')} ${d} m to go.`
@@ -3383,6 +3471,8 @@ const PLACE_WORDS = [
 const ACTION_RE = /\b(go|head|drive|move|navigate|travel|investigate|survey|check|look|explore|visit|inspect|examine|study|approach|return|come|take|scout|search|observe|watch)\b/
 const SURVEY_RE = /\b(investigate|survey|look around|look for|signs? of|search|study|examine|inspect|scan|check for|observe)\b/
 const POLITE_PLACE_RE = new RegExp(ADDR + String.raw`(?:(?:can|could|would|will|shall)\s+(?:we|you|u|someone|somebody|one of you)\b|let'?s\b|let us\b|i (?:want|need|'d like|would like) (?:you|someone|a rover|one of you) to\b|please\b)`)
+const AROUND_RE = /\b(explore|exploring|look around|looking around|scout|poke around|have a look around)\b/
+const SURVEY_ONLY_RE = /\b(investigat\w*|survey|look for|signs? of|search for|study|examine|inspect|scan|check for|observe)\b/
 const DIR_RE = /\b(north[- ]?east|north[- ]?west|south[- ]?east|south[- ]?west|north|south|east|west)(?:ern|erly|wards?)?\b/
 const ORD = { first: 1, '1st': 1, one: 1, second: 2, '2nd': 2, two: 2, third: 3, '3rd': 3, three: 3 }
 
@@ -3406,9 +3496,17 @@ function parsePlace(t) {
   }
   if (!kind || !ACTION_RE.test(t)) return null
   if (!POLITE_PLACE_RE.test(t) && QWORD_RE.test(t)) return null // "did you check the vent?" asks
-  const survey = SURVEY_RE.test(t)
-  if (kind === 'lander' && !survey) return null // "go back to the lander" is the return order
-  return { kind, id, survey, life: /\b(life|living|alive|organisms?|biology|biosignatures?)\b/.test(t), qual: parseQualifier(t) }
+  let survey = SURVEY_RE.test(t)
+  // v7: "explore around the lake", "go to the vent and look around": a focus on the place.
+  // "investigate ...": survey first, then the focus.
+  let focus = false
+  if (PROTOCOL >= 7) {
+    const around = AROUND_RE.test(t)
+    focus = around || /\binvestigat/.test(t)
+    if (around && !SURVEY_ONLY_RE.test(t)) survey = false
+  }
+  if (kind === 'lander' && !survey && !focus) return null // "go back to the lander" is the return order
+  return { kind, id, survey, focus, life: /\b(life|living|alive|organisms?|biology|biosignatures?)\b/.test(t), qual: parseQualifier(t) }
 }
 
 function ordinalIn(t) {
@@ -3635,9 +3733,17 @@ function shorePoint(c, rover) {
   return best ? [r1(best.x), r1(best.y)] : null
 }
 
-function cmdGoPlace(rover, c, survey, replyTo, life = false) {
+function cmdGoPlace(rover, c, survey, replyTo, life = false, focus = false) {
   const busy = unavailable(rover)
   if (busy) return ['refuse', busy]
+  // v7: "explore around ..." starts the focus at once: the unknown ground near the place
+  // first. With nothing unknown left there it just goes and has a look (as in v6).
+  let mapped = false
+  if (focus && !survey) {
+    const fa = focusAround(c)
+    if (focusFrontiers(fa).length) return cmdFocus(rover, fa, replyTo)
+    mapped = fa
+  }
   const goal = c.kind === 'water' ? shorePoint(c, rover) : standoffPoint(c.x, c.y, c.standoff ?? 3, rover)
   if (!goal) return ['refuse', `I can't find a safe spot next to ${c.name} on what the fleet has mapped.`]
   const low = lowBatteryRefusal(rover, goal[0], goal[1], c.name)
@@ -3646,9 +3752,11 @@ function cmdGoPlace(rover, c, survey, replyTo, life = false) {
   rover.survey = null
   const len = goTo(rover, goal[0], goal[1], 'exploring', (l) => `Operator: ${survey ? 'survey' : 'go to'} ${c.name}. Route ${l} m.`, 'operator')
   if (len === null) return ['refuse', `No safe route to ${c.name} on what I know: slopes over ${sim.slopeLimit} deg or water block the way.`]
-  rover.placeTask = { name: c.name, kind: c.kind, wi: c.wi, x: c.x, y: c.y, goal, survey, life, replyTo }
+  rover.placeTask = { name: c.name, kind: c.kind, wi: c.wi, x: c.x, y: c.y, size: c.size, goal, survey, life, replyTo, focus: focus && survey }
+  rememberPlace(rover, c.x, c.y, c.name)
   const spot = c.kind === 'water' ? `a spot on the shore 3 m from the water, ${at(goal[0], goal[1])}` : c.kind === 'herd' ? `the observation point ${OBSERVE_DIST} m from it, ${at(goal[0], goal[1])}` : `next to it, ${at(goal[0], goal[1])}`
-  return ['ack', `Heading to ${c.name} at ${at(c.x, c.y)}: ${spot}, ${len} m.${survey ? ` Then I'll stop and survey for about ${SURVEY_S} s.` : ''}`]
+  const then = survey ? ` Then I'll stop and survey for about ${SURVEY_S} s${focus ? ', and explore around it after that' : ''}.` : mapped ? ` Everything within ${mapped.r} m of it is mapped already, so I'll just take a look.` : ''
+  return ['ack', `Heading to ${c.name} at ${at(c.x, c.y)}: ${spot}, ${len} m.${then}`]
 }
 
 // More than one candidate and nothing to choose between them: ask (choose_place).
@@ -3659,7 +3767,7 @@ function askPlace(rover, cands, place, replyTo, source) {
   const noun = PLACE_NOUN[place.kind] || ['place', 'places']
   const question = `I know ${plural(cands.length, noun[0], noun[1])}${cands.length > 3 ? ' (the 3 closest are on the map)' : ''}. Which one${place.survey ? ' should I survey' : ''}?`
   const deadline = requestDeadline()
-  const q = { id: `q${sim.nextRequest++}`, rover: rover.id, t: sim.t, question, options, default: deadline === null ? null : 'cancel', deadline, kind: 'place', hold: true, at: [rover.x, rover.y], place: { cands: top, survey: place.survey, life: place.life, replyTo } }
+  const q = { id: `q${sim.nextRequest++}`, rover: rover.id, t: sim.t, question, options, default: deadline === null ? null : 'cancel', deadline, kind: 'place', hold: true, at: [rover.x, rover.y], place: { cands: top, survey: place.survey, life: place.life, focus: place.focus, replyTo } }
   rover.request = q
   sim.requests.push(q)
   planner.asked++
@@ -3671,7 +3779,7 @@ function applyPlace(rover, q, option) {
   if (option === 'cancel') return ['ack', `OK, never mind. ${rover.goal ? 'Carrying on with what I was doing.' : 'Back to exploring.'}`]
   const c = q.place.cands[Number(String(option).slice(1)) - 1]
   if (!c) return ['refuse', 'I lost track of that option.']
-  return cmdGoPlace(rover, c, q.place.survey, q.place.replyTo, q.place.life)
+  return cmdGoPlace(rover, c, q.place.survey, q.place.replyTo, q.place.life, q.place.focus)
 }
 
 // The open place question an operator message could be answering.
@@ -3740,7 +3848,7 @@ function respondPlace(place, targets, to, source, replyTo) {
       rover = [...pool].sort((a, b) => distTo(a, c) - distTo(b, c))[0]
       sayFleet('info', `${rover.name} is closest (${Math.round(distTo(rover, c))} m), heading there.`)
     }
-    say(rover, cmdGoPlace(rover, c, place.survey, replyTo, place.life))
+    say(rover, cmdGoPlace(rover, c, place.survey, replyTo, place.life, place.focus))
     return
   }
   askPlace(rover, cands, place, replyTo, source)
@@ -3827,8 +3935,214 @@ function finishSurvey(rover, why) {
     else if (trace) parts.push(`No movement, but the organic trace ${trace.id} is a possible sign of life: worth a swab.`)
     else parts.push('No signs of life here: no movement and no organic traces within 12 m.')
   }
+  // v7: "investigate" goes on with a focus on the place, if there is unknown ground left.
+  let next = null
+  if (s.focus && why === 'done') {
+    const fa = focusAround(s)
+    if (focusFrontiers(fa).length) {
+      next = fa
+      parts.push(`Next I'll explore ${fa.label} for about ${FOCUS_OPERATOR_S} s: the unknown ground within ${fa.r} m first.`)
+    } else parts.push(`Everything within ${fa.r} m is already mapped, so I'm going back to normal exploration.`)
+  }
   addChat(rover.id, 'operator', parts.join(' '), 'info', gemmaReady() ? 'gemma' : 'rules', null, s.replyTo)
   addEvent(rover.id, moving.length ? 'discovery' : 'info', `Survey of ${s.name} finished: ${moving.length ? `${plural(moving.length, 'moving object')} seen` : 'nothing moving'}.`, [rover.x, rover.y], 'operator')
+  if (next) startFocus(rover, { ...next, reason: 'operator', replyTo: s.replyTo, seconds: FOCUS_OPERATOR_S })
+}
+
+// ---------------------------------------------------------------------------
+// Version 7: concentrating on an area (rover `focus`), for the operator or out of curiosity
+
+const FOCUS_OPERATOR_S = 120 // sim seconds
+const FOCUS_INTEREST_S = 60
+const FOCUS_INTEREST_R = 10 // m
+const FOCUS_COOLDOWN_S = 80 // sim s after a focus before the same rover gets curious again
+const FOCUS_AWAY_M = 25 // "explore north of the lander": a circle this far out
+
+// Explored and total map cells inside a circle (identified water counts as explored).
+function circleCells(x, y, r) {
+  const R = Math.ceil(r / RES)
+  const ci = toI(x)
+  const cj = toJ(y)
+  let known = 0
+  let total = 0
+  for (let dj = -R; dj <= R; dj++) {
+    for (let di = -R; di <= R; di++) {
+      if (di * di + dj * dj > R * R) continue
+      const i = ci + di
+      const j = cj + dj
+      if (!inMap(i, j)) continue
+      total++
+      const k = idx(i, j)
+      if (sim.known[k] || sim.waterSeen[k]) known++
+    }
+  }
+  return [known, total]
+}
+
+// Frontier clusters inside a focus circle (with a little slack at the edge).
+const focusFrontiers = (f) => sim.frontiers.filter((q) => Math.hypot(q[0] - f.x, q[1] - f.y) <= f.r + 1.5)
+
+// The circle and its label for a place the operator named (a v6 candidate).
+function focusAround(c) {
+  if (c.kind === 'water') {
+    const stream = /stream/.test(c.name)
+    return { x: c.x, y: c.y, r: clamp(Math.round((c.size || 10) / 2 + 8), 10, 22), label: stream ? "the stream's banks" : `the ${(c.size || 10) < 11 ? 'pond' : 'lake'}'s shore` }
+  }
+  if (c.kind === 'lander') return { x: c.x, y: c.y, r: 16, label: 'around the lander' }
+  return { x: c.x, y: c.y, r: c.kind === 'spire' || c.kind === 'herd' ? 12 : 10, label: `around ${c.name}` }
+}
+
+function rememberPlace(rover, x, y, name) {
+  rover.lastPlace = { x, y, name }
+  sim.lastPlace = { x, y, name, rover: rover.id }
+}
+
+function startFocus(rover, { x, y, r, reason, label, replyTo = null, seconds }) {
+  if (rover.focus) endFocus(rover, 'replaced')
+  const [known] = circleCells(x, y, r)
+  rover.focus = {
+    x,
+    y,
+    r,
+    reason,
+    label,
+    replyTo,
+    start: sim.t,
+    until: sim.t + seconds,
+    known0: known,
+    targets0: new Set(sim.discovered.keys()),
+    water0: new Set(sim.identified),
+    sightings0: rover.st.sightings.length,
+  }
+  if (reason === 'operator') {
+    releaseTarget(rover)
+    if (rover.state === 'observing') endObserve(rover, null)
+    rover.survey = null
+    rover.placeTask = null
+    rover.hold = false
+    rover.holdUntil = null
+    rememberPlace(rover, x, y, label.replace(/^around /, ''))
+  }
+  // Pick the next goal inside the circle now (a sampling or watching rover finishes first).
+  if (rover.state === 'exploring' || rover.state === 'idle') Object.assign(rover, { state: 'idle', timer: 0.3, goal: null, path: [] })
+}
+
+// The report when a focus ends: what was mapped and found inside the circle, from the
+// fleet's own knowledge. `why`: time | done | blocked | return | replaced (silent).
+function endFocus(rover, why) {
+  const f = rover.focus
+  if (!f) return
+  rover.focus = null
+  rover.focusCooldownT = sim.t + FOCUS_COOLDOWN_S
+  if (why === 'replaced') return
+  const [known] = circleCells(f.x, f.y, f.r)
+  const m2 = Math.max(0, Math.round((known - f.known0) * RES * RES))
+  const secs = Math.round(sim.t - f.start)
+  const inside = (x, y) => Math.hypot(x - f.x, y - f.y) <= f.r + 2
+  const finds = [...sim.discovered.values()].filter((t) => !f.targets0.has(t.id) && inside(t.x, t.y)).map((t) => `the ${KIND_LABEL[t.kind]} ${t.id}`)
+  for (const wi of sim.identified) {
+    if (f.water0.has(wi)) continue
+    const w = world.water[wi]
+    if (world.cover[wi].some((c) => c.seen && inside(c.x, c.y))) finds.push(w.kind === 'river' ? 'a stream' : 'a body of water')
+  }
+  if (rover.st.sightings.slice(f.sightings0).some((q) => inside(q.x, q.y))) finds.push('a herd of grazers')
+  const verb = f.reason === 'operator' ? 'exploring' : 'looking around'
+  const lead = {
+    time: `Done ${verb} ${f.label}`,
+    done: `Nothing unknown left around ${f.label.replace(/^around /, '')}, so I'm done ${verb}`,
+    blocked: `I can't reach the rest of the unknown ground around ${f.label.replace(/^around /, '')} on what I know, so I'm done ${verb}`,
+    return: `Stopped ${verb} ${f.label} to head back to the lander (${rover.samples.length >= TUBES ? 'tubes full' : `battery ${pctOf(rover.battery)}`})`,
+  }[why] || `Done ${verb} ${f.label}`
+  const found = finds.length ? ` Found ${finds.length > 1 ? `${finds.slice(0, -1).join(', ')} and ${finds[finds.length - 1]}` : finds[0]} there.` : ' Nothing new turned up there.'
+  const tail = why === 'return' ? '' : ' Back to normal exploration.'
+  addChat(rover.id, 'operator', `${lead}: mapped ${fmtInt(m2)} m2 more in ${secs} s.${found}${tail}`, 'info', gemmaReady() ? 'gemma' : 'rules', null, f.replyTo)
+  addEvent(rover.id, finds.length ? 'discovery' : 'info', `Finished ${verb} ${f.label}: ${fmtInt(m2)} m2 mapped${finds.length ? `, ${plural(finds.length, 'find')}` : ''}.`, [f.x, f.y], f.reason === 'operator' ? 'operator' : null)
+}
+
+// The rover's own curiosity after a find: stick around for about a minute, now and then,
+// when there is unknown ground nearby and nothing more pressing.
+function maybeCurious(rover, x, y, lead, label) {
+  if (PROTOCOL < 7 || rover.focus || sim.t < rover.focusCooldownT) return false
+  if (!['exploring', 'idle', 'investigating'].includes(rover.state) || rover.placeTask || rover.survey || rover.request || rover.hold) return false
+  if (lowBattery(rover, 0.45)) return false
+  if (sim.rovers.some((q) => q !== rover && q.focus && Math.hypot(q.focus.x - x, q.focus.y - y) < q.focus.r + 4)) return false
+  const [known, total] = circleCells(x, y, FOCUS_INTEREST_R)
+  if (total - known < total * 0.2) return false // little left to map there
+  if (sim.rand() > 0.6) return false
+  startFocus(rover, { x, y, r: FOCUS_INTEREST_R, reason: 'interest', label, seconds: FOCUS_INTEREST_S })
+  addEvent(rover.id, 'info', `${lead} Sticking around for about ${FOCUS_INTEREST_S} s to look for more.`, [x, y])
+  return true
+}
+
+// An operator focus on a circle { x, y, r, label }. Returns [kind, text] for the chat.
+function cmdFocus(rover, fa, replyTo) {
+  const busy = unavailable(rover)
+  if (busy) return ['refuse', busy]
+  if (rover.request && rover.request.kind !== 'place') return ['refuse', "I'm waiting for your answer to my question first. Answer it, then ask again."]
+  const lim = MAP_SIZE / 2 - 1
+  if (Math.abs(fa.x) > lim || Math.abs(fa.y) > lim) return ['refuse', `${at(fa.x, fa.y)} is outside the map: it spans ${-MAP_SIZE / 2} to ${MAP_SIZE / 2} m on both axes.`]
+  const low = lowBatteryRefusal(rover, fa.x, fa.y, fa.label.replace(/^around /, ''))
+  if (low) return ['refuse', low]
+  const [known, total] = circleCells(fa.x, fa.y, fa.r)
+  if (!focusFrontiers(fa).length) return ['refuse', `Everything within ${fa.r} m of ${fa.label.replace(/^around /, '')} is already mapped (${Math.round((known / Math.max(1, total)) * 100)}%). Nothing unknown to explore there.`]
+  if (rover.request?.kind === 'place') resolveRequest(rover.request, 'cancelled')
+  if (rover.state === 'observing') endObserve(rover, null)
+  startFocus(rover, { ...fa, reason: 'operator', replyTo, seconds: FOCUS_OPERATOR_S })
+  addEvent(rover.id, 'info', `Operator: explore ${fa.label}. Unknown ground within ${fa.r} m first, for about ${FOCUS_OPERATOR_S} s.`, [fa.x, fa.y], 'operator')
+  rover.lastGoalEventT = sim.t
+  const d = Math.round(Math.hypot(fa.x - rover.x, fa.y - rover.y))
+  return ['ack', `Exploring ${fa.label} for about ${FOCUS_OPERATOR_S} s: the unknown ground within ${fa.r} m first (${100 - Math.round((known / Math.max(1, total)) * 100)}% of it is unmapped${d > fa.r ? `, centre ${d} m ${compass(fa.x - rover.x, fa.y - rover.y)} of me` : ''}), then back to normal exploration.`]
+}
+
+// "explore around 10, -5", "explore north of the lander", "explore here", "explore
+// there". Null for anything else (named places go through parsePlace).
+function parseFocusSpot(t) {
+  if (!AROUND_RE.test(t)) return null
+  if (!POLITE_PLACE_RE.test(t) && QWORD_RE.test(t)) return null // "did you explore there?" asks
+  let m = /\b(?:around|near|by|at|about)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*(?:,\s*|\s+)(-?\d+(?:\.\d+)?)/.exec(t)
+  if (m) return { x: Number(m[1]), y: Number(m[2]) }
+  m = /\b(north[- ]?east|north[- ]?west|south[- ]?east|south[- ]?west|north|south|east|west)\s+of\s+(?:the\s+)?(lander|base)\b/.exec(t)
+  if (m) return { dir: m[1].replace(/^(north|south)[- ]?(east|west)$/, '$1-$2') }
+  m = /\b(?:explore|look around|scout|poke around)\s+(?:(?:over|around|right)\s+)?(here|there)\b/.exec(t) || /\bexplore\s+(?:this|that)\s+(?:area|spot|place)\b/.exec(t)
+  if (m) return { ref: m[1] === 'here' || /\bthis\b/.test(m[0]) ? 'here' : 'there' }
+  return null
+}
+
+function respondFocusSpot(spot, targets, to, source, replyTo) {
+  const single = to !== 'all' && targets.length === 1 ? targets[0] : null
+  const sayFleet = (kind, text) => addChat('fleet', 'operator', text, kind, source, null, replyTo)
+  const r0 = 12
+  let fa
+  if (spot.ref === 'here') {
+    if (!single) return sayFleet('question', 'Which rover should explore where it is? Say, for example, "rover 2, explore here".')
+    fa = { x: r1(single.x), y: r1(single.y), r: r0, label: `around ${at(single.x, single.y)}` }
+  } else if (spot.ref === 'there') {
+    const lp = single?.lastPlace || sim.lastPlace
+    if (!lp) {
+      const text = 'I\'m not sure where "there" is. Name a place or give coordinates, like "explore around the lake" or "explore around 10, -5".'
+      return single ? addChat(single.id, 'operator', text, 'question', source, null, replyTo) : sayFleet('question', text)
+    }
+    fa = { x: r1(lp.x), y: r1(lp.y), r: r0, label: `around ${lp.name}` }
+  } else if (spot.dir) {
+    const [ux, uy] = DIRS[spot.dir]
+    fa = { x: r1(LANDER.x + ux * FOCUS_AWAY_M), y: r1(LANDER.y + uy * FOCUS_AWAY_M), r: 15, label: `the ground ${spot.dir} of the lander` }
+  } else {
+    fa = { x: spot.x, y: spot.y, r: r0, label: `around (${spot.x}, ${spot.y})` }
+  }
+  const lim = MAP_SIZE / 2 - 1
+  if (Math.abs(fa.x) > lim || Math.abs(fa.y) > lim) {
+    const text = `${at(fa.x, fa.y)} is outside the map: it spans ${-MAP_SIZE / 2} to ${MAP_SIZE / 2} m on both axes.`
+    return single ? addChat(single.id, 'operator', text, 'refuse', source, null, replyTo) : sayFleet('refuse', text)
+  }
+  let rover = single
+  if (!rover) {
+    const able = targets.filter((r) => !unavailable(r) && !r.request).sort((a, b) => Math.hypot(a.x - fa.x, a.y - fa.y) - Math.hypot(b.x - fa.x, b.y - fa.y))
+    rover = able[0]
+    if (!rover) return sayFleet('refuse', 'Every rover is busy right now (charging, rebooting or waiting for your answer).')
+    if (targets.length > 1) sayFleet('info', `${rover.name} is the closest free rover (${Math.round(Math.hypot(rover.x - fa.x, rover.y - fa.y))} m), sending it.`)
+  }
+  const [kind, text] = cmdFocus(rover, fa, replyTo)
+  addChat(rover.id, 'operator', text, kind, source, null, replyTo)
 }
 
 // Mock-only test hook: the fleet learns every lake, target and spire at once.
@@ -4184,6 +4498,9 @@ function roverStates() {
         replans: r.st.replans,
       },
     }),
+    ...(PROTOCOL >= 7 && r.focus && {
+      focus: { x: r1(r.focus.x), y: r1(r.focus.y), r: r1(r.focus.r), reason: r.focus.reason, label: r.focus.label, ends_in: r1(Math.max(0, r.focus.until - sim.t)) },
+    }),
     ...(PROTOCOL >= 4 && {
       track_id: r.trackId,
       samples: [...r.samples],
@@ -4398,6 +4715,7 @@ const server = http.createServer((req, res) => {
     '/api/_mock/rearm': (b) => {
       // {"armed": true} (default): the next lifeform sighting asks the operator again.
       sim.firstLifeAsked = b?.armed === false
+      for (const h of sim.herds) h.asked = sim.firstLifeAsked // v7: every herd is asked about once
       return { ok: true, armed: !sim.firstLifeAsked }
     },
     '/api/_mock/reveal': (b) => revealAll(b),

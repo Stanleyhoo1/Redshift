@@ -35,6 +35,13 @@ DEGRADED_DIST_K = 2.5       # a rover that cannot see far weighs distance this m
 DEGRADED_MAX_GOAL = 14.0    # and avoids frontiers farther than this (unless there is nothing closer)
 SEARCH_TTL = 3.0            # an unfinished plan older than this (sim s) is dropped and restarted
 DIR_BIAS = 30.0             # operator "explore <direction>": utility bonus for frontiers straight that way
+# protocol v7: a rover with a focus (an area to explore) strongly prefers unknown ground inside its circle ...
+FOCUS_IN = 60.0             # ... utility bonus for a frontier inside the circle
+FOCUS_EDGE_K = 4.0          # ... else this much less per metre beyond the circle's edge (the nearest edge wins)
+CLAIMED = 200.0             # ... and a frontier another rover is already heading for only if nothing else is left
+FOCUS_CLAIM_PENALTY = 15.0  # other rovers leave the unknown ground inside someone's focus circle to that rover
+HERD_DISMISSED_M = 15.0     # tracks this close to a herd the operator said to leave alone are not observed again ...
+HERD_DISMISSED_S = 600.0    # ... for this long (sim s)
 
 
 def compass(dx: float, dy: float) -> str:
@@ -109,6 +116,9 @@ class Fleet:
         self.samples_cached = 0
         self.science_score = 0
         self.skip_logged: set = set()      # (rover id, target index) trade-offs already logged
+        self.interest_spots: list = []     # [(x, y, t)] places a rover already stuck around out of curiosity (v7)
+        self.spires_seen: dict = {}        # spire id -> (t, rover id, x, y) when the fleet's LiDAR first saw it
+        self.dismissed_herds: list = []    # [(x, y, t)] herds the operator said to leave alone (keep exploring)
 
     # ------------------------------------------------------------------ events
     def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None) -> None:
@@ -428,10 +438,14 @@ class Fleet:
         self.observed_areas = [a for a in self.observed_areas if t - a[2] < 300.0]
         observing = [r for r in self.rovers if r.state == "observing" and r.obs is not None]
         max_obs = 2 if len(self.rovers) >= 3 else 1     # the others keep exploring
+        self.dismissed_herds = [d for d in self.dismissed_herds if t - d[2] < HERD_DISMISSED_S]
         for tr in tracker.confirmed():
             if tr.observer is not None or tr.ignored or tr.status == "lost" or t < tr.done_until:
                 continue
             px, py = tr.predict(t)
+            if any(math.hypot(px - dx, py - dy) < HERD_DISMISSED_M for dx, dy, _ in self.dismissed_herds):
+                tr.ignored = True           # the operator said to leave this herd alone (protocol v7)
+                continue
             if any(o2.observer is not None and math.hypot(o2.x - px, o2.y - py) < 12.0 for o2 in tracker.confirmed()):
                 continue                    # its herd is already being watched
             if any(math.hypot(px - ax, py - ay) < 15.0 for ax, ay, _ in self.observed_areas):
@@ -513,7 +527,9 @@ class Fleet:
 
     # ------------------------------------------------------------------ goals
     def choose_goal(self, t: float, rover, max_tries: int = 6):
-        """Pick the best frontier cluster for this rover and plan to it. Returns (goal, path, size) or None."""
+        """Pick the best frontier cluster for this rover and plan to it. Returns (goal, path, size) or None.
+        A rover with a focus (protocol v7) takes unclaimed frontiers inside its circle first, then the ones
+        nearest the circle's edge; the others leave the ground inside someone's focus circle to that rover."""
         rover.goal_fail_reason = None
         if self.complete or not self.frontiers:
             return None
@@ -522,8 +538,12 @@ class Fleet:
         bias = getattr(rover, "dir_bias", None)      # operator: "explore north" (unit vector, until t)
         if bias is not None and t >= bias[2]:
             bias = None
+        fc = getattr(rover, "focus", None)
+        circles = [(o.focus["x"], o.focus["y"], o.focus["r"]) for o in self.rovers
+                   if o is not rover and getattr(o, "focus", None) is not None]
         reach = self.reach.ravel() if (self.reach is not None and self.in_reach(rover.x, rover.y)) else None
         skipped_battery = 0
+        claimed_keys: set = set()
         for (x, y, size, idx) in self.frontiers:
             key = self._bucket(x, y)
             if key in self.blacklist or rover.blacklist.get(key, -1.0) > t:
@@ -544,21 +564,41 @@ class Fleet:
             ang = abs(math.atan2(math.sin(math.atan2(y - rover.y, x - rover.x) - rover.yaw),
                                  math.cos(math.atan2(y - rover.y, x - rover.x) - rover.yaw)))
             u -= W_TURN * ang
+            claimed = False
             for o in self.rovers:
                 if o is rover:
                     continue
                 if o.goal is not None and o.state in ("exploring", "investigating") and \
                         math.hypot(x - o.goal[0], y - o.goal[1]) < OVERLAP_RADIUS:
                     u -= OVERLAP_PENALTY
+                    claimed = True
                 if math.hypot(x - o.x, y - o.y) < 6.0:
                     u -= NEAR_ROVER_PENALTY
             if any(math.hypot(x - sx, y - sy) < self.cfg.target_bonus_radius for sx, sy in self.sampled_points):
                 u += SAMPLE_BONUS
             if bias is not None:
                 u += DIR_BIAS * ((x - rover.x) * bias[0] + (y - rover.y) * bias[1]) / max(d, 1e-6)
+            if fc is not None:
+                dc = math.hypot(x - fc["x"], y - fc["y"])
+                if claimed:
+                    u -= CLAIMED                # fleet claims still keep rovers from duplicating work
+                    claimed_keys.add(key)
+                elif dc <= fc["r"]:
+                    u += FOCUS_IN
+                else:
+                    u -= FOCUS_EDGE_K * (dc - fc["r"])
+            elif any(math.hypot(x - cx, y - cy) <= cr for cx, cy, cr in circles):
+                u -= FOCUS_CLAIM_PENALTY
             cands.append((u, x, y, size, key))
         if not cands and skipped_battery:
             rover.goal_fail_reason = "battery"
+        if fc is not None and fc.get("arrived") is not None:
+            # there: only unknown ground nearby counts; nothing left means the focus is done
+            near = fc["r"] + self.cfg.focus_margin
+            cands = [c for c in cands if c[4] not in claimed_keys and math.hypot(c[1] - fc["x"], c[2] - fc["y"]) <= near]
+            if not cands:
+                rover.goal_fail_reason = rover.goal_fail_reason or "focus_done"
+                return None
         cands.sort(key=lambda c: -c[0])
         cands = cands[:max_tries]
         rover.goal_options = list(cands)        # ranked options: tier 2 (Gemma) may pick another one
@@ -594,6 +634,9 @@ class Fleet:
         dirn = compass(ts.spec.x - rover.x, ts.spec.y - rover.y)
         at = (ts.spec.x, ts.spec.y)
         est = f"estimated value {ts.spec.est_value}/10"
+        if hasattr(rover, "note_interest"):     # protocol v7 curiosity: targets come in clusters, look around it
+            rover.note_interest(t, ts.spec.x, ts.spec.y, "target", f"a possible {label} ({ts.spec.id})",
+                                f"{ts.spec.id} ({label})")
         if rover.can_investigate(t, ts):
             ts.status = "investigating"
             ts.investigator = rover.id
