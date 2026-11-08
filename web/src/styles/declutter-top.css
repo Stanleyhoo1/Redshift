@@ -1,0 +1,170 @@
+/* The overlays over the top of the map: the hazard bar (folds to a pill) and the questions
+   (docked at the top right of the map, smaller, folding to a count chip). */
+
+/* Everything here lines up on the right edge of the map, under the top edge, so the
+   centre of the map (and the rovers) stays clear. .hud-top already sits inside the map
+   column, so it follows the sidebar when that narrows. */
+.hud-top {
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* ---- Hazards */
+
+.hud-hazards.hz-folded {
+  width: auto;
+  padding: 0;
+  gap: 4px;
+  background: rgba(8, 12, 19, 0.78);
+}
+
+.hz-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px 6px 9px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.hz-pill:hover {
+  color: var(--ink);
+}
+
+.hz-pill:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+.hz-pill > svg:first-child {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: var(--warn, #f2b84b);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.hz-pill .hz-badge {
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.hz-pill .fold-chev {
+  color: var(--ink-3-hud, var(--ink-3));
+}
+
+.hz-folded .hz-status {
+  max-width: 320px;
+  margin: 0;
+  padding: 0 10px 7px;
+  font-size: 12px;
+}
+
+.hz-fold {
+  margin-left: auto;
+}
+
+/* ---- Questions */
+
+.rq-stack {
+  width: min(440px, 100%);
+  align-items: flex-end;
+}
+
+.rq-stack > .hud-request {
+  align-self: stretch;
+}
+
+.hud-request {
+  --rq-w: 132px;
+  --rq-h: 99px;
+  gap: 11px;
+  padding: 10px 11px 13px 10px;
+}
+
+.rq-stack > .rq-strip {
+  align-self: stretch;
+}
+
+.rq-fold {
+  margin-left: auto;
+  margin-right: -4px;
+}
+
+.rq-more-btn {
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-2);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.rq-more-btn:hover {
+  color: var(--ink);
+}
+
+.rq-more-btn:focus-visible,
+.rq-chip:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+/* Folded: a chip with the count, pulsing whenever a new question arrives. */
+.rq-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  border-color: color-mix(in srgb, var(--signal) 55%, var(--line-2));
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  animation:
+    rq-in 380ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    rq-glow 2.4s ease-in-out 400ms 4;
+}
+
+.rq-chip b {
+  color: var(--ink);
+}
+
+.rq-chip .rover-dot {
+  background: var(--rover);
+}
+
+.rq-chip:hover {
+  color: var(--ink);
+}
+
+@media (max-height: 820px), (max-width: 1240px) {
+  .rq-stack {
+    width: min(400px, 100%);
+  }
+  .hud-request {
+    --rq-w: 116px;
+    --rq-h: 87px;
+    gap: 10px;
+    padding: 9px 10px 12px 9px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rq-chip {
+    animation: none;
+  }
+}
