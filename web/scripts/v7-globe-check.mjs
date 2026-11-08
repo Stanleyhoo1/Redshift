@@ -512,7 +512,16 @@ add('hazard-button', async (page) => {
 // Clicking an event with a place on the planet flies down to it.
 add('event-click', async (page) => {
   await toGlobe(page)
-  const r = await api('/api/hazard', { type: 'rockfall', rover: 'r2' })
+  // The mock refuses a spot near the lander, the map edge or another hazard ("Try again in a
+  // few seconds"), which depends on where the rovers are by now, so ask a few times: for
+  // Rover 2 first, then for any rover.
+  let r
+  for (let i = 0; i < 8; i++) {
+    r = await api('/api/hazard', i % 2 ? { type: 'rockfall' } : { type: 'rockfall', rover: 'r2' })
+    if (r.status === 200) break
+    log(`rockfall refused (${r.error || r.status}), asking again`)
+    await page.waitForTimeout(1500)
+  }
   if (r.status !== 200) return fail(`could not start a rockfall (${r.status} ${r.error || ''})`)
   await page.click('#tab-events')
   const row = page.locator('li.ev.ev-link .ev-btn').first()
