@@ -1,0 +1,146 @@
+/* Right sidebar declutter: foldable sections and the narrow rail (components/Sidebar.jsx). */
+
+:root[data-side='rail'] {
+  --side-w: 56px;
+}
+
+.side-head-top .side-collapse {
+  margin-left: 4px;
+}
+
+/* Points right: pushes the sidebar off to the right edge. */
+.side-collapse .fold-chev[data-open] {
+  transform: none;
+}
+
+.side-fold {
+  flex: none;
+  padding: 0 16px;
+  border-top: 1px solid var(--line);
+}
+
+.side-fold > .fold-head {
+  padding: 4px 0;
+}
+
+.side-fold-log:not([data-folded]) {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.side-fold-log > .fold-body:not([hidden]) {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin: 0 -16px;
+}
+
+.side-fold > .fold-body > .stats,
+.side-fold > .fold-body > .rovers {
+  margin-left: -16px;
+  margin-right: -16px;
+}
+
+/* A question is waiting while the log is folded: the summary says so in amber. */
+.side[data-ask] .side-fold-log[data-folded] .fold-summary {
+  color: var(--amber);
+}
+
+/* ---- the rail */
+
+.side-rail {
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+}
+
+.rail-open .fold-chev {
+  transform: rotate(180deg);
+}
+
+.rail-open {
+  padding: 8px;
+  border: 1px solid var(--line-2);
+}
+
+.rail-rovers {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rail-rover {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  width: 44px;
+  padding: 6px 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.rail-rover:hover,
+.rail-rover[aria-pressed='true'] {
+  border-color: var(--line-2);
+  color: var(--ink);
+}
+
+.rail-rover i {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--rover);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--rover) 22%, transparent);
+}
+
+.rail-rover[data-state='fault'] span,
+.rail-rover[data-state='recovering'] span {
+  color: var(--red);
+}
+
+.rail-rover[data-state='charging'] span {
+  color: var(--amber);
+}
+
+.rail-ask {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 40px;
+  padding: 6px 0;
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--amber) 14%, transparent);
+  color: var(--amber);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.rail-ask small {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Rover rows: the brain latency only shows when it runs high; otherwise it is in the row's tooltip. */
+.side .rover .brain-chip[data-level='ok'],
+.side .rover .brain-chip[data-level='none'] {
+  display: none;
+}
