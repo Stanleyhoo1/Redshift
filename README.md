@@ -72,6 +72,7 @@ The rules always keep control of safety: Gemma's picks are only taken from optio
 - **Samples tab:** every sample collected so far, sorted by science value, with the instrument used (drill, scoop, gas sniffer, swab), the lab result, and whether it is still on a rover or cached at the lander. Rover cards show their 3 tube slots and a progress bar while sampling.
 - **Comms tab:** type instructions ("rover 2, explore north", "everyone come home", "orange one, sample the vent"). Gemma turns them into commands, the rules check they are safe, and the rover replies or refuses with its reasons. Rover questions appear here and as a card at the top, with the rover's camera view and a countdown.
 - **Reality:** overlays the true terrain and every real target, so you can compare it with what the fleet knows.
+- **Reset sim and New mission:** Reset sim lands the fleet on a new random planet with the same settings. New mission opens the setup screen first, to change gravity, fleet size, sector size, features, wear or speed; the gravity readout and the slope figure show how steep the rovers can climb and tow at that gravity.
 
 ## Terrain (version 7)
 
@@ -102,10 +103,28 @@ With biomes on (the default; `BIOMES=0` or the setup screen's Biomes switch turn
 | Obsidian badlands | glassy near-black, violet sheen | canyon, boulder fields, mesas | dunes, no ice |
 | Rust plains | today's red-brown | (only ever a secondary region) | |
 
+Each picture is the whole 120 m sector with Reality on (the true ground, with the measurement lattice over it) and the dashboard panels hidden. The second biome named is the secondary one.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/biomes/basalt.jpg" alt="Basalt fields"><br><b>Basalt fields</b>, seed 4, with ash regions</td>
+<td width="50%"><img src="docs/images/biomes/verdigris.jpg" alt="Verdigris lowlands"><br><b>Verdigris lowlands</b>, seed 31, with basalt regions</td>
+</tr>
+<tr>
+<td><img src="docs/images/biomes/frost.jpg" alt="Frost plains"><br><b>Frost plains</b>, seed 1, with ash regions</td>
+<td><img src="docs/images/biomes/ash.jpg" alt="Ash wastes"><br><b>Ash wastes</b>, seed 10, with verdigris regions</td>
+</tr>
+<tr>
+<td><img src="docs/images/biomes/salt.jpg" alt="Salt flats"><br><b>Salt flats</b>, seed 6, with ash regions</td>
+<td><img src="docs/images/biomes/obsidian.jpg" alt="Obsidian badlands"><br><b>Obsidian badlands</b>, seed 42 (the default), with ash regions</td>
+</tr>
+</table>
+
+To retake them: start the sim with `AUTO_LAUNCH=1` and a vite pointed at it, then run `node scripts/biome-shots.mjs <app url> <sim url> <out dir>` from `web/` (see the top of the script).
+
 How it picks features: every feature setting stays the upper limit. The biome only scales how many of each feature the generator tries to place: the count is multiplied by 75 % of the primary biome's weight plus 25 % of the secondary's, rounded (a primary weight of 0 means none at all, and the canyon, a single feature, is there only when its weight is 0.5 or more). The biome also sets the camera's soil, rock, sky and light colours, and the dashboard's ground, sky, haze, planet and legend colours, blending into the secondary biome's colours across its regions. The lifeform mix also follows the primary biome when More lifeforms is on. The rovers never read the biome: their cameras only see the colours.
 
 The planet view (`G`, or View: Planet) shows the whole world from orbit with the landing sector marked.
-- **Reset sim and New mission:** Reset sim lands the fleet on a new random planet with the same settings. New mission opens the setup screen first, to change gravity, fleet size, sector size, features, wear or speed; the gravity readout and the slope figure show how steep the rovers can climb and tow at that gravity.
 
 ## Run natively with the MuJoCo viewer
 
