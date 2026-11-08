@@ -4410,3 +4410,243 @@ kbd {
   padding: 0 6px;
   font-size: 11px;
 }
+
+/* ---------------------------------------------------------------- v6: requests that wait, place choices */
+
+/* No countdown: a calm "Waiting for you" pill instead of the seconds. */
+.rq-wait {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 10px 3px 8px;
+  border: 1px solid rgba(79, 224, 239, 0.35);
+  border-radius: 999px;
+  background: rgba(79, 224, 239, 0.07);
+  font-size: 12.5px;
+  font-weight: 640;
+  color: #b9f3f9;
+  white-space: nowrap;
+}
+
+.rq-wait i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--signal);
+  animation: rq-breathe 2.8s ease-in-out infinite;
+}
+
+@keyframes rq-breathe {
+  50% {
+    opacity: 0.35;
+    transform: scale(0.75);
+  }
+}
+
+.hud-request[data-kind='open'][data-wait] {
+  animation:
+    rq-in 380ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    rq-glow 4.8s ease-in-out 400ms infinite;
+}
+
+.rq-bar[data-wait] {
+  background: rgba(79, 224, 239, 0.06);
+}
+
+.rq-bar[data-wait] i {
+  transform: none !important;
+  background: linear-gradient(90deg, transparent, rgba(79, 224, 239, 0.55), transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: rq-sweep 4.5s ease-in-out infinite;
+}
+
+@keyframes rq-sweep {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+
+.rq-strip-wait {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #9fe9f2;
+  white-space: nowrap;
+}
+
+.rq-strip-bar[data-wait] {
+  opacity: 0.35;
+}
+
+/* Numbered place chips (card and chat), numbered like the map markers. */
+.place-num {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--c, var(--rover, var(--signal)));
+  color: #05070b;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.rq-opt[data-place] {
+  flex: 1 1 210px;
+  align-items: flex-start;
+  min-width: 0;
+  padding: 7px 11px;
+  text-align: left;
+}
+
+.rq-opt[data-place] .rq-opt-label {
+  white-space: normal;
+  line-height: 1.3;
+}
+
+.rq-opt-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.rq-opt[data-hl],
+.msg-opt[data-hl] {
+  border-color: var(--c, var(--rover, var(--signal)));
+  background: color-mix(in srgb, var(--c, var(--rover, var(--signal))) 16%, transparent);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--c, var(--rover, var(--signal))) 30%, transparent);
+}
+
+.msg-opt[data-place] {
+  text-align: left;
+}
+
+.msg-opt .place-num {
+  min-width: 17px;
+  height: 17px;
+  font-size: 11px;
+}
+
+.msg-q-foot[data-wait] {
+  color: #8fdbe4;
+}
+
+/* The top-down sketch of the candidates (in place of the camera picture). */
+.rq-map svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.rq-map-lander {
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1.2;
+}
+
+.rq-map-line {
+  stroke: var(--rover);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.5;
+}
+
+.rq-map-line[data-hl] {
+  opacity: 1;
+}
+
+.rq-map-pin {
+  cursor: pointer;
+}
+
+.rq-map-pin circle {
+  fill: rgba(6, 9, 14, 0.85);
+  stroke: var(--rover);
+  stroke-width: 1.6;
+  transition: fill 120ms;
+}
+
+.rq-map-pin text {
+  fill: var(--ink);
+  font-size: 10.5px;
+  font-weight: 800;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.rq-map-pin[data-hl] circle,
+.rq-map-pin[data-chosen] circle {
+  fill: var(--rover);
+}
+
+.rq-map-pin[data-hl] text,
+.rq-map-pin[data-chosen] text {
+  fill: #05070b;
+}
+
+.rq-map-rover {
+  fill: var(--rover);
+  stroke: #05070b;
+  stroke-width: 1.4;
+}
+
+/* Candidate badges on the 3D map. */
+.place-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 3px 10px 3px 3px;
+  border: 1.5px solid var(--c);
+  border-radius: 999px;
+  background: rgba(6, 9, 14, 0.88);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--c) 35%, transparent);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 640;
+  line-height: 1.2;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: auto;
+  cursor: pointer;
+  transition:
+    transform 140ms ease-out,
+    opacity 160ms,
+    box-shadow 140ms;
+}
+
+.place-mark .place-num {
+  min-width: 22px;
+  height: 22px;
+  font-size: 13px;
+  background: var(--c);
+}
+
+.place-mark:hover,
+.place-mark[data-hl] {
+  transform: scale(1.12);
+  background: rgba(10, 15, 23, 0.96);
+  box-shadow: 0 0 24px color-mix(in srgb, var(--c) 60%, transparent);
+}
+
+.place-mark[data-chosen] {
+  transform: scale(1.12);
+  background: color-mix(in srgb, var(--c) 28%, rgba(6, 9, 14, 0.92));
+}
+
+.place-mark[data-dim] {
+  opacity: 0.4;
+}
+
+.place-mark:disabled {
+  cursor: default;
+}
+

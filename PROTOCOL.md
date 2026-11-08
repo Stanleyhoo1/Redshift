@@ -192,7 +192,7 @@ Optional `"source": "rules" | "gemma" | "operator"` on events (missing means rul
 ```
 
 - A rover asks when it (or Gemma) cannot interpret what it senses. It acts cautiously (slows or holds) while waiting.
-- `expires_in`: WALL-CLOCK seconds left (env `OPERATOR_TIMEOUT_S`, default 20). On expiry the rover takes `default` (always the safest option) and says so in the chat. No answer is ever required for the mission to continue.
+- `expires_in`: WALL-CLOCK seconds left (env `OPERATOR_TIMEOUT_S`). On expiry the rover takes `default` (always the safest option) and says so in the chat. Since version 6 the default is 0: `expires_in` is null and the request waits for the operator (see Version 6).
 
 ### `POST /api/chat`
 
@@ -322,6 +322,46 @@ Running totals for this rover since the sim started: `distance_m` driven, `mappe
 
 `GET /api/camera/{rover_id}.jpg` now accepts `w` and `h` up to 1280 x 720 (for an enlarged view in the UI). Larger values are clamped. Default stays 320 x 240.
 
+## Version 6 additions (commanding by place, choosing between candidates, questions that wait)
+
+All optional for clients.
+
+### Commands that name a place
+
+Operator messages can name things the fleet has sensed instead of coordinates: "go to the water source", "can we investigate the lake again for signs of life", "check out the vent", "go back to the herd", "rover 3, survey the spires", "take a look at t7". Polite forms ("can we ...", "could you ...", "let's ...", "I want you to ...") followed by an action are commands, not questions. The sim resolves the place from fleet knowledge only (identified water, found targets by kind or id, lifeform tracks and the places herds were observed, spires on the fleet's map, hazard sites, the lander), never from ground truth the fleet has not sensed.
+
+- One candidate, or a qualifier that picks one (nearest, farthest, biggest, smallest, newest, a compass direction, "the one near rover 2", "the second one", an id): the rover goes. The goal is a safe reachable point next to the place (for water, a shoreline point about 3 m from the edge; for a creature, the observation standoff; never inside water or a no-go zone). The ack says where and how far.
+- "investigate", "survey", "look around", "look for life", "check for signs of ...": after arriving the rover surveys: it stops, turns slowly through 360 deg so the camera sweeps the area while LiDAR watches for movement, for about 30 sim seconds, then reports in chat (`kind: "info"`, `reply_to` the command): what moved and what it saw. A moving track during the survey starts the normal lifeform observation.
+- No rover named or picked in the UI (or "all"): the closest rover that is free goes, and says so ("r2 is closest (18 m), heading there.").
+- Nothing known matches: the fleet says so and lists what it does know ("I don't know any water yet. Known: 2 vents, 1 ice deposit, 1 herd.").
+- More than one candidate and nothing to choose between them: a `choose_place` request (below). The rover that would go holds position while it waits.
+
+### Request additions
+
+```json
+{"id": "q7", "rover": "r2", "kind": "choose_place", "t": 2655.0,
+ "question": "I know 3 bodies of water. Which one?",
+ "options": [{"id": "p1", "label": "Lake 14 m across, 22 m north-east of me", "x": 31.0, "y": -12.5},
+             {"id": "p2", "label": "Stream near (-40, 8), 61 m west", "x": -40.0, "y": 8.0},
+             {"id": "p3", "label": "Pond 6 m across near the lander", "x": 4.0, "y": 9.5},
+             {"id": "cancel", "label": "Never mind"}],
+ "default": null, "expires_in": null, "image": null}
+```
+
+- `kind` (optional on every request): `"anomaly" | "lifeform" | "choose_place"`.
+- Options may carry `x`, `y`: the UI highlights every candidate on the map (numbered markers) and the operator answers by clicking a marker, an option chip, or typing in chat ("the second one", "p2", "the one near the lander"). An operator chat message that clearly picks an option of an open `choose_place` request answers it (the chat reply carries that `request_id`).
+- `default` may be null (no automatic choice). `expires_in` may be null: the request never expires and waits for the operator.
+
+### Questions wait for the operator
+
+`OPERATOR_TIMEOUT_S` now defaults to 0: no request expires and `expires_in` is null. A rover with an open request holds position until the operator answers; it still moves if staying is the danger (backing out of soft ground or liquid, heading home on a low battery, making room for a creature that came too close). Set `OPERATOR_TIMEOUT_S` above 0 to bring back the countdown and the automatic safe default.
+
+Sim notes (clarifications):
+- Anomaly and lifeform requests keep a non-null `default` (the safe option, applied only when `OPERATOR_TIMEOUT_S` is above 0). A `choose_place` request has `default: null`, or `"cancel"` when `OPERATOR_TIMEOUT_S` is above 0.
+- A new operator command for a rover (go to, a place, explore, sample, return) closes that rover's open request without a reply (it disappears from `requests`; `POST /api/answer` then gets 409).
+- The rover state stays `"exploring"` during a survey (goal null). Chat for a place command: one `ack` (or `refuse`, `question`), an `info` on arrival, and with investigate the survey `info`; all carry `reply_to` the command, and `request_id` when they follow a `choose_place` answer.
+- "go to the lander" without investigate means return home (the closest free rover when none is named).
+
 ### `GET /api/camera/{rover_id}.jpg`
 
 Live image rendered by MuJoCo from the rover's point of view, at the current sim state.
@@ -354,5 +394,5 @@ Nothing required. The server must ignore any text the client sends.
 | `GEMMA_URL` | http://host.docker.internal:11434 | Ollama server (falls back to localhost:11434) |
 | `GEMMA_MODEL` | gemma4:e2b | preferred model; falls back to gemma4:e4b, then gemma3:4b if not installed |
 | `GEMMA_FAKE` | 0 | 1 = deterministic fake model (demo and tests without Ollama) |
-| `OPERATOR_TIMEOUT_S` | 20 | wall seconds a rover waits for an operator answer before taking the safe default |
+| `OPERATOR_TIMEOUT_S` | 0 | 0 = operator requests never expire (the rover waits); above 0 = wall seconds before the rover takes the safe default |
 | `AUTO_RESET_S` | 0 | off by default (the sim only resets on `POST /api/reset`); if set, after exploration completes and all rovers park, wait this long, then reset with a random seed and broadcast `init` |

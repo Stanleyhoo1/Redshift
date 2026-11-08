@@ -18,6 +18,7 @@ import { Water } from './Water.jsx'
 import { Spires, fallDebug } from './Spires.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
+import { PlaceCandidates } from './PlaceCandidates.jsx'
 import { CameraRig } from './CameraRig.jsx'
 import { Atmosphere } from './Atmosphere.jsx'
 import { Gravel } from './Gravel.jsx'
@@ -101,6 +102,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       {view.life && <Life reality={view.reality} />}
       {view.reality && <Reality />}
       <FocusMarker focus={focus} />
+      <PlaceCandidates />
       <Placement reality={view.reality} />
       <CameraRig follow={follow} overview={overview} focus={focus} />
       {DEBUG && <DebugHook />}

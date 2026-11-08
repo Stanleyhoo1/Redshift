@@ -1,9 +1,11 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import { appStore, simStore, useSim, roverPoses, hudLayout } from '../state/store.js'
 import { sampleGroundNear } from '../state/simState.js'
+import { hasPlaces } from '../lib/answers.js'
+import { groundAt } from './ground.js'
 
 const _d = new THREE.Vector3()
 const _o = new THREE.Vector3()
@@ -106,6 +108,116 @@ function overviewPose(box, size, fov, free) {
   return { target, position: target.clone().addScaledVector(dir, d) }
 }
 
+// ---------------------------------------------------------------- v6: fit place candidates
+
+const FIT_QUIET_MS = 1500 // wait this long after the user last moved the camera
+const FIT_GIVE_UP_MS = 9000 // and drop the fit if they keep moving it this long
+const _f = new THREE.Vector3()
+const _r = new THREE.Vector3()
+const _u = new THREE.Vector3()
+
+// Where a fitted view may put things: the free rect, minus the request card (top right),
+// either below it or beside it, whichever leaves more room. Pixels, inset by a margin.
+function fitRect(size) {
+  const W = size.width
+  const H = size.height
+  const f = freeRect(size)
+  let { x0, x1, y0, y1 } = f
+  const rq = hudLayout.requests
+  if (rq && rq.right > x0 && rq.left < x1 && rq.bottom > y0) {
+    const below = { x0, x1, y0: Math.max(y0, rq.bottom + 12), y1 }
+    const beside = { x0, x1: Math.min(x1, rq.left - 12), y0, y1 }
+    const area = (r) => Math.max(0, r.x1 - r.x0) * Math.max(0, r.y1 - r.y0)
+    const pick = area(below) >= area(beside) ? below : beside
+    if (pick.x1 - pick.x0 > W * 0.25 && pick.y1 - pick.y0 > H * 0.25) ({ x0, x1, y0, y1 } = pick)
+  }
+  const m = Math.min(36, W * 0.03)
+  return { x0: x0 + m, x1: x1 - m, y0: y0 + m, y1: y1 - m }
+}
+
+// Project a world point (x east, y north, h up) to view pixels; false when behind.
+function toPx(cam, size, x, y, h, out) {
+  _p.set(x, h, -y).project(cam)
+  out.x = ((_p.x + 1) / 2) * size.width
+  out.y = ((1 - _p.y) / 2) * size.height
+  return _p.z < 1 && _p.z > -1
+}
+
+function allInView(cam, size, pts, rect) {
+  const o = { x: 0, y: 0 }
+  for (const [x, y, h] of pts) {
+    if (!toPx(cam, size, x, y, h, o)) return false
+    if (o.x < rect.x0 || o.x > rect.x1 || o.y < rect.y0 || o.y > rect.y1) return false
+  }
+  return true
+}
+
+// A camera pose that keeps the current heading (elevation kept between about 40 and 70
+// degrees so hills do not hide anything) and shows every point inside `rect`.
+function fitPose(camera, target0, size, pts, rect, maxDist) {
+  const cam = camera.clone()
+  cam.updateProjectionMatrix()
+  const dir = new THREE.Vector3().copy(camera.position).sub(target0)
+  if (dir.lengthSq() < 1e-6) dir.set(0, Math.sin(ELEVATION), Math.cos(ELEVATION))
+  dir.normalize()
+  const ey = THREE.MathUtils.clamp(dir.y, Math.sin(0.7), Math.sin(1.22))
+  if (ey !== dir.y) {
+    const flat = Math.hypot(dir.x, dir.z) || 1
+    const c = Math.cos(Math.asin(ey))
+    dir.set(dir.x === 0 && dir.z === 0 ? 0 : (dir.x / flat) * c, ey, dir.x === 0 && dir.z === 0 ? c : (dir.z / flat) * c)
+  }
+  const target = new THREE.Vector3()
+  for (const [x, y, h] of pts) target.add(_p.set(x, h, -y))
+  target.multiplyScalar(1 / pts.length)
+  const place = (d) => {
+    cam.position.copy(target).addScaledVector(dir, d)
+    cam.lookAt(target)
+    cam.updateMatrixWorld(true)
+  }
+  const o = { x: 0, y: 0 }
+  const fits = () => {
+    for (const [x, y, h] of pts) {
+      if (!toPx(cam, size, x, y, h, o)) return false
+      if (o.x < rect.x0 || o.x > rect.x1 || o.y < rect.y0 || o.y > rect.y1) return false
+    }
+    return true
+  }
+  let d = maxDist
+  for (let pass = 0; pass < 3; pass++) {
+    let lo = 6
+    let hi = maxDist
+    for (let it = 0; it < 24; it++) {
+      const mid = (lo + hi) / 2
+      place(mid)
+      if (fits()) hi = mid
+      else lo = mid
+    }
+    d = hi
+    place(d)
+    // Centre the points in the rect: slide the target along the view plane.
+    let px0 = Infinity
+    let px1 = -Infinity
+    let py0 = Infinity
+    let py1 = -Infinity
+    for (const [x, y, h] of pts) {
+      toPx(cam, size, x, y, h, o)
+      px0 = Math.min(px0, o.x)
+      px1 = Math.max(px1, o.x)
+      py0 = Math.min(py0, o.y)
+      py1 = Math.max(py1, o.y)
+    }
+    const dx = (px0 + px1) / 2 - (rect.x0 + rect.x1) / 2
+    const dy = (py0 + py1) / 2 - (rect.y0 + rect.y1) / 2
+    if (Math.abs(dx) < 2 && Math.abs(dy) < 2) break
+    const mPerPx = (2 * d * Math.tan(THREE.MathUtils.degToRad(cam.fov / 2))) / Math.max(1, size.height)
+    _r.setFromMatrixColumn(cam.matrixWorld, 0)
+    _u.setFromMatrixColumn(cam.matrixWorld, 1)
+    target.addScaledVector(_r, dx * mPerPx).addScaledVector(_u, -dy * mPerPx)
+  }
+  place(d)
+  return { target, position: cam.position.clone() }
+}
+
 // Keeps the free part of the view centred on screen with a view offset, easing when a
 // panel opens or closes so the picture glides instead of jumping.
 function applyShift(s, camera, size, free, dt) {
@@ -132,6 +244,11 @@ function applyShift(s, camera, size, free, dt) {
 //   user   - someone moved the camera: hands off until "Off" (0 / Esc) or a sim reset
 //   follow - glides along with one rover; you can still orbit and zoom around it
 //   fly    - glides to a spot (an event with a location), then hands over as "user"
+// Version 6: when a request with place candidates opens, the camera glides once to show
+// the asking rover and every candidate (only if they are not in view already, and never
+// while the user is moving the camera). A followed rover's follow pauses for it ("Back
+// to" shows). When the request closes and nobody touched the camera meanwhile, it goes
+// back to the overview or the follow it left.
 // Panning while following (anything that moves the orbit target), or clicking an event
 // that flies elsewhere, pauses the follow: the camera goes free where it is, the rover
 // stays selected, and appStore.followPaused tells App to show "Back to". Clearing that
@@ -143,7 +260,16 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
   const size = useThree((s) => s.size)
   const dom = useThree((s) => s.gl.domElement)
   const controls = useRef()
-  const st = useRef({ mode: 'auto', snapped: false, key: '', checkedAt: 0, goal: null, followId: null, zooming: false, overview, gen, focusKey: focus?.key ?? null, fly: null, shift: null, last: new THREE.Vector3(), hasLast: false, panned: 0, panIntent: false })
+  const st = useRef({ mode: 'auto', snapped: false, key: '', checkedAt: 0, goal: null, followId: null, zooming: false, overview, gen, focusKey: focus?.key ?? null, fly: null, shift: null, last: new THREE.Vector3(), hasLast: false, panned: 0, panIntent: false, dragging: false, lastGesture: -1e9, fit: null, fitCarry: null, fitPending: null, fitDone: new Set() })
+  // v6: the newest open request with place candidates; its rover and candidates are
+  // framed once when it opens (see placeFit).
+  const requests = useSim((s) => s.requests)
+  const placeReq = useMemo(() => {
+    for (let k = requests.length - 1; k >= 0; k--) if (hasPlaces(requests[k])) return requests[k]
+    return null
+  }, [requests])
+  const placeRef = useRef(placeReq)
+  placeRef.current = placeReq
 
   // Which gesture is under way, the way OrbitControls maps them: right button (or a
   // modifier with the left one) or two fingers pan. Only target motion from a pan
@@ -189,6 +315,13 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
     s.overview = overview
     s.gen = gen
     const paused = !!follow && appStore.get().followPaused
+    if (newRun) {
+      s.fit = null
+      s.fitCarry = null
+      s.fitPending = null
+      s.fitDone.clear()
+    }
+    if (s.fit && (follow !== s.followId || wantOverview)) s.fit.touched = true
     if (follow !== s.followId) {
       s.followId = follow
       s.zooming = !!follow && !paused
@@ -240,13 +373,16 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
           const flat = Math.hypot(_o.x, _o.z) || 1
           _o.set((_o.x / flat) * 0.82, 0.57, (_o.z / flat) * 0.82)
         }
-        s.fly = { target, position: target.clone().addScaledVector(_o, FLY_DISTANCE) }
+        s.fly = { target, position: target.clone().addScaledVector(_o, FLY_DISTANCE), rate: 2.6, kind: 'event' }
         s.mode = 'fly'
+        if (s.fit) s.fit.touched = true
       }
     }
 
+    placeFit(c, s, paused)
+
     if (s.mode === 'fly') {
-      const a = 1 - Math.exp(-Math.min(dt, 0.1) * 2.6)
+      const a = 1 - Math.exp(-Math.min(dt, 0.1) * (s.fly.rate || 2.6))
       c.target.lerp(s.fly.target, a)
       camera.position.lerp(s.fly.position, a)
       camera.lookAt(c.target)
@@ -295,6 +431,68 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
     }
   }
 
+  // v6: frame the asking rover and its place candidates once per request.
+  function placeFit(c, s, paused) {
+    const q = placeRef.current
+    const now = performance.now()
+    if (s.fit && (!q || q.id !== s.fit.id)) {
+      const f = s.fit
+      s.fit = null
+      if (!f.touched) {
+        // Another request is about to be framed: it inherits where to go back to.
+        if (q && !s.fitDone.has(q.id)) s.fitCarry = f
+        else if (f.back === 'auto' && !follow && (s.mode === 'user' || s.mode === 'fly')) s.mode = 'auto'
+        else if (f.back === 'follow' && follow && follow === f.followId && paused) appStore.patch({ followPaused: false })
+      }
+    }
+    if (!q || s.fitDone.has(q.id)) return
+    if (!s.fitPending || s.fitPending.id !== q.id) s.fitPending = { id: q.id, since: now }
+    const busy = s.dragging || now - s.lastGesture < FIT_QUIET_MS || (s.mode === 'fly' && s.fly?.kind !== 'fit')
+    if (busy) {
+      if (now - s.fitPending.since > FIT_GIVE_UP_MS) {
+        s.fitDone.add(q.id)
+        s.fitPending = null
+        s.fitCarry = null
+      }
+      return
+    }
+    s.fitDone.add(q.id)
+    s.fitPending = null
+    const carry = s.fitCarry
+    s.fitCarry = null
+    // Rover and candidates, with room around each for the ring and the badge above it.
+    const key = []
+    const pad = []
+    const rp = roverPoses.get(q.rover)
+    if (rp) {
+      key.push([rp.x, -rp.z, rp.y])
+      for (const [dx, dy] of [[-2, -2], [2, 2]]) pad.push([rp.x + dx, -rp.z + dy, rp.y])
+      pad.push([rp.x, -rp.z, rp.y + 3])
+    }
+    for (const o of q.options) {
+      if (!Number.isFinite(o.x) || !Number.isFinite(o.y)) continue
+      const h = groundAt(o.x, o.y, (map.minH + map.maxH) / 2)
+      key.push([o.x, o.y, h])
+      for (const [dx, dy] of [[-3.5, -3.5], [3.5, -3.5], [-3.5, 3.5], [3.5, 3.5]]) pad.push([o.x + dx, o.y + dy, h])
+      pad.push([o.x, o.y, h + 6])
+    }
+    if (!key.length) return
+    const rect = fitRect(size)
+    const back = carry ? carry.back : s.mode === 'auto' ? 'auto' : s.mode === 'follow' && !paused ? 'follow' : null
+    s.fit = { id: q.id, back, followId: carry ? carry.followId : follow, touched: false }
+    camera.updateMatrixWorld()
+    if (allInView(camera, size, key, rect)) return
+    const span = Math.max(map.width, map.depth)
+    const pose = fitPose(camera, c.target, size, [...key, ...pad], rect, Math.max(240, span * 3) * 0.95)
+    if (s.mode === 'follow') {
+      appStore.patch({ followPaused: true })
+      s.zooming = false
+    }
+    if (c._panOffset?.isVector3) c._panOffset.set(0, 0, 0)
+    s.fly = { target: pose.target, position: pose.position, rate: 1.6, kind: 'fit' }
+    s.mode = 'fly'
+  }
+
   const span = map ? Math.max(map.width, map.depth) : 80
   return (
     <OrbitControls
@@ -313,6 +511,14 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
         if (s.mode === 'auto' || s.mode === 'fly') s.mode = 'user'
         s.zooming = false
         s.panned = 0
+        s.dragging = true
+        s.lastGesture = performance.now()
+        if (s.fit) s.fit.touched = true
+      }}
+      onEnd={() => {
+        const s = st.current
+        s.dragging = false
+        s.lastGesture = performance.now()
       }}
     />
   )

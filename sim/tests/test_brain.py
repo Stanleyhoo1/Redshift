@@ -36,7 +36,7 @@ LEGACY = dict(map_size=MAP_SIZE, water=False, spires=False, lifeforms=False, dri
 PLANNER_KEYS = {"model", "state", "online", "calls", "ok", "fallbacks", "avg_ms", "p95_ms", "last_ms", "budget_ms",
                 "over_budget"}
 CHAT_KEYS = {"id", "t", "from", "to", "text", "kind", "source", "request_id", "reply_to"}    # reply_to: protocol v5
-REQUEST_KEYS = {"id", "rover", "t", "question", "options", "default", "expires_in", "image"}
+REQUEST_KEYS = {"id", "rover", "kind", "t", "question", "options", "default", "expires_in", "image"}   # kind: v6
 KINDS = {"command", "ack", "refuse", "question", "answer", "info", "reply"}
 
 
@@ -231,7 +231,7 @@ def test_unsafe_gemma_action_never_beats_a_safety_reaction():
 # ====================================================================== 3. questions
 def test_first_anomaly_asks_the_operator_and_the_answer_is_applied():
     p = fake_planner()
-    sim = make_sim(p)
+    sim = make_sim(p, operator_timeout_s=20.0)      # the countdown (the default since v6 is no expiry)
     try:
         sim.run_for(40.0)
         h = trigger(sim, "rockfall")
@@ -243,7 +243,7 @@ def test_first_anomaly_asks_the_operator_and_the_answer_is_applied():
         msg = sim.tick_message()
         assert len(msg["requests"]) == 1, "no question opened"
         q = msg["requests"][0]
-        assert set(q) == REQUEST_KEYS and q["rover"] == rid
+        assert set(q) == REQUEST_KEYS and q["rover"] == rid and q["kind"] == "anomaly"
         ids = [o["id"] for o in q["options"]]
         assert 2 <= len(ids) <= 4 and q["default"] == "reroute" == ids[0] and set(ids) <= set(g.ACTIONS)
         assert q["image"] == f"/api/camera/{rid}.jpg?view=fpv" and 0 < q["expires_in"] <= 20.0
@@ -273,7 +273,7 @@ def test_first_anomaly_asks_the_operator_and_the_answer_is_applied():
 
 def test_question_expires_to_the_safe_default():
     p = fake_planner()
-    sim = make_sim(p)
+    sim = make_sim(p, operator_timeout_s=20.0)      # OPERATOR_TIMEOUT_S above 0: the old countdown
     now = [1000.0]
     sim.advisor.clock = lambda: now[0]
     try:

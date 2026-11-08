@@ -2,7 +2,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import { useSim } from '../state/store.js'
 import { postChat } from '../net/connection.js'
 import { cleanMsg, mmss } from '../lib/format.js'
-import { optionLabel, sendAnswer, useAnswers } from '../lib/answers.js'
+import { autoDefault, optionLabel, placeChipProps, placeNumbers, sendAnswer, useAnswers, usePlaceHover } from '../lib/answers.js'
 import { useNow } from '../lib/useNow.js'
 import { SourceTag } from './Planner.jsx'
 import '../styles/interaction.css'
@@ -12,6 +12,8 @@ import '../styles/interaction.css'
 // Version 5: questions get `kind: "reply"` answers carrying `reply_to` (the operator
 // message they answer); they are drawn linked to that question. Until something answers
 // an operator message it shows a small "thinking" line (quietly dropped after 15 s).
+// Version 6: questions that wait for the operator (no countdown, no default) and place
+// choices: the chips are numbered like the map markers and hovering one lights its marker.
 
 const KIND_LABEL = { refuse: 'Refused', question: 'Question', reply: 'Reply' }
 const THINK_S = 15
@@ -29,8 +31,9 @@ function suggestions(meta) {
   return out
 }
 
-// How a closed question ended, from what followed it in the thread.
-function resolution(m, chat, answers) {
+// How a closed question ended, from what followed it in the thread. `waited`: the
+// request had no countdown (version 6), so it can only have been answered or withdrawn.
+function resolution(m, chat, answers, waited, byMsgId) {
   const a = answers[m.request_id]
   const mine = a?.state === 'sent'
   let reply = null
@@ -40,11 +43,16 @@ function resolution(m, chat, answers) {
     if (!reply) reply = x
   }
   if (mine) return { kind: 'answered', text: `You answered: ${a.option.replace(/_/g, ' ')}` }
+  // Answered by typing (version 6): the rover's reply quotes the operator's message.
+  const typed = reply?.reply_to ? byMsgId[reply.reply_to] : null
+  if (typed && typed.from === 'operator') return { kind: 'answered', text: `Answered in chat: "${typed.text}"` }
+  if (reply && waited) return { kind: reply.kind === 'ack' ? 'answered' : 'closed', text: reply.kind === 'ack' ? 'Answered' : 'Closed' }
   if (reply) return { kind: 'expired', text: 'No answer in time: it took the safe default' }
   return { kind: 'closed', text: 'Closed' }
 }
 
 function InlineQuestion({ m, req, answer, res, now }) {
+  const hover = usePlaceHover()
   if (!req) {
     return (
       <p className="msg-res" data-kind={res.kind}>
@@ -61,6 +69,9 @@ function InlineQuestion({ m, req, answer, res, now }) {
   }
   const pending = answer?.state === 'pending'
   const left = req.deadline === null ? null : Math.max(0, Math.ceil(req.deadline - now))
+  const auto = autoDefault(req)
+  const nums = placeNumbers(req)
+  const anyPlace = Object.keys(nums).length > 0
   return (
     <div className="msg-q">
       <div className="msg-opts" role="group" aria-label={`Answer ${m.from}`}>
@@ -69,19 +80,34 @@ function InlineQuestion({ m, req, answer, res, now }) {
             key={o.id}
             type="button"
             className="msg-opt"
-            data-default={o.id === req.default || undefined}
+            data-default={o.id === auto || undefined}
+            data-place={nums[o.id] ? true : undefined}
             disabled={pending}
             aria-busy={(pending && answer.option === o.id) || undefined}
             onClick={() => sendAnswer(req.id, o.id)}
-            title={o.id === req.default ? 'The safe default: taken if nobody answers' : undefined}
+            title={o.id === auto ? 'The safe default: taken if nobody answers' : nums[o.id] ? `Marker ${nums[o.id]} on the map` : undefined}
+            {...placeChipProps(req, o, hover)}
           >
+            {nums[o.id] && (
+              <b className="place-num" aria-hidden="true">
+                {nums[o.id]}
+              </b>
+            )}
             {o.label}
-            {o.id === req.default && <small>safe default</small>}
+            {o.id === auto && <small>safe default</small>}
           </button>
         ))}
       </div>
-      <p className="msg-q-foot" data-low={(left !== null && left <= 5) || undefined}>
-        {answer?.state === 'error' ? <span className="msg-q-err">{answer.error}</span> : left !== null ? `${left} s left, then the safe default` : 'Waiting for your answer'}
+      <p className="msg-q-foot" data-low={(left !== null && left <= 5) || undefined} data-wait={left === null || undefined}>
+        {answer?.state === 'error' ? (
+          <span className="msg-q-err">{answer.error}</span>
+        ) : left !== null ? (
+          auto ? `${left} s left, then the safe default` : `${left} s left`
+        ) : anyPlace ? (
+          'Waiting for you: pick one here, click its marker on the map, or type "the second one"'
+        ) : (
+          'Waiting for you: the rover holds until you answer'
+        )}
       </p>
     </div>
   )
@@ -305,8 +331,10 @@ function Composer({ to, setTo, inputRef }) {
 // A sim that never sends reply_to (older protocol) answers in order: the next message
 // from the addressed rover (or any rover or the fleet, for a message to all).
 function answersMsg(x, m, exact) {
-  if (x.from === 'operator' || x.request_id) return false
+  if (x.from === 'operator') return false
+  // reply_to is exact, also on a v6 question or ack that carries a request_id.
   if (x.reply_to) return x.reply_to === m.id
+  if (x.request_id) return false
   const fromOk = !m.to || m.to === 'all' || x.from === m.to || x.from === 'fleet'
   if (!fromOk) return false
   return exact ? x.kind === 'question' : true
@@ -366,6 +394,11 @@ export function CommsPanel({ hidden, inputRef, selected = null }) {
     return out
   }, [chat])
   const thinking = usePendingThinking(chat, initSeq, gen)
+  // v6: whether each request this panel saw had a countdown, so a closed one that never
+  // had one is not described as "no answer in time".
+  const waitedRef = useRef({ gen, map: new Map() })
+  if (waitedRef.current.gen !== gen) waitedRef.current = { gen, map: new Map() }
+  for (const q of requests) waitedRef.current.map.set(q.id, q.deadline === null)
 
   // The addressee follows the selected rover (All when none is selected); the menu
   // still picks anyone.
@@ -429,7 +462,7 @@ export function CommsPanel({ hidden, inputRef, selected = null }) {
               live={m.key > initSeq}
               req={req}
               answer={isQ ? answers[m.request_id] || null : null}
-              res={isQ && !req ? resolution(m, chat, answers) : null}
+              res={isQ && !req ? resolution(m, chat, answers, waitedRef.current.map.get(m.request_id) ?? false, byMsgId) : null}
               now={req ? now : 0}
               onPick={pick}
               quote={quote}

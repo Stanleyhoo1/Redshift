@@ -12,8 +12,9 @@ or Gemma 3 4B on older Ollama) on ONE background thread beside the rules. It
   (b) interprets anomalies (new obstacle, wheel slip, low visibility) from the camera image plus
       the sensor numbers: a classification, a confidence and one action from a fixed list, or
       "ask_operator" when it is not sure (confidence below 0.55), and
-  (c) turns the operator's typed messages ("rover 2 go to 10, -5") into structured commands,
-      or "unclear" with a clarifying question. A regex parser does the same when Gemma is
+  (c) turns the operator's typed messages ("rover 2 go to 10, -5", "can we investigate the lake
+      for signs of life": go_to_place, protocol v6) into structured commands, or "unclear" with a
+      clarifying question. A regex parser does the same when Gemma is
       offline or answers something invalid, and
   (d) describes something the LiDAR tracker saw moving (camera image plus track numbers): a
       lifeform or not, a short label ("possible lifeform, six legs, about 1.2 m"), what to do
@@ -101,7 +102,7 @@ __all__ = [
     "GemmaPlanner", "OllamaBackend", "FakeBackend", "GemmaError", "GemmaTimeout", "GemmaOffline",
     "make_choice_request", "make_interpretation_request", "make_command_request", "make_description_request",
     "make_answer_request", "build_prompt", "DESCRIBE_CLASSES", "DESCRIBE_ACTIONS", "TOPICS", "question_intent",
-    "question_topic", "wants_each",
+    "question_topic", "wants_each", "PLACES", "QUALIFIERS", "parse_place", "near_reference",
     "build_schema", "validate", "run_request", "parse_command", "cited_numbers", "render_readings",
     "colour_name", "latency_summary", "estimate_tokens", "get_planner", "planner_from_env", "close_planner",
 ]
@@ -117,11 +118,14 @@ CLASSES = ("rock", "steep_slope", "soft_ground", "dust", "liquid", "other_rover"
 DESCRIBE_CLASSES = ("lifeform", "rock", "other_rover", "dust", "unknown")
 DESCRIBE_ACTIONS = ("approach", "observe", "ignore", "ask_operator")
 MAX_LABEL_WORDS = 10
-COMMANDS = ("go_to", "explore_direction", "sample_target", "return_home", "hold", "resume", "avoid_area",
-            "question", "unclear")
+COMMANDS = ("go_to", "go_to_place", "explore_direction", "sample_target", "return_home", "hold", "resume",
+            "avoid_area", "question", "unclear")
 TOPICS = ("status", "history", "exploration", "finds", "samples", "battery", "hazards", "lifeforms", "water",
           "location", "why", "unknown")
 DIRECTIONS = ("north", "south", "east", "west", "north-east", "north-west", "south-east", "south-west")
+# protocol v6: commands that name a place the fleet knows ("go to the water source")
+PLACES = ("water", "spire", "mineral", "ice", "vent", "trace", "target", "lifeform", "hazard", "lander")
+QUALIFIERS = ("nearest", "farthest", "biggest", "smallest", "newest") + DIRECTIONS + ("near_rover", "ordinal", "none")
 
 MAX_REASON_WORDS = 25
 MAX_CANDIDATES = 6
@@ -131,7 +135,7 @@ MAX_TEXT = 300         # longest operator message
 SKIP_KEYS = {"scan", "path", "image", "images", "jpeg"}
 MAX_RESULTS = 512      # results kept for poll(); older tickets are forgotten
 MAX_LATENCIES = 200    # window for avg / p95
-COMMAND_NUM_PREDICT = 128
+COMMAND_NUM_PREDICT = 160
 ANSWER_NUM_PREDICT = 128
 MAX_ANSWER_WORDS = 60
 MAX_ANSWER_CHARS = 360
@@ -163,18 +167,15 @@ SYSTEM_INTERPRET = SYSTEM_BASE + (
     'Example reason: "slip 52% while ground speed 0.05 m/s: the wheels spin in soft ground."'
 )
 SYSTEM_COMMAND = (
-    "You turn a human operator's message into one command for a fleet of rovers exploring a super-Earth. "
-    "Commands: go_to (rover, x, y), explore_direction (rover, direction), sample_target (rover, target_id), "
-    "return_home, hold or resume (rover or all), avoid_area (x, y, radius in m), question (rover, topic: the "
-    "operator asks for information: what, where, why, how, any, status, report), unclear (ask one short question). "
-    "rover is an id from the rover list, all, or none if the message names no rover; match names, numbers "
-    "and colours to ids ('rover 2' is r2, 'the orange one' is the orange rover). "
-    "A direction or area without coordinates (north, north of the lander) means explore_direction. "
-    "go_to needs coordinates from the message or the lists, never the rover's own position. "
-
-    "Use only numbers and ids from the message or the lists. Put 0 or none in unused fields. "
-    "If the message is ambiguous, choose unclear and ask in question; otherwise question is empty. "
-    "ack is one short sentence confirming the command. Reply with JSON only."
+    "Turn a human operator's message into one command for a fleet of rovers on a super-Earth. "
+    "Commands: go_to (x, y); go_to_place (place, target_id, qualifier, ordinal, near_rover, investigate): a "
+    "place named without coordinates, like the water, a vent, the herd, t7; explore_direction (direction); "
+    "sample_target (target_id); return_home, hold, resume; avoid_area (x, y, radius m); question (topic): asks for "
+    "information; unclear (ask one short question). Polite requests to act (can we, could you, let's, please) "
+    "are commands. rover: an id, all, or none if no rover is named ('rover 2' is r2, 'the orange one' the orange "
+    "rover). investigate is true for investigate, survey, look around, look for or signs of life. A direction "
+    "or area without coordinates or place means explore_direction. Use only numbers and ids from the message "
+    "or the lists, never a rover's own position; 0 or none if unused. ack: one short sentence. JSON only."
 )
 
 SYSTEM_DESCRIBE = SYSTEM_BASE + (
@@ -854,8 +855,14 @@ def build_schema(req: Request) -> dict:
         rover = ({"type": "string", "enum": list(req.ids) + ["all", "none"]} if req.ids else {"type": "string"})
         target = ({"type": "string", "enum": list(req.target_ids) + ["none"]} if req.target_ids
                   else {"type": "string"})
+        near = ({"type": "string", "enum": list(req.ids) + ["lander", "none"]} if req.ids else {"type": "string"})
         props = {"command": {"type": "string", "enum": list(COMMANDS)},
                  "rover": rover,
+                 "place": {"type": "string", "enum": list(PLACES) + ["none"]},
+                 "qualifier": {"type": "string", "enum": list(QUALIFIERS)},
+                 "ordinal": {"type": "number"},
+                 "near_rover": near,
+                 "investigate": {"type": "boolean"},
                  "direction": {"type": "string", "enum": list(DIRECTIONS) + ["none"]},
                  "x": {"type": "number"}, "y": {"type": "number"}, "radius": {"type": "number"},
                  "target_id": target,
@@ -901,20 +908,30 @@ _HELP = ("Sorry, I did not understand. Try: 'rover 2 go to 10, -5', 'all return'
 
 
 # ---- questions ("rover 2, what have you found?", "everyone, report battery", "status")
-_CMD_VERBS_Q = r"go|drive|head|move|return|come|hold|stop|wait|park|resume|continue|sample|explore|avoid|check"
 _SUBJ = r"(?:you|u|we|they|it|anyone|anybody|everyone|the fleet|the rovers?|any|r\d+|rover\s*\w+)"
+_CMD_VERBS = (r"go|drive|head|move|return|come|hold|stop|halt|freeze|wait|park|resume|continue|carry on|keep|"
+              r"sample|explore|scout|survey|avoid|stay|check|investigate|inspect|send|get|navigate|travel|recall|dock|"
+              r"proceed|turn|back|visit|revisit|scan|search|examine|study|observe|watch|approach|swing by|stop by|"
+              r"look (?:at|around|for|into|over)|have a look|take a look|take a closer look")
+_CMD_VERBS_Q = _CMD_VERBS            # "can you go home?" / "can we investigate the lake" are orders, not questions
 _Q_START_RE = re.compile(r"^(?:what|whats|what's|where|wheres|where's|why|how|hows|how's|which|who|when|is|are|am|"
                          r"was|were|any|anything|seen|seeing|found|got)\b"
                          rf"|^(?:do|does|did|have|has|had)\s+{_SUBJ}\b"
-                         rf"|^(?:can|could)\s+{_SUBJ}\b(?!\s+(?:please\s+)?(?:{_CMD_VERBS_Q})\b)")
+                         rf"|^(?:can|could)\s+{_SUBJ}\b(?!\s+(?:please\s+)?(?:also\s+|now\s+|maybe\s+)?(?:{_CMD_VERBS_Q})\b)")
 _Q_TELL_RE = re.compile(r"\b(?:tell me|let me know|give me (?:a |an |your )?(?:update|report|status|summary|rundown)|"
                         r"report(?!\s+(?:back|to|in)\b)|status|update me|summary|sitrep|what'?s up|"
                         r"how are (?:you|things)|how is it going|how'?s it going)\b")
-_CMD_VERBS = (r"go|drive|head|move|return|come|hold|stop|halt|freeze|wait|park|resume|continue|carry on|keep|"
-              r"sample|explore|scout|survey|avoid|stay|check|investigate|inspect|send|get|navigate|travel|recall|dock|"
-              r"proceed|turn|back")
-_CMD_PREFIX_RE = re.compile(rf"^(?:please\s+)?(?:can|could|would|will) (?:you|u)\s+(?:please\s+)?(?:{_CMD_VERBS})\b"
-                            r"|^(?:how about|what about|why don'?t you|why not)\b")
+# polite orders: "can we investigate ...", "could you check ...", "let's survey ...", "I want you to go ..."
+_POLITE_SUBJ = (r"(?:you|u|we|y'?all|you guys|someone|somebody|one of you|a rover|the rovers?|the fleet|"
+                r"rover\s*\w+|r\d+)")
+_CMD_PREFIX_RE = re.compile(
+    rf"^(?:please\s+)?(?:can|could|would|will|shall)\s+(?:{_POLITE_SUBJ}\s+)?(?:please\s+)?(?:also\s+|now\s+|maybe\s+)?"
+    rf"(?:{_CMD_VERBS})\b"
+    r"|^(?:how about|what about|why don'?t you|why not)\b"
+    rf"|^(?:let'?s|lets|let us)\s+(?:also\s+|now\s+)?(?:{_CMD_VERBS})\b"
+    rf"|^(?:i|we)\s*(?:'d|would)?\s+(?:want|like|need)\s+(?:you\s+|one of you\s+|a rover\s+|someone\s+)?to\s+"
+    rf"(?:{_CMD_VERBS})\b"
+    rf"|^(?:you|we)\s+(?:should|must|need to|have to|could)\s+(?:{_CMD_VERBS})\b")
 _IMPERATIVE_RE = re.compile(rf"^(?:please\s+)?(?:{_CMD_VERBS}|map)\b")
 _LEAD_RE = re.compile(r"^(?:[\s,.:;!\-]|hey\b|hi\b|ok\b|okay\b|so\b|and\b|also\b|quick question\b|question\b)+")
 _EACH_RE = re.compile(r"\b(?:each|every rover|everyone|everybody|all of you|all rovers|each of you|every one of you)\b")
@@ -979,6 +996,148 @@ def wants_each(text: str) -> bool:
     return bool(_EACH_RE.search(" ".join(str(text or "").lower().split())))
 
 
+# ---- places (protocol v6): "go to the water source", "can we investigate the lake for signs of life"
+_PLACE_RES = tuple((k, re.compile(rx)) for k, rx in (
+    ("hazard", r"\b(?:fallen spires?|rock ?falls?|boulders?|new rocks|landslides?|soft (?:ground|sand|spot|patch)|"
+               r"sand(?: ?pits?| patch)?|quicksand|sinkholes?|hazards?|danger(?:ous)? (?:zone|area|spot)s?)\b"),
+    ("water", r"\b(?:water(?: ?sources?| ?holes?)?|lakes?|ponds?|pools?|rivers?|streams?|creeks?|liquids?|"
+              r"shore(?:lines?)?s?|seas?|puddles?)\b"),
+    ("spire", r"\b(?:spires?|crystals?|towers?|pillars?|obelisks?|monoliths?)\b"),
+    ("vent", r"\b(?:vents?|geysers?|fumaroles?)\b"),
+    ("ice", r"\b(?:ice|icy|frost)\b"),
+    ("mineral", r"\b(?:minerals?|outcrops?|veins?|ores?)\b"),
+    ("trace", r"\b(?:organics?|organic traces?|traces?(?! of)|residues?|biofilms?)\b"),
+    ("lifeform", r"\b(?:herds?|creatures?|animals?|lifeforms?|life forms?|grazers?|aliens?(?! spires?)|organisms?|"
+                 r"wildlife|beasts?)\b"),
+    ("target", r"\b(?:targets?|science sites?|sample sites?|discover(?:y|ies))\b"),
+    ("lander", r"\b(?:lander|landing (?:site|pad)|home base|base)\b"),
+))
+_PLACE_VERB_RE = re.compile(r"\b(?:go|goes|going|head\w*|drive|move|navigate|travel|visit\w*|revisit\w*|return\w*|"
+                            r"come back|get back|back to|investigat\w*|check\w*|look\w*|inspect\w*|survey\w*|scan\w*|"
+                            r"search\w*|explor\w*|examin\w*|stud(?:y|ies)|observ\w*|watch\w*|approach\w*|send|"
+                            r"swing by|stop by|take|get (?:to|over|closer)|bring|reach|find)\b")
+_INVESTIGATE_RE = re.compile(r"\b(?:investigat\w*|survey\w*|look(?:ing)? around|look(?:ing)? for|have a look around|"
+                             r"search\w*|scan\w*|examin\w*|explor\w* (?:around|near)|check(?:ing)? (?:for|around)|"
+                             r"stud(?:y|ying)|observ\w*|watch\w*|signs? of|traces? of|evidence of)\b")
+_SIGNS_RE = re.compile(r"\b(?:for\s+)?(?:any\s+|some\s+)?(?:signs?|traces?|evidence|hints?|indications?)\s+of\s+"
+                       r"(?:any\s+)?(\w+(?: forms?)?)")
+_LOOKFOR_RE = re.compile(r"\b(?:look|looking|search|searching|check|checking|scan|scanning|hunt|hunting)\s+"
+                         r"(?:out\s+)?for\s+(?:any\s+|some\s+|more\s+)?(\w+(?: forms?)?)")
+_LIFE_WORDS = re.compile(r"^(?:life|life forms?|lifeforms?|creatures?|animals?|movement|activity|organisms?|biology|"
+                         r"aliens?|grazers?|herds?|living)$")
+_NEAR_RE = re.compile(r"\b(?:near(?:est)?(?: to)?|close to|closest to|next to|beside)\s+(?:the\s+)?"
+                      r"(?:(lander|landing site|base|home)\b"
+                      rf"|(?:rover|robot|unit)\s*(?:#|no\.?|number)?\s*({_NUMWORD})\b|r(\d+)\b"
+                      r"|(" + "|".join(_COLOURS + tuple(_COLOUR_SYNONYMS)) + r")\s+(?:rover|robot|one)\b)")
+_ORDINAL_RE = re.compile(r"\b(first|second|third|fourth|fifth|sixth|1st|2nd|3rd|4th|5th|6th)\b"
+                         r"|\b(?:number|no\.?|#|option)\s*(\d)\b")
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+             "1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5, "6th": 6}
+_QUAL_RES = tuple((k, re.compile(rx)) for k, rx in (
+    ("nearest", r"\b(?:nearest|closest|nearby|close by|near (?:me|you|here))\b"),
+    ("farthest", r"\b(?:farthest|furthest|most distant|remotest|last)\b"),
+    ("biggest", r"\b(?:biggest|largest|bigger|larger|big|large|main|major|huge)\b"),
+    ("smallest", r"\b(?:smallest|smaller|small|little|tiny|minor)\b"),
+    ("newest", r"\b(?:newest|latest|most recent|recent(?:ly found)?|new|just found|last found)\b"),
+))
+_DIR_ADJ_RE = re.compile(r"\b(north|south)[\s-]?(east|west)(?:ern)?\b|\b(north|south|east|west)(?:ern|wards?)?\b")
+_SAMPLE_WORD_RE = re.compile(r"\b(?:sample|samples|sampling|drill|scoop|swab|sniff|collect|grab a sample|take a sample)\b")
+_PLACE_SYNONYMS = {"lake": "water", "pond": "water", "river": "water", "stream": "water", "liquid": "water",
+                   "herd": "lifeform", "herds": "lifeform", "creature": "lifeform", "creatures": "lifeform",
+                   "animal": "lifeform", "life": "lifeform", "lifeforms": "lifeform", "grazer": "lifeform",
+                   "spires": "spire", "crystal": "spire", "vents": "vent", "minerals": "mineral", "outcrop": "mineral",
+                   "traces": "trace", "organic": "trace", "targets": "target", "base": "lander", "hazards": "hazard",
+                   "rockfall": "hazard", "sand": "hazard"}
+_QUAL_SYNONYMS = {"closest": "nearest", "near": "nearest", "furthest": "farthest", "largest": "biggest",
+                  "big": "biggest", "small": "smallest", "latest": "newest", "new": "newest", "recent": "newest",
+                  "northeast": "north-east", "northwest": "north-west", "southeast": "south-east",
+                  "southwest": "south-west", "near rover": "near_rover", "nearrover": "near_rover"}
+
+
+def near_reference(low: str, rovers: list | None = None):
+    """'the lake near rover 2' -> ("r2", span); 'the one near the lander' -> ("lander", span); else (None, None)."""
+    m = _NEAR_RE.search(low or "")
+    if not m:
+        return None, None
+    if m.group(1):
+        return "lander", m.span()
+    if m.group(2):
+        tok = m.group(2)
+        return f"r{int(tok) if tok.isdigit() else _WORD_NUMS[tok]}", m.span()
+    if m.group(3):
+        return f"r{m.group(3)}", m.span()
+    col = colour_name(m.group(4))
+    match = [r["id"] for r in (rovers or []) if r.get("colour", colour_name(r.get("color"))) == col]
+    return (match[0] if len(match) == 1 else None), m.span()
+
+
+def _place_words(text: str) -> tuple:
+    """(place kind, span) of the first place word in the text, or (None, None)."""
+    best = None
+    for kind, rx in _PLACE_RES:
+        m = rx.search(text)
+        if m and (best is None or m.start() < best[1][0]):
+            best = (kind, m.span())
+    return best if best else (None, None)
+
+
+def _qualifier(text: str) -> tuple:
+    """(qualifier, ordinal) from the words: ordinal > nearest/farthest > direction > size > newest."""
+    m = _ORDINAL_RE.search(text)
+    if m:
+        return "ordinal", (_ORDINALS[m.group(1)] if m.group(1) else int(m.group(2)))
+    for kind in ("nearest", "farthest"):
+        if dict(_QUAL_RES)[kind].search(text):
+            return kind, None
+    d = _DIR_ADJ_RE.search(text)
+    if d:
+        return (f"{d.group(1)}-{d.group(2)}" if d.group(1) else d.group(3)), None
+    for kind in ("biggest", "smallest", "newest"):
+        if dict(_QUAL_RES)[kind].search(text):
+            return kind, None
+    return "none", None
+
+
+def parse_place(low: str, rest: str, rover, target, rovers: list, polite: bool = False) -> dict | None:
+    """A go_to_place command from the operator's words, or None if the message names no known kind of place
+    with an action. low: the whole message (lower case); rest: rover mentions (and a target id) blanked."""
+    text = rest
+    life = False
+    inv = bool(_INVESTIGATE_RE.search(text))
+    for rx in (_SIGNS_RE, _LOOKFOR_RE):
+        for m in list(rx.finditer(text)):
+            obj = m.group(1)
+            inv = True
+            if _LIFE_WORDS.match(obj):
+                life = True
+                text = _blank(text, [m.span()])
+    near, span = near_reference(low, rovers)
+    if span is not None:
+        text = _blank(text, [(a, b) for a, b in [span] if b <= len(text)])
+    place, pspan = _place_words(text)
+    if place is None and target:
+        place = "target"
+    if place is None and life:
+        place = "lifeform"
+    if place is None:
+        return None
+    if place == "lander":
+        if _DIR_RE.search(text) or (_RETURN_RE.search(text) and not inv):
+            return None                   # "north of the lander" (explore), "back to the lander" (return home)
+    if not (inv or polite or _PLACE_VERB_RE.search(text)):
+        return None
+    qtext = _blank(text, [pspan]) if pspan else text
+    qual, ordinal = _qualifier(qtext)
+    if qual == "none" and near is not None:
+        qual = "near_rover"
+    if target and place in ("mineral", "ice", "vent", "trace", "target"):
+        qual, ordinal = "none", None
+    return {"type": "go_to_place", "rover": rover, "place": place,
+            "target_id": target if place in ("mineral", "ice", "vent", "trace", "target") else None,
+            "qualifier": qual, "ordinal": ordinal, "near_rover": near if qual == "near_rover" else None,
+            "investigate": inv}
+
+
 def _ask(rover, topic: str, conf: float) -> dict:
     cmd = {"type": "question", "rover": rover, "topic": topic if topic in TOPICS else "unknown"}
     return {"command": cmd, "ack": "", "question": None, "confidence": conf}
@@ -1006,8 +1165,12 @@ def _blank(text: str, spans: list) -> str:
 
 
 def _resolve_rover(low: str, rovers: list) -> tuple:
-    """(rover id | "all" | None, text with the rover mentions blanked out, question or None)."""
+    """(rover id | "all" | None, text with the rover mentions blanked out, question or None). A rover named
+    as a reference ("the lake near rover 2") is not the addressee: that phrase is blanked first."""
     ids = [r["id"] for r in rovers]
+    m_near = _NEAR_RE.search(low)
+    if m_near and not m_near.group(1):
+        low = _blank(low, [m_near.span()])
     found, spans = [], []
     for m in _ROVERN_RE.finditer(low):
         tok = m.group(1) or m.group(2)
@@ -1061,6 +1224,10 @@ def command_ack(cmd: dict) -> str:
         return f"{who} exploring {cmd['direction']}." if who else f"Exploring {cmd['direction']}."
     if typ == "sample_target":
         return f"{who} going to sample {cmd['target_id']}." if who else f"Going to sample {cmd['target_id']}."
+    if typ == "go_to_place":
+        what = cmd.get("target_id") or {"lifeform": "herd", "hazard": "hazard site"}.get(cmd["place"], cmd["place"])
+        verb = "investigating" if cmd.get("investigate") else "going to"
+        return f"{who} {verb} the {what}." if who else f"{verb[:1].upper() + verb[1:]} the {what}."
     if typ == "return_home":
         return f"{who} returning to the lander." if who else "Returning to the lander."
     if typ == "hold":
@@ -1093,6 +1260,8 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
         {"type": "return_home" | "hold" | "resume", "rover"}     rover: "r1".."rN", "all" or None
         {"type": "avoid_area", "x", "y", "radius"}    {"type": "unclear", "question"}
         {"type": "question", "rover", "topic"}        the operator asks for information (TOPICS)
+        {"type": "go_to_place", "rover", "place", "target_id", "qualifier", "ordinal", "near_rover", "investigate"}
+                                                      a place the fleet knows (PLACES, QUALIFIERS; protocol v6)
     fleet_context: {"rovers": [{"id", "name", "color", "x", "y"}], "targets": [{"id", ...}], ...}
     (raw or already compacted)."""
     ctx = _fleet_context(fleet_context)       # idempotent: raw or already compacted
@@ -1127,10 +1296,17 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
         if pair is None:
             return _unclear("Which area should the rovers avoid? Give x, y and a radius, like 'avoid 12, -4 radius 3'.")
         return _done({"type": "avoid_area", "x": pair[0], "y": pair[1], "radius": max(0.5, min(30.0, radius))})
-    if target and (_SAMPLE_RE.search(rest) or not rest.strip() or rover is not None):
+    looking = target and re.search(r"\b(?:look|survey|observe|watch)", rest) and not _SAMPLE_WORD_RE.search(rest)
+    if target and not looking and (_SAMPLE_RE.search(rest) or not rest.strip() or rover is not None):
         if target_ids and target not in target_ids:
             return _unclear(f"I do not know target {target}. Known targets: {', '.join(target_ids)}.")
         return _done({"type": "sample_target", "rover": rover, "target_id": target})
+    if pair is None:                  # protocol v6: a place the fleet knows ("go to the water source")
+        if target and target_ids and target not in target_ids:
+            return _unclear(f"I do not know target {target}. Known targets: {', '.join(target_ids)}.")
+        place = parse_place(low, rest, rover, target, rovers)
+        if place is not None:
+            return _done(place)
     if _RETURN_RE.search(rest):
         return _done({"type": "return_home", "rover": rover})
     if _RESUME_RE.search(rest):
@@ -1260,6 +1436,89 @@ def _fix_go_to(req: Request, cmd: dict, data: dict) -> dict:
     if at_self:
         who = rv or "the rover"
         return {"type": "unclear", "question": f"Where should {who} go? Give x, y or a direction."}
+    return cmd
+
+
+def _explicit_xy(req: Request) -> bool:
+    low = (req.text or "").lower()
+    _, cleaned, _ = _resolve_rover(low, (req.payload.get("fleet") or {}).get("rovers", []))
+    return len(numbers_in_text(_TARGET_RE.sub(" ", cleaned))) >= 2
+
+
+def _place_command(req: Request, data: dict, rv) -> dict:
+    """Gemma's go_to_place, checked: every enum, ids that exist. Raises ValueError (the parser decides)."""
+    def norm(v) -> str:
+        s = str(v if v is not None else "").strip().lower().replace("_", " ")
+        return " ".join(s.split())
+
+    place = norm(data.get("place"))
+    place = _PLACE_SYNONYMS.get(place, place)
+    tid = str(data.get("target_id") or "").strip()
+    if tid.lower() in ("", "none", "null", "0"):
+        tid = None
+    if tid is not None:
+        if req.target_ids and tid not in req.target_ids:
+            raise ValueError(f"target {tid!r} not in {list(req.target_ids)}")
+        if not req.target_ids and not re.fullmatch(r"t\d+", tid):
+            raise ValueError(f"target {tid!r} is not a target id")
+    if place not in PLACES:
+        if tid is None:
+            raise ValueError(f"place {data.get('place')!r} not in {list(PLACES)}")
+        place = "target"
+    if place not in ("mineral", "ice", "vent", "trace", "target"):
+        tid = None
+    qual = norm(data.get("qualifier")) or "none"
+    qual = _QUAL_SYNONYMS.get(qual, qual).replace(" ", "-") if qual not in ("near rover",) else "near_rover"
+    if qual not in QUALIFIERS:
+        raise ValueError(f"qualifier {data.get('qualifier')!r} not in {list(QUALIFIERS)}")
+    ordinal = None
+    if qual == "ordinal":
+        try:
+            ordinal = int(float(data.get("ordinal")))
+        except (TypeError, ValueError):
+            ordinal = 0
+        if not 1 <= ordinal <= 9:
+            qual, ordinal = "none", None          # no usable number: ask which one
+    near = norm(data.get("near_rover"))
+    if near in ("", "none", "null", "0"):
+        near = None
+    elif near in ("lander", "base", "the lander"):
+        near = "lander"
+    elif near not in (req.ids or ()) and not (not req.ids and re.fullmatch(r"r\d+", near)):
+        raise ValueError(f"near_rover {data.get('near_rover')!r} is not a rover id or lander")
+    if qual == "near_rover" and near is None:
+        qual = "none"
+    inv = data.get("investigate")
+    inv = inv.strip().lower() in ("true", "yes", "1") if isinstance(inv, str) else bool(inv)
+    return {"type": "go_to_place", "rover": rv, "place": place, "target_id": tid, "qualifier": qual,
+            "ordinal": ordinal, "near_rover": near if qual == "near_rover" else None, "investigate": inv}
+
+
+def _fix_place(req: Request, cmd: dict) -> dict:
+    """Post-check place commands with the keyword parser. When the operator's words name a known kind of place
+    (the parser made a go_to_place) and Gemma answered go_to without coordinates in the message (often the
+    rover's own position), explore_direction, unclear, return_home or sample_target, the place command stands.
+    Gemma's go_to_place keeps the place the operator's words name, and picks up a qualifier or investigate the
+    parser saw. Explicit coordinates always mean go_to."""
+    p = (req.parsed or {}).get("command") or {}
+    typ = cmd.get("type")
+    if p.get("type") == "go_to_place":
+        if typ == "go_to_place":
+            out = dict(cmd, place=p["place"])
+            if p.get("target_id"):
+                out["target_id"] = p["target_id"]
+            if out.get("place") not in ("mineral", "ice", "vent", "trace", "target"):
+                out["target_id"] = None
+            if cmd.get("qualifier") in (None, "none") and p.get("qualifier") not in (None, "none"):
+                out.update(qualifier=p["qualifier"], ordinal=p.get("ordinal"), near_rover=p.get("near_rover"))
+            out["investigate"] = bool(cmd.get("investigate")) or bool(p.get("investigate"))
+            return out
+        if typ in ("go_to", "explore_direction", "unclear", "return_home", "sample_target", "resume") and \
+                not _explicit_xy(req):
+            return dict(p)
+        return cmd
+    if typ == "go_to_place" and p.get("type") == "go_to" and _explicit_xy(req):
+        return dict(p)
     return cmd
 
 
@@ -1396,6 +1655,8 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             cmd = {"type": typ, "rover": rv, "target_id": tid}
         elif typ in ("return_home", "hold", "resume"):
             cmd = {"type": typ, "rover": rv}
+        elif typ == "go_to_place":
+            cmd = _place_command(req, data, rv)
         elif typ == "question":
             topic = str(data.get("topic") or "").strip().lower()
             cmd = {"type": "question", "rover": rv, "topic": topic if topic in TOPICS else "unknown"}
@@ -1405,6 +1666,7 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
     except ValueError as e:
         return bad(str(e))
     cmd = _fix_go_to(req, cmd, data)
+    cmd = _fix_place(req, cmd)
     cmd = _fix_intent(req, cmd)
     if cmd["type"] == "unclear":
         cmd["question"] = _strip_label(cmd["question"]) or _HELP
@@ -1808,9 +2070,12 @@ class FakeBackend(Backend):
     def _command(self, req: Request) -> dict:
         p = parse_command(req.text or "", req.payload.get("fleet"))
         c = p["command"]
-        return {"command": c["type"], "rover": c.get("rover") or "none", "direction": c.get("direction", "none"),
+        return {"command": c["type"], "rover": c.get("rover") or "none", "place": c.get("place") or "none",
+                "qualifier": c.get("qualifier") or "none", "ordinal": c.get("ordinal") or 0,
+                "near_rover": c.get("near_rover") or "none", "investigate": bool(c.get("investigate")),
+                "direction": c.get("direction", "none"),
                 "x": c.get("x", 0), "y": c.get("y", 0), "radius": c.get("radius", 0),
-                "target_id": c.get("target_id", "none"), "topic": c.get("topic", "none"),
+                "target_id": c.get("target_id") or "none", "topic": c.get("topic", "none"),
                 "question": c.get("question", ""), "ack": p["ack"], "confidence": 0.85}
 
     _LEADS = {"status": "Status: ", "history": "My log: ", "exploration": "Mapping so far: ", "finds": "Finds: ", "samples": "Samples: ",

@@ -15,6 +15,10 @@ import { reducedMotion } from './sceneConstants.js'
 // it), or faded with Reality on. Each track gets a dashed ring, a velocity arrow and its
 // label in a small tag; lost tracks fade out. An observing rover gets a dashed line of
 // sight to the track it watches.
+// When the fleet loses a track, the creature does not just vanish: a faded "last seen"
+// copy stays frozen where it was last seen (no walk cycle) while the track is lost, and
+// the tag says how long ago. It goes when the sim forgets the track; a reacquired track
+// brings the live creature back.
 
 const TRACK_NEAR = 3 // m: a creature counts as noticed when a live track is this close
 
@@ -106,19 +110,20 @@ function skinMaterial() {
   return m
 }
 
-function makeSet(ghost) {
-  const o = ghost ? { transparent: true, opacity: 0.3, depthWrite: false } : {}
+// ghost: the faded Reality set. memory: the fainter, greyer "last seen" set (lost tracks).
+function makeSet(ghost, memory = false) {
+  const o = ghost ? { transparent: true, opacity: memory ? 0.26 : 0.3, depthWrite: false } : {}
   const std = (p) => {
     const m = new THREE.MeshStandardMaterial(p)
     m.userData.realistic = true
     return m
   }
   const mats = {
-    body: ghost ? std({ color: '#c9c09e', roughness: 0.6, emissive: '#55513e', emissiveIntensity: 0.5, ...o }) : skinMaterial(),
+    body: memory ? std({ color: '#a9ad9c', roughness: 0.7, emissive: '#3c4038', emissiveIntensity: 0.4, ...o }) : ghost ? std({ color: '#c9c09e', roughness: 0.6, emissive: '#55513e', emissiveIntensity: 0.5, ...o }) : skinMaterial(),
     plate: std({ color: '#6a6550', roughness: 0.3, metalness: 0.1, ...o }),
     limb: std({ color: '#6b6550', roughness: 0.45, metalness: 0.05, ...o }),
-    dot: new THREE.MeshBasicMaterial({ color: LIFE, transparent: ghost, opacity: ghost ? 0.5 : 1, depthWrite: !ghost }),
-    halo: new THREE.MeshBasicMaterial({ color: LIFE, map: glowTexture(), transparent: true, opacity: ghost ? 0.1 : 0.22, depthWrite: false, blending: THREE.AdditiveBlending }),
+    dot: new THREE.MeshBasicMaterial({ color: LIFE, transparent: ghost, opacity: memory ? 0.25 : ghost ? 0.5 : 1, depthWrite: !ghost }),
+    halo: new THREE.MeshBasicMaterial({ color: LIFE, map: glowTexture(), transparent: true, opacity: memory ? 0.05 : ghost ? 0.1 : 0.22, depthWrite: false, blending: THREE.AdditiveBlending }),
   }
   const mk = (g, m, n, shadow) => {
     const mesh = new THREE.InstancedMesh(g, m, n)
@@ -177,7 +182,8 @@ function limb(mesh, i, a, b, w) {
 const SIDES = [-1, 1]
 const PARTS = ['body', 'plate', 'limb', 'dot', 'halo']
 
-function writeCreature(set, pose, S, t) {
+// still: a frozen pose (the "last seen" copy): no antenna wiggle, no pulsing spots.
+function writeCreature(set, pose, S, t, still = false) {
   const c = set.n++
   _qy.setFromAxisAngle(UP, pose.yaw)
   _G.compose(_p.set(pose.x, pose.gz, -pose.y), _qy, _s.set(1, 1, 1))
@@ -208,7 +214,7 @@ function writeCreature(set, pose, S, t) {
       limb(set.limb, li++, _k, _b, 0.02 * S)
     }
   }
-  const wig = reducedMotion ? 0 : Math.sin(t * 3 + pose.seed) * 0.04 * S
+  const wig = reducedMotion || still ? 0 : Math.sin(t * 3 + pose.seed) * 0.04 * S
   for (const side of SIDES) {
     _a.set(0.48 * S, 0.56 * S + bob, side * 0.05 * S)
     _b.set(0.7 * S, 0.76 * S + bob + wig * side, side * 0.16 * S)
@@ -218,7 +224,7 @@ function writeCreature(set, pose, S, t) {
   let di = c * DOTS
   for (let k = 0; k < SPOTS.length; k++) {
     const [x, y, z, r0] = SPOTS[k]
-    const pulse = reducedMotion ? 1 : 0.8 + 0.35 * Math.sin(t * 2.2 + pose.seed + k * 1.3)
+    const pulse = reducedMotion || still ? 1 : 0.8 + 0.35 * Math.sin(t * 2.2 + pose.seed + k * 1.3)
     for (const side of SIDES) {
       const r = r0 * S * pulse
       put(set.dot, di++, _p.set(x * S, y * S + bob, side * z * S), NOQ, _s.set(r, r, r))
@@ -238,11 +244,23 @@ function finish(set) {
 
 const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a))
 
+// The last displayed pose of the creature each track followed, by track id: where its
+// "last seen" copy stands once the track is lost. Plain objects reused every frame.
+function memoryFor(mem, id) {
+  let m = mem.get(id)
+  if (!m) mem.set(id, (m = { x: 0, y: 0, yaw: 0, gz: null, phase: 0, spd: 0, seed: (hashStr(id) % 628) / 100, size: 1 }))
+  return m
+}
+
 function Creatures({ reality }) {
-  const sets = useMemo(() => ({ solid: makeSet(false), ghost: makeSet(true) }), [])
+  const sets = useMemo(() => ({ solid: makeSet(false), ghost: makeSet(true), memory: makeSet(true, true) }), [])
   const poses = useRef(new Map())
+  const mem = useRef(new Map())
   const gen = useSim((s) => s.gen)
-  useEffect(() => poses.current.clear(), [gen])
+  useEffect(() => {
+    poses.current.clear()
+    mem.current.clear()
+  }, [gen])
   useEffect(
     () => () => {
       for (const set of Object.values(sets)) {
@@ -259,12 +277,13 @@ function Creatures({ reality }) {
     const T = s.terrain
     sets.solid.n = 0
     sets.ghost.n = 0
+    sets.memory.n = 0
     const a = 1 - Math.exp(-Math.min(dt, 0.1) * 5)
     for (const life of s.lifeforms) {
-      let tracked = false
+      let tracked = null
       for (const k of s.tracks) {
         if (k.status === 'tracking' && Math.abs(k.x - life.x) < TRACK_NEAR && Math.abs(k.y - life.y) < TRACK_NEAR && Math.hypot(k.x - life.x, k.y - life.y) < TRACK_NEAR) {
-          tracked = true
+          tracked = k
           break
         }
       }
@@ -287,11 +306,52 @@ function Creatures({ reality }) {
       const g = sampleGround(T, p.x, p.y) ?? (Number.isFinite(life.z) ? life.z - 0.25 * life.size : groundAt(p.x, p.y))
       p.gz = p.gz === null ? g : p.gz + (g - p.gz) * Math.min(1, a * 1.5)
       writeCreature(set, p, life.size, now)
+      if (tracked) {
+        const m = memoryFor(mem.current, tracked.id)
+        m.x = p.x
+        m.y = p.y
+        m.yaw = p.yaw
+        m.gz = p.gz
+        m.phase = p.phase
+        m.size = life.size
+      }
+    }
+    // Lost tracks: a frozen, faded copy where the creature was last seen.
+    for (const k of s.tracks) {
+      if (k.status !== 'lost' || sets.memory.n >= MAXC) continue
+      let back = false // reacquired under another track id: the live one shows instead
+      for (const o of s.tracks) {
+        if (o.status === 'tracking' && Math.abs(o.x - k.x) < 1.2 && Math.abs(o.y - k.y) < 1.2) {
+          back = true
+          break
+        }
+      }
+      if (back) continue
+      let m = mem.current.get(k.id)
+      if (!m) {
+        // Lost before this client saw it live (a late joiner): the track's own estimate.
+        m = memoryFor(mem.current, k.id)
+        m.x = k.x
+        m.y = k.y
+        m.yaw = Math.hypot(k.vx, k.vy) > 0.01 ? Math.atan2(k.vy, k.vx) : 0
+        m.size = Number.isFinite(k.size) && k.size > 0 ? k.size : 1
+      }
+      if (m.gz === null) m.gz = sampleGround(T, m.x, m.y) ?? groundAt(m.x, m.y)
+      writeCreature(sets.memory, m, m.size, now, true)
+    }
+    // Forget the copies of tracks the sim no longer lists.
+    if (mem.current.size > s.tracks.length) {
+      for (const id of mem.current.keys()) {
+        let listed = false
+        for (const k of s.tracks) if (k.id === id) listed = true
+        if (!listed) mem.current.delete(id)
+      }
     }
     // Forget creatures the sim no longer lists.
     if (poses.current.size > s.lifeforms.length + 8) for (const [id, p] of poses.current) if (now - p.at > 2) poses.current.delete(id)
     finish(sets.solid)
     finish(sets.ghost)
+    finish(sets.memory)
   })
 
   return (
@@ -330,17 +390,27 @@ function clusterInfo(k, tracks) {
   return others
 }
 
+// Sim time at which this client first saw each track lost (for sims without last_seen).
+const lostAtSim = new Map()
+
 function TrackTag({ id }) {
-  // Only the text and status re-render (positions move in useFrame).
+  // Only the text and status re-render (positions move in useFrame). A lost track says
+  // how long ago it was last seen, in whole sim seconds (re-renders once a second).
   const info = useSim((s) => {
     const k = s.tracks.find((q) => q.id === id)
     if (!k) return ''
     const more = clusterInfo(k, s.tracks)
-    return more < 0 ? '' : `${k.status}\u0001${k.label ?? ''}\u0001${k.observer ?? ''}\u0001${more}`
+    if (more < 0) return ''
+    let ago = -1
+    if (k.status === 'lost') {
+      const since = Number.isFinite(k.last_seen) ? k.last_seen : lostAtSim.get(id)
+      if (Number.isFinite(since) && Number.isFinite(s.t)) ago = Math.max(0, Math.round(s.t - since))
+    }
+    return `${k.status}\u0001${k.label ?? ''}\u0001${k.observer ?? ''}\u0001${more}\u0001${ago}`
   })
   const names = useSim((s) => s.roverMeta)
   if (!info) return null
-  const [status, label, observer, more] = info.split('\u0001')
+  const [status, label, observer, more, ago] = info.split('\u0001')
   const watcher = observer ? names.find((m) => m.id === observer) : null
   const n = Number(more)
   return (
@@ -348,7 +418,11 @@ function TrackTag({ id }) {
       <span className="track-tag-id">{id}</span>
       <span className="track-tag-label">{label || 'moving object'}</span>
       {n > 0 && <span className="track-tag-more">+{n}</span>}
-      {status === 'lost' ? <span className="track-tag-lost">lost</span> : watcher && <span className="track-tag-eye" style={{ '--c': watcher.color }} title={`${watcher.name} is watching`} />}
+      {status === 'lost' ? (
+        <span className="track-tag-lost">{Number(ago) >= 0 ? `last seen ${ago} s ago` : 'lost'}</span>
+      ) : (
+        watcher && <span className="track-tag-eye" style={{ '--c': watcher.color }} title={`${watcher.name} is watching`} />
+      )}
     </div>
   )
 }
@@ -362,7 +436,7 @@ function TrackMarker({ id }) {
   const ringXyz = useMemo(() => new Float32Array((RING_SEGS + 1) * 3), [])
   const arrowXyz = useMemo(() => new Float32Array(5 * 3), [])
   const st = useRef({ x: null, y: null, gz: 0, lostAt: null })
-  useEffect(() => () => (ring.dispose(), arrow.dispose(), trackPoses.delete(id)), [ring, arrow, id])
+  useEffect(() => () => (ring.dispose(), arrow.dispose(), trackPoses.delete(id), lostAtSim.delete(id)), [ring, arrow, id])
   useEffect(() => {
     ring.setResolution(size.width, size.height)
     arrow.setResolution(size.width, size.height)
@@ -400,8 +474,13 @@ function TrackMarker({ id }) {
 
     // Lost: fade out over a few seconds.
     const now = nowSeconds()
-    if (k.status === 'lost') p.lostAt ??= now
-    else p.lostAt = null
+    if (k.status === 'lost') {
+      p.lostAt ??= now
+      if (!lostAtSim.has(id) && Number.isFinite(s.t)) lostAtSim.set(id, s.t)
+    } else {
+      p.lostAt = null
+      lostAtSim.delete(id)
+    }
     const fade = p.lostAt === null ? 1 : Math.max(0.12, 1 - (now - p.lostAt) / 6)
     ring.material.opacity = 0.95 * fade
     arrow.material.opacity = 0.95 * fade
