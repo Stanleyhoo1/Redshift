@@ -323,3 +323,104 @@
     gap: 4px;
   }
 }
+
+/* ---- Hazards, open: a single-column dropdown under where the pill sits, instead of the
+   full two-row bar across the map. Title and fold button on top, one hazard per line,
+   then the target and the status line. */
+@keyframes hz-drop-in {
+  from {
+    opacity: 0.6;
+    transform: translateY(-4px);
+  }
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) {
+  width: min(256px, 100%);
+  padding: 6px 8px 9px;
+  gap: 8px;
+  background: rgba(8, 12, 19, 0.9);
+  animation: hz-drop-in 180ms ease-out;
+}
+
+.hud-hazards:not(.hz-folded) > .hz-row:first-child {
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.hud-hazards:not(.hz-folded) .hz-title {
+  padding: 2px 2px 0;
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.hud-hazards:not(.hz-folded) .hz-title svg {
+  width: 14px;
+  height: 14px;
+}
+
+.hud-hazards:not(.hz-folded) .hz-fold {
+  order: 1;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-buttons {
+  order: 2;
+  display: flex;
+  flex: 1 1 100%;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-title span {
+  display: inline;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-sep {
+  display: block;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-btn {
+  flex: none;
+  justify-content: flex-start;
+  padding: 6px 9px;
+  font-size: 13px;
+}
+
+.hud-hazards:not(.hz-folded) .hz-btn .hz-badge {
+  margin-left: auto;
+}
+
+.hud-hazards:not(.hz-folded) .hz-sep {
+  width: auto;
+  height: 1px;
+  margin: 2px 4px;
+}
+
+.hud-hazards:not(.hz-folded) > .hz-row-2 {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-2);
+}
+
+.hud-hazards:not(.hz-folded) .hz-target {
+  flex-wrap: wrap;
+  gap: 5px 8px;
+}
+
+.hud-top > .hud-hazards:not(.hz-folded) .hz-status {
+  flex: none;
+  padding: 0 2px;
+  font-size: 12px;
+  -webkit-line-clamp: 3;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hud-top > .hud-hazards:not(.hz-folded) {
+    animation: none;
+  }
+}
