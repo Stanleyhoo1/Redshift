@@ -1018,6 +1018,13 @@ code {
   border-top: 1px solid var(--line);
 }
 
+/* v7 kinds of lifeform: three to a row so the legend keeps its width */
+.legend-row.legend-kinds {
+  display: grid;
+  grid-template-columns: repeat(3, max-content);
+  justify-content: start;
+}
+
 .sw {
   flex: none;
   width: 12px;

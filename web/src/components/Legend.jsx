@@ -94,7 +94,7 @@ export function Legend({ slopeColors, frontiers, life = true, reality = false })
         </ul>
       )}
       {v4 && life && kinds.length > 0 && (
-        <ul className="legend-list legend-row" aria-label="Kinds of lifeform">
+        <ul className="legend-list legend-row legend-kinds" aria-label="Kinds of lifeform">
           {kinds.map((k) => (
             <li key={k} title={KIND_LOOK[k].hint}>
               <i className="sw sw-life" style={{ '--c': KIND_LOOK[k].color }} />
