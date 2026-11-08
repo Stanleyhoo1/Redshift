@@ -116,7 +116,7 @@ export function Flora({ reality }) {
     cap.current.instanceMatrix.needsUpdate = true
     if (cap.current.instanceColor) cap.current.instanceColor.needsUpdate = true
     bulb.current.instanceMatrix.needsUpdate = true
-    if (bulbMat.current) bulbMat.current.emissiveIntensity = reducedMotion ? 1.7 : 1.5 + 0.5 * Math.sin(clock.elapsedTime * 1.6)
+    if (bulbMat.current) bulbMat.current.emissiveIntensity = reducedMotion ? 1.5 : 1.35 + 0.45 * Math.sin(clock.elapsedTime * 1.6)
   })
 
   if (!list.length) return null
@@ -129,7 +129,7 @@ export function Flora({ reality }) {
         <meshStandardMaterial color="#ffffff" emissive="#ffffff" roughness={0.6} side={THREE.DoubleSide} onBeforeCompile={glowCaps} customProgramCacheKey={() => 'redshift-flora-cap-1'} />
       </instancedMesh>
       <instancedMesh ref={bulb} args={[geos.bulb, undefined, MAX * BULBS]} frustumCulled={false}>
-        <meshStandardMaterial ref={bulbMat} color="#b8ff48" emissive="#9cff2a" emissiveIntensity={1.7} roughness={0.4} />
+        <meshStandardMaterial ref={bulbMat} color="#b8ff48" emissive="#5cff1e" emissiveIntensity={1.5} roughness={0.4} />
       </instancedMesh>
       {Array.isArray(zones) && zones.filter((z) => Array.isArray(z) && z.length >= 3 && z.every(Number.isFinite)).map((z, i) => (
         <Ring key={i} x={z[0]} y={z[1]} r={z[2]} />
