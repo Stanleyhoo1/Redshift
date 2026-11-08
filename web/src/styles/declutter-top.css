@@ -198,3 +198,29 @@
 .hud-top > .banners {
   align-self: center;
 }
+
+/* The card never enters from fully transparent: a busy frame (or a slow GPU) could
+   otherwise leave an empty gap above the "+N more waiting" chip while it fades in. */
+@keyframes rq-card-in {
+  from {
+    opacity: 0.55;
+    transform: translateY(-6px);
+  }
+}
+
+.rq-stack > .hud-request,
+.rq-stack > .hud-request[data-kind] {
+  animation: rq-card-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.rq-stack > .hud-request[data-kind='open'] {
+  animation:
+    rq-card-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    rq-glow 2.4s ease-in-out 400ms 4;
+}
+
+.rq-stack > .hud-request[data-kind='open'][data-wait] {
+  animation:
+    rq-card-in 300ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    rq-glow 4.8s ease-in-out 400ms 2;
+}
