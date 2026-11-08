@@ -16,6 +16,7 @@ import { DustStorm } from './DustStorm.jsx'
 import { FocusMarker } from './FocusMarker.jsx'
 import { Water } from './Water.jsx'
 import { Spires, fallDebug } from './Spires.jsx'
+import { Flora } from './Flora.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
 import { PlaceCandidates } from './PlaceCandidates.jsx'
@@ -106,6 +107,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <Water reality={view.reality} />
       <HazardVisuals reality={view.reality} />
       <Spires reality={view.reality} />
+      <Flora reality={view.reality} />
       <Lander />
       {view.frontiers && <Frontiers />}
       <Targets />
