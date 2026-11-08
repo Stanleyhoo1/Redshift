@@ -129,8 +129,8 @@ export const SPARES = [
 // "tip_over" -> "tip over"; the sim's own words otherwise.
 export const causeText = (c) => (c ? c.replace(/_/g, ' ') : 'unknown')
 export const SEVERITIES = [
-  { key: 'light', label: 'Light', hint: 'A knock: one part loses a little' },
-  { key: 'heavy', label: 'Heavy', hint: 'A hard hit: one part badly damaged, the rover still drives' },
+  { key: 'small', label: 'Small', hint: 'Flat 20 points off one part' },
+  { key: 'huge', label: 'Huge', hint: 'Flat 60 points off one part (a drive or power this low can strand it)' },
   { key: 'disable', label: 'Disable', hint: 'It can no longer drive: distress, a helper, a diagnosis' },
   { key: 'wreck', label: 'Wreck', hint: 'Beyond field repair: tow home or salvage' },
 ]

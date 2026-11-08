@@ -45,7 +45,8 @@ import mujoco
 import numpy as np
 
 TYPES = ("rockfall", "sand", "dust_storm", "rover_fault", "spire_fall", "lifeform", "damage")
-SEVERITIES = ("light", "heavy", "disable", "wreck", "jam")     # jam: a sim extra, see PROTOCOL.md v9 notes
+SEVERITIES = ("small", "huge", "disable", "wreck", "jam", "light", "heavy")   # light/heavy: old names of small/huge
+FLAT_DAMAGE = {"small": 25.0, "huge": 60.0}    # flat points off one part
 HIT_RADIUS = 2.0       # protocol v9: a rockfall or spire fall clicked this close to a rover is aimed at it
 POINT_TYPES = ("rockfall", "sand", "spire_fall", "lifeform")
 DROP_HEIGHT = 5.0      # boulders start this far above the ground
@@ -694,7 +695,8 @@ class HazardManager:
         from .health import PARTS
         sim = self.sim
         if severity is None:
-            severity = "heavy"
+            severity = "huge"
+        severity = {"light": "small", "heavy": "huge"}.get(severity, severity)
         if severity not in SEVERITIES:
             raise HazardError(f"unknown severity {severity!r} (use {', '.join(SEVERITIES[:4])}, or jam)")
         if part is not None and part not in PARTS:
@@ -716,13 +718,9 @@ class HazardManager:
         cur = hp.values()
         rng = self.rng
         sets, kinds = {}, {}
-        if severity == "light":
+        if severity in FLAT_DAMAGE:          # flat: always the same number of points off one part
             p = part or PARTS[int(rng.integers(len(PARTS)))]
-            sets[p] = max(cur[p] - float(rng.uniform(15.0, 25.0)), 30.0 if p in ("drive_l", "drive_r", "power") else 5.0)
-        elif severity == "heavy":
-            p = part or ("drive_l", "drive_r")[int(rng.integers(2))]
-            floor = 25.0 if p in ("drive_l", "drive_r", "power") else 0.0      # heavy never immobilises
-            sets[p] = max(min(cur[p], float(rng.uniform(35.0, 45.0))), floor)
+            sets[p] = max(cur[p] - FLAT_DAMAGE[severity], 0.0)
         elif severity == "disable":
             if part in ("drive_l", "drive_r"):
                 sets[part] = 0.0

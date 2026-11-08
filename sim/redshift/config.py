@@ -124,6 +124,7 @@ class Config:
     focus_offset: float = 20.0         # "explore north of the lander": the circle's centre this far that way (m)
     focus_travel_s: float = 180.0      # an area focus not reached in this long is given up (sim s)
     curiosity: bool = True             # rovers stick around something new they found (interest focus)
+    field_patch: bool = True           # v9: a helper patches a stranded rover's drive enough to limp home
     interest_s: float = 60.0           # ... for about this long (sim s)
     interest_r: float = 10.0           # ... within this radius (m)
     interest_cooldown_s: float = 150.0  # per rover, after an interest focus ends (sim s)

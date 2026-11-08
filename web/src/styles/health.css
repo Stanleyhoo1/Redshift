@@ -653,10 +653,12 @@
   cursor: progress;
 }
 
+.hz-sev[data-sev='small'],
 .hz-sev[data-sev='light'] {
   border-color: rgba(243, 178, 74, 0.45);
 }
 
+.hz-sev[data-sev='huge'],
 .hz-sev[data-sev='heavy'] {
   border-color: rgba(255, 140, 70, 0.55);
 }

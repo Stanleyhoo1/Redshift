@@ -476,8 +476,12 @@ class RescueManager:
             bits.append(f"{PART_NAME[p]} {hp.value(p, field_fixed=True):.0f}%")
         found = [f"{words.get(k, k)} ({PART_NAME[p]})" for p, k, _pts in fix]
         mobile_after = hp.mobile(field_fixed=True)
+        patch = hp.can_patch()
+        rec["patch"] = patch
         if fix and mobile_after:
             verdict = "Fixable here."
+        elif patch:
+            verdict = "I can patch it enough to limp home to the lander for a proper repair."
         elif fix:
             verdict = "Part of it is fixable here, but it still won't drive after that."
         else:
@@ -487,17 +491,19 @@ class RescueManager:
         rec["diag"] = text
         self._log(t, "info", f"{h.id} {text[0].lower() + text[1:]}", h.id, at=(rover.x, rover.y))
         self._say(h.id, t, text, "info", reply_to=rec.get("cid"))
-        if fix:
+        if fix or patch:
             rec["phase"] = "repairing"
             rec["t_phase"] = t
-            names = ", ".join(words.get(k, k) for _p, k, _pts in fix)
+            names = ", ".join([words.get(k, k) for _p, k, _pts in fix] + (["a temporary drive patch"] if patch else []))
             self._log(t, "info", f"{h.id} fixing {rover.id} in the field: {names} (about {FIX_S:.0f} s).", h.id,
                       at=(rover.x, rover.y))
 
     def _field_fixed(self, rec, rover, h, t: float) -> None:
         done = rover.health.field_fix()
+        if rec.get("patch") and not rover.health.mobile():
+            done += rover.health.field_patch()     # just enough to drive home slowly
         rec["fixed"] = True
-        words = {"jam": "freed its jammed", "trip": "reset its tripped", "dirt": "cleaned its"}
+        words = {"jam": "freed its jammed", "trip": "reset its tripped", "dirt": "cleaned its", "patch": "patched its"}
         what = ", ".join(f"{words.get(k, 'fixed its')} {PART_NAME[p]}" + (" controller" if k == "trip" else "")
                          for p, k, _b, _a in done) or "found nothing to fix"
         if rover.health.mobile():

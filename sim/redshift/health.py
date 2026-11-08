@@ -47,6 +47,8 @@ MOBILE_DRIVE_MIN = 15.0        # a skid steer needs both sides: either side belo
 MOBILE_POWER_MIN = 10.0        # ... nor with the power system below this
 OK_MIN = 80.0                  # every part at least this: status "ok"
 WRECK_HP = 30.0                # immobile and hp below this (or 3 parts broken): beyond field repair, "wrecked"
+PATCH_DRIVE = 25.0             # a field patch brings a dead drive side back to this (enough to limp home) ...
+PATCH_POWER = 25.0             # ... and the power system to this
 REPAIR_HOME_HP = 55.0          # a rover that can still drive heads home for repair below this hp ...
 REPAIR_HOME_PART = 35.0        # ... or with a drive, the LiDAR or power below this
 COMMS_FULL_M = 220.0           # radio range with comms at 100% (covers the whole 120 m map)
@@ -245,6 +247,26 @@ class Health:
         also = "; ".join(f"{PART_NAME[d['part']]} {d['before']}% -> {d['after']}%" for d, _k in out[1:])
         self._log_damage(t, main, kind, f"Also {also}." if also else "")
         return [d for d, _k in out]
+
+    def can_patch(self) -> bool:
+        """After the field fix it still can't drive, but it is not beyond field repair: a helper can patch the
+        drive and power (bypass a burnt winding, rewire a cell) just enough to limp home for a lander repair."""
+        if not getattr(self.rover.cfg, "field_patch", True):
+            return False
+        return not self.mobile(field_fixed=True) and not self.beyond_field_repair()
+
+    def field_patch(self) -> list:
+        """The helper's temporary patch: drives up to PATCH_DRIVE and power up to PATCH_POWER, no more (the
+        lander repairs it properly). Returns [(part, "patch", before, after)]."""
+        out = []
+        for p, floor in (("drive_l", PATCH_DRIVE), ("drive_r", PATCH_DRIVE), ("power", PATCH_POWER)):
+            before = self.value(p, field_fixed=True)
+            if before < floor:
+                self.perm[p] = 100.0 - floor
+                out.append((p, "patch", int(round(before)), int(round(self.value(p)))))
+        if out:
+            self.version += 1
+        return out
 
     def field_fix(self) -> list:
         """The helper's fix: clears every field-fixable fault. Returns [(part, kind, before, after)]."""
