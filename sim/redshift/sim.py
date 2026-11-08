@@ -71,6 +71,10 @@ class Simulation:
         self.hazards = HazardManager(self)
         self.fleet.hazards = self.hazards
         self.lifeforms = LifeformManager(self)
+        self.geysers = None             # v7: eruption schedule and plume scatter (only with cfg.geysers)
+        if getattr(cfg, "geysers", False):
+            from .v7_geysers import GeyserManager
+            self.geysers = GeyserManager(self)
         self.camera_ok = None           # rules' camera checks: None = not tried yet, False = no OpenGL here
         self._features_sent = -1
         self.advisor = Advisor(self, planner, frame_source, wait_for_gemma=wait_for_gemma)
@@ -128,6 +132,8 @@ class Simulation:
         self._check_rovers_in_world()
         t = float(d.time)
         hz.step(t)
+        if self.geysers is not None:
+            self.geysers.update(t)
         c1 = time.perf_counter()
         n = len(self.rovers)
         s0 = self.ticks % n
@@ -273,10 +279,13 @@ class Simulation:
     def features_msg(self) -> dict:
         """Ground truth of the static features (protocol v4): water outlines and spires."""
         standing = self.hazards.spire_standing
-        return {"water": [w.to_msg() for w in self.terrain.water],
-                "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
-                            "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
-                           for sp in self.hazards.all_spires()]}
+        out = {"water": [w.to_msg() for w in self.terrain.water],
+               "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
+                           "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
+                          for sp in self.hazards.all_spires()]}
+        if getattr(self, "geysers", None) is not None:      # v7: vents and their eruption state
+            out["geysers"] = self.geysers.to_msg(self.t)
+        return out
 
     def close(self) -> None:
         """Stop tier 2's worker thread (the shared Gemma planner itself keeps running)."""

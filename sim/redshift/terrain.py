@@ -181,6 +181,10 @@ class Terrain:
         self.targets = self._make_targets(rng)
         self._add_traces(frng)
         self._assign_values(frng)
+        self.geysers = []                                 # v7 vents (own stream, see v7_geysers.py)
+        if getattr(cfg, "geysers", False):
+            from .v7_geysers import plan_vents
+            self.geysers = plan_vents(cfg, self)
 
     # ------------------------------------------------------------------ heights
     def _make_heights(self, rng: np.random.Generator) -> np.ndarray:
