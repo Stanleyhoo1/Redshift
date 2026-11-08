@@ -71,3 +71,22 @@ def test_ice_zones_in_fleet_stats_only_when_on_and_learned():
     off = Simulation(Config(seed=42))
     assert "ice_zones" not in off.fleet.stats()
     assert "ice" not in off.features_msg() and "dunes" not in off.features_msg()
+
+
+def test_low_traction_fires_on_ice_readings_and_not_on_sand_readings():
+    from redshift.sim import Simulation
+    sim = Simulation(Config(seed=42, ice_sheets=True))
+    r = sim.rovers[0]
+    r.state, r.cmd_v, r.gyro_z, r.tilt, r.v_wheel = "exploring", 0.6, 0.0, 1.0, 0.6
+    r.slip, r.spin_load = 0.9, 0.14            # ice: wheels spin freely at low motor load
+    assert sim.cfg.sand_spin_load > 0.14       # so the soft ground rule stays quiet
+    assert not v7_surface.check_low_traction(r, 10.0)
+    assert v7_surface.check_low_traction(r, 11.0)
+    assert r.anomaly["kind"] == "low_traction" and r.rec_phase == "ice"
+    assert sim.fleet.ice_zones and not sim.fleet.soft_zones
+    r2 = sim.rovers[1]
+    r2.state, r2.cmd_v, r2.gyro_z, r2.tilt, r2.v_wheel = "exploring", 0.6, 0.0, 1.0, 0.6
+    r2.x, r2.y = -30.0, 30.0
+    r2.slip, r2.spin_load = 0.9, 0.8           # sand: the motors work hard
+    assert not v7_surface.check_low_traction(r2, 10.0)
+    assert not v7_surface.check_low_traction(r2, 11.0)
