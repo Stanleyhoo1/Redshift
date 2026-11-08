@@ -699,7 +699,7 @@ class Fleet:
     def report_slope_stall(self, t: float, rover, slope_deg: float, load: float | None = None) -> bool:
         """A rover could not climb a slope. Returns True if the fleet limit was lowered."""
         measured = int(round(slope_deg))
-        floor = max(self.cfg.slope_limit_floor_deg, math.floor(self.best_climb))
+        floor = max(self.cfg.slope_floor_deg, math.floor(self.best_climb))
         new = max(floor, measured - 2)
         why = f"slope {measured} deg" + (f" with motors at {load * 100:.0f}%" if load is not None else "")
         if new < self.slope_limit - 0.01:

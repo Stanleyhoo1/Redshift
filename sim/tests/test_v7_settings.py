@@ -192,3 +192,255 @@ def test_from_env_clamps_come_from_the_settings_table(monkeypatch):
     monkeypatch.setenv("MAP_SIZE", "125")                    # inside the range: kept as given (no step here)
     assert Config.from_env().map_size == 125.0
     assert Config.from_env(seed=9).seed == 9                  # overrides still win
+
+
+# ====================================================================== gravity
+def test_derived_thresholds_are_identical_at_2g():
+    cfg = Config()
+    assert cfg.rover_mass == 22.5
+    assert cfg.climb_limit_deg == pytest.approx(21.25, abs=0.01)
+    assert cfg.target_path_slope_deg == C.TARGET_PATH_SLOPE == 15.0
+    assert cfg.reach_slope_deg == C.REACH_SLOPE == 18.0
+    assert cfg.passable_slope_deg == C.PASSABLE_SLOPE == 20.0
+    assert cfg.slope_floor_deg == cfg.slope_limit_floor_deg == 12.0
+    assert cfg.sand_spin_load == C.SAND_SPIN_LOAD == 0.2
+    assert cfg.tow_limit_deg == pytest.approx(8.35, abs=0.01)
+
+
+def test_derived_thresholds_are_lower_at_3g():
+    hi = Config(gravity_g=3.0)
+    assert hi.climb_limit_deg == pytest.approx(13.98, abs=0.01)
+    assert hi.target_path_slope_deg == pytest.approx(hi.climb_limit_deg - 2.0) and hi.target_path_slope_deg < 15.0
+    assert hi.reach_slope_deg == pytest.approx(hi.climb_limit_deg - 1.0) and hi.reach_slope_deg < 18.0
+    assert hi.passable_slope_deg == pytest.approx(hi.climb_limit_deg - 1.0) and hi.passable_slope_deg < 20.0
+    assert hi.slope_floor_deg == pytest.approx(11.98, abs=0.01) and hi.slope_floor_deg < 12.0
+    assert hi.sand_spin_load == 0.2                    # heavier than 2 g: sand loads the wheels at least as much
+    assert hi.tow_limit_deg < Config().tow_limit_deg
+    lo = Config(gravity_g=1.0)
+    assert lo.sand_spin_load == pytest.approx(0.1)     # half the weight, half the wheel load in sand
+    assert (lo.target_path_slope_deg, lo.reach_slope_deg, lo.passable_slope_deg, lo.slope_floor_deg) == \
+        (15.0, 18.0, 20.0, 12.0)
+    assert Config(gravity_g=0.5).climb_limit_deg == C.CLIMB_CAP_DEG == 30.0     # grip, not torque, limits it
+
+
+def test_physics_table_for_the_setup_screen():
+    rows = C.physics_table(Config())
+    assert [r["gravity_g"] for r in rows] == [round(0.5 + 0.1 * k, 1) for k in range(26)]
+    by_g = {r["gravity_g"]: r for r in rows}
+    assert by_g[2.0] == {"gravity_g": 2.0, "climb_deg": 21.3, "tow_deg": 8.4, "grip_limited": False}
+    assert by_g[0.5]["climb_deg"] == 30.0 and by_g[0.5]["grip_limited"] is True
+    assert by_g[3.0]["climb_deg"] == 14.0
+    climbs = [r["climb_deg"] for r in rows]
+    assert climbs == sorted(climbs, reverse=True)
+    assert all(r["tow_deg"] < r["climb_deg"] for r in rows)
+    for r in rows:      # the wear and towing design's 0.8 * asin(4T/r / ((m1 + m2) g)), as is from 0.73 g up
+        if r["gravity_g"] >= 0.8:
+            plain = 0.8 * math.degrees(math.asin(4 * 7.2 / 0.18 / (2 * 22.5 * 9.81 * r["gravity_g"])))
+            assert r["tow_deg"] == round(plain, 1), r
+    assert by_g[0.5]["tow_deg"] == by_g[0.7]["tow_deg"] == 24.0     # below it the 30 deg grip cap holds
+    json.dumps(rows)
+
+
+def test_terrain_targets_and_traps_use_the_derived_slopes():
+    from redshift import terrain
+    from redshift.terrain import Terrain
+    assert terrain.TARGET_PATH_SLOPE == 15.0 and terrain.REACH_SLOPE == 18.0       # still importable from terrain
+    c2, c3 = Config(seed=42, water=False), Config(seed=42, water=False, gravity_g=3.0)
+    t2, t3 = Terrain(c2), Terrain(c3)
+    assert np.array_equal(t2.truth_heights, t3.truth_heights)        # same ground, only the limits change
+    assert np.array_equal(t2.reach, t2.reachable(15.0))
+    assert np.array_equal(t3.reach, t3.reachable(c3.target_path_slope_deg))
+    assert t3.reach.sum() < t2.reach.sum() and not (t3.reach & ~t2.reach).any()
+    for cfg in (c3, Config(seed=42, gravity_g=3.0), Config(seed=7, gravity_g=3.0)):      # with water too
+        ter = t3 if cfg is c3 else Terrain(cfg)
+        for tg in ter.targets:
+            i, j = ter.ij(tg.x, tg.y)
+            assert ter.reach[j, i], (cfg.seed, tg.id)                 # every target reachable at 3 g
+
+
+def test_passable_ground_and_slope_floor_follow_gravity():
+    from redshift.sim import Simulation
+    from redshift.terrain import slope_deg
+    for g, floor in ((2.0, 12.0), (3.0, Config(gravity_g=3.0).slope_floor_deg)):
+        cfg = Config(seed=42, gravity_g=g, **SMALL)
+        sim = Simulation(cfg)
+        try:
+            assert all(r.mass == pytest.approx(cfg.rover_mass) for r in sim.rovers)    # the model matches the formula
+            H = sim.hazards.truth_heights(sim.terrain.truth_heights)
+            want = (slope_deg(H, cfg.res) <= min(sim.fleet.slope_limit, cfg.passable_slope_deg)) & ~sim.terrain.wet
+            assert np.array_equal(sim.hazards._passable_base(), want), g
+            if g == 3.0:
+                assert want.sum() < ((slope_deg(H, cfg.res) <= 20.0) & ~sim.terrain.wet).sum()
+            assert sim.fleet.report_slope_stall(sim.t, sim.rovers[0], 13.0)
+            assert sim.fleet.slope_limit == pytest.approx(floor), g
+        finally:
+            sim.close()
+
+
+def _sand_suspect(sim, load: float) -> bool:
+    """Feed rover 1's own wheel channels by hand: wheels at 0.54 m/s, body still, motors at `load` of the
+    torque cap. True if the soft ground (sand) detector starts its slip timer."""
+    r = sim.rovers[0]
+    r.state, r.cmd_v, r.gyro_z, r.tilt, r.speed_fwd = "exploring", 0.5, 0.0, 0.0, 0.0
+    r.spin_load, r.slip, r.slip_since = 0.0, 0.0, None
+    for _ in range(8):
+        sim.data.qvel[r.wdofs] = 3.0
+        sim.data.actuator_force[r.acts] = load * sim.cfg.motor_torque
+        r._read_drive_sensors(sim.t)
+    return r.slip_since is not None
+
+
+def test_sand_detector_scales_with_gravity():
+    from redshift.sim import Simulation
+    for g, light, heavy in ((2.0, False, True), (1.0, True, True)):
+        sim = Simulation(Config(seed=42, gravity_g=g, **SMALL))
+        try:
+            assert _sand_suspect(sim, 0.15) is light, g        # 0.15 of the cap: sand at 1 g, not at 2 g
+            assert _sand_suspect(sim, 0.30) is heavy, g
+        finally:
+            sim.close()
+
+
+# ====================================================================== Gemma states the gravity
+from redshift import gemma as g  # noqa: E402
+
+PERCEPTION = {"battery": 0.64, "state": "exploring", "x": 3.21, "y": -1.04, "lidar_range": 8.0, "lidar_hits": 812,
+              "pitch": 3.1, "roll": -1.2, "wheel_speed": 0.62, "ground_speed": 0.58, "slip": 0.06,
+              "motor_load": 0.41, "spectro": None, "slope_limit_deg": 20.0, "home_distance": 31.2,
+              "scan": [0.1] * 900}                       # the largest prompt inputs of test_gemma.py
+CANDIDATES = [
+    {"id": "f1", "kind": "frontier", "summary": "frontier 9 m north, 34 cells, slope max 12 deg, battery after return 58%"},
+    {"id": "f2", "kind": "frontier", "summary": "frontier 21 m east, 80 cells, slope max 18 deg, battery after return 41%"},
+    {"id": "f3", "kind": "frontier", "summary": "frontier 6 m west, 8 cells, slope max 6 deg, battery after return 66%"},
+    {"id": "home", "kind": "return", "summary": "lander 31 m south-west, battery on arrival 60%"},
+]
+SLIP = {"type": "wheel_slip", "slip": 0.46, "duration_s": 2.4, "detail": "wheels spinning, not moving"}
+OPTIONS = ["reroute", "back_out", "proceed_slowly", "wait"]
+TRACK = {"distance": 6.2, "speed": 0.3, "size": 1.2}
+FLEET = {"rovers": [{"id": "r1", "name": "Rover 1", "color": "#ff7a45", "x": 3.2, "y": -1.0, "state": "exploring",
+                     "battery": 0.64},
+                    {"id": "r2", "name": "Rover 2", "color": "#36cfc9", "x": -8.5, "y": 12.1, "state": "returning",
+                     "battery": 0.31}],
+         "targets": [{"id": "t4", "kind": "ice", "x": 12.0, "y": -4.5, "status": "found"}],
+         "lander": [0.0, 0.0], "map_size": 80}
+ANSWER_FACTS = ["I have mapped 1,904 m2, mostly north-east of the lander.", "I found 1 target: t4 (ice), 13 m east."]
+
+
+def _prompts(gravity=None) -> dict:
+    kw = {} if gravity is None else {"gravity_g": gravity}
+    reqs = [g.make_choice_request(1, "r1", 0.0, PERCEPTION, CANDIDATES, **kw),
+            g.make_interpretation_request(2, "r1", 0.0, PERCEPTION, SLIP, b"x", OPTIONS, **kw),
+            g.make_description_request(3, "r1", 0.0, PERCEPTION, TRACK, b"x", **kw),
+            g.make_command_request(4, 0.0, "rover 2 go to 10, -5", FLEET, **kw),
+            g.make_answer_request(5, "r2", 0.0, "what have you found?", "finds", ANSWER_FACTS, "RULES", **kw)]
+    return {r.kind: g.build_prompt(r) for r in reqs}
+
+
+def test_gemma_prompts_at_2g_are_unchanged():
+    assert g.SYSTEM_BASE == ("You advise an autonomous rover exploring an unknown super-Earth (gravity 2 g, no link "
+                             "to Earth). Decide only from the rover's own sensor readings listed below. ")
+    plain = _prompts()
+    assert plain == _prompts(2.0)
+    assert plain["choice"][0] == g.SYSTEM_CHOICE and plain["interpretation"][0] == g.SYSTEM_INTERPRET
+    assert plain["describe"][0] == g.SYSTEM_DESCRIBE
+    assert plain["command"][0] == g.SYSTEM_COMMAND and plain["answer"][0] == g.SYSTEM_ANSWER
+    n = g.estimate_tokens("".join(plain["interpretation"]))
+    assert n <= 397, n                    # the longest prompt is no longer than before v7 (budget: under 400)
+
+
+@pytest.mark.parametrize("gravity, text", [(3.0, "an unknown super-Earth (gravity 3 g, no link to Earth)"),
+                                           (2.5, "an unknown super-Earth (gravity 2.5 g, no link to Earth)"),
+                                           (1.0, "an unknown planet (gravity 1 g, no link to Earth)"),
+                                           (0.5, "an unknown planet (gravity 0.5 g, no link to Earth)")])
+def test_gemma_prompts_state_the_configured_gravity(gravity, text):
+    prompts = _prompts(gravity)
+    for kind in ("choice", "interpretation", "describe"):
+        system, user = prompts[kind]
+        assert text in system and "gravity 2 g" not in system, kind
+        assert g.estimate_tokens(system + user) < 400, kind
+    # commands and answers name the same world, never a gravity number (they may only quote their own inputs)
+    for kind, plain in (("command", g.SYSTEM_COMMAND), ("answer", g.SYSTEM_ANSWER)):
+        system, user = prompts[kind]
+        want = plain if gravity > 1.0 else plain.replace("a super-Earth", "a planet")
+        assert system == want and ("super-Earth" in system) == (gravity > 1.0), kind
+        assert "gravity" not in system and g.estimate_tokens(system + user) < 400, kind
+
+
+class SystemRecorder(g.FakeBackend):
+    """The fake model, keeping every system prompt it was sent."""
+
+    def __init__(self):
+        super().__init__(latency_s=0.0)
+        self.systems = []
+
+    def chat(self, req, system, user, schema, timeout):
+        self.systems.append((req.kind, system))
+        return super().chat(req, system, user, schema, timeout)
+
+
+def _planner(backend):
+    p = g.GemmaPlanner(g.GemmaConfig(fake=True, check_every_s=3600.0, timeout_s=2.0), backend=backend)
+    assert p.wait_ready(2.0), p.stats()
+    return p
+
+
+def _result(p, ticket, timeout=5.0):
+    end = time.perf_counter() + timeout
+    while time.perf_counter() < end:
+        r = p.poll(ticket)
+        if r is not None:
+            return r
+        time.sleep(0.002)
+    raise AssertionError(f"no result for ticket {ticket}")
+
+
+def test_planner_submits_carry_the_gravity():
+    rec = SystemRecorder()
+    p = _planner(rec)
+    try:
+        assert _result(p, p.submit_choice("r1", 1.0, PERCEPTION, CANDIDATES, default="f1", gravity_g=3.0)).ok
+        assert _result(p, p.submit_interpretation("r2", 1.0, PERCEPTION, SLIP, None, OPTIONS, gravity_g=0.5)).ok
+        assert _result(p, p.submit_description("r3", 1.0, PERCEPTION, TRACK, None, gravity_g=1.0)) is not None
+        assert _result(p, p.submit_choice("r1", 2.0, PERCEPTION, CANDIDATES, default="f1")).ok
+        assert _result(p, p.submit_command(3.0, "rover 2 go to 10, -5", FLEET, gravity_g=0.5)) is not None
+        assert _result(p, p.submit_answer("r2", 3.0, "what have you found?", "finds", ANSWER_FACTS, "RULES",
+                                          gravity_g=1.0)) is not None
+        assert _result(p, p.submit_command(4.0, "rover 2 go to 10, -5", FLEET)) is not None
+    finally:
+        p.close()
+    (k1, s1), (k2, s2), (k3, s3), (k4, s4), (k5, s5), (k6, s6), (k7, s7) = rec.systems
+    assert (k1, k2, k3, k4, k5, k6, k7) == ("choice", "interpretation", "describe", "choice", "command", "answer",
+                                            "command")
+    assert "super-Earth (gravity 3 g," in s1 and "planet (gravity 0.5 g," in s2 and "planet (gravity 1 g," in s3
+    assert s4 == g.SYSTEM_CHOICE and s7 == g.SYSTEM_COMMAND          # the default is 2 g, as before
+    assert s5 == g.SYSTEM_COMMAND.replace("a super-Earth", "a planet")
+    assert s6 == g.SYSTEM_ANSWER.replace("a super-Earth", "a planet")
+
+
+def test_advisor_sends_the_configured_gravity():
+    from redshift.sim import Simulation
+    rec = SystemRecorder()
+    p = _planner(rec)
+    legacy = dict(map_size=80.0, water=False, spires=False, lifeforms=False, drill_s=3.0, scoop_s=3.0, sniffer_s=3.0,
+                  swab_s=3.0, sample_capacity=99, num_boulders=12)            # test_brain.py's scripted world
+    sim = Simulation(Config(seed=42, gravity_g=1.0, plan_clock="model", operator_ask_first=False, **legacy),
+                     planner=p, frame_source=lambda rid: JPEG, wait_for_gemma=True)
+    try:
+        sim.run_for(12.0)
+        r = sim.rovers[0]
+        r.on_anomaly(sim.t, "slip", {"slip": 0.82, "wheel_speed": 0.61, "ground_speed": 0.11}, "Testing.")
+        sim.step()
+        sim.advisor.operator_message("rover 1 hold")                    # Gemma parses a command
+        sim.advisor.operator_message("what have you found?", "r1")      # then a question, answered by Gemma
+        for _ in range(12):
+            sim.step()
+    finally:
+        p.close()
+        sim.close()
+    kinds = [k for k, _ in rec.systems]
+    assert {"interpretation", "command", "answer"} <= set(kinds), kinds
+    for kind, system in rec.systems:
+        if kind in ("choice", "interpretation", "describe"):
+            assert "planet (gravity 1 g," in system and "gravity 2 g" not in system, kind
+        else:
+            assert "a planet" in system and "super-Earth" not in system, kind

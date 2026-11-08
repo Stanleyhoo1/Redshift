@@ -18,16 +18,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import Config
+from .config import REACH_SLOPE, TARGET_PATH_SLOPE, Config  # noqa: F401 (the 2 g values, still importable here)
 
 KINDS = ("mineral", "ice", "vent")            # kinds placed in clusters; "trace" is placed near herds
 ALL_KINDS = ("mineral", "ice", "vent", "trace")
 INSTRUMENT = {"mineral": "drill", "ice": "scoop", "vent": "sniffer", "trace": "swab"}
 BREACH_STRETCH = 1.5   # crater bowl is (1 + this) times longer in the breach direction
 BREACH_WIDTH = 0.7     # angular half width of the breach (rad)
-TARGET_PATH_SLOPE = 15.0   # every target can be reached from the lander without crossing steeper ground
 KIND_LABEL = {"mineral": "mineral outcrop", "ice": "ice deposit", "vent": "thermal vent", "trace": "organic trace"}
-REACH_SLOPE = 18.0         # flood fill slope for the "no traps" checks of lakes and rivers
 VALUE_RANGE = {"mineral": (2, 7), "ice": (3, 7), "vent": (3, 7), "trace": (6, 10)}   # plus 2 jackpots (8, 9)
 # on-board analysis results, by kind and value tier (low <= 4, mid 5 to 7, high >= 8)
 ANALYSIS = {
@@ -178,7 +176,7 @@ class Terrain:
         self.truth_nospire = self._with_rocks()           # terrain and rocks
         self.spires = self._make_spires(frng) if cfg.spires else []
         self.truth_heights = self.with_spires(self.truth_nospire, self.spires)
-        self.reach = self.reachable(TARGET_PATH_SLOPE)
+        self.reach = self.reachable(cfg.target_path_slope_deg)    # every target reachable without steeper ground
         self.herds = self._make_herds(frng) if cfg.lifeforms else []
         self.targets = self._make_targets(rng)
         self._add_traces(frng)
@@ -494,7 +492,7 @@ class Terrain:
     def _no_trap(self, H: np.ndarray, wet: np.ndarray, reach0: np.ndarray) -> bool:
         """True if every sample reachable before (reach0) is still reachable with this water, apart
         from the water itself and a small margin around it."""
-        ok = (slope_deg(H, self.res) <= REACH_SLOPE) & ~wet
+        ok = (slope_deg(H, self.res) <= self.cfg.reach_slope_deg) & ~wet
         reach = self.flood(ok)
         k = 4
         near = np.zeros_like(wet)
@@ -513,7 +511,7 @@ class Terrain:
         scale = cfg.map_size / 80.0
         n_lakes = 1 if self.area < 1.5 else int(frng.integers(1, 3))
         H = self.heights
-        reach0 = self.flood(slope_deg(H, self.res) <= REACH_SLOPE)
+        reach0 = self.flood(slope_deg(H, self.res) <= cfg.reach_slope_deg)
         sl0 = slope_deg(H, self.res)
         X, Y = self.X, self.Y
         tries = [(12.0, 20.0, 1.5)] * 120 + [(14.0, 24.0, 2.2)] * 120 + [(17.0, 28.0, 3.2)] * 200
