@@ -135,7 +135,8 @@ export function Lander() {
     // Docked rovers' tags land on the lander tag on screen: slide it down out from under
     // them (checked a few times a second, it reads layout).
     const el = tag.current
-    if (el && el.parentElement && (tick.current = (tick.current + 1) % 8) === 0) {
+    if (el && el.parentElement && clock.elapsedTime - tick.current > 0.25) {
+      tick.current = clock.elapsedTime
       const tr = el.parentElement.getBoundingClientRect()
       let push = 0
       for (const r of document.querySelectorAll('.rover-tag')) {
