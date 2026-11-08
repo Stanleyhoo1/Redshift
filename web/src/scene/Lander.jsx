@@ -121,6 +121,8 @@ export function Lander() {
 
   const bulb = useRef()
   const beam = useRef()
+  const tag = useRef()
+  const tick = useRef(0)
   useFrame(({ clock }) => {
     if (!lander || !group.current) return
     const g = sampleGroundNear(simStore.get().terrain, lander.x, lander.y, 10) ?? 0
@@ -130,6 +132,21 @@ export function Lander() {
     fx.bulbMat.opacity = 0.35 + 0.65 * blink
     fx.beamMat.opacity = 0.15 + 0.75 * blink
     if (beam.current) beam.current.scale.setScalar(0.9 + 0.5 * blink)
+    // Docked rovers' tags land on the lander tag on screen: slide it down out from under
+    // them (checked a few times a second, it reads layout).
+    const el = tag.current
+    if (el && el.parentElement && (tick.current = (tick.current + 1) % 8) === 0) {
+      const tr = el.parentElement.getBoundingClientRect()
+      let push = 0
+      for (const r of document.querySelectorAll('.rover-tag')) {
+        const b = r.getBoundingClientRect()
+        if (b.width && b.right > tr.left && b.left < tr.right && b.bottom > tr.top && b.top < tr.bottom) push = Math.max(push, Math.round(b.bottom - tr.top + 2))
+      }
+      if (push !== (Number(el.dataset.push) || 0)) {
+        el.dataset.push = String(push)
+        el.style.transform = push ? `translateY(${push}px)` : ''
+      }
+    }
   })
 
   if (!lander) return null
@@ -148,7 +165,7 @@ export function Lander() {
         {/* Below the pad (on screen), so it does not collide with the tags of docked rovers above them. */}
         {labelsReady && (
           <Html position={[0, 0.3, R + 1.1]} center zIndexRange={[11, 0]} style={{ pointerEvents: 'none' }}>
-            <div className="lander-tag">
+            <div className="lander-tag" ref={tag}>
               Lander
               {/* An empty cache shows just "Lander" (an empty tube next to a 0 read as "0 0"); the
                   sidebar's science score already says "Cache empty". */}

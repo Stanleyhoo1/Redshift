@@ -194,3 +194,8 @@
 .lander-tag:not(:hover) .lander-cache-word {
   display: none;
 }
+
+.rover-tag,
+.lander-tag {
+  transition: transform 0.25s ease;
+}
