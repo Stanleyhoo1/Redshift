@@ -216,3 +216,26 @@
   border-radius: 2px;
   background: var(--state);
 }
+
+/* ---- short screens: a tighter header. The tagline stays for screen readers and in the
+   wordmark's tooltip; the world facts sit right under the wordmark. */
+@media (max-height: 760px) {
+  .side-head {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+  .side-head .subtitle {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .side-head .facts {
+    margin-top: 6px;
+  }
+  .side-head .facts-biome {
+    margin-top: 1px;
+  }
+}

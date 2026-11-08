@@ -21,7 +21,7 @@ const RED = [255, 92, 70]
 function Wordmark() {
   const n = WORD.length
   return (
-    <h1 className="wordmark" aria-label={WORD}>
+    <h1 className="wordmark" aria-label={WORD} title="Autonomous super-Earth survey">
       {[...WORD].map((ch, i) => {
         const t = i / (n - 1)
         const k = Math.pow(t, 1.7)
