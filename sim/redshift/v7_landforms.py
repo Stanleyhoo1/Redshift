@@ -13,6 +13,8 @@ import math
 
 import numpy as np
 
+from . import v7_biomes
+
 K_MESAS, K_CANYON, K_BFIELD, K_PITS = 7101, 7102, 7104, 7105
 WALL_DEG = 65.0          # mesa and canyon wall steepness (well above any climb limit)
 LANDER_CLEAR = 20.0      # landforms keep at least this far from the lander (scaled down on small maps)
@@ -168,6 +170,8 @@ def _mesas(ter, h: np.ndarray, reach0: np.ndarray, taken: np.ndarray):
     area = ter.area
     n_mesa = max(1, int(round(int(rng.integers(1, 3)) * area)))
     n_butte = max(1, int(round(int(rng.integers(1, 4)) * area)))
+    n_mesa = v7_biomes.count(ter, "mesas", n_mesa)            # v7 biomes: 1.0 (no change) when off
+    n_butte = v7_biomes.count(ter, "mesas", n_butte)
     sizes = [("mesa", 6.0, 10.0)] * n_mesa + [("butte", 2.5, 4.5)] * n_butte
     out = []
     foot_all = np.zeros(h.shape, bool)
@@ -220,6 +224,7 @@ def _pits(ter, h: np.ndarray, reach0: np.ndarray, taken: np.ndarray):
     X, Y = ter.X, ter.Y
     clear = _clear_dist(ter)
     n = max(2, int(round(int(rng.integers(2, 5)) * ter.area)))
+    n = v7_biomes.count(ter, "pits", n)
     out = []
     foot_all = np.zeros(h.shape, bool)
     from .terrain import slope_deg
@@ -266,11 +271,13 @@ def apply(ter, h: np.ndarray) -> np.ndarray:
     mask = np.zeros(h.shape, bool)
     info = {}
     ter._canyon_line = None
-    if cfg.canyon:
+    if cfg.canyon and v7_biomes.has_canyon(ter):
         ter.heights = h
         h, foot, can = _canyon(ter, h, reach0)
         mask |= foot
         info["canyon"] = can
+    elif cfg.canyon:                                       # v7 biomes: this world's ground has no canyon
+        info["canyon"] = None
     if cfg.mesas:
         reach0 = reach0 & ~_dilate(mask, 4)
         h, foot, mesas = _mesas(ter, h, reach0, _dilate(mask, 6))
@@ -305,6 +312,7 @@ def make_boulder_fields(ter) -> list:
     half = cfg.map_size / 2.0
     clear = _clear_dist(ter)
     n_fields = max(1, int(round(1.4 * ter.area)))
+    n_fields = v7_biomes.count(ter, "boulder_fields", n_fields)
     per = 32 if ter.area <= 2.5 else max(12, int(32 * 2.25 / ter.area))
     rocks = []
     fields = []
