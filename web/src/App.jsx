@@ -10,9 +10,14 @@ import { RequestCards } from './components/RequestCards.jsx'
 import { FollowPill } from './components/FollowPill.jsx'
 import { CameraViewer } from './components/CameraViewer.jsx'
 import { SensorDetail } from './components/SensorDetail.jsx'
+import { SetupScreen } from './components/SetupScreen.jsx'
 import { startConnection, wsUrl } from './net/connection.js'
 import { appStore, simStore, useApp, useSim } from './state/store.js'
 import { stopPlacing } from './lib/placement.js'
+// v7 planet view (src/globe)
+import { GlobeFade } from './globe/GlobeFade.jsx'
+import { GlobeLegend } from './globe/GlobeLegend.jsx'
+import { globeShown, leaveGlobe, useViewMode } from './globe/viewMode.js'
 
 function Waiting() {
   const ready = useSim((s) => s.ready)
@@ -53,6 +58,8 @@ export default function App() {
   const roverMeta = useSim((s) => s.roverMeta)
   const followPaused = useApp((a) => a.followPaused)
   const modal = useApp((a) => a.modal)
+  const globe = useViewMode(globeShown) // v7: the planet is drawn instead of the sector
+  const placing = useApp((a) => !!a.placing) // a hazard is being placed: the question cards fold to strips
   const selectedRef = useRef(selected)
   selectedRef.current = selected
   const followRef = useRef(follow)
@@ -60,6 +67,12 @@ export default function App() {
 
   // Panning away pauses the follow (CameraRig sets appStore.followPaused); this resumes.
   const resumeFollow = useCallback(() => appStore.patch({ followPaused: false }), [])
+
+  // A folded question strip was opened: stop placing a hazard, or fly back down from the planet.
+  const expandRequests = useCallback(() => {
+    stopPlacing()
+    leaveGlobe()
+  }, [])
 
   const goOverview = useCallback(() => {
     setFollow(null)
@@ -73,7 +86,9 @@ export default function App() {
   // (while the follow is paused, it resumes instead).
   const select = useCallback(
     (id) => {
-      if (id && selectedRef.current === id) {
+      // v7: picked while on the planet: fly back down and open it (never a toggle-close).
+      const fromGlobe = id ? leaveGlobe() : false
+      if (id && selectedRef.current === id && !fromGlobe) {
         if (appStore.get().followPaused && followRef.current === id) resumeFollow()
         else goOverview()
         return
@@ -87,6 +102,7 @@ export default function App() {
   // Follow buttons, 3D clicks and number keys only ever open (never toggle closed); on
   // the paused rover they resume following it.
   const show = useCallback((id) => {
+    leaveGlobe() // v7: rovers live on the sector; from the planet this flies back down first
     setSelected(id)
     setFollow(id)
     appStore.patch({ followPaused: false })
@@ -97,6 +113,7 @@ export default function App() {
   // follow (the rover stays selected) instead of dropping it.
   const focusEvent = useCallback((e) => {
     if (!e?.at) return
+    leaveGlobe() // v7: events happen on the sector
     if (followRef.current) appStore.patch({ followPaused: true })
     setFocus({ x: e.at[0], y: e.at[1], key: `${e.key}:${performance.now()}`, hazard: e.level === 'hazard' })
   }, [])
@@ -108,6 +125,18 @@ export default function App() {
   }, [gen])
 
   useEffect(() => startConnection(), [])
+
+  // v7: while the sim waits for a launch, the setup screen is open and cannot be dismissed. The launched
+  // world's init (phase "running") closes it. An older sim never sends phase "setup". The phase decides,
+  // not how the screen was opened: whatever replaces or closes the forced screen during setup (another
+  // viewer, New mission, Esc) is put back at once.
+  const phase = useSim((s) => s.phase)
+  const setupForced = phase === 'setup'
+  useEffect(() => {
+    const forcedOpen = modal?.kind === 'setup' && !!modal.forced
+    if (phase === 'setup' && !forcedOpen) appStore.patch({ modal: { kind: 'setup', forced: true } })
+    else if (phase !== 'setup' && forcedOpen) appStore.patch({ modal: null })
+  }, [phase, modal])
 
   // After a reset the followed or selected rover may no longer exist.
   useEffect(() => {
@@ -151,32 +180,47 @@ export default function App() {
   }, [goOverview, show, resumeFollow])
 
   const paused = !!follow && followPaused
+  // Under a viewer or the setup screen the dashboard is inert: Tab cannot reach it (nor Reset sim or New
+  // mission behind the forced setup screen), and screen readers skip it.
+  const behind = !!modal || setupForced
   return (
     <div className="app">
-      <main className="view" data-follow-paused={paused || undefined}>
+      <main className="view" data-follow-paused={paused || undefined} inert={behind}>
         {/* Pixel ratio capped at 1.5: crisp with MSAA, and spares laptop GPUs on retina screens. */}
         <Canvas flat linear dpr={[1, 1.5]} camera={{ position: [0, 68, 46], fov: 42, near: 0.5, far: 2000 }} gl={{ antialias: true, powerPreference: 'high-performance' }}>
           <Scene view={view} follow={follow} overview={overview} selected={selected} onSelect={show} focus={focus} />
         </Canvas>
-        <DustHaze />
+        {/* v7: the fade between the sector and the planet; no dust veil over the planet */}
+        <GlobeFade />
+        {!globe && <DustHaze />}
         <div className="vignette" aria-hidden="true" />
         <ViewControls view={view} setView={setView} follow={follow} onSelect={show} onOverview={goOverview} />
         <div className="hud-top">
           <HazardPanel />
           <PlacementHint />
-          <RequestCards onSelect={show} />
+          <RequestCards onSelect={show} collapsed={globe || placing} onExpand={expandRequests} />
           <div className="banners">
             <ConnBanner />
             <DustBanner />
           </div>
         </div>
-        {selected ? <SensorPanel roverId={selected} onClose={closePanel} /> : <Legend slopeColors={view.slope} frontiers={view.frontiers} life={view.life} />}
-        {paused && <FollowPill roverId={follow} onResume={resumeFollow} />}
+        {/* v7: on the planet its own legend shows; an open sensor panel stays mounted but
+            hidden, so it comes back as it was; no follow pill over the planet */}
+        {globe && <GlobeLegend reality={view.reality} />}
+        {selected ? (
+          <div className="globe-keep" hidden={globe}>
+            <SensorPanel roverId={selected} onClose={closePanel} />
+          </div>
+        ) : (
+          !globe && <Legend slopeColors={view.slope} frontiers={view.frontiers} life={view.life} reality={view.reality} />
+        )}
+        {paused && !globe && <FollowPill roverId={follow} onResume={resumeFollow} />}
         <Waiting />
       </main>
-      <Sidebar follow={follow} selected={selected} onSelect={select} onFocusEvent={focusEvent} />
-      {modal?.kind === 'camera' && <CameraViewer key={`cam:${modal.rover}`} roverId={modal.rover} view={modal.view} />}
-      {modal?.kind === 'sensors' && <SensorDetail key={`sd:${modal.key}`} roverId={modal.rover} focus={modal.focus} />}
+      <Sidebar follow={follow} selected={selected} onSelect={select} onFocusEvent={focusEvent} inert={behind} />
+      {!setupForced && modal?.kind === 'camera' && <CameraViewer key={`cam:${modal.rover}`} roverId={modal.rover} view={modal.view} />}
+      {!setupForced && modal?.kind === 'sensors' && <SensorDetail key={`sd:${modal.key}`} roverId={modal.rover} focus={modal.focus} />}
+      {(setupForced || modal?.kind === 'setup') && <SetupScreen key={setupForced ? 'setup-forced' : 'setup'} forced={setupForced} />}
     </div>
   )
 }

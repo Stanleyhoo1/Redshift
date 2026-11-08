@@ -46,6 +46,8 @@ def _wrap(a: float) -> float:
 
 
 class Creature:
+    kind = "grazer"           # v7 life variety sets another kind on the creature (v7_life.py)
+
     def __init__(self, cid: str, herd, mocap: int, x: float, y: float, yaw: float, size: float, cruise: float,
                  rng: np.random.Generator):
         self.id = cid
@@ -71,6 +73,11 @@ class Creature:
         self.bumped = -1e9
 
     def to_msg(self) -> dict:
+        if self.kind != "grazer":
+            from .v7_life import msg_extra
+            return {"id": self.id, "kind": self.kind, "x": round(self.x, 2), "y": round(self.y, 2),
+                    "z": round(self.z, 2), "yaw": round(self.yaw, 3), "speed": round(self.speed, 2),
+                    "size": round(self.size, 2), **msg_extra(self)}
         return {"id": self.id, "kind": "grazer", "x": round(self.x, 2), "y": round(self.y, 2), "z": round(self.z, 2),
                 "yaw": round(self.yaw, 3), "speed": round(self.speed, 2), "size": round(self.size, 2)}
 
@@ -79,6 +86,7 @@ class Herd:
     def __init__(self, spec):
         self.id = spec.id
         self.cx, self.cy, self.radius = spec.cx, spec.cy, spec.radius
+        self.kind = getattr(spec, "kind", "grazer")
         self.members: list = []
 
     def centre(self):
@@ -103,6 +111,10 @@ class LifeformManager:
                 if k >= len(mocaps):
                     break
                 c = Creature(f"l{k + 1}", h, mocaps[k], x, y, yaw, size, cruise, self.rng)
+                if h.kind != "grazer":
+                    from . import v7_life
+                    c.kind = h.kind
+                    v7_life.init_creature(self, h, c)
                 h.members.append(c)
                 self.creatures.append(c)
                 k += 1
@@ -129,6 +141,10 @@ class LifeformManager:
         return bool(self._rocky[j, i])
 
     def _place(self, c: Creature, t: float) -> None:
+        if c.kind != "grazer":
+            from . import v7_life
+            v7_life.place(self, c, t)
+            return
         d = self.sim.data
         c.z = self.ter.height_at(c.x, c.y)
         bob = 0.02 * math.sin(c.phase + 6.0 * t) if c.speed > 0.05 else 0.0
@@ -143,6 +159,10 @@ class LifeformManager:
         rng = self.rng
         for h in self.herds:
             if not h.members:
+                continue
+            if h.kind != "grazer":             # v7 life variety: the other kinds behave their own way
+                from . import v7_life
+                v7_life.step_herd(self, h, t, dt, rovers)
                 continue
             hx, hy = h.centre()
             for c in h.members:
@@ -322,11 +342,15 @@ class LifeformManager:
         herd.cx, herd.cy = x, y
         rng = self.rng
         placed = []
+        spread, sep = 2.2, 1.3
+        if herd.kind != "grazer":
+            from .v7_life import KINDS
+            spread, sep = KINDS[herd.kind].spread, KINDS[herd.kind].sep
         for c in herd.members:
             for _ in range(80):
-                rr, aa = float(rng.uniform(0.0, 2.2)), float(rng.uniform(0, 2 * math.pi))
+                rr, aa = float(rng.uniform(0.0, spread)), float(rng.uniform(0, 2 * math.pi))
                 px, py = x + rr * math.cos(aa), y + rr * math.sin(aa)
-                if self._bad(px, py) or any(math.hypot(px - qx, py - qy) < 1.3 for qx, qy in placed):
+                if self._bad(px, py) or any(math.hypot(px - qx, py - qy) < sep for qx, qy in placed):
                     continue
                 break
             else:
@@ -339,6 +363,9 @@ class LifeformManager:
             c.pause_until = 0.0                 # start walking at once, so the rovers see motion
             c.speed = c.cruise
             self._place(c, self.sim.t)
+        if herd.kind != "grazer":
+            from . import v7_life
+            v7_life.on_moved(self, herd, self.sim.t)
 
     def spot_ok(self, x: float, y: float) -> bool:
         """Can a herd stand around (x, y)?"""

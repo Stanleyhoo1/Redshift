@@ -655,8 +655,11 @@ function Readouts({ rover, limit }) {
         {spectro ? (
           <span className="sp-v">
             <i className="sw-diamond" style={{ '--c': ks?.color || '#e6edf5' }} />
-            {ks ? ks.label : 'Target'} {spectro.id}
-            {num(spectro.dist) && <span className="sp-dim">, {fixed(spectro.dist, 1)} m</span>}
+            {/* One inline span, so the row's flex gap does not open a space before the comma. */}
+            <span>
+              {ks ? ks.label : 'Target'} {spectro.id}
+              {num(spectro.dist) && <span className="sp-dim">, {fixed(spectro.dist, 1)} m</span>}
+            </span>
           </span>
         ) : (
           <span className="sp-v sp-dim">{s ? 'Nothing in range' : '--'}</span>

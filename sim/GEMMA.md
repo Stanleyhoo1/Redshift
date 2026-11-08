@@ -301,8 +301,13 @@ drops questions still queued about the old world.
   every 2 to 3 wall seconds at about 0.3 s each, plus the odd anomaly, sighting or command. One call
   runs at a time; typed commands go first, then answers to questions, then anomalies, then lifeform
   descriptions, then choices. A question costs two calls (reading it, then writing the answer).
-- Prompts are small (under 400 tokens plus the picture), answers short (JSON only, temperature 0,
-  thinking off).
+- Prompts are small (under 400 tokens plus the picture, for the default 3 rover fleet), answers short
+  (JSON only, temperature 0, thinking off).
+- Gravity (v7): the planner is shared across resets, so each request carries its world's gravity. Choices,
+  interpretations and descriptions state it in the system prompt ("an unknown super-Earth (gravity 2.5 g,
+  ..."; at 1 g and below "an unknown planet (gravity 1 g, ..."); commands and answers only name the world
+  ("a super-Earth", at 1 g and below "a planet"), since they may only quote their own inputs. At exactly
+  2 g every prompt is byte for byte as before v7.
 
 ## Settings (environment variables)
 
@@ -351,9 +356,15 @@ tk = gp.submit_interpretation("r1", t, perception, anomaly, jpeg_or_None,
                               ["reroute", "back_out", "proceed_slowly", "wait"], default="back_out")
 tk = gp.submit_command(t, "rover 2 go to 10, -5", fleet_context)   # rovers, targets, lander, bounds
 tk = gp.submit_answer("r2", t, "what have you found?", "finds", facts, default=rule_text)
+tk = gp.submit_choice("r1", t, perception, candidates, default="f1", gravity_g=1.0)   # v7, see below
 res = gp.poll(tk)                      # None while pending, then a Result; never blocks
 gp.stats(); gp.cancel()                # status badge; drop queued questions (on reset)
 ```
+
+Every `submit_*` call (and every `make_*_request`) takes a keyword `gravity_g` (default 2.0): the world's
+gravity in Earth g, written into that request's prompt as described under "Gravity" above. The advisor
+passes `cfg.gravity_g` unless it is exactly 2 g, so at 2 g the calls and prompts are the same as before
+v7.
 
 `res.ok` is True only for a valid Gemma answer; otherwise `res.source == "fallback"` and the result
 carries the caller's default (or the keyword parser's command). Choices: `res.choice`, `res.reason`,

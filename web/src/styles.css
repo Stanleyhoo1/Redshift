@@ -9,6 +9,8 @@
   --ink: #e8eef5;
   --ink-2: #aab7c7;
   --ink-3: #7b8aa0;
+  /* Grey for small text on the glass HUD panels, which can sit over light ground. */
+  --ink-3-hud: #8e9cb1;
   --signal: #4fe0ef;
   --amber: #f3b24a;
   --red: #f2594b;
@@ -95,8 +97,10 @@ code {
   height: 100vh;
   background: var(--panel);
   border-left: 1px solid var(--line);
-  /* Last resort on very short screens: scroll rather than clip. */
+  /* Last resort on very short screens: scroll rather than clip. Sideways it clips, so focusing
+     a tab can never scroll the whole sidebar left (hidden still allows a scripted scroll). */
   overflow-x: hidden;
+  overflow-x: clip;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--line-2) transparent;
@@ -557,11 +561,14 @@ code {
   flex: none;
   display: flex;
   gap: 4px;
+  min-width: 0;
   padding: 10px 12px 8px;
 }
 
 .tab {
   display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
   align-items: center;
   gap: 7px;
   padding: 5px 12px;
@@ -614,16 +621,21 @@ code {
   line-height: 18px;
 }
 
-/* A rover is waiting for an answer while you read the events: the tab calls you over. */
+/* A rover is waiting for an answer while you read the events: the tab calls you over. The
+   badge pulses a few times, then stays as the steady signal (questions can wait indefinitely),
+   and only the selected tab ever gets a frame. */
 .tab[data-ask] {
   color: var(--ink);
-  animation: tab-ask 1.8s ease-in-out infinite;
+}
+
+.tab[data-ask] .tab-ask {
+  animation: tab-ask 1.8s ease-in-out 4;
 }
 
 @keyframes tab-ask {
   50% {
-    background: rgba(79, 224, 239, 0.1);
-    box-shadow: inset 0 0 0 1px rgba(79, 224, 239, 0.6);
+    background: #8ef0fa;
+    box-shadow: 0 0 0 3px rgba(79, 224, 239, 0.28), 0 0 12px rgba(79, 224, 239, 0.45);
   }
 }
 
@@ -721,7 +733,7 @@ code {
 .hud {
   position: absolute;
   z-index: 30;
-  background: rgba(8, 12, 19, 0.8);
+  background: rgba(8, 12, 19, 0.88);
   -webkit-backdrop-filter: blur(10px);
   backdrop-filter: blur(10px);
   border: 1px solid var(--line-2);
@@ -877,6 +889,20 @@ code {
   font-weight: 600;
 }
 
+/* Follow with 4 to 8 rovers: Off and up to four rovers per row in even columns, not a ragged wrap that
+   leaves the last rover alone on a line. Three rovers keep the plain row above. */
+.seg.seg-follow-many {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.seg-follow-many button {
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 0;
+}
+
 .dot {
   display: inline-block;
   flex: none;
@@ -888,6 +914,18 @@ code {
 .reset {
   padding-top: 10px;
   border-top: 1px solid var(--line);
+}
+
+.reset-row {
+  display: flex;
+  gap: 8px;
+}
+
+.reset-row .btn {
+  flex: 1 1 0;
+  padding-left: 8px;
+  padding-right: 8px;
+  white-space: nowrap;
 }
 
 .reset-confirm > span {
@@ -990,6 +1028,13 @@ code {
   margin-top: 10px;
   padding-top: 9px;
   border-top: 1px solid var(--line);
+}
+
+/* v7 kinds of lifeform: three to a row so the legend keeps its width */
+.legend-row.legend-kinds {
+  display: grid;
+  grid-template-columns: repeat(3, max-content);
+  justify-content: start;
 }
 
 .sw {
@@ -1833,9 +1878,9 @@ code {
   margin: 0;
   padding: 0;
   list-style: none;
-  font-size: 10.5px;
+  font-size: 11.5px;
   line-height: 1.35;
-  color: var(--ink-3);
+  color: var(--ink-3-hud);
 }
 
 .sp-radar-key li {
@@ -2241,6 +2286,30 @@ code {
     --cam-h: 150px;
   }
   .sp-brain-budget-text {
+    display: none;
+  }
+}
+
+/* Short screens (720p, laptops) wide enough for it: the instrument panel starts right of the
+   control column (16 + 232 + 16), so it never covers Graphics, Reset sim or New mission. */
+@media (max-height: 820px) and (min-width: 1270px) {
+  .hud-sensors {
+    left: 264px;
+    max-width: calc(100% - 280px);
+    --cam-w: 184px;
+    --cam-h: 138px;
+    --read-w: 228px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  .hud-sensors .sp-body {
+    gap: 9px;
+  }
+  .hud-sensors .sp-cam-bar .seg-xs button {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+  .hud-sensors .sp-brain-budget-text {
     display: none;
   }
 }
@@ -2985,7 +3054,7 @@ code {
 .hud-request[data-kind='open'] {
   animation:
     rq-in 380ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    rq-glow 2.4s ease-in-out 400ms infinite;
+    rq-glow 2.4s ease-in-out 400ms 4;
 }
 
 .hud-request[data-kind='answered'] {
@@ -3071,7 +3140,7 @@ code {
   padding: 1px 6px;
   border-radius: 5px;
   background: rgba(4, 7, 11, 0.8);
-  font-size: 10.5px;
+  font-size: 11.5px;
   font-weight: 600;
   color: var(--ink-2);
   white-space: nowrap;
@@ -3690,6 +3759,9 @@ code {
   .hud-hazards[data-v4] .hz-btn {
     padding: 6px 8px;
   }
+  .hud-hazards[data-v4] .hz-status:not([data-kind]) {
+    -webkit-line-clamp: 1;
+  }
 }
 
 .banner-place {
@@ -4159,6 +4231,26 @@ kbd {
   color: var(--ink-3);
 }
 
+/* v7 biomes: the world's ground under its name, small. */
+.facts-biome {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 3px;
+  font-size: 12px;
+  font-weight: 450;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.facts-biome i {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
 /* The Samples tab. */
 .samples {
   flex: 1;
@@ -4348,17 +4440,28 @@ kbd {
   background: var(--c);
 }
 
-/* Compact rover cards: tubes sit between the state pill and the battery. */
+/* Compact rover cards: the tubes get a column of their own between an empty spacer and the
+   battery, so they can never slide over the state pill. The speed line below spans the tubes
+   and battery columns, so it no longer forces the battery column wider than the bar. */
 .rover-list[data-compact] .rover {
+  grid-template-columns: auto minmax(0, auto) auto minmax(0, 1fr) auto auto;
   grid-template-areas:
-    'dot name pill tubes batt'
-    '. goal goal goal speed';
+    'dot name pill . tubes batt'
+    '. goal goal goal speed speed';
 }
 
 .rover-list[data-compact] .tubes {
   grid-area: tubes;
   justify-self: end;
-  margin-left: 4px;
+  margin-left: 0;
+}
+
+.rover-list[data-compact] .rover-speed {
+  justify-self: end;
+}
+
+.rover-list[data-compact] .battery {
+  width: 80px;
 }
 
 /* 720p with sample science: four facts on one line (the gravity and time values speak for
@@ -4447,7 +4550,7 @@ kbd {
 .hud-request[data-kind='open'][data-wait] {
   animation:
     rq-in 380ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    rq-glow 4.8s ease-in-out 400ms infinite;
+    rq-glow 4.8s ease-in-out 400ms 2;
 }
 
 .rq-bar[data-wait] {
@@ -5386,5 +5489,86 @@ kbd {
 @media (min-width: 1500px) {
   :root {
     --side-w: 430px;
+  }
+}
+
+/* ---------------------------------------------------------------- polish: small grey text on the HUD glass */
+
+.hud .hud-label,
+.hud .ramp-ends,
+.hud .legend-hint,
+.hud .legend-sub {
+  color: var(--ink-3-hud);
+}
+
+/* The question badge on the Comms tab is just the count: a round cyan chip. */
+.tab-ask {
+  min-width: 18px;
+  text-align: center;
+}
+
+/* Sampling progress inside the rover's tag (replaces the separate chip over the target). */
+.rover-tag-samp {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+  padding-left: 7px;
+  border-left: 1px solid var(--line-2);
+  color: var(--ink-2);
+  font-weight: 560;
+}
+
+.rover-tag-samp .instr-icon,
+.rover-tag-samp b {
+  color: var(--c);
+}
+
+.rover-tag-samp b {
+  font-weight: 700;
+}
+
+/* The "Waiting for the simulation" card centres in the map area right of the controls column,
+   so the controls never cover its left edge. */
+@media (min-width: 861px) {
+  .waiting {
+    padding-left: calc(232px + 32px);
+  }
+}
+
+/* Event log: Gemma's quoted reasoning on its own clamped line, and the "show where" icon in
+   the row's top-right corner instead of trailing alone on a line of its own. */
+.ev-why {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-top: 2px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 1.38;
+}
+
+.ev-btn {
+  position: relative;
+  padding-right: 28px;
+}
+
+.ev-btn .ev-goto {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  margin: 0;
+  opacity: 0.55;
+}
+
+.ev-btn:hover .ev-goto,
+.ev-btn:focus-visible .ev-goto {
+  opacity: 1;
+}
+
+@media (max-height: 820px) {
+  .ev {
+    font-size: 13.5px;
   }
 }

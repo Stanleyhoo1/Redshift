@@ -420,6 +420,10 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
     ox, oy = cfg.origin
     spans_i = _tile_spans(cfg.nx, cfg.hfield_tile)
     spans_j = _tile_spans(cfg.ny, cfg.hfield_tile)
+    from . import v7_biomes
+
+    def _secondary(x: float, y: float) -> bool:          # v7 biomes: tiles in the secondary region
+        return v7_biomes.tile_biome(terrain, x, y) == "secondary"
 
     assets, geoms, tile_meta = [], [], []
     for (j0, j1) in spans_j:
@@ -437,7 +441,7 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
             )
             geoms.append(
                 f'<geom name="g_{name}" type="hfield" hfield="{name}" pos="{cxw:.4f} {cyw:.4f} {lo:.4f}" '
-                f'material="{visuals.ground_material(i0, j0, cfg.seed)}" group="{GROUP_TERRAIN}" '
+                f'material="{visuals.ground_material(i0, j0, cfg.seed, _secondary(cxw, cyw))}" group="{GROUP_TERRAIN}" '
                 f'friction="{cfg.terrain_friction} 0.005 0.0001"/>'
             )
             tile_meta.append((j0, i0, j1 - j0 + 1, i1 - i0 + 1, lo, rz))
@@ -471,6 +475,12 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
             f'pos="{rock.x:.3f} {rock.y:.3f} {rock.z:.3f}" euler="0 0 {rock.yaw:.3f}" material="rock" '
             f'group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/>'
         )
+    for k, rock in enumerate(getattr(terrain, "bfield", None) or []):     # v7 boulder fields
+        geoms.append(
+            f'<geom name="bfield_{k}" type="ellipsoid" size="{rock.sx:.3f} {rock.sy:.3f} {rock.sz:.3f}" '
+            f'pos="{rock.x:.3f} {rock.y:.3f} {rock.z:.3f}" euler="0 0 {rock.yaw:.3f}" material="rock" '
+            f'group="{GROUP_ROCK}" friction="0.8 0.005 0.0001"/>'
+        )
 
     decor = []
     for t in terrain.targets:
@@ -495,6 +505,10 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
                 geoms.append(f'<geom name="water_{w.id}_{k}" type="box" size="{hl:.3f} {hw:.3f} 0.01" '
                              f'pos="{bx:.3f} {by:.3f} {w.level - 0.01 - 0.0007 * k:.4f}" euler="0 0 {yaw:.4f}" '
                              f'material="water" group="{GROUP_WATER}" contype="0" conaffinity="0"/>')
+
+    if getattr(cfg, "geysers", False):              # v7 geyser vent cones (seen by LiDAR, solid)
+        from .v7_geysers import vent_geoms_xml
+        geoms += vent_geoms_xml(getattr(terrain, "geysers", []))
 
     bodies, actuators, sensors, rover_ids = [], [], [], []
     z0 = rover_spawn_height(cfg)
@@ -532,14 +546,26 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
                                          [(0.5, 0.45, 0.8, 0.18), (2.9, 0.5, 0.6, 0.16)], crystal_meshes))
 
     bodies += decor                 # what the targets look like to the camera (static, visual only)
+    if getattr(terrain, "flora", None):     # v7 alien flora: static proxies and decor
+        from . import v7_flora
+        geoms.append(v7_flora.geoms_xml(terrain.flora))
 
     # lifeforms (lifeforms.py moves them)
     life_names = []
     for h in getattr(terrain, "herds", []):
+        kind = getattr(h, "kind", "grazer")
         for k, (x, y, yaw, size, _speed) in enumerate(h.members):
             name = f"life_{h.id}_{k}"
             life_names.append(name)
-            bodies.append(creature_body_xml(name, x, y, float(terrain.height_at(x, y)), yaw, size))
+            if kind == "grazer":
+                bodies.append(creature_body_xml(name, x, y, float(terrain.height_at(x, y)), yaw, size))
+            else:                   # v7 life variety: the other kinds (v7_life.py)
+                from . import v7_life
+                bodies.append(v7_life.body_xml(kind, name, x, y, float(terrain.height_at(x, y)), yaw, size,
+                                               GROUP_TARGET, _yaw_quat))
+    if any(getattr(h, "kind", "grazer") != "grazer" for h in getattr(terrain, "herds", [])):
+        from . import v7_life
+        assets.append(v7_life.materials_xml(terrain))
 
     span = cfg.map_size
     xml = f"""
@@ -557,7 +583,7 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
     {visuals.crystal_mesh("mineral_xtal", 0.26, 0.035, 0.06)}
   </asset>
   <worldbody>
-    {visuals.lights_xml()}
+    {visuals.lights_xml(cfg)}
     {''.join(geoms)}
     {''.join(bodies)}
   </worldbody>

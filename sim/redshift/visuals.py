@@ -43,6 +43,7 @@ SHADOW_SIZE = 2048
 
 REGOLITH_PX = 1024
 REGOLITH_VARIANTS = 4
+SECONDARY_VARIANTS = 2             # v7 biomes: regolith variants of the secondary biome's ground
 ROCK_PX = 256
 SOLAR_PX = 128
 SKY_PX = 512
@@ -134,7 +135,9 @@ def _shade_discs(img: np.ndarray, xs, ys, rs, alphas, factor: float) -> np.ndarr
 
 
 # ====================================================================== textures
-def _regolith(seed: int, px: int, variants: int) -> list:
+def _regolith(seed: int, px: int, variants: int, soil: dict | None = None, vseed: int = 0) -> list:
+    """soil: a v7 biome's colours (v7_biomes.BIOMES[id]["soil"]); None is today's ochre-rust soil.
+    vseed: offset for the variant streams (the secondary biome's variants differ from the primary's)."""
     rng = np.random.default_rng(1000 + seed)
     tint = 1.0 + 0.04 * (rng.random(3) - 0.5)                  # each planet a slightly different soil
     low = _fbm(px, 2, 3, rng)                                  # patches 1 to 2.5 m
@@ -145,6 +148,10 @@ def _regolith(seed: int, px: int, variants: int) -> list:
     light = np.array([0.72, 0.63, 0.55], np.float32)
     grey = np.array([0.55, 0.53, 0.51], np.float32)
     redd = np.array([0.64, 0.48, 0.39], np.float32)
+    peb = ([0.30, 0.26, 0.23], [0.60, 0.54, 0.47], [0.45, 0.33, 0.25])
+    if soil is not None:
+        dark, light, grey, redd = (np.array(soil[k], np.float32) for k in ("dark", "light", "grey", "tint"))
+        peb = tuple(list(c) for c in soil["pebbles"])
 
     def colour(lowf, rustf):
         b = np.clip(0.52 + 1.15 * lowf + 0.55 * mid + 0.45 * grain, 0.0, 1.0)[..., None]
@@ -160,8 +167,7 @@ def _regolith(seed: int, px: int, variants: int) -> list:
     px_, py_ = rng.random(n) * px, rng.random(n) * px
     pr = px / 1024.0 * (0.6 + 3.2 * rng.random(n) ** 4)
     c = rng.random(n)
-    prgb = np.where((c < 0.55)[:, None], [0.30, 0.26, 0.23], np.where((c < 0.8)[:, None], [0.60, 0.54, 0.47],
-                                                                       [0.45, 0.33, 0.25]))
+    prgb = np.where((c < 0.55)[:, None], peb[0], np.where((c < 0.8)[:, None], peb[1], peb[2]))
     prgb = prgb * (0.85 + 0.3 * rng.random(n))[:, None]
     pa = 0.3 + 0.35 * rng.random(n)
     big = pr > 1.6
@@ -172,7 +178,7 @@ def _regolith(seed: int, px: int, variants: int) -> list:
     win = (wv[:, None] * wv[None, :])
     out = []
     for k in range(variants):
-        vr = np.random.default_rng(2000 + 97 * seed + k)
+        vr = np.random.default_rng(2000 + 97 * seed + k + vseed)
         if k == 0:
             img = base.copy()
         else:
@@ -187,18 +193,19 @@ def _regolith(seed: int, px: int, variants: int) -> list:
             m = n // 3
             ex, ey = (0.2 + 0.6 * vr.random(m)) * px, (0.2 + 0.6 * vr.random(m)) * px
             er = px / 1024.0 * (0.6 + 3.5 * vr.random(m) ** 4)
-            ergb = np.array([0.30, 0.26, 0.23]) * (0.85 + 0.3 * vr.random(m))[:, None]
+            ergb = np.array(peb[0]) * (0.85 + 0.3 * vr.random(m))[:, None]
             img = _paint_discs(img, ex, ey, er, ergb, 0.3 + 0.35 * vr.random(m))
         out.append(np.clip(img * 255.0, 0, 255).astype(np.uint8))
     return out
 
 
-def _rock(seed: int, px: int) -> np.ndarray:
+def _rock(seed: int, px: int, rock=None) -> np.ndarray:
     rng = np.random.default_rng(3000 + seed)
     a = _fbm(px, 4, 5, rng, 0.6)
     spots = _fbm(px, 32, 2, rng)
     b = np.clip(0.55 + 1.2 * a + 0.5 * spots, 0.0, 1.0)[..., None]
-    img = np.array([0.20, 0.17, 0.15]) + np.array([0.36, 0.31, 0.27]) * b
+    base, span = ((0.20, 0.17, 0.15), (0.36, 0.31, 0.27)) if rock is None else rock
+    img = np.array(base) + np.array(span) * b
     return np.clip(img * 255.0, 0, 255).astype(np.uint8)
 
 
@@ -228,18 +235,19 @@ def _solar(px: int) -> np.ndarray:
     return np.clip(img * 255.0, 0, 255).astype(np.uint8)
 
 
-def sky_colour(d: np.ndarray) -> np.ndarray:
-    """Sky colour (0..1) for unit view directions d (..., 3) in world coordinates (z up)."""
+def sky_colour(d: np.ndarray, sky: dict | None = None) -> np.ndarray:
+    """Sky colour (0..1) for unit view directions d (..., 3) in world coordinates (z up). sky: a v7
+    biome's sky colours (None: today's rust sky)."""
     el = np.degrees(np.arcsin(np.clip(d[..., 2], -1.0, 1.0)))
     e = np.maximum(el, 0.0)
-    zen = np.array([0.17, 0.08, 0.07])
-    mid = np.array([0.42, 0.24, 0.17])
-    hor = np.array(HORIZON_RGB)
+    zen = np.array([0.17, 0.08, 0.07] if sky is None else sky["zen"])
+    mid = np.array([0.42, 0.24, 0.17] if sky is None else sky["mid"])
+    hor = np.array(HORIZON_RGB if sky is None else sky["hor"])
     f1 = np.exp(-e / 6.0)[..., None]                         # bright haze band at the horizon
     f2 = np.exp(-e / 30.0)[..., None]
     c = zen * (1 - f2) + mid * f2 * (1 - f1) + hor * f1
     below = np.clip(-el / 8.0, 0.0, 1.0)[..., None]          # under the horizon: dusty ground haze
-    c = c * (1 - below) + np.array([0.46, 0.31, 0.23]) * below
+    c = c * (1 - below) + np.array([0.46, 0.31, 0.23] if sky is None else sky["below"]) * below
     cosg = np.clip((d * TO_SUN).sum(-1), -1.0, 1.0)
     g = np.degrees(np.arccos(cosg))
     glow = (0.55 * np.exp(-g / 3.0) + 0.22 * np.exp(-g / 14.0))[..., None]
@@ -249,7 +257,7 @@ def sky_colour(d: np.ndarray) -> np.ndarray:
     return np.clip(c, 0.0, 1.0)
 
 
-def _sky(px: int) -> np.ndarray:
+def _sky(px: int, sky: dict | None = None) -> np.ndarray:
     """Cube map in MuJoCo's face order (+x, -x, up, down, -y, +y), as found by rendering a
     direction-coded test cube: side faces have row 0 at the top and column 0 on the right."""
     r = (np.arange(px) + 0.5) / px
@@ -261,30 +269,61 @@ def _sky(px: int) -> np.ndarray:
     out = []
     for f in faces:
         d = f / np.linalg.norm(f, axis=-1, keepdims=True)
-        out.append(sky_colour(d))
+        out.append(sky_colour(d, sky))
     return np.clip(np.concatenate(out, 0) * 255.0, 0, 255).astype(np.uint8)
 
 
-def textures(seed: int) -> dict:
-    """{texture name: uint8 array (h, w, 3)} for this seed (cached)."""
-    key = int(seed)
+def textures(seed: int, biome=None) -> dict:
+    """{texture name: uint8 array (h, w, 3)} for this seed (cached). biome: (primary, secondary) v7 biome
+    ids, or None for today's look. With a biome the soil, rocks and sky take its colours, and the secondary
+    biome's ground gets SECONDARY_VARIANTS more regolith textures."""
+    from . import v7_biomes
+    key = int(seed) if biome is None else (int(seed), *biome)
     hit = _CACHE.get(key)
     if hit is not None:
         _CACHE.move_to_end(key)
         return hit
-    out = {f"regolith{k}": img for k, img in enumerate(_regolith(key, REGOLITH_PX, REGOLITH_VARIANTS))}
-    out["rocktex"] = _rock(key, ROCK_PX)
+    seed = int(seed)
+    if biome is None:
+        out = {f"regolith{k}": img for k, img in enumerate(_regolith(seed, REGOLITH_PX, REGOLITH_VARIANTS))}
+        out["rocktex"] = _rock(seed, ROCK_PX)
+        sky_key, sky_cols = "sky", None
+    else:
+        p, sec = (v7_biomes.BIOMES[b] for b in biome)
+        out = {f"regolith{k}": img for k, img in
+               enumerate(_regolith(seed, REGOLITH_PX, REGOLITH_VARIANTS, p["soil"]))}
+        for k, img in enumerate(_regolith(seed + 1, REGOLITH_PX, SECONDARY_VARIANTS, sec["soil"], vseed=7)):
+            out[f"regolith{REGOLITH_VARIANTS + k}"] = img
+        out["rocktex"] = _rock(seed, ROCK_PX, p["rock"])
+        sky_key, sky_cols = ("sky", biome[0]), p["sky"]
     out["watertex"] = _water(WATER_PX)
     out["solartex"] = _solar(SOLAR_PX)
-    sky = _CACHE.get("sky")
+    sky = _CACHE.get(sky_key)
     if sky is None:
-        sky = _CACHE["sky"] = _sky(SKY_PX)
+        sky = _CACHE[sky_key] = _sky(SKY_PX, sky_cols)
     out["sky"] = sky
     _CACHE[key] = out
-    while len(_CACHE) > 5:
-        old = next(k for k in _CACHE if k != "sky")
+    while sum(1 for k in _CACHE if not _is_sky(k)) > 5:
+        old = next(k for k in _CACHE if not _is_sky(k))
         del _CACHE[old]
     return out
+
+
+def _is_sky(k) -> bool:
+    return k == "sky" or (isinstance(k, tuple) and len(k) == 2 and k[0] == "sky")
+
+
+def biome_of(cfg):
+    """(primary, secondary) v7 biome ids, or None with biomes off."""
+    from . import v7_biomes
+    return v7_biomes.pick(cfg)
+
+
+def horizon_rgb(cfg) -> tuple:
+    """The haze and distance fog colour: the biome's horizon, else today's HORIZON_RGB."""
+    from . import v7_biomes
+    b = biome_of(cfg)
+    return HORIZON_RGB if b is None else tuple(v7_biomes.BIOMES[b[0]]["sky"]["hor"])
 
 
 # ====================================================================== MJCF pieces
@@ -296,8 +335,8 @@ def visual_xml(cfg) -> str:
             f'<global offwidth="1280" offheight="720" elevation="-25" azimuth="135"/>'
             f'<map znear="0.02" zfar="{span * 3:.0f}" haze="0.12" fogstart="0.2" fogend="1.5" shadowclip="1.0"/>'
             f'<quality shadowsize="{SHADOW_SIZE}" numslices="20" numstacks="12"/>'
-            f'<headlight ambient="{_hex(HEAD_AMBIENT)}" diffuse="{_hex(HEAD_DIFFUSE)}" specular="0.04 0.04 0.04"/>'
-            f'<rgba haze="{_hex(HORIZON_RGB)} 1" fog="{_hex(HORIZON_RGB)} 1"/>'
+            f'<headlight ambient="{_hex(_light(cfg)[1])}" diffuse="{_hex(HEAD_DIFFUSE)}" specular="0.04 0.04 0.04"/>'
+            f'<rgba haze="{_hex(horizon_rgb(cfg))} 1" fog="{_hex(horizon_rgb(cfg))} 1"/>'
             f'</visual>')
 
 
@@ -310,6 +349,12 @@ def asset_xml(cfg) -> str:
                      f'width="{rp}" height="{rp}"/>')
         parts.append(f'<material name="ground{k}" texture="regolith{k}" texrepeat="1 1" texuniform="false" '
                      f'specular="0.06" shininess="0.15" reflectance="0"/>')
+    if biome_of(cfg) is not None:                              # v7 biomes: the secondary ground
+        for k in range(REGOLITH_VARIANTS, REGOLITH_VARIANTS + SECONDARY_VARIANTS):
+            parts.append(f'<texture name="regolith{k}" type="2d" builtin="flat" rgb1="0.55 0.38 0.27" '
+                         f'width="{rp}" height="{rp}"/>')
+            parts.append(f'<material name="ground{k}" texture="regolith{k}" texrepeat="1 1" texuniform="false" '
+                         f'specular="0.06" shininess="0.15" reflectance="0"/>')
     parts += [
         f'<texture name="rocktex" type="2d" builtin="flat" rgb1="0.35 0.3 0.27" width="{kp}" height="{kp}"/>',
         f'<texture name="solartex" type="2d" builtin="flat" rgb1="0.05 0.08 0.17" width="{sp}" height="{sp}"/>',
@@ -360,22 +405,35 @@ def target_material_xml(kind: str, rgba: str) -> str:
             f'emission="{TARGET_EMISSION}"/>')
 
 
-def lights_xml() -> str:
+def _light(cfg) -> tuple:
+    """(sun colour, ambient) of this world: the v7 biome's, else today's warm ones."""
+    from . import v7_biomes
+    b = biome_of(cfg) if cfg is not None else None
+    if b is None:
+        return SUN_RGB, HEAD_AMBIENT
+    lt = v7_biomes.BIOMES[b[0]]["light"]
+    return tuple(lt["sun"]), tuple(lt["ambient"])
+
+
+def lights_xml(cfg=None) -> str:
     """Sun (casts shadows; its position is upstream of the map so the viewer's shadow box covers it;
     camera.py moves it in front of each camera) and a weak sky fill from the other side."""
     p = -SUN_DIR * 90.0
     fill = np.array([-SUN_DIR[0], -SUN_DIR[1], -0.8])
     fill /= np.linalg.norm(fill)
     return (f'<light name="sun" directional="true" pos="{p[0]:.2f} {p[1]:.2f} {p[2]:.2f}" '
-            f'dir="{SUN_DIR[0]:.4f} {SUN_DIR[1]:.4f} {SUN_DIR[2]:.4f}" diffuse="{_hex(SUN_RGB)}" '
+            f'dir="{SUN_DIR[0]:.4f} {SUN_DIR[1]:.4f} {SUN_DIR[2]:.4f}" diffuse="{_hex(_light(cfg)[0])}" '
             f'specular="0.35 0.3 0.25" ambient="0.06 0.04 0.03" castshadow="true"/>'
             f'<light name="skyfill" directional="true" pos="0 0 60" dir="{fill[0]:.4f} {fill[1]:.4f} {fill[2]:.4f}" '
             f'diffuse="{_hex(SKY_FILL_RGB)}" specular="0 0 0" castshadow="false"/>')
 
 
-def ground_material(i0: int, j0: int, seed: int) -> str:
-    """Which regolith variant a heightfield tile uses (a fixed hash, so the pattern does not repeat)."""
+def ground_material(i0: int, j0: int, seed: int, secondary: bool = False) -> str:
+    """Which regolith variant a heightfield tile uses (a fixed hash, so the pattern does not repeat).
+    secondary: the tile lies in the v7 secondary biome's region (its own variants)."""
     h = (i0 * 73856093) ^ (j0 * 19349663) ^ (seed * 83492791)
+    if secondary:
+        return f"ground{REGOLITH_VARIANTS + (h >> 3) % SECONDARY_VARIANTS}"
     return f"ground{(h >> 3) % REGOLITH_VARIANTS}"
 
 
@@ -408,7 +466,7 @@ def paint(model, cfg) -> None:
     """Fill the procedural textures into the compiled model and set the fog in metres."""
     import mujoco
 
-    for name, img in textures(cfg.seed).items():
+    for name, img in textures(cfg.seed, biome_of(cfg)).items():
         tid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_TEXTURE, name)
         if tid < 0:
             continue

@@ -2,16 +2,28 @@ import { useSim } from '../state/store.js'
 import { degrees, fixed } from '../lib/format.js'
 import { KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
 import '../styles/scene.css'
+import { TerrainLegend } from './TerrainLegend.jsx'
+import { biomeOf, groundSwatch } from '../lib/biomes.js'
+import { KIND_LOOK, legendKinds } from '../scene/lifeKinds.js'
+import { LegendToggle, useLegendOpen } from './LegendToggle.jsx'
 
-export function Legend({ slopeColors, frontiers, life = true }) {
+export function Legend({ slopeColors, frontiers, life = true, reality = false }) {
   const limit = useSim((s) => s.limit)
   const map = useSim((s) => s.map)
+  const world = useSim((s) => s.world)
+  const biome = biomeOf(world)
   const v4 = useSim((s) => s.v4)
   const hasTrace = useSim((s) => s.v4 || s.targets.some((t) => t.kind === 'trace'))
+  // v7 kinds of lifeform: one entry per kind the fleet has noticed (all present with Reality on),
+  // only once a kind other than grazers is about
+  const kindList = useSim((s) => legendKinds(s.lifeforms, s.tracks, reality).join(','))
+  const kinds = kindList && kindList !== 'grazer' ? kindList.split(',') : []
   const lim = Number.isFinite(limit.current) ? limit.current : 30
   const caution = lim * 0.6
+  const open = useLegendOpen()
   return (
-    <div className="hud hud-legend" aria-label="Map legend">
+    <div className="hud hud-legend" aria-label="Map legend" data-collapsed={!open || undefined}>
+      <LegendToggle open={open} lim={lim} changedAt={limit.changedAt} />
       {slopeColors ? (
         <>
           <div className="legend-title" key={limit.changedAt ?? 'base'} data-flash={limit.changedAt !== null || undefined}>
@@ -41,8 +53,8 @@ export function Legend({ slopeColors, frontiers, life = true }) {
             Slope limit {degrees(lim)} deg
           </div>
           <ul className="legend-list">
-            <li title="The ground as the rovers mapped it: dust on the flats, rock on steep ground">
-              <i className="sw sw-ground" />
+            <li title={biome ? `The ground as the rovers mapped it: ${biome.name.toLowerCase()}, rock on steep ground` : 'The ground as the rovers mapped it: dust on the flats, rock on steep ground'}>
+              <i className="sw sw-ground" style={biome ? { background: groundSwatch(world) } : undefined} />
               Mapped ground <span>{map ? `${fixed(map.minH, 1)} to ${fixed(map.maxH, 1)} m` : '--'}</span>
             </li>
           </ul>
@@ -87,6 +99,17 @@ export function Legend({ slopeColors, frontiers, life = true }) {
           )}
         </ul>
       )}
+      {v4 && life && kinds.length > 0 && (
+        <ul className="legend-list legend-row legend-kinds" aria-label="Kinds of lifeform">
+          {kinds.map((k) => (
+            <li key={k} title={KIND_LOOK[k].hint}>
+              <i className="sw sw-life" style={{ '--c': KIND_LOOK[k].color }} />
+              {KIND_LOOK[k].label}
+            </li>
+          ))}
+        </ul>
+      )}
+      <TerrainLegend />
       <ul className="legend-list legend-row">
         {Object.entries(KIND_STYLE)
           .filter(([k]) => k !== 'trace' || hasTrace)

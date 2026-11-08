@@ -8,6 +8,17 @@ services:
       MAP_SIZE: ${MAP_SIZE:-120}
       GRAVITY_G: ${GRAVITY_G:-2.0}
       AUTO_RESET_S: ${AUTO_RESET_S:-0}
+      AUTO_LAUNCH: ${AUTO_LAUNCH:-0}
+      MESAS: ${MESAS:-1}
+      CANYON: ${CANYON:-1}
+      DUNES: ${DUNES:-1}
+      BOULDER_FIELDS: ${BOULDER_FIELDS:-1}
+      PITS: ${PITS:-1}
+      GEYSERS: ${GEYSERS:-1}
+      ICE_SHEETS: ${ICE_SHEETS:-1}
+      GROUND_DETAIL: ${GROUND_DETAIL:-1}
+      FLORA: ${FLORA:-1}
+      WEAR: ${WEAR:-normal}
       GEMMA_ENABLED: ${GEMMA_ENABLED:-1}
       GEMMA_URL: ${GEMMA_URL:-http://host.docker.internal:11434}
       GEMMA_MODEL: ${GEMMA_MODEL:-gemma4:e2b}

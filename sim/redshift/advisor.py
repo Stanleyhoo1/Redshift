@@ -266,6 +266,13 @@ class Advisor:
     def _rover(self, rid):
         return next((r for r in self.sim.rovers if r.id == rid), None)
 
+    def _gravity_kw(self) -> dict:
+        """Gemma is told this world's gravity (v7). Only passed when it is not 2 g: at 2 g the call and the
+        prompt stay exactly as before (tests wrap submit_choice with the old signature). Exactly 2 g only:
+        a world at 2.04 g (GRAVITY_G=2.04) is told 2.04."""
+        gv = float(self.cfg.gravity_g)
+        return {} if gv == 2.0 else {"gravity_g": gv}
+
     def close(self) -> None:
         self._stop.set()
         if self._worker is not None:
@@ -603,7 +610,7 @@ class Advisor:
         perception = dict(self._perception(rover), slope_limit_deg=round(self.fleet.slope_limit, 1))
         if rover.home_dist is not None:
             perception["home_distance"] = round(rover.home_dist, 1)
-        job.ticket = self.planner.submit_choice(rover.id, t, perception, cands, default="f1")
+        job.ticket = self.planner.submit_choice(rover.id, t, perception, cands, default="f1", **self._gravity_kw())
         job.stage, job.wall = "wait", self.clock()
         if self.wait_for_gemma:
             self._wait(job.ticket)
@@ -752,10 +759,15 @@ class Advisor:
                 time.sleep(0.05)
         self._camera_evidence(job)
         if job.get("type") == "describe":
-            tk = self.planner.submit_description(job["rover"], job["t"], job["perception"], job["obs"], jpeg)
+            kw = self._gravity_kw()
+            if getattr(self.cfg, "life_variety", False):      # v7: the label may name a kind it sees
+                from .gemma import KIND_LOOKS
+                kw["kinds"] = tuple(KIND_LOOKS)
+            tk = self.planner.submit_description(job["rover"], job["t"], job["perception"], job["obs"], jpeg, **kw)
         else:
             tk = self.planner.submit_interpretation(job["rover"], job["t"], job["perception"], job["anomaly"], jpeg,
-                                                    INTERP_OPTIONS, default=RULE_REACTION[job["kind"]])
+                                                    INTERP_OPTIONS, default=RULE_REACTION[job["kind"]],
+                                                    **self._gravity_kw())
         if self.wait_for_gemma:
             self._wait(tk)
         with self._mu:
@@ -1418,7 +1430,7 @@ class Advisor:
             return cid
         preview = parse_command(text, ctx)["command"].get("rover")
         cid = self.say("operator", t, text, "command", to=rover_hint or preview or None, source=None)
-        tk = self.planner.submit_command(t, text, ctx)
+        tk = self.planner.submit_command(t, text, ctx, **self._gravity_kw())
         self.commands.append({"ticket": tk, "cid": cid, "hint": rover_hint, "t": t, "wall": self.clock(), "text": text})
         if self.wait_for_gemma:
             self._wait(tk)
@@ -1615,7 +1627,7 @@ class Advisor:
                    "ticket": None, "budget": budget}
             if self.planner.online:
                 job["ticket"] = self.planner.submit_answer(sp, t, text, topic, facts, rules, timeout_s=budget,
-                                                           context=context)
+                                                           context=context, **self._gravity_kw())
                 self.answers.append(job)
                 if self.wait_for_gemma:
                     self._wait(job["ticket"])

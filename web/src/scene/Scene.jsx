@@ -16,6 +16,13 @@ import { DustStorm } from './DustStorm.jsx'
 import { FocusMarker } from './FocusMarker.jsx'
 import { Water } from './Water.jsx'
 import { Spires, fallDebug } from './Spires.jsx'
+import { IceSheets } from './IceSheets.jsx'
+import { IceZones } from './IceZones.jsx'
+import { Flora } from './Flora.jsx'
+import { Geysers } from './Geysers.jsx'
+import { BoulderFields } from './BoulderFields.jsx'
+import { MapMarkers } from './MapMarkers.jsx'
+import { GroundDetail } from './GroundDetail.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
 import { PlaceCandidates } from './PlaceCandidates.jsx'
@@ -26,6 +33,9 @@ import { CameraRig } from './CameraRig.jsx'
 import { Atmosphere } from './Atmosphere.jsx'
 import { Gravel } from './Gravel.jsx'
 import { cameraDebug } from './debugCamera.js'
+import { GlobeLayer } from '../globe/GlobeLayer.jsx'
+import { globeDebug } from '../globe/globeDebug.js'
+import { viewMode } from '../globe/viewMode.js'
 
 // Test aid, only with ?debug in the URL: lets scripts find where a world point is on
 // screen and read a slim copy of the sim state (see scripts/v4-shots.mjs).
@@ -38,6 +48,7 @@ function DebugHook() {
   useEffect(() => {
     window.__redshift = {
       ...cameraDebug(camera, () => get().controls),
+      ...globeDebug(),
       screenOf(x, y, lift = 0) {
         const v = new THREE.Vector3(x, groundAt(x, y) + lift, -y).project(camera)
         const r = gl.domElement.getBoundingClientRect()
@@ -80,6 +91,14 @@ function DebugHook() {
           rescues: s.rescues,
           wrecks: s.wrecks,
           spares: s.spares,
+          phase: s.phase,
+          config: s.config,
+          world: s.world,
+          gen: s.gen,
+          roverMeta: s.roverMeta,
+          view: viewMode.get().view,
+          viewRender: viewMode.get().render,
+          viewPhase: viewMode.get().phase,
         }
       },
     }
@@ -97,11 +116,18 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <Atmosphere />
       <DustStorm />
       <Ground />
-      <Terrain slopeColors={view.slope} />
+      <Terrain slopeColors={view.slope} reality={view.reality} />
       <Gravel />
       <Water reality={view.reality} />
       <HazardVisuals reality={view.reality} />
       <Spires reality={view.reality} />
+      <IceSheets reality={view.reality} />
+      <IceZones />
+      <Flora reality={view.reality} />
+      <Geysers reality={view.reality} />
+      <BoulderFields reality={view.reality} />
+      <MapMarkers reality={view.reality} />
+      <GroundDetail reality={view.reality} />
       <Lander />
       {view.frontiers && <Frontiers />}
       <FocusAreas />
@@ -116,6 +142,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <PlaceCandidates />
       <Placement reality={view.reality} />
       <CameraRig follow={follow} overview={overview} focus={focus} />
+      <GlobeLayer onSelect={onSelect} reality={view.reality} />
       {DEBUG && <DebugHook />}
     </>
   )

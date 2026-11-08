@@ -6,6 +6,7 @@ import { HAZARD_TYPES, PARTS, SEVERITIES, partLabel } from '../lib/theme.js'
 import { PLACE_TEXT, placement, startPlacing, stopPlacing } from '../lib/placement.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { PartIcon } from './HealthBits.jsx'
+import { leaveGlobe } from '../globe/viewMode.js'
 
 const COOLDOWN_OK = 4000
 const COOLDOWN_ERR = 1200
@@ -201,6 +202,7 @@ export function HazardPanel() {
   }, [])
 
   const press = (h) => {
+    leaveGlobe() // v7: hazards act on the sector, so the planet view flies back down first
     if (placing?.type === h.type) return stopPlacing() // second click cancels
     if (h.type === 'damage' && dmg) return closeDamage()
     if (h.type === 'damage' && target) return openDamage(target)
@@ -293,7 +295,7 @@ export function HazardPanel() {
             ))}
           </div>
         </div>
-        <p className="hz-status" data-kind={status?.kind} key={status?.key ?? 'hint'} role={status?.kind === 'error' ? 'alert' : 'status'}>
+        <p className="hz-status" data-kind={status?.kind} key={status?.key ?? 'hint'} role={status?.kind === 'error' ? 'alert' : 'status'} title={status ? undefined : HINT}>
           {status ? status.text : HINT}
         </p>
       </div>

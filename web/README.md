@@ -10,9 +10,10 @@ Vite + React + three.js (@react-three/fiber, drei). Node 22.
 
 ```sh
 npm install
-npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
-                  #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, AUTONOMY_MODE, MOCK_GEMMA=offline, MOCK_PROTOCOL=2..8,
-                  #   MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE, MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off, MOCK_KNOCK_S)
+npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, WEAR, MESAS ... FLORA,
+                  #   BRAIN_BUDGET_MS, GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, AUTONOMY_MODE, MOCK_GEMMA=offline,
+                  #   MOCK_PROTOCOL=2..9, MOCK_PRELAUNCH=1, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
+                  #   MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off, MOCK_KNOCK_S)
 npm run dev       # in a second terminal, then open http://localhost:5173
 ```
 
@@ -71,10 +72,43 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   stats the science score. The Samples tab lists every sample, best first: kind, instrument,
   analysis, value, and who carries it or "cached at lander". Rows fly the camera there.
 - Event log rows with a target icon fly the camera to where it happened. Hazards are red.
-- Keys: `R` `F` `P` `S` `L` `B` toggle layers, `1` to `9` select a rover, `Esc` cancels
-  placement, closes the sensor panel (then returns to the overview), `0` for the overview,
-  `/` for the message box.
-- Reset sim asks for confirmation, then restarts the sim with a random seed.
+- Reset sim asks for confirmation, then restarts the sim with a random seed and the same settings. New
+  mission opens the setup screen.
+- Setup screen (version 7 sims): opens by itself while the sim waits for a launch (it cannot be closed
+  then) and from New mission. Gravity (slider and presets; the big numeral narrows, gets heavier and redder
+  as gravity grows, and a figure shows the predicted steepest climb and towing slope), seed, rovers, sector
+  size, speed, the world features and wear, all drawn from `GET /api/config`. Launch sends only what
+  changed. An older sim gets a seed-only form that resets.
+- Planet view (version 7, web only): `G` or View: Planet in the controls (the row above
+  Graphics) lifts the camera off the map, fades, and shows the whole planet under the same
+  low sun as the sector, with the landing site in daylight and a glow of thick air on the
+  limb. Like the sector, it starts blank: the fleet has not surveyed the planet, so it is a
+  dark grey ball with faint latitude and longitude lines every 15 degrees. The landing
+  sector shows the fleet's own map, live: a square patch at the site, map north to the
+  planet's north, empty right after launch and filling in as the rovers map the ground
+  (mapped ground in the map legend's colours with shaded relief, the fleet's water, ice,
+  plant and soft sand zones on top). It is enlarged to about 14 degrees across, since the
+  real sector is far too small to see from orbit. It repaints at most twice a second, and
+  only when the map changed (once a second on Graphics Low). Reality (`R`) also works on the
+  planet: it fades in the true planet, drawn from the world's seed (dusty plains, darker
+  maria, craters, polar ice), and the patch keeps showing the fleet's map. The legend gives
+  the planet's name, its radius (gravity x 6371 km, assuming Earth's density) and the
+  site's latitude and longitude (from the seed). A cyan ring frames the landing sector, with
+  a live card: sector size, explored share, gravity, sim time and every rover's state.
+  Drag to turn the
+  planet, scroll to zoom, `0` frames the site again. Left alone for a few seconds it sways
+  slowly, about 20 degrees towards the sun over a minute and back, so the site and its card
+  stay in view. Reset sim on the planet glides to the new world's site. Clicking the ring,
+  Fly down to the sector, `G` or View: Sector dives back to the map, and so does anything
+  that acts on the sector: selecting a rover (cards, keys, the card's rover rows), clicking
+  an event, a hazard button, or a rover asking you to pick a place. Hazard placement never
+  carries over to the planet. An open sensor panel hides on the planet and comes back as
+  it was. With reduced motion the switch is instant and the planet stays still. Graphics
+  Low draws a simpler planet (fewer noise layers, one crater size, fewer stars).
+- Keys: `R` `F` `P` `S` `L` `B` toggle layers, `1` to `9` select a rover, `G` switches
+  between the sector and the planet, `Esc` cancels placement, closes the sensor panel (then
+  returns to the overview), `0` for the overview (on the planet: frames the site), `/` for
+  the message box.
 - Following: orbit (left drag) and zoom keep following the rover. A pan (right drag, or a
   modifier with the left button, or two fingers) or a click on an event that flies the
   camera elsewhere pauses the follow right where you put the camera: the rover stays
@@ -268,6 +302,37 @@ Gemma decides in autonomous mode (logged), supervised mode asks with a `rescue` 
 Fleet `spares`, `rescues` (mock extra: `progress`) and `wrecks`. Chat: "rover 1, go help rover
 2", "tow it", "salvage rover 3", "leave it", "how is rover 2?". Test hook: `POST
 /api/_mock/heal {"rover"?}`.
+Version 7 biomes (`src/lib/biomes.js`): each sim biome has a palette (ground dust, soil, rock, strata, pebbles and dune sand for the terrain shader; zenith, sky, horizon, haze and light for the sky dome and fog; a three step ramp for the sector map patch and the legend swatch). The store keeps init `world.biome` and `features.biome_map`; the terrain shader gets both palettes and the blend grid as a small 8 bit texture and mixes them per pixel (the border frayed by noise), and the atmosphere, the planet view (Reality on), the mapped sector patch, the legends and the World line (with the biome name, also on the sector card) follow the world. An older sim, the mock, or biomes off send neither: the `rust` palette is exactly the old theme, so nothing changes. `node --test test/biomes.test.mjs` covers the palettes and the blend helpers.
+
+Version 7 terrain visuals: map markers keep the small features readable from the sector overview. Each fungal tree (a cap glyph in its violet to teal cap colour), bush (a lime bulb cluster), geyser vent (an ochre ring round a white throat that pulses while it erupts) and boulder field (three grey stones) gets one constant-size glyph (one instanced draw call), shown like the models (Reality on, or once the ground there is mapped) and faded out as the camera comes within about 50 m, gone under 24 m, so close-ups show the models. Boulder fields are drawn as real rocks from `boulder_fields[].rocks`.
+
+Version 7 in the mock (the default; `MOCK_PROTOCOL=6` for the previous behaviour): launch settings with
+the sim's table, presets and physics rows (`GET /api/config`), `POST /api/launch` (a second launch sent
+from the setup phase lands nothing new, as in the sim) and settings in `POST /api/reset` (same error texts as
+the sim; other keys are ignored and listed in `ignored`), and init `phase` and `config`. `MOCK_PRELAUNCH=1` starts in
+the setup phase like the sim's default `AUTO_LAUNCH=0` (frozen at t = 0, hazards, chat and answers get 409);
+without it the mock runs at once, so the older scripts are unaffected. The v7 world features are only stored
+and echoed. `node scripts/setup-unit.mjs` checks the setup helpers, the init fields and the HTTP helpers
+without a browser; `node scripts/setup-check.mjs [url] [outDir]` (mock started with `MOCK_PRELAUNCH=1`, or
+the sim with `AUTO_LAUNCH=0`) drives the setup screen (also that neither Tab nor New mission gets past the
+forced screen), launches and saves 5 screenshots.
+`scripts/screenshot.mjs` launches a sim that waits in its setup phase (`POST /api/launch {}`) before its
+shots, so it works with the sim's default `AUTO_LAUNCH=0`; a running sim or an older one is left alone.
+Version 7 planet view: `node scripts/v7-globe-check.mjs http://localhost:5182 <outDir>` (the
+mock on 8102 started with `MOCK_FIRST_QUESTION_S=99999`, vite on 5182 with
+`SIM_URL=http://localhost:8102`; `ONLY=toggle-key,marker-click` runs a few) switches both
+ways and checks the fade, the card, the legend, the kept sensor panel, orbit, scroll, `0`,
+the idle sway over more than a minute, Reset sim on the planet, Graphics Low, reduced
+motion, every way back to the sector, and click-to-place after a trip to the planet, and
+saves screenshots; it fails on any console error or warning. Run it once more with
+`WIDTH=1280 HEIGHT=720 ONLY=hud-fit,toggle-key` to check that the controls still end above
+the map legend on a short screen. The pure parts (planet numbers and the idle sway, the
+view state machine, the star, planet and marker materials) have Node tests, and one test
+fails if a file outside `src/globe` imports drei's `Html` directly (sector labels must use
+`src/globe/PlaneHtml.jsx`, which hides them on the planet): `node --test test/*.test.mjs`.
+With `?debug`, `window.__redshift` also has `setView('globe' | 'plane', instant)`,
+`globeState()` and `globeSiteScreen()`, and `state()` reports `view`, `viewRender` and
+`viewPhase`.
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

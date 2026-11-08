@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
-import { Html } from '@react-three/drei'
+import { Html } from '../globe/PlaneHtml.jsx'
 import * as THREE from 'three'
 import { appStore, simStore, useSim, roverPoses } from '../state/store.js'
 import { placement } from '../lib/placement.js'
@@ -8,7 +8,8 @@ import { forEachTrailPoint, sampleGround, sampleGroundNear, TRAIL_POINTS } from 
 import { FatPolyline } from './fatLine.js'
 import { glowTexture, warningTexture } from './textures.js'
 import { reducedMotion } from './sceneConstants.js'
-import { HAZARD } from '../lib/theme.js'
+import { HAZARD, instrumentStyle, kindStyle } from '../lib/theme.js'
+import { InstrumentIcon } from '../components/SampleBits.jsx'
 import { hardwareMaterials, wreckMaterials } from './hardware.js'
 import { MAST_TOP, WHEELS, WHEEL_R, roverParts } from './roverModel.js'
 import { RoverDust, dustSources } from './RoverDust.jsx'
@@ -295,6 +296,7 @@ function Rover({ meta, selected, onSelect }) {
           >
             <span className="dot" style={{ background: meta.color }} />
             {meta.name}
+            <TagSampling roverId={meta.id} />
             {faulted && <span className="rover-tag-fault">Fault</span>}
             {tagChip && (
               <span className="rover-tag-chip" data-kind={tagChip.kind}>
@@ -310,6 +312,27 @@ function Rover({ meta, selected, onSelect }) {
         </Html>
       )}
     </group>
+  )
+}
+
+// While the rover samples: the instrument and whole-percent progress inside its own tag, in
+// the target's colour. Inside drei's own React root, so it subscribes to the store itself; the
+// selector string only changes on whole percents, so the tag does not re-render every tick.
+function TagSampling({ roverId }) {
+  const info = useSim((s) => {
+    const sm = s.rovers[roverId]?.sampling
+    if (!sm) return ''
+    const kind = s.targets.find((t) => t.id === sm.target)?.kind ?? ''
+    return `${sm.instrument ?? ''}|${Math.round((Number(sm.progress) || 0) * 100)}|${kind}`
+  })
+  if (!info) return null
+  const [instrument, pct, kind] = info.split('|')
+  return (
+    <span className="rover-tag-samp" style={{ '--c': kindStyle(kind).color }}>
+      <InstrumentIcon kind={instrument} />
+      {instrumentStyle(instrument).label}
+      <b>{pct}%</b>
+    </span>
   )
 }
 

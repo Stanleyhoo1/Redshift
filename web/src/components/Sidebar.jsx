@@ -8,6 +8,7 @@ import { CommsPanel } from './Comms.jsx'
 import { PlannerPill } from './Planner.jsx'
 import { SamplesPanel } from './Samples.jsx'
 import { ModeSwitch, PriorityChip } from './Autonomy.jsx'
+import { BIOMES, biomeOf } from '../lib/biomes.js'
 
 const WORD = 'Redshift'
 const INK = [232, 238, 245]
@@ -59,11 +60,20 @@ function WorldFacts() {
   const world = useSim((s) => s.world)
   const science = useSim((s) => Number.isFinite(s.fleet.science_score))
   const g = Number.isFinite(world?.gravity_g) ? world.gravity_g : Number.isFinite(world?.gravity) ? world.gravity / 9.81 : null
+  const biome = biomeOf(world)
   return (
     <dl className="facts">
       <div>
         <dt>World</dt>
-        <dd>{world?.name || '--'}</dd>
+        <dd>
+          {world?.name || '--'}
+          {biome && (
+            <span className="facts-biome" title={biome.secondary ? `Mostly ${biome.name.toLowerCase()}, with patches of ${BIOMES[biome.secondary].name.toLowerCase()}` : biome.name}>
+              <i style={{ background: BIOMES[biome.id].map[1] }} />
+              {biome.name}
+            </span>
+          )}
+        </dd>
       </div>
       <div className="facts-g">
         <dt>Gravity</dt>
@@ -152,7 +162,9 @@ function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
         >
           Comms
           {asking > 0 ? (
-            <span className="tab-ask">{asking === 1 ? 'Question' : `${asking} questions`}</span>
+            <span className="tab-ask" aria-label={`${asking} ${asking === 1 ? 'question' : 'questions'} waiting`} title={`${asking} ${asking === 1 ? 'question' : 'questions'} waiting`}>
+              {asking}
+            </span>
           ) : (
             unread > 0 && (
               <span className="tab-badge" aria-label={`${unread} unread`}>
@@ -175,11 +187,11 @@ function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
   )
 }
 
-export function Sidebar({ follow, selected, onSelect, onFocusEvent }) {
+export function Sidebar({ follow, selected, onSelect, onFocusEvent, inert = false }) {
   // With Comms open the fleet stats fold into one row, so the conversation has room.
   const [tab, setTab] = useState('events')
   return (
-    <aside className="side" data-tab={tab}>
+    <aside className="side" data-tab={tab} inert={inert}>
       <header className="side-head">
         <div className="side-head-top">
           <Wordmark />

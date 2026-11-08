@@ -358,7 +358,12 @@ def _blend(rgb: np.ndarray, f: np.ndarray, colour) -> np.ndarray:
     return out.astype(np.uint8)
 
 
-def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float, dust: float = 0.0) -> np.ndarray:
+def _visuals():
+    from . import visuals
+    return visuals
+
+
+def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float, dust: float = 0.0, horizon=None) -> np.ndarray:
     """Distance haze of a dense atmosphere: blend toward the horizon colour with distance along the ray
     (exponential, nothing within visuals.FOG_START_M), never on the sky (farther than SKY_DIST_M).
     dust > 0: a dust storm veil on top (thicker with distance, the sky veiled too)."""
@@ -372,7 +377,7 @@ def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float, dust: float = 0.0) -> n
     f *= np.float32(-HAZE_MAX)
     f += np.float32(HAZE_MAX)
     f[sky] = 0.0
-    out = _blend(rgb, f, HORIZON_RGB)
+    out = _blend(rgb, f, HORIZON_RGB if horizon is None else horizon)
     if dust > 0.0:
         g = np.exp(dist * np.float32(-1.0 / DUST_SCALE_M))
         g *= np.float32(-DUST_MAX * dust)
@@ -480,6 +485,17 @@ class _Gfx:
         self.opt.sitegroup[:] = 0
         self.max_w = int(min(MAX_W, m.vis.global_.offwidth))
         self.max_h = int(min(MAX_H, m.vis.global_.offheight))
+
+    def option(self, hide=()) -> mujoco.MjvOption:
+        """A view option with these geom groups hidden, for callers that build their own scene (v7_flora's
+        segmentation frames). Also undoes the per-frame culling of the private model's geom groups."""
+        self.model.geom_group[:] = self.base_group
+        o = mujoco.MjvOption()
+        o.geomgroup[:] = _GEOM_GROUPS
+        for gid in hide:
+            o.geomgroup[gid] = 0
+        o.sitegroup[:] = 0
+        return o
 
     def snapshot(self, d) -> None:
         """Copy the state the picture needs (sim lock held: microseconds)."""
@@ -603,6 +619,7 @@ class GLRenderer:
                 dust = _dust_level(s) if look else 0.0
                 hl = getattr(rover, "health", None)       # protocol v9: a damaged camera is noisy
                 noise = hl.effects()["camera_noise"] if (hl is not None and view == "fpv") else 0.0
+                horizon = _visuals().horizon_rgb(s.cfg) if getattr(s.cfg, "biomes", False) else None
             break
         else:
             raise RuntimeError("the model kept changing while rendering")
@@ -642,7 +659,7 @@ class GLRenderer:
         rgb = rgb[::-1]                                     # OpenGL rows start at the bottom
         dep = _linear_depth(raw[::-1], spec.near, spec.far) if raw is not None else None
         if look:
-            rgb = _haze(rgb, dep, spec.fovy, dust)
+            rgb = _haze(rgb, dep, spec.fovy, dust, horizon)
         if noise > 0.5:
             rgb = _sensor_noise(rgb, noise, num)
         return Frame(np.ascontiguousarray(rgb), dep if depth else None, spec, t, pos, yaw,

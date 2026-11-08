@@ -132,7 +132,7 @@ const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
       <span className="ev-text">
         <span className="ev-who">{life ? 'Lifeform' : hazard ? 'Hazard' : rover ? rover.name : e.rover || 'Fleet'}</span>{' '}
         {e.source !== 'rules' && !e.decision && <SourceTag source={e.source} />}
-        <span className="ev-msg">{cleanMsg(e.msg, e.rover, byId)}</span>
+        <EventMsg text={cleanMsg(e.msg, e.rover, byId)} />
         {e.damage && <DamageLine d={e.damage} />}
         {e.at && (
           <span className="ev-goto" aria-hidden="true">
@@ -311,5 +311,23 @@ export function EventLog({ onFocusEvent, hidden }) {
         )}
       </ol>
     </div>
+  )
+}
+
+// A Gemma decision quotes its reasoning after ": '": that part goes on its own dimmer line,
+// clamped to two lines (the full text in the tooltip), so one event no longer fills the column.
+// Any other message renders as before.
+function EventMsg({ text }) {
+  const msg = typeof text === 'string' ? text : String(text ?? '')
+  const cut = msg.indexOf(": '")
+  if (cut <= 0) return <span className="ev-msg">{msg}</span>
+  const why = msg.slice(cut + 2)
+  return (
+    <span className="ev-msg">
+      {msg.slice(0, cut + 1)}
+      <span className="ev-why" title={why}>
+        {why}
+      </span>
+    </span>
   )
 }

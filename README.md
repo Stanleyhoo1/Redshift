@@ -24,6 +24,8 @@ docker compose up --build
 
 Open http://localhost:8080. The web container talks to the sim over Docker's private network, so only port 8080 is used on your machine.
 
+The dashboard opens on the setup screen: pick gravity, fleet size, sector, features and wear, then press Launch (set `AUTO_LAUNCH=1` to skip it).
+
 If the page stays on "Waiting for the simulation", check the sim container with `docker compose ps -a` and `docker compose logs --tail=60 sim`.
 
 Change the planet or speed:
@@ -36,11 +38,16 @@ Stop with Ctrl+C, then `docker compose down`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SEED` | 42 | terrain and target layout |
-| `NUM_ROVERS` | 3 | rovers in the fleet |
-| `SIM_SPEED` | 3.0 | sim seconds per real second |
-| `MAP_SIZE` | 120 | map width in metres |
-| `GRAVITY_G` | 2.0 | gravity in Earth g |
+| `SEED` | 42 | terrain and target layout (0 or more; the setup screen offers 0 to 2147483647) |
+| `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
+| `SIM_SPEED` | 3.0 | sim seconds per real second (0.5 to 10) |
+| `MAP_SIZE` | 120 | map width in metres (60 to 200) |
+| `GRAVITY_G` | 2.0 | gravity in Earth g (0.5 to 3) |
+| `AUTO_LAUNCH` | 0 | 0: the fleet waits on the setup screen until you press Launch. 1: start at once with these values |
+| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 terrain features, each on by default (0 leaves it out). See "Terrain" below |
+| `BIOMES` | 1 | each world gets its own ground, colours and terrain mix (0: the old rust world). See "Biomes" below |
+| `LIFE_VARIETY` | 1 | skitterers, drifters, crawlers and burrowers join the grazers (0: grazers only) |
+| `WEAR` | normal | how fast parts wear out: off, normal or harsh (the setting exists, but wear itself is not part of this build yet) |
 | `AUTO_RESET_S` | 0 | off: the planet only changes when you press Reset sim. Set it (e.g. 60) to land on a new random planet that many seconds after exploration finishes |
 | `GEMMA_ENABLED` | 1 | 0 = rules only |
 | `GEMMA_MODEL` | gemma4:e2b | falls back to gemma4:e4b, then gemma3:4b if not installed |
@@ -73,6 +80,59 @@ The dashboard plays two roles: the judges' window into what the rovers sense and
 - **Cameras:** click the camera image for a large view (scroll to zoom, drag to pan, V for onboard or chase, D to show or hide detection boxes). The sensor panel's expand buttons open a big radar and history charts.
 - **Area exploration:** "explore around X" draws a dashed circle with a countdown while the rover maps it (or re-surveys it if it is already mapped), then it reports what it found. Rovers also stay curious on their own for about a minute after a new find.
 - **Reality:** overlays the true terrain and every real target, so you can compare it with what the fleet knows.
+- **Reset sim and New mission:** Reset sim lands the fleet on a new random planet with the same settings. New mission opens the setup screen first, to change gravity, fleet size, sector size, features, wear or speed; the gravity readout and the slope figure show how steep the rovers can climb and tow at that gravity.
+
+## Terrain (version 7)
+
+Each feature can be switched off on the setup screen or with its env var. With all of them off the planet is exactly the one from version 6.
+
+- **Mesas and buttes:** flat-topped hills with cliff walls no rover can climb. Rovers see the walls in their LiDAR map and drive around.
+- **Canyon:** a winding trench across part of the map with two ramps, the only ways across. The ramps are no steeper than the towing slope at the chosen gravity.
+- **Pits:** sinkholes and small, deep lava-tube skylights. Sheer drops that the planner treats as impassable.
+- **Boulder fields:** dense patches of boulders to steer around.
+- **Dunes:** fields of rippled loose sand where the wheels slip more, but rovers can still cross slowly.
+- **Ice sheets:** level frozen ground with almost no grip. A rover that sees high wheel slip at low motor load on level ground reports low traction, backs out and the fleet marks an ice zone to avoid.
+- **Geysers:** vents that erupt on a schedule. Steam scatters the LiDAR (those returns never reach the map), and rovers learn to keep clear of a vent once they have seen it erupt.
+- **Alien flora:** groves of fungal trees with violet and teal caps and glowing lime bulb bushes. A rover identifies a plant from its LiDAR and camera and keeps at least 4 m away (planetary protection, like the grazers).
+- **More lifeforms:** besides the grazers, four more kinds, picked by the biome where each group lives. Skitterers are small amber six-legged runners in swarms of 6 to 14 that scatter from a rover within about 8 m. Drifters are translucent glowing bells floating 1.5 to 3.5 m up, trailing tendrils, drifting with the wind in groups of 2 to 5 (the LiDAR sees their low tendrils). Crawlers are big, slow, shelled loners or pairs, about 1.6 m long. Burrowers pop up from small mounds for a few seconds and sink again; the LiDAR only sees them while they are up. The rovers observe every kind from at least 4 m; anything the LiDAR measures as large (or the camera names a crawler) is kept at 6 m. With Gemma, the camera answer can name the kind ("possible skitterer swarm"); the rovers never read the true kind. The legend lists a kind once the fleet has noticed one (all of them with Reality on).
+- **Ground detail:** pebbles, cracks and small craters for looks only. Drawn by the dashboard, nothing the rovers sense.
+
+### Biomes
+
+With biomes on (the default; `BIOMES=0` or the setup screen's Biomes switch turns them off) the seed picks a **primary biome** for the whole sector and a **secondary biome** that covers a few soft regions, about 25 to 40 percent of the ground. The lander always stands on the primary ground.
+
+| Biome | Ground | More of | Less of, or none |
+|---|---|---|---|
+| Basalt fields | dark blue-grey volcanic rock | pits, boulder fields, vents | dunes, ice |
+| Verdigris lowlands | grey-green mineral | alien flora (twice as much) | pits, vents, no ice |
+| Frost plains | pale blue-grey and white | ice sheets (two and a half times) | vents, no flora |
+| Ash wastes | lavender-grey ash | geysers (twice), dunes, pits | no ice |
+| Salt flats | pale bone and cream, slate rock | dunes (twice), mesas, canyon | pits, no geysers |
+| Obsidian badlands | glassy near-black, violet sheen | canyon, boulder fields, mesas | dunes, no ice |
+| Rust plains | today's red-brown | (only ever a secondary region) | |
+
+Each picture is the whole 120 m sector with Reality on (the true ground, with the measurement lattice over it) and the dashboard panels hidden. The second biome named is the secondary one.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/biomes/basalt.jpg" alt="Basalt fields"><br><b>Basalt fields</b>, seed 4, with ash regions</td>
+<td width="50%"><img src="docs/images/biomes/verdigris.jpg" alt="Verdigris lowlands"><br><b>Verdigris lowlands</b>, seed 31, with basalt regions</td>
+</tr>
+<tr>
+<td><img src="docs/images/biomes/frost.jpg" alt="Frost plains"><br><b>Frost plains</b>, seed 1, with ash regions</td>
+<td><img src="docs/images/biomes/ash.jpg" alt="Ash wastes"><br><b>Ash wastes</b>, seed 10, with verdigris regions</td>
+</tr>
+<tr>
+<td><img src="docs/images/biomes/salt.jpg" alt="Salt flats"><br><b>Salt flats</b>, seed 6, with ash regions</td>
+<td><img src="docs/images/biomes/obsidian.jpg" alt="Obsidian badlands"><br><b>Obsidian badlands</b>, seed 42 (the default), with ash regions</td>
+</tr>
+</table>
+
+To retake them: start the sim with `AUTO_LAUNCH=1` and a vite pointed at it, then run `node scripts/biome-shots.mjs <app url> <sim url> <out dir>` from `web/` (see the top of the script).
+
+How it picks features: every feature setting stays the upper limit. The biome only scales how many of each feature the generator tries to place: the count is multiplied by 75 % of the primary biome's weight plus 25 % of the secondary's, rounded (a primary weight of 0 means none at all, and the canyon, a single feature, is there only when its weight is 0.5 or more). The biome also sets the camera's soil, rock, sky and light colours, and the dashboard's ground, sky, haze, planet and legend colours, blending into the secondary biome's colours across its regions. The lifeform mix also follows the primary biome when More lifeforms is on. The rovers never read the biome: their cameras only see the colours.
+
+The planet view (`G`, or View: Planet) shows the whole world from orbit with the landing sector marked.
 
 ## Run natively with the MuJoCo viewer
 

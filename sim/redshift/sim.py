@@ -32,6 +32,7 @@ from .lifeforms import LifeformManager
 from .mapping import FleetMap
 from .rover import Rover
 from .terrain import Terrain
+from . import v7_biomes, v7_landforms
 from .world import build_world, rover_spawn_height
 
 
@@ -65,6 +66,11 @@ class Simulation:
 
         self.map = FleetMap(cfg)
         self.fleet = Fleet(cfg, self.map, self.terrain.targets)
+        self.flora = None               # v7 alien flora (truth contacts, rover identification)
+        if cfg.flora:
+            from .v7_flora import FloraSystem
+            self.flora = FloraSystem(self)
+            self.fleet.flora = self.flora
         self.hazards = None
         self.rovers = [Rover(self, k, rid, f"Rover {k + 1}", color, docks[k])
                        for k, (rid, _x, _y, _yaw, color) in enumerate(spawns)]
@@ -76,6 +82,10 @@ class Simulation:
         from .rescue import RescueManager
         self.rescue = RescueManager(self)   # protocol v9: distress, helpers, towing, salvage, repair
         self.fleet.rescue = self.rescue
+        self.geysers = None             # v7: eruption schedule and plume scatter (only with cfg.geysers)
+        if getattr(cfg, "geysers", False):
+            from .v7_geysers import GeyserManager
+            self.geysers = GeyserManager(self)
         self.camera_ok = None           # rules' camera checks: None = not tried yet, False = no OpenGL here
         self._features_sent = -1
         self.advisor = Advisor(self, planner, frame_source, wait_for_gemma=wait_for_gemma)
@@ -136,9 +146,13 @@ class Simulation:
         if d.time < t_start + 0.5 * self.agent_dt or not np.isfinite(d.qpos).all() or not np.isfinite(d.qvel).all():
             self._recover_physics(t_start)
         self._check_rovers_in_world()
+        if self.flora is not None:
+            self.flora.truth_step()
         t = float(d.time)
         hz.step(t)
         mon.after_physics(t)
+        if self.geysers is not None:
+            self.geysers.update(t)
         c1 = time.perf_counter()
         n = len(self.rovers)
         s0 = self.ticks % n
@@ -234,10 +248,14 @@ class Simulation:
         truth = self.terrain.truth_nospire          # colour scale: terrain and rocks, not the tall spires
         evs = [Fleet.public_event(e) for e in self.fleet.events if e["_seq"] <= self._event_cursor][-50:]
         self._features_sent = self.hazards.features_version
+        world = {"name": cfg.world_name, "gravity": round(cfg.gravity, 2),
+                 "gravity_g": float(cfg.gravity_g), "seed": int(cfg.seed)}
+        biome = v7_biomes.world_msg(self.terrain)               # v7 biomes: only when on
+        if biome is not None:
+            world["biome"] = biome
         return {
             "type": "init",
-            "world": {"name": cfg.world_name, "gravity": round(cfg.gravity, 2),
-                      "gravity_g": float(cfg.gravity_g), "seed": int(cfg.seed)},
+            "world": world,
             "map": {"nx": cfg.nx, "ny": cfg.ny, "res": cfg.res,
                     "origin": [float(cfg.origin[0]), float(cfg.origin[1])],
                     "min_h": round(float(truth.min()), 2), "max_h": round(float(truth.max()), 2)},
@@ -285,10 +303,24 @@ class Simulation:
     def features_msg(self) -> dict:
         """Ground truth of the static features (protocol v4): water outlines and spires."""
         standing = self.hazards.spire_standing
-        return {"water": [w.to_msg() for w in self.terrain.water],
-                "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
-                            "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
-                           for sp in self.hazards.all_spires()]}
+        out = {"water": [w.to_msg() for w in self.terrain.water],
+               "spires": [{"id": sp.id, "x": round(sp.x, 2), "y": round(sp.y, 2), "height": round(sp.height, 2),
+                           "radius": round(sp.radius, 2), "standing": bool(standing.get(sp.id, True))}
+                          for sp in self.hazards.all_spires()],
+               **v7_landforms.features(self.terrain),
+               **self._v7_surface_features()}
+        if getattr(self, "geysers", None) is not None:      # v7: vents and their eruption state
+            out["geysers"] = self.geysers.to_msg(self.t)
+        if self.flora is not None:
+            out["flora"] = self.flora.features()
+        bmap = v7_biomes.biome_map(self.terrain)              # v7 biomes: only when on
+        if bmap is not None:
+            out["biome_map"] = bmap
+        return out
+
+    def _v7_surface_features(self) -> dict:
+        from . import v7_surface
+        return v7_surface.features(self.terrain)
 
     def close(self) -> None:
         """Stop tier 2's worker thread (the shared Gemma planner itself keeps running)."""

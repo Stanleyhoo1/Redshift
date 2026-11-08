@@ -18,16 +18,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import Config
+from .config import REACH_SLOPE, TARGET_PATH_SLOPE, Config  # noqa: F401 (the 2 g values, still importable here)
+from . import v7_landforms
 
 KINDS = ("mineral", "ice", "vent")            # kinds placed in clusters; "trace" is placed near herds
 ALL_KINDS = ("mineral", "ice", "vent", "trace")
 INSTRUMENT = {"mineral": "drill", "ice": "scoop", "vent": "sniffer", "trace": "swab"}
 BREACH_STRETCH = 1.5   # crater bowl is (1 + this) times longer in the breach direction
 BREACH_WIDTH = 0.7     # angular half width of the breach (rad)
-TARGET_PATH_SLOPE = 15.0   # every target can be reached from the lander without crossing steeper ground
 KIND_LABEL = {"mineral": "mineral outcrop", "ice": "ice deposit", "vent": "thermal vent", "trace": "organic trace"}
-REACH_SLOPE = 18.0         # flood fill slope for the "no traps" checks of lakes and rivers
 VALUE_RANGE = {"mineral": (2, 7), "ice": (3, 7), "vent": (3, 7), "trace": (6, 10)}   # plus 2 jackpots (8, 9)
 # on-board analysis results, by kind and value tier (low <= 4, mid 5 to 7, high >= 8)
 ANALYSIS = {
@@ -166,23 +165,49 @@ class Terrain:
         self._placed = []                  # (x, y, radius) of mounds and craters
         self._ridges = []                  # ridge spines (p0, p1)
         self.heights = self._make_heights(rng)
+        from . import v7_biomes
+        v7_biomes.attach(self)                            # v7 biomes (own stream): before every v7 feature
+        self.landform_mask = None                         # v7 landforms: cells nothing else may use
+        self.landforms = None
+        if v7_landforms.any_on(cfg):
+            self.heights = v7_landforms.apply(self, self.heights)
+        from . import v7_surface
+        v7_surface.build(self, cfg)                        # v7 dunes and ice sheets (own streams)
         self.wet = np.zeros(self.heights.shape, bool)     # under liquid
         self.wet_id = np.zeros(self.heights.shape, np.int8)   # 1 + index into self.water, 0 = dry
         self.water: list = []
         if cfg.water:
             self._make_water(frng)
+            v7_surface.after_water(self)
         self.min_h = float(self.heights.min())
         self.max_h = float(self.heights.max())
         self.slope = slope_deg(self.heights, self.res)
         self.rocks = self._make_rocks(rng)
+        self.bfield = v7_landforms.make_boulder_fields(self) if cfg.boulder_fields else []
         self.truth_nospire = self._with_rocks()           # terrain and rocks
         self.spires = self._make_spires(frng) if cfg.spires else []
         self.truth_heights = self.with_spires(self.truth_nospire, self.spires)
-        self.reach = self.reachable(TARGET_PATH_SLOPE)
+        self.reach = self.reachable(cfg.target_path_slope_deg)    # every target reachable without steeper ground
         self.herds = self._make_herds(frng) if cfg.lifeforms else []
+        if self.herds and getattr(cfg, "life_variety", False):
+            from . import v7_life
+            v7_life.vary(self, cfg)                        # v7: kinds by biome, a couple more groups (own stream)
         self.targets = self._make_targets(rng)
         self._add_traces(frng)
         self._assign_values(frng)
+        self.geysers = []                                 # v7 vents (own stream, see v7_geysers.py)
+        if getattr(cfg, "geysers", False):
+            from .v7_geysers import plan_vents
+            self.geysers = plan_vents(cfg, self)
+        self.flora = []                    # v7 alien flora (own stream, placed last)
+        if getattr(cfg, "flora", False):
+            from . import v7_flora
+            self.flora = v7_flora.place(cfg, self)
+
+    def biome_id_at(self, x: float, y: float):
+        """v7 biomes: the biome id at (x, y), primary or secondary by region (None with biomes off)."""
+        from . import v7_biomes
+        return v7_biomes.biome_id_at(self, x, y)
 
     # ------------------------------------------------------------------ heights
     def _make_heights(self, rng: np.random.Generator) -> np.ndarray:
@@ -365,6 +390,8 @@ class Terrain:
             x, y = rng.uniform(-half + 2, half - 2, 2)
             if math.hypot(x, y) < cfg.lander_flat_radius + 3.0:
                 continue
+            if self.landform_mask is not None and not v7_landforms.spot_clear(self, x, y, 0.5):
+                continue
             size = rng.uniform(0.3, 1.0)
             sx = size / 2 * rng.uniform(0.8, 1.2)
             sy = size / 2 * rng.uniform(0.7, 1.1)
@@ -400,6 +427,10 @@ class Terrain:
             if not self.reach[tj, ti]:
                 return False
             if any(math.hypot(x - r.x, y - r.y) < r.sx + r.sy + 1.5 for r in self.rocks):
+                return False
+            if self.bfield and any(math.hypot(x - r.x, y - r.y) < r.sx + r.sy + 1.5 for r in self.bfield):
+                return False
+            if not v7_landforms.spot_clear(self, x, y, 1.5):
                 return False
             if self.wet_near(x, y, 2.5) or any(math.hypot(x - sp.x, y - sp.y) < 3.0 for sp in self.spires):
                 return False
@@ -439,7 +470,7 @@ class Terrain:
 
     def _with_rocks(self) -> np.ndarray:
         H = self.heights.copy()
-        for r in self.rocks:
+        for r in (self.rocks + self.bfield if self.bfield else self.rocks):
             ext = max(r.sx, r.sy)
             i0, j0 = self.ij(r.x - ext, r.y - ext)
             i1, j1 = self.ij(r.x + ext, r.y + ext)
@@ -475,6 +506,8 @@ class Terrain:
         """Away from mounds and craters (their footprint) and ridge spines (about 7 m wide)."""
         if any(math.hypot(x - px, y - py) < 0.75 * pr + margin for px, py, pr in self._placed):
             return False
+        if not v7_landforms.spot_clear(self, x, y, margin + 6.0):
+            return False
         for a, b in self._ridges:
             d, _ = _seg_dist(np.array([x]), np.array([y]), a, b)
             if float(d[0]) < 7.0 + margin:
@@ -494,7 +527,7 @@ class Terrain:
     def _no_trap(self, H: np.ndarray, wet: np.ndarray, reach0: np.ndarray) -> bool:
         """True if every sample reachable before (reach0) is still reachable with this water, apart
         from the water itself and a small margin around it."""
-        ok = (slope_deg(H, self.res) <= REACH_SLOPE) & ~wet
+        ok = (slope_deg(H, self.res) <= self.cfg.reach_slope_deg) & ~wet
         reach = self.flood(ok)
         k = 4
         near = np.zeros_like(wet)
@@ -513,7 +546,7 @@ class Terrain:
         scale = cfg.map_size / 80.0
         n_lakes = 1 if self.area < 1.5 else int(frng.integers(1, 3))
         H = self.heights
-        reach0 = self.flood(slope_deg(H, self.res) <= REACH_SLOPE)
+        reach0 = self.flood(slope_deg(H, self.res) <= cfg.reach_slope_deg)
         sl0 = slope_deg(H, self.res)
         X, Y = self.X, self.Y
         tries = [(12.0, 20.0, 1.5)] * 120 + [(14.0, 24.0, 2.2)] * 120 + [(17.0, 28.0, 3.2)] * 200
@@ -680,6 +713,8 @@ class Terrain:
             if math.hypot(x, y) < cfg.lander_flat_radius + 9.0 or self.wet_near(x, y, 3.0):
                 continue
             if self.max_slope_near(x, y, 1.0) > 14.0:
+                continue
+            if not v7_landforms.spot_clear(self, x, y, 3.0):
                 continue
             i, j = self.ij(x, y)
             k = int(round(3.0 / self.res))

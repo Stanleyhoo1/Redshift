@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 import mujoco
 import numpy as np
 
+from . import v7_landforms
+
 TYPES = ("rockfall", "sand", "dust_storm", "rover_fault", "spire_fall", "lifeform", "damage")
 SEVERITIES = ("small", "huge", "disable", "wreck", "jam", "light", "heavy")   # light/heavy: old names of small/huge
 FLAT_DAMAGE = {"small": 25.0, "huge": 60.0}    # flat points off one part
@@ -369,6 +371,8 @@ class HazardManager:
             return False
         if sim.terrain.wet_near(x, y, rad + 0.3):
             return False
+        if not v7_landforms.spot_clear(sim.terrain, x, y, rad + 0.5):
+            return False                       # v7: not in a pit, on a mesa wall or in the canyon
         for r in sim.rovers:
             if math.hypot(x - r.x, y - r.y) < rad + rover_clear:
                 return False
@@ -387,7 +391,7 @@ class HazardManager:
         """Ground a rover can really drive on (true terrain, spires and boulders already down, no water)."""
         from .terrain import slope_deg
         H = self.truth_heights(self.sim.terrain.truth_heights)
-        lim = min(self.sim.fleet.slope_limit, 20.0)
+        lim = min(self.sim.fleet.slope_limit, self.cfg.passable_slope_deg)
         return (slope_deg(H, self.cfg.res) <= lim) & ~self.sim.terrain.wet
 
     def _still_connected(self, ok: np.ndarray, rover, spots, sizes) -> bool:
@@ -1106,6 +1110,22 @@ class HazardManager:
                          if math.hypot(hd.centre()[0] - hx, hd.centre()[1] - hy) < 20.0), None)
 
         fresh = [hd for hd in free if counted(hd) is None] or free
+        if sim.cfg.life_variety:
+            # v7: which kind wanders in follows the biome weights at the spot (among the kinds this world has)
+            from . import v7_life
+            w = v7_life.weights_at(sim.terrain, spot[0], spot[1])
+            have = {hd.kind for hd in free}
+            w = {k: (v if k in have else 0.0) for k, v in w.items()}
+            if not any(w.values()):
+                w = {k: 1.0 for k in have}
+            kind = v7_life.pick_kind(lf.rng, w)
+            pool = [hd for hd in free if hd.kind == kind]
+            fresh = [hd for hd in pool if counted(hd) is None] or pool
+            if kind == "crawler":           # a big one arrives a little further out (it keeps 6 m)
+                a = math.atan2(spot[1] - rover.y, spot[0] - rover.x)
+                far = (spot[0] + 1.5 * math.cos(a), spot[1] + 1.5 * math.sin(a))
+                if lf.spot_ok(*far):
+                    spot = far
         herd = min(fresh, key=lambda hd: math.hypot(hd.centre()[0] - spot[0], hd.centre()[1] - spot[1]))
         k = counted(herd)
         lf.move_herd(herd, spot[0], spot[1], face)
@@ -1123,7 +1143,13 @@ class HazardManager:
         # the fleet reacts to this herd even if other rovers already watch herds (fleet._assign_observers)
         f.injected_herds = [hh for hh in getattr(f, "injected_herds", []) if t < hh[3]] + [(spot[0], spot[1], rover.id, t + 30.0)]
         h = self._new("lifeform", t, rover=rover.id, x=spot[0], y=spot[1])
-        sim.fleet.log(t, "hazard", f"A herd of creatures wanders into view of {rover.name}.", None, at=spot)
+        if sim.cfg.life_variety:
+            from .v7_life import group_phrase
+            what = group_phrase(herd.kind, len(herd.members))
+            sim.fleet.log(t, "hazard", f"{what[0].upper()}{what[1:]} wanders into view of {rover.name}.", None,
+                          at=spot)
+        else:
+            sim.fleet.log(t, "hazard", f"A herd of creatures wanders into view of {rover.name}.", None, at=spot)
         if charge:                                    # protocol v9 demo: its territorial member charges the rover
             lf.provoke(herd, rover, t + 3.0)
         return h
@@ -1140,24 +1166,33 @@ class HazardManager:
 
     def update_physics(self, t: float) -> None:
         """Once per decision cycle, before the physics substeps: sand contact properties."""
+        from . import v7_surface
         patches = self.patches
-        if not patches and not any(self._body_damped.values()):
+        surf = v7_surface.surface_of(self.sim)     # v7 region causes (dunes, ice), None when off
+        if not patches and not any(self._body_damped.values()) and surf is None:
             return
         m, d, cfg = self.sim.model, self.sim.data, self.cfg
         for r in self.sim.rovers:
             gids, dofs = self._wheels[r.id]
             freed = self.freed_until.get(r.id, -1.0) > t
             n_in = 0
+            regs = surf.state.setdefault(r.id, [0] * len(gids)) if surf is not None else None
             for k, gid in enumerate(gids):
                 inside = False
                 if patches and not freed:
                     wx, wy = d.geom_xpos[gid][0], d.geom_xpos[gid][1]
                     inside = any((wx - p.x) ** 2 + (wy - p.y) ** 2 <= p.radius ** 2 for p in patches)
+                reg_changed = False
+                if regs is not None:
+                    reg = surf.region_at(d.geom_xpos[gid][0], d.geom_xpos[gid][1])
+                    reg_changed, regs[k] = reg != regs[k], reg
                 n_in += inside
-                if inside != self._in_sand[r.id][k]:
+                if inside != self._in_sand[r.id][k] or reg_changed:
                     self._in_sand[r.id][k] = inside
-                    m.geom_friction[gid][0] = cfg.sand_friction if inside else self._base_fric[gid]
-                    m.dof_damping[dofs[k]] = self._base_wdamp[dofs[k]] + (cfg.sand_wheel_damping if inside else 0.0)
+                    fric, damp = v7_surface.compose_wheel(self._base_fric[gid], self._base_wdamp[dofs[k]], inside,
+                                                          regs[k] if regs is not None else 0, cfg)
+                    m.geom_friction[gid][0] = fric
+                    m.dof_damping[dofs[k]] = damp
             b = r.vadr
             if n_in:
                 weight = r.mass * cfg.gravity

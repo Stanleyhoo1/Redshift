@@ -114,6 +114,7 @@ class Fleet:
         self.plan_slices = 0
         self._costs: dict = {}             # (limit, limit_version, unknown_cost) -> (grid, t)
         self.soft_zones: list = []         # [(x, y, radius, rover id, t)] soft ground found by wheel slip
+        self.ice_zones: list = []          # v7: [(x, y, radius, rover id, t)] frozen ground found by low traction
         self.orphan = None                 # (x, y, rover id, t): area a faulted rover had to drop
         self.hazards = None                # set by the sim; only told about soft zones (for the UI)
         self.water_zones: list = []        # [(x, y, radius, rover id, t)] liquid the fleet identified
@@ -845,7 +846,7 @@ class Fleet:
     def report_slope_stall(self, t: float, rover, slope_deg: float, load: float | None = None) -> bool:
         """A rover could not climb a slope. Returns True if the fleet limit was lowered."""
         measured = int(round(slope_deg))
-        floor = max(self.cfg.slope_limit_floor_deg, math.floor(self.best_climb))
+        floor = max(self.cfg.slope_floor_deg, math.floor(self.best_climb))
         new = max(floor, measured - 2)
         why = f"slope {measured} deg" + (f" with motors at {load * 100:.0f}%" if load is not None else "")
         if new < self.slope_limit - 0.01:
@@ -871,7 +872,7 @@ class Fleet:
     # ------------------------------------------------------------------ stats
     def stats(self) -> dict:
         found = sum(1 for ts in self.targets if ts.status is not None)
-        return {
+        out = {
             "explored_pct": round(self.map.explored_pct(), 1),
             "slope_limit_deg": round(self.slope_limit, 1),
             "slope_limit_initial_deg": round(float(self.cfg.slope_limit_initial_deg), 1),
@@ -891,7 +892,15 @@ class Fleet:
             "spares": dict(self.spares),                    # protocol v9
             "rescues": self.rescues_msg(),
             "wrecks": [dict(w) for w in self.wrecks],
+            **({"ice_zones": [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in self.ice_zones]}
+               if self.cfg.ice_sheets and self.ice_zones else {}),
         }
+        gz = getattr(self, "geyser_zones", None)
+        if gz:                              # v7: only when geysers are on and the fleet has seen one
+            out["geyser_zones"] = [[round(z[0], 2), round(z[1], 2), round(z[2], 2)] for z in gz]
+        if getattr(self, "flora", None) is not None:
+            out.update(self.flora.stats())     # v7: only when flora is on and some is known
+        return out
 
     def discovered_targets(self) -> list:
         return [ts.to_msg() for ts in self.targets if ts.status is not None]

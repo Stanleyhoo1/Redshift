@@ -4,6 +4,7 @@ import { resetSim } from '../net/connection.js'
 import { shortName } from '../lib/format.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { useGraphics, visualPrefs } from '../state/visualPrefs.js'
+import { ViewModeControl } from '../globe/ViewModeControl.jsx'
 import '../styles/scene.css'
 
 // The realistic ground is the first impression: slope colours start off (once per page
@@ -15,6 +16,8 @@ function GraphicsControl() {
   const graphics = useGraphics()
   return (
     <div className="hud-group">
+      {/* v7 planet view: View, Sector | Planet, laid out like the Graphics row below it */}
+      <ViewModeControl />
       <div className="gfx-row">
         <div className="hud-label" id="gfx-label">
           Graphics
@@ -54,7 +57,7 @@ function ConnStatus() {
   if (conn === 'open') {
     state = stale ? 'stale' : ready ? 'open' : 'connecting'
     label = stale ? 'No data' : ready ? 'Live' : 'Waiting for sim'
-  } else if (conn === 'reconnecting') label = 'Reconnecting'
+  } else if (conn === 'reconnecting') label = ready ? 'Reconnecting' : 'Connecting' // never connected yet: still connecting
   return (
     <div className="conn" data-state={state} role="status">
       <span className="conn-dot" aria-hidden="true" />
@@ -122,9 +125,14 @@ function ResetControl() {
   }
   return (
     <div className="reset">
-      <button type="button" className="btn btn-wide" disabled={phase === 'pending'} onClick={() => setPhase('confirm')}>
-        {phase === 'pending' ? 'Resetting...' : 'Reset sim'}
-      </button>
+      <div className="reset-row">
+        <button type="button" className="btn btn-wide" disabled={phase === 'pending'} onClick={() => setPhase('confirm')}>
+          {phase === 'pending' ? 'Resetting...' : 'Reset sim'}
+        </button>
+        <button type="button" className="btn btn-wide" title="Choose gravity, fleet, sector and features, then launch" onClick={() => appStore.patch({ modal: { kind: 'setup', forced: simStore.get().phase === 'setup' } })}>
+          New mission
+        </button>
+      </div>
       {phase === 'error' && <p className="reset-error">{error}. Check that the sim is running.</p>}
     </div>
   )
@@ -164,7 +172,7 @@ export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
         <div className="hud-label" id="follow-label">
           Follow
         </div>
-        <div className="seg" role="group" aria-labelledby="follow-label">
+        <div className={`seg${meta.length > 3 ? ' seg-follow-many' : ''}`} role="group" aria-labelledby="follow-label">
           <button type="button" aria-pressed={!follow} onClick={onOverview} title="Overview (0)">
             Off
           </button>

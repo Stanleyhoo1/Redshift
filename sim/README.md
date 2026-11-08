@@ -20,7 +20,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 
 | File | What it does |
 |---|---|
-| `redshift/config.py` | All settings in one place. Reads the env vars below. |
+| `redshift/config.py` | All settings in one place. Reads the env vars below. `SETTINGS` is the table of launch settings (key, range, label, help) behind the setup screen, `GET /api/config` and `POST /api/launch`; the slope thresholds tuned for 2 g follow the launch gravity (see "Learning the slope limit"). |
 | `redshift/terrain.py` | Makes the ground: plains, hills, ridges, craters (each with a gentle way in), rocks, science targets in clusters, one or two lakes (often with a short river), alien spires, the home areas of the grazer herds, organic "trace" targets near them, and each target's science value and analysis. Feature counts grow with the map area. Same seed, same world. |
 | `redshift/world.py` | Builds the MuJoCo physics model: the ground as height-map tiles, rocks, the lander pad, target markers, liquid surfaces, spires, creatures, hidden rockfall boulders and spare spires, and the rovers (4 wheels, skid steering, front axle that rocks so all wheels touch, an IMU). |
 | `redshift/mapping.py` | The shared fleet map. Turns LiDAR hits into heights and slopes for each grid cell, notices when mapped ground changes, keeps layers for soft ground, identified water and "no echo here" evidence, and finds frontiers (edges of the known area). |
@@ -29,6 +29,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `redshift/fleet.py` | Team decisions: who goes to which frontier, the shared slope limit, the target list and the sample cache, soft ground and water reports, who observes a lifeform, who takes over from a broken rover, and the event log. |
 | `redshift/tracker.py` | Motion tracker: LiDAR point clusters that move between sweeps become tracks (position, speed, size). |
 | `redshift/lifeforms.py` | The grazers: they wander, graze, keep together, avoid bad ground and shy away from rovers. The rovers never read this. |
+| `redshift/v7_life.py` | "More lifeforms" (`LIFE_VARIETY`): the kinds (skitterer, drifter, crawler, burrower), their biome weights, which kind each group is (own stream `default_rng([seed, 7113])`), their MuJoCo bodies (few LiDAR geoms; drifter tendrils hang low enough for the LiDAR, a burrower sinks below the ground) and their behaviour. Ground truth only. |
 | `redshift/hazards.py` | Changes the world on request: rockfall, sand, dust storm, rover fault, spire fall, and (demo) a herd walking into view. Rockfall, sand, spire fall and lifeform can be put at a clicked point. Only the UI sees this list; the rovers must find out for themselves. |
 | `redshift/sim.py` | Runs it all: steps the physics, runs the rovers' decisions 5 times per sim second, and builds the messages for the UI. Also a command line runner that can script hazards. |
 | `redshift/camera.py` | Live pictures from each rover's mast camera (MuJoCo renders, up to 1280 x 720), for the UI and for Gemma: sun shadows placed in front of each camera, distance haze from the depth buffer, a dust veil in storms. Renders the views clients keep asking for in the background and answers with the newest frame at once (protocol v8), culls what cannot change a pixel, and runs the rovers' detector renders. |
@@ -43,7 +44,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `redshift/health.py` | Protocol v9: each rover's parts (drive_l, drive_r, lidar, camera, power, comms), hp, status and self diagnosis, how damage changes the rover (torque and top speed per drive side, LiDAR range and rays, camera noise, battery drain, radio range), and the physics monitor that turns shocks and contact forces into damage. |
 | `redshift/rescue.py` | Protocol v9: distress and the silent-rover heartbeat, picking the helper, diagnosis, field repair, the tow / salvage / leave decision (Gemma or a `rescue` request), physical towing with a kinematic fallback, salvage, wrecks, repair at the lander with spares. |
 | `redshift/gaps.py` | Unexplored gaps (protocol v8): connected pockets of unknown ground inside the map with known ground around most of their edge (narrow channels sealed first), with the frontiers on their edge. A few ms on the 120 m map, cached by the fleet and refreshed every 3 s only while needed. |
-| `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
+| `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `GET /api/config`, `POST /api/launch`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma and builds the world; with `AUTO_LAUNCH=0` (the default) it waits in the setup phase until `POST /api/launch`, then runs the sim in the background at `SIM_SPEED` times real time. A reset or launch builds the new world before it stops the old one. |
 | `scripts/climb_test.py` | Drives a rover up ramps of known angle to check how steep it can climb. |
 | `scripts/gemma_bench.py` | Measures Gemma's speed and answers against a real Ollama. |
 | `scripts/camera_bench.py` | Camera render time per frame (320 x 240 and 1280 x 720 by default); `--live`: request latency, frame age, frames per second and brain time with a client polling like the UI. |
@@ -60,6 +61,9 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `tests/test_v7.py` | Area focus (frontier choice inside the circle, claims, the stay and its report, "explore north of the lander", survey then focus), curiosity (triggers, cooldown, limits), chat references (keyword parser and fake Gemma), following a new herd while asking, and leaving for the lander when waiting would drain the battery. |
 | `tests/test_v9.py` | Protocol v9: boulder and spire hits damage, normal driving does not; drive pull, LiDAR range, power and camera effects; the `damage` hazard (every severity and every 400); distress, helper choice and field repair; the silent rover; tow home and a lander repair with a spare; waiting for a missing spare; Gemma salvaging a wreck; a supervised `rescue` request (safe / note / about); health questions and rescue orders (keyword parser, fake Gemma, in the sim); a creature charge. |
 | `tests/test_v8.py` | Autonomy mode (env, `POST /api/mode`, chat; decisions by Gemma, the rules and the 0.5 floor, logged with a `decision` object; supervised asks with Gemma's suggestion; switching decides open questions), gap detection and gaps as places and as a priority, the other priorities, the re-survey and its report, area questions, and a table of operator messages through the keyword parser and the fake Gemma. |
+| `tests/test_v7_biomes.py` | Biomes: the pick (deterministic, never rust as primary, every biome reachable over seeds 0 to 400), the region field and `terrain.biome_id_at`, the feature weights (frost has no flora, salt no geysers, ash no ice), init `world.biome` and `features.biome_map`, flags off byte-identical to the world before biomes, and camera safety: every biome's ground colours stay outside the target spotting tolerance, and from open ground on every biome the target spotting finds only real markers, the liquid check sees no liquid and the plant check labels no ground. |
+| `tests/test_v7_settings.py` | Launch settings (protocol v7): the settings table and its parser (every bad value and its message), the round trip, `from_env` clamps and feature switches, the slope thresholds derived from gravity (identical at 2 g), Gemma's gravity text, the setup phase, `GET /api/config`, `POST /api/launch`, settings in `POST /api/reset`, the 409s, and no em dash in the files this step touched. |
+| `tests/test_v7_life.py` | More lifeforms: flags off gives exactly the old herds and messages (a digest), kinds by biome weights, each kind's behaviour, LiDAR sees burrowers only while up and drifters at their height, rovers keep 4 m (6 m from crawlers), the hazard follows the biome, and Gemma's kind hint. |
 
 `test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
 numbers) written for the old 80 m world, so they run with `MAP_SIZE` 80 and the v4 features (water,
@@ -160,11 +164,11 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SEED` | 42 | terrain and target layout |
+| `SEED` | 42 | terrain and target layout (0 or more; the setup screen offers 0 to 2147483647) |
 | `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
-| `SIM_SPEED` | 3.0 | sim seconds per wall second |
-| `MAP_SIZE` | 120 | map width in metres (feature counts grow with the area; 80 gives the old layout) |
-| `GRAVITY_G` | 2.0 | gravity in Earth g |
+| `SIM_SPEED` | 3.0 | sim seconds per wall second (0.5 to 10) |
+| `MAP_SIZE` | 120 | map width in metres, 60 to 200 (feature counts grow with the area; 80 gives the old layout) |
+| `GRAVITY_G` | 2.0 | gravity in Earth g (0.5 to 3); out of range values are clamped |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer |
 | `BRAIN_BUDGET_MS` | 40 | compute budget per rover per decision cycle (ms) |
 | `AUTO_RESET_S` | 0 | off by default. If set, once exploration is complete and every rover is parked, wait this many seconds, then start a new random planet (server only) |
@@ -182,8 +186,22 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `CAMERA_FPS` | 12 | most frames per second rendered for one streamed view (it follows the client's request rate below that) |
 | `VISION` | 1 | 0 = no onboard object detection (the rovers decide from LiDAR and the old colour check only) |
 | `VISION_HZ` | 1.0 | detector renders per rover per wall second (small 256 x 192 frames without shadows; a streamed fpv view counts too) |
+| `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase until `POST /api/launch` (the setup screen); 1 = start at once. `AUTO_RESET_S` above 0 also starts at once |
+| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features (0 leaves one out). Off in a bare `Config()`, on in `Config.from_env()`. Code: `v7_landforms.py` (mesas, canyon, pits, boulder fields), `v7_surface.py` (dunes, ice sheets, wheel friction composer, low traction rule), `v7_geysers.py`, `v7_flora.py`; ground detail is drawn by the web only |
+| `BIOMES` | 1 | v7 biomes (`v7_biomes.py`): the seed picks a primary biome and a secondary one in soft regions; they scale the v7 feature counts and set the camera colours. Off in a bare `Config()` |
+| `LIFE_VARIETY` | 1 | more lifeform kinds than the grazers (stream `[seed, 7113]`). Off in a bare `Config()` |
+| `WEAR` | normal | `off`, `normal` or `harsh` (parts wear out about 4 times sooner). Accepted and echoed in `config`; wear itself is not part of this build yet |
 
 More Gemma settings (timeouts, tokens, model loading) are in `GEMMA.md`.
+
+## Biomes (v7)
+
+`v7_biomes.py` holds the `BIOMES` table: per biome a name, the feature weights, the lifeform weights, and the camera colours (soil ramp, pebbles, rock, sun and ambient light, sky). `Terrain.__init__` calls `v7_biomes.attach` right after the height field and before any v7 feature, so every generator can scale its count:
+
+- `pick(cfg)`: `(primary, secondary)` from `default_rng([seed, 7112])`; the primary is never `rust`, the secondary is any other id (rust allowed). None with biomes off.
+- `Region`: the secondary share 0..1, a few soft Gaussian blobs warped by long waves, thresholded at a seeded quantile so it covers 25 to 40 percent of the sector, and kept at 0 round the lander.
+- `terrain.biome` (`{id, name, secondary}` or None), `terrain.biome_id_at(x, y)`, `weight(terrain, feature)` (1.0 with biomes off; else 0 when the primary weight is 0, otherwise 0.75 primary + 0.25 secondary) and `count(terrain, feature, n)` (exactly n when the weight is 1). The canyon is built only when `weight >= 0.5`. Counts change after each generator's own draws, so with biomes off the worlds are byte for byte the old ones (the test checks hashes of the heights, the features message, the materials and the textures).
+- Camera look: `visuals.textures(seed, biome)` paints the regolith (four primary variants plus two of the secondary, used on tiles whose centre lies in the secondary region), rocks and sky in the biome's colours, and the sun, ambient and haze follow it. Every colour is checked to stay outside the target spotting tolerance of every marker colour and off the blue liquid rule, so no biome's ground, nor one biome's patch seen against another's, can trip the camera checks.
 
 ## Sensors
 
@@ -665,6 +683,10 @@ expansions instead (3 us each, measured here), which makes runs repeat exactly; 
   96%"). Every rover replans with the new limit straight away. The limit never drops below the
   steepest climb a rover has already managed. A stall caused by a rock or by losing grip does not
   count. The real limit at 2 g is about 20.5 deg (see `scripts/climb_test.py`).
+  At another launch gravity the predicted limit is `asin(4 T / r / (m g))`, capped at 30 deg where grip
+  takes over (about 14 deg at 3 g), and the thresholds tuned for 2 g follow it: target paths 15 deg, the
+  no-trap flood 18 deg, hazard placement 20 deg, the slope floor 12 deg and the sand wheel load 0.2 (see
+  PROTOCOL.md, "Version 7 additions", Sim notes). At 2 g they are unchanged.
 - **Science.** If a LiDAR ray hits a target within 8 m, the rover reports it with the
   spectrometer's value estimate. If it is free, has the battery and a tube to spare, it drives over,
   runs the instrument, analyses the sample and keeps it in a tube (see "Samples"). Busy rovers log
