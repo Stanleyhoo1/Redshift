@@ -23,7 +23,7 @@ def test_landforms_appear_and_starts_reach_lander():
     cfg = Config(seed=42, mesas=True, canyon=True, pits=True, boulder_fields=True)
     t = Terrain(cfg)
     lf = t.landforms
-    assert lf["mesas"] and lf["boulder_fields"]
+    assert lf["mesas"] and lf["pits"] and lf["boulder_fields"]
     assert 0 < len(t.bfield) < 300
     for x, y in dock_spots(cfg, cfg.num_rovers):
         i, j = t.ij(x, y)

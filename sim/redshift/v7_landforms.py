@@ -273,10 +273,12 @@ def apply(ter, h: np.ndarray) -> np.ndarray:
         mask |= foot
         info["canyon"] = can
     if cfg.mesas:
+        reach0 = reach0 & ~_dilate(mask, 4)
         h, foot, mesas = _mesas(ter, h, reach0, _dilate(mask, 6))
         mask |= foot
         info["mesas"] = mesas
     if cfg.pits:
+        reach0 = reach0 & ~_dilate(mask, 4)
         h, foot, pits = _pits(ter, h, reach0, _dilate(mask, 6))
         mask |= foot
         info["pits"] = pits
