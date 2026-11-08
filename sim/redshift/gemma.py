@@ -119,8 +119,8 @@ DESCRIBE_ACTIONS = ("approach", "observe", "ignore", "ask_operator")
 MAX_LABEL_WORDS = 10
 COMMANDS = ("go_to", "explore_direction", "sample_target", "return_home", "hold", "resume", "avoid_area",
             "question", "unclear")
-TOPICS = ("status", "exploration", "finds", "samples", "battery", "hazards", "lifeforms", "water", "location",
-          "why", "unknown")
+TOPICS = ("status", "history", "exploration", "finds", "samples", "battery", "hazards", "lifeforms", "water",
+          "location", "why", "unknown")
 DIRECTIONS = ("north", "south", "east", "west", "north-east", "north-west", "south-east", "south-west")
 
 MAX_REASON_WORDS = 25
@@ -931,6 +931,9 @@ _TOPIC_RES = (   # first match wins
     ("hazards", re.compile(r"problem|issue|trouble|hazard|danger|wrong|rock ?fall|\brocks?\b|boulder|\bsand|stuck|"
                            r"\bdust|storm|fault|obstacle|\brisk|damage|broke|spire|incident|difficult|scary")),
     ("finds", re.compile(r"\bfind|found|discover|target|interesting|science|\bspot|detect|result")),
+    ("history", re.compile(r"done so far|have you done|did you do|you('?ve| have) done|been up to|been doing|"
+                           r"what have you (?:achieved|accomplished)|\brecap|\bhistory\b|\blogs?\b|mission report|"
+                           r"your day\b|summar|everything you")),
     ("exploration", re.compile(r"explor|mapped|\bmap\b|cover|\barea|region|\bbeen\b|visited|driven|\bdrive|travel|"
                                r"distance|how far|how much ground|progress|percent")),
     ("status", re.compile(r"status|how are you|how'?s it going|how is it going|update|report|sitrep|\bok\b|okay|"
@@ -1810,7 +1813,7 @@ class FakeBackend(Backend):
                 "target_id": c.get("target_id", "none"), "topic": c.get("topic", "none"),
                 "question": c.get("question", ""), "ack": p["ack"], "confidence": 0.85}
 
-    _LEADS = {"status": "Status: ", "exploration": "Mapping so far: ", "finds": "Finds: ", "samples": "Samples: ",
+    _LEADS = {"status": "Status: ", "history": "My log: ", "exploration": "Mapping so far: ", "finds": "Finds: ", "samples": "Samples: ",
               "battery": "Power check: ", "hazards": "Hazards: ", "lifeforms": "Lifeforms: ", "water": "Water: ",
               "location": "Position: ", "why": "Plan: "}
 

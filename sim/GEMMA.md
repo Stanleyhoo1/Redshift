@@ -78,8 +78,9 @@ about 0.9 m tall). Gemma thinks: rock (confidence 0.80). What should I do?
 [Go around] (default)  [Approach slowly]  [Wait]
 ```
 
-While it waits the rover creeps at 0.25 m/s along its safe route (fast enough that the slip and
-stall detectors keep working). Your answer is applied ("r2: going around, thanks."). No answer in
+While it waits the rover holds position. It only moves if staying put is the danger: backing out of
+soft ground or liquid, heading home on a low battery, or making room for a creature that came closer
+than the planetary protection distance. Your answer is applied ("r2: going around, thanks."). No answer in
 20 wall seconds (`OPERATOR_TIMEOUT_S`): it takes the safest option and says so ("r2: no reply in
 20 s, taking the safe option: go around."). If Gemma is offline the rules still ask about the first
 anomaly, without Gemma's guess. At most one open question per rover, two for the fleet, and one
