@@ -324,6 +324,7 @@ def make_boulder_fields(ter) -> list:
         else:
             continue
         got = 0
+        first = len(rocks)
         for _k in range(per * 8):
             if got >= per:
                 break
@@ -342,8 +343,10 @@ def make_boulder_fields(ter) -> list:
             z = ter.height_at(bx, by) + sz * 0.45
             rocks.append(Rock(bx, by, z, sx, sy, sz, yaw))
             got += 1
+        # The field's boulders for the map view: [x, y, size], size the mean horizontal half-size (m).
+        field_rocks = [[round(r.x, 2), round(r.y, 2), round((r.sx + r.sy) / 2, 2)] for r in rocks[first:]]
         fields.append({"id": f"bfield{len(fields) + 1}", "x": round(x, 2), "y": round(y, 2),
-                       "radius": round(R, 2), "count": got})
+                       "radius": round(R, 2), "count": got, "rocks": field_rocks})
     ter.landforms = dict(getattr(ter, "landforms", None) or {})
     ter.landforms["boulder_fields"] = fields
     return rocks
