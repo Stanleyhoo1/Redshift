@@ -19,6 +19,7 @@ import { Spires, fallDebug } from './Spires.jsx'
 import { IceSheets } from './IceSheets.jsx'
 import { Flora } from './Flora.jsx'
 import { Geysers } from './Geysers.jsx'
+import { GroundDetail } from './GroundDetail.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
 import { PlaceCandidates } from './PlaceCandidates.jsx'
@@ -104,7 +105,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <Atmosphere />
       <DustStorm />
       <Ground />
-      <Terrain slopeColors={view.slope} />
+      <Terrain slopeColors={view.slope} reality={view.reality} />
       <Gravel />
       <Water reality={view.reality} />
       <HazardVisuals reality={view.reality} />
@@ -112,6 +113,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <IceSheets reality={view.reality} />
       <Flora reality={view.reality} />
       <Geysers reality={view.reality} />
+      <GroundDetail reality={view.reality} />
       <Lander />
       {view.frontiers && <Frontiers />}
       <Targets />
