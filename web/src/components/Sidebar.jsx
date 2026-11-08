@@ -144,7 +144,9 @@ function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
         >
           Comms
           {asking > 0 ? (
-            <span className="tab-ask">{asking === 1 ? 'Question' : `${asking} questions`}</span>
+            <span className="tab-ask" aria-label={`${asking} ${asking === 1 ? 'question' : 'questions'} waiting`} title={`${asking} ${asking === 1 ? 'question' : 'questions'} waiting`}>
+              {asking}
+            </span>
           ) : (
             unread > 0 && (
               <span className="tab-badge" aria-label={`${unread} unread`}>
