@@ -205,7 +205,7 @@ export default function App() {
             <SensorPanel roverId={selected} onClose={closePanel} />
           </div>
         ) : (
-          !globe && <Legend slopeColors={view.slope} frontiers={view.frontiers} life={view.life} />
+          !globe && <Legend slopeColors={view.slope} frontiers={view.frontiers} life={view.life} reality={view.reality} />
         )}
         {paused && !globe && <FollowPill roverId={follow} onResume={resumeFollow} />}
         <Waiting />

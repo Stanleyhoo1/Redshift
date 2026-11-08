@@ -3,12 +3,17 @@ import { degrees, fixed } from '../lib/format.js'
 import { KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
 import '../styles/scene.css'
 import { TerrainLegend } from './TerrainLegend.jsx'
+import { KIND_LOOK, legendKinds } from '../scene/lifeKinds.js'
 
-export function Legend({ slopeColors, frontiers, life = true }) {
+export function Legend({ slopeColors, frontiers, life = true, reality = false }) {
   const limit = useSim((s) => s.limit)
   const map = useSim((s) => s.map)
   const v4 = useSim((s) => s.v4)
   const hasTrace = useSim((s) => s.v4 || s.targets.some((t) => t.kind === 'trace'))
+  // v7 kinds of lifeform: one entry per kind the fleet has noticed (all present with Reality on),
+  // only once a kind other than grazers is about
+  const kindList = useSim((s) => legendKinds(s.lifeforms, s.tracks, reality).join(','))
+  const kinds = kindList && kindList !== 'grazer' ? kindList.split(',') : []
   const lim = Number.isFinite(limit.current) ? limit.current : 30
   const caution = lim * 0.6
   return (
@@ -86,6 +91,16 @@ export function Legend({ slopeColors, frontiers, life = true }) {
               </li>
             </>
           )}
+        </ul>
+      )}
+      {v4 && life && kinds.length > 0 && (
+        <ul className="legend-list legend-row" aria-label="Kinds of lifeform">
+          {kinds.map((k) => (
+            <li key={k} title={KIND_LOOK[k].hint}>
+              <i className="sw sw-life" style={{ '--c': KIND_LOOK[k].color }} />
+              {KIND_LOOK[k].label}
+            </li>
+          ))}
         </ul>
       )}
       <TerrainLegend />
