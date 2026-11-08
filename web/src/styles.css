@@ -890,6 +890,18 @@ code {
   border-top: 1px solid var(--line);
 }
 
+.reset-row {
+  display: flex;
+  gap: 8px;
+}
+
+.reset-row .btn {
+  flex: 1 1 0;
+  padding-left: 8px;
+  padding-right: 8px;
+  white-space: nowrap;
+}
+
 .reset-confirm > span {
   display: block;
   padding: 0 2px;

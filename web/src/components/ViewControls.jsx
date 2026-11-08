@@ -122,9 +122,14 @@ function ResetControl() {
   }
   return (
     <div className="reset">
-      <button type="button" className="btn btn-wide" disabled={phase === 'pending'} onClick={() => setPhase('confirm')}>
-        {phase === 'pending' ? 'Resetting...' : 'Reset sim'}
-      </button>
+      <div className="reset-row">
+        <button type="button" className="btn btn-wide" disabled={phase === 'pending'} onClick={() => setPhase('confirm')}>
+          {phase === 'pending' ? 'Resetting...' : 'Reset sim'}
+        </button>
+        <button type="button" className="btn btn-wide" title="Choose gravity, fleet, sector and features, then launch" onClick={() => appStore.patch({ modal: { kind: 'setup' } })}>
+          New mission
+        </button>
+      </div>
       {phase === 'error' && <p className="reset-error">{error}. Check that the sim is running.</p>}
     </div>
   )

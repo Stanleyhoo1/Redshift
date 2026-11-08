@@ -72,6 +72,11 @@ function DebugHook() {
           hazards: s.hazards,
           requests: s.requests,
           lander: s.lander,
+          phase: s.phase,
+          config: s.config,
+          world: s.world,
+          gen: s.gen,
+          roverMeta: s.roverMeta,
         }
       },
     }
