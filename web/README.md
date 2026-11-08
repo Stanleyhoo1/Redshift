@@ -120,6 +120,20 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   question, the options (the safe default marked) and a countdown. Answer there or in the
   thread; the card confirms, or says which safe default it took when time ran out. More
   questions queue as strips under the card. The asking rover's name tag shows a "?".
+- Place choices and questions that wait (version 6): orders can name a place ("go to the
+  water source", "can we investigate the lake for signs of life"). When several places
+  match, the rover asks with a `choose_place` request: every candidate gets a numbered
+  marker on the map in the rover's colour (pulsing ring, badge with a short label, faint
+  line from the rover), the card shows numbered chips and a small north-up map instead of
+  the camera, and the question in Comms has the same chips. Click a marker, a chip, or
+  type "the second one". Hovering a marker lights its chips and the other way round. When
+  such a request opens the camera glides once to show the rover and all candidates (not
+  while you are moving the camera, and not if they are already in view; a follow pauses
+  with "Back to"), and goes back afterwards if you did not touch it. A request with
+  `expires_in` null shows "Waiting for you" (no countdown, no safe default): the rover
+  holds until you answer. Older sims with a countdown work as before.
+- Lost tracks (version 4): a faded, frozen copy of the creature stays where the fleet last
+  saw it, and the tag says "last seen 12 s ago", until the sim forgets the track.
 - Every version 2, 3 and 4 field is optional: with an older sim the panel shows dashes, the
   camera says it is unavailable, the hazard buttons say the sim does not support them, the
   Gemma pill and bar stay hidden, Comms says the sim has no operator chat, and the version 4
@@ -153,6 +167,21 @@ noisy ground in perspective that moves with the rover, horizon tilted by roll an
 rover itself in the chase view. `MOCK_ANSWER_DELAY_MS` adds thinking time (for screenshots).
 `node scripts/v5-shots.mjs` (mock started with `MOCK_ANSWER_DELAY_MS=11000`, preview running)
 drives follow and pan, the camera viewer, the sensor view and Comms, and saves screenshots.
+
+Version 6 in the mock (the default; `MOCK_PROTOCOL=5` for the previous behaviour): place
+orders for water, vents, minerals, ice, traces, spires, herds and the lander, from what the
+fleet knows, with qualifiers (nearest, farthest, biggest, smallest, newest, a direction,
+near the lander or a rover, an id like t7). The closest free rover goes when none is named;
+two or more matches give a `choose_place` request with up to 3 candidates and "Never
+mind", answered by `/api/answer` or chat text ("p2", "the second one", "the one near the
+lander", "the stream"). The rover drives to a safe spot next to the place (3 m from a
+shore), and "investigate", "survey" or "look for life" make it stop, turn slowly for 30 sim
+seconds and report in chat (`reply_to` the order). Every request has `kind`, and
+`OPERATOR_TIMEOUT_S` defaults to 0 (requests wait, `expires_in` null; set it above 0 for the
+countdown). Test hook: `POST /api/_mock/reveal {"water"?, "targets"?, "spires"?}` (the fleet
+learns them all). `node scripts/v6-check.mjs` (mock started with
+`MOCK_FIRST_QUESTION_S=99999`, preview running) sends an ambiguous order, saves one
+screenshot and clicks a marker.
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

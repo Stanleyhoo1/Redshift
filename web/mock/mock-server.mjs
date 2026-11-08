@@ -30,16 +30,27 @@
 // samples, hazards met, lifeforms seen, replans); and a procedural camera image (PNG,
 // up to 1280 x 720) instead of 503: hazy sky, noisy ground in perspective, horizon tilted
 // by the rover's roll, the rover itself in the chase view. MOCK_CAMERA=off gives 503.
+// Version 6 additions: commands that name a place ("go to the water source", "can we
+// investigate the lake for signs of life", "rover 3, survey the spires", "take a look at
+// t7"), resolved from what the fleet knows (identified water, found targets, spire groves
+// on the map, herds, the lander) with qualifiers (nearest, farthest, biggest, smallest,
+// newest, a compass direction, near the lander or a rover, an id); the closest free rover
+// goes when none is named; a `choose_place` request with 2 or 3 candidates (x, y) when it
+// is ambiguous, answered by /api/answer or by chat text ("the second one", "p2"); surveys
+// (stop, turn slowly through 360 deg for 30 sim s, then an info report with reply_to);
+// `kind` on every request; and requests that never expire (OPERATOR_TIMEOUT_S defaults
+// to 0, so `expires_in` is null and the rover holds until answered).
 //
 // Run: node mock/mock-server.mjs
 // Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
 //      GEMMA_ENABLED, GEMMA_MODEL, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S,
 //      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
-//      MOCK_PROTOCOL (2, 3 or 4 = an older sim without the later fields), MOCK_CAMERA (off),
+//      MOCK_PROTOCOL (2 to 5 = an older sim without the later fields), MOCK_CAMERA (off),
 //      MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions)
 // Mock-only test hooks (not part of the protocol): POST /api/_mock/planner {"state"},
 // POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"},
-// POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question).
+// POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question),
+// POST /api/_mock/reveal {"water"?, "targets"?, "spires"?} (the fleet learns all of them at once, for testing place commands).
 
 import http from 'node:http'
 import zlib from 'node:zlib'
@@ -78,9 +89,11 @@ const FAULT_S = 90
 const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma4:e2b'
 const GEMMA_BUDGET_MS = Number(process.env.GEMMA_BUDGET_MS || 3000)
 const GEMMA_WARMUP_S = Number(process.env.MOCK_GEMMA_WARMUP_S || 10)
-const OPERATOR_TIMEOUT_S = Number(process.env.OPERATOR_TIMEOUT_S || 20)
 const FIRST_QUESTION_S = Number(process.env.MOCK_FIRST_QUESTION_S || 40)
-const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 5) // 2, 3 or 4 = behave like an older sim (no later fields or endpoints)
+const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 6) // 2 to 5 = behave like an older sim (no later fields or endpoints)
+// v6: 0 = requests never expire (the rover waits for the operator). Older protocols: 20 s.
+const OPERATOR_TIMEOUT_S = Math.max(0, Number(process.env.OPERATOR_TIMEOUT_S ?? (PROTOCOL >= 6 ? 0 : 20)) || 0)
+const requestDeadline = () => (OPERATOR_TIMEOUT_S > 0 ? wallNow() + OPERATOR_TIMEOUT_S : null)
 const CAMERA_ON = PROTOCOL >= 5 && process.env.MOCK_CAMERA !== 'off'
 const ANSWER_EXTRA_MS = Math.max(0, Number(process.env.MOCK_ANSWER_DELAY_MS || 0)) // mock only: slower answers, for screenshots
 const HAZARD_TYPES = ['rockfall', 'sand', 'dust_storm', 'rover_fault', ...(PROTOCOL >= 4 ? ['spire_fall', 'lifeform'] : [])]
@@ -688,6 +701,7 @@ function newSim(seed) {
     waterSeenCount: 0,
     waterZones: [], // [x, y, r] the fleet has identified
     identified: new Set(), // water body indices
+    identifiedAt: new Map(), // v6: water body index -> sim time it was identified
     spireSeen: new Set(),
     lifeforms: [],
     herds: [],
@@ -906,6 +920,7 @@ function senseWater(rover) {
     if (!sim.identified.has(wi)) {
       if (distToPoly(rover.x, rover.y, w.outline) > IDENTIFY_RANGE && !pointInPoly(rover.x, rover.y, w.outline)) return
       sim.identified.add(wi)
+      sim.identifiedAt.set(wi, sim.t)
       revealCover(wi, rover, SENSOR_RADIUS)
       const xs = w.outline.map((p) => p[0])
       const ys = w.outline.map((p) => p[1])
@@ -1265,6 +1280,8 @@ function releaseTarget(rover) {
 
 function startReturn(rover, msg = null, source = null) {
   releaseTarget(rover)
+  rover.placeTask = null
+  rover.survey = null
   const [dx, dy] = dockPoint(rover)
   if (!setGoal(rover, dx, dy, 'returning')) {
     rover.state = 'returning'
@@ -1490,6 +1507,17 @@ function stepRover(rover, dt) {
     rover.sandT = 0
   }
 
+  // v6: a survey ends when anything else takes over the rover.
+  if (rover.survey && rover.state !== 'investigating') rover.survey = null
+  // v6: a rover waiting for an answer still moves when staying is the danger: a low
+  // battery withdraws the question and sends it home.
+  const q = rover.request
+  if (q && !q.pending && q.deadline === null && rover.state !== 'charging' && rover.state !== 'fault' && lowBattery(rover, 0.2)) {
+    resolveRequest(q, 'cancelled')
+    addChat(rover.id, 'operator', `Battery at ${Math.round(rover.battery * 100)}%, so I can't wait for your answer any longer. Heading back to charge; ask me again later.`, 'info', 'rules', q.id)
+    if (rover.state !== 'returning') startReturn(rover)
+  }
+
   // "Wait here" as an answer holds for a minute of sim time at most.
   if (rover.hold && rover.holdUntil !== null && sim.t > rover.holdUntil) {
     rover.hold = false
@@ -1543,6 +1571,7 @@ function stepRover(rover, dt) {
         else if (Math.abs(rover.path.length - before) > 4 && sim.rand() < 0.35) addEvent(rover.id, 'info', 'New terrain ahead. Replanned the route around steep ground.')
       }
       if (arrived) {
+        if (arrivePlace(rover)) break // v6: a place the operator named
         rover.goal = null
         if (!chooseExplorationGoal(rover)) {
           rover.state = 'idle'
@@ -1552,6 +1581,10 @@ function stepRover(rover, dt) {
       break
     }
     case 'investigating': {
+      if (rover.survey) {
+        stepSurvey(rover, dt) // v6: surveying a place the operator named
+        break
+      }
       const t = sim.discovered.get(rover.targetId)
       if (!t) {
         rover.state = 'idle'
@@ -2682,7 +2715,8 @@ const SAFE_DEFAULT = { rockfall: 'reroute', unknown: 'reroute', sand: 'back_out'
 // (or holds, on soft ground) and asks. Returns false when it already has a question open.
 function askAbout(rover, kind, info) {
   if (PROTOCOL < 3 || rover.request || rover.state === 'fault') return false
-  const hold = kind === 'sand' || kind === 'life'
+  // v6: with no timeout the rover holds position until the operator answers.
+  const hold = kind === 'sand' || kind === 'life' || OPERATOR_TIMEOUT_S <= 0
   rover.request = { pending: true, hold } // act cautiously while the model looks at the image
   const g = gemmaCall('vision')
   later(g.ok ? g.ms : 120, () => {
@@ -2695,9 +2729,10 @@ function askAbout(rover, kind, info) {
     const source = g.ok ? 'gemma' : 'rules'
     let question
     let note
+    const caution = OPERATOR_TIMEOUT_S <= 0 ? 'Holding here' : 'Slowing to 0.15 m/s'
     if (kind === 'rockfall') {
       question = `LiDAR shows ${info.n} objects up to ${info.tall} m tall, ${info.dist} m ahead, that were not on my map. ${g.ok ? `From the camera I can't tell rocks from a slope edge (${conf}% confidence).` : 'My rules cannot tell rocks from a slope edge.'} What should I do?`
-      note = `Unsure about ${info.n} new objects ${info.dist} m ahead${g.ok ? ` (camera ${conf}% confident)` : ''}. Slowing to 0.15 m/s and asking the operator.`
+      note = `Unsure about ${info.n} new objects ${info.dist} m ahead${g.ok ? ` (camera ${conf}% confident)` : ''}. ${caution} and asking the operator.`
     } else if (kind === 'life') {
       question = `Possible lifeform ${info.dist} m ${info.dir}. Follow it or keep exploring?`
       note = `Something is moving ${info.dist} m ${info.dir}${g.ok ? `: the camera sees legs (${conf + 30}% confident)` : ''}. Watching it from here and asking the operator.`
@@ -2706,7 +2741,7 @@ function askAbout(rover, kind, info) {
       note = `Slip ${info.slip}% on ground that looks flat${g.ok ? ` (camera ${conf}% confident)` : ''}. Holding and asking the operator.`
     } else {
       question = `Something I can't identify ${info.dist} m ahead: LiDAR says ${info.tall} m tall${g.ok ? `, but the camera is only ${conf}% sure it is a rock` : ', and my rules have no class for it'}. What should I do?`
-      note = `Unidentified object ${info.dist} m ahead, ${info.tall} m tall${g.ok ? `, camera ${conf}% confident` : ''}. Slowing to 0.15 m/s and asking the operator.`
+      note = `Unidentified object ${info.dist} m ahead, ${info.tall} m tall${g.ok ? `, camera ${conf}% confident` : ''}. ${caution} and asking the operator.`
     }
     const q = {
       id: `q${sim.nextRequest++}`,
@@ -2715,7 +2750,7 @@ function askAbout(rover, kind, info) {
       question,
       options: OPTION_SETS[kind],
       default: SAFE_DEFAULT[kind],
-      deadline: wallNow() + OPERATOR_TIMEOUT_S,
+      deadline: requestDeadline(),
       kind,
       hold,
       at: info.at || [rover.x, rover.y],
@@ -2729,16 +2764,19 @@ function askAbout(rover, kind, info) {
   return true
 }
 
+const REQUEST_KIND = { rockfall: 'anomaly', unknown: 'anomaly', sand: 'anomaly', life: 'lifeform', place: 'choose_place' }
+
 function publicRequest(q) {
   return {
     id: q.id,
     rover: q.rover,
+    ...(PROTOCOL >= 6 && { kind: REQUEST_KIND[q.kind] || 'anomaly' }),
     t: r1(q.t),
     question: q.question,
     options: q.options,
     default: q.default,
-    expires_in: r1(Math.max(0, q.deadline - wallNow())),
-    image: `/api/camera/${q.rover}.jpg?view=fpv`,
+    expires_in: q.deadline === null ? null : r1(Math.max(0, q.deadline - wallNow())),
+    image: q.kind === 'place' ? null : `/api/camera/${q.rover}.jpg?view=fpv`,
   }
 }
 
@@ -2746,6 +2784,7 @@ function publicRequest(q) {
 function applyOption(rover, q, option) {
   if (!rover) return ''
   if (rover.state === 'fault') return 'Motors are down, so I will decide once they are back.'
+  if (q.kind === 'place') return applyPlace(rover, q, option)
   if (q.kind === 'life') {
     const k = sim.tracks.find((x) => x.id === rover.trackId)
     if (option === 'keep_exploring' || !k || rover.state !== 'observing') {
@@ -2786,17 +2825,21 @@ function applyOption(rover, q, option) {
   return ''
 }
 
-function resolveRequest(q, how, option) {
+// `typed`: the operator answered by typing in chat (v6): that message already is in the
+// thread, so the rover's reply quotes it (reply_to) instead of echoing an answer line.
+function resolveRequest(q, how, option, typed = null) {
   sim.requests = sim.requests.filter((x) => x !== q)
   sim.closedRequests.set(q.id, how)
   const rover = sim.rovers.find((r) => r.id === q.rover)
   if (rover && rover.request === q) rover.request = null
   const label = q.options.find((o) => o.id === option)?.label || option
+  if (how === 'cancelled') return
   if (how === 'answered') {
-    addChat('operator', q.rover, label, 'answer', null, q.id)
-    later(300 + Math.random() * 400, () => {
-      const did = applyOption(rover, q, option)
-      addChat(q.rover, 'operator', did || `OK: ${label.toLowerCase()}.`, 'ack', 'rules', q.id)
+    if (!typed) addChat('operator', q.rover, label, 'answer', null, q.id)
+    later(typed ? 0 : 300 + Math.random() * 400, () => {
+      const res = applyOption(rover, q, option)
+      const [kind, did] = Array.isArray(res) ? res : ['ack', res]
+      addChat(q.rover, 'operator', did || `OK: ${label.toLowerCase()}.`, kind, typed ? typed.source : 'rules', q.id, typed ? typed.id : null)
       addEvent(q.rover, 'info', `Operator chose "${label}". ${did}`.trim(), q.at, 'operator')
     })
   } else {
@@ -2808,7 +2851,7 @@ function resolveRequest(q, how, option) {
 
 function stepRequests() {
   const now = wallNow()
-  for (const q of [...sim.requests]) if (now >= q.deadline) resolveRequest(q, 'expired', q.default)
+  for (const q of [...sim.requests]) if (q.deadline !== null && now >= q.deadline) resolveRequest(q, 'expired', q.default)
   if (PROTOCOL >= 3 && !sim.firstAsked && now >= sim.firstQuestionAt) {
     const driving = sim.rovers.filter((r) => r.state === 'exploring' && !r.request && !r.hold && r.speed > 0.1 && remainingPath(r) > 5)
     if (driving.length) {
@@ -2838,6 +2881,7 @@ function answerRequest(id, option) {
   if (!q) {
     const how = sim.closedRequests.get(key)
     if (how === 'expired') throw new HttpError(409, 'Too late: that question already expired and the rover took the safe default.')
+    if (how === 'cancelled') throw new HttpError(409, 'That question was withdrawn: the rover had to move (low battery or danger).')
     if (how) throw new HttpError(409, 'That question was already answered.')
     throw new HttpError(404, `No open question with id "${key}".`)
   }
@@ -2854,7 +2898,7 @@ function parseCommand(lower) {
   }
   const dir = /\b(?:explore|go|head|drive|move|scout|survey|search)\s+(?:to\s+the\s+|the\s+|towards?\s+(?:the\s+)?)?(north[- ]?east|north[- ]?west|south[- ]?east|south[- ]?west|north|south|east|west)\b/.exec(lower)
   if (dir) return { cmd: 'explore', dir: dir[1].replace(/^(north|south)[- ]?(east|west)$/, '$1-$2') }
-  if (/\b(return|come back|come home|go home|head home|go back|back to (?:the )?(?:lander|base)|dock|recall)\b/.test(lower)) return { cmd: 'return' }
+  if (/\b(return|come back|come home|go home|head home|go back|back to (?:the )?(?:lander|base)|(?:go|head|drive|move|come)\s+to\s+(?:the\s+)?(?:lander|base)|dock|recall)\b/.test(lower)) return { cmd: 'return' }
   if (/\b(resume|continue|carry on|keep going|unpause|go on)\b/.test(lower)) return { cmd: 'resume' }
   if (/\b(hold|stop|halt|freeze|wait|pause|stay)\b/.test(lower)) return { cmd: 'hold' }
   if (/\b(explore|survey|scout)\b/.test(lower)) return { cmd: 'resume' }
@@ -2889,6 +2933,8 @@ function unavailable(rover) {
 function goTo(rover, x, y, state, eventMsg, source) {
   releaseTarget(rover)
   rover.hold = false
+  rover.survey = null
+  rover.placeTask = null
   if (!setGoal(rover, x, y, state)) return null
   rover.goalWhy = eventMsg(0).replace(/\s*Route \d+ m\.?$/, '').replace(/,?\s*0 m\.?$/, '.')
   addEvent(rover.id, 'info', eventMsg(Math.round(remainingPath(rover))), [x, y], source)
@@ -2967,7 +3013,8 @@ function handleChat(text, roverParam) {
     targets = [r]
     to = r.id
   } else {
-    const lower = raw.toLowerCase()
+    // "the one near rover 2" names a place, not who should go (v6).
+    const lower = raw.toLowerCase().replace(/\b(?:near|by|next to|closest to|nearest to)\s+(?:the\s+)?(?:rover\s*\d+|r\d+)\b/g, ' ')
     const named = [...new Set([...lower.matchAll(/\b(?:rover\s*|r)(\d+)\b/g)].map((m) => `r${m[1]}`))]
       .map((id) => sim.rovers.find((r) => r.id === id))
       .filter(Boolean)
@@ -2979,6 +3026,24 @@ function handleChat(text, roverParam) {
   const g = gemmaCall('command')
   const source = g.ok ? 'gemma' : 'rules'
   const lower = raw.toLowerCase()
+  if (PROTOCOL >= 6) {
+    // v6: text that picks an option of an open place question answers it.
+    const open = openPlaceRequest(targets, to)
+    const option = open && pickOption(lower, open)
+    if (option) {
+      later(g.ok ? g.ms : 120, () => {
+        if (sim.requests.includes(open)) resolveRequest(open, 'answered', option, { id: msg.id, source })
+        else addChat(open.rover, 'operator', 'That question was already closed.', 'refuse', source, open.id, msg.id)
+      })
+      return msg.id
+    }
+    // v6: commands that name a place ("go to the water source").
+    const place = parsePlace(lower)
+    if (place) {
+      later(g.ok ? g.ms : 120 + Math.random() * 120, () => respondPlace(place, targets, to, source, msg.id))
+      return msg.id
+    }
+  }
   if (PROTOCOL >= 5 && isQuestion(lower)) {
     // v5: a question gets an answer from the rover's fact sheet, after a moment's thought.
     const g2 = g.ok ? gemmaCall('answer') : { ok: false, ms: 0 }
@@ -3117,7 +3182,8 @@ function whyText(r) {
   if (r.state === 'fault') return `My motors are rebooting after a fault (${Math.ceil(r.faultHazard?.remaining ?? 0)} s left), so I'm not going anywhere until they're back.`
   if (r.state === 'charging') return `I'm docked at the lander, charging (${pctOf(r.battery)}). I'll head out again once the battery is high enough for a useful trip.`
   if (r.hold) return `I'm holding at ${at(r.x, r.y)} because you asked me to. Say "resume" and I'll carry on.`
-  if (r.request) return "I've stopped to ask you something about what I sensed. I'll act on your answer, or take the safe option when the time runs out."
+  if (r.request) return OPERATOR_TIMEOUT_S > 0 ? "I've stopped to ask you something about what I sensed. I'll act on your answer, or take the safe option when the time runs out." : "I've stopped to ask you something, and I'm holding here until you answer."
+  if (r.survey) return `I'm surveying ${r.survey.name} because you asked: turning slowly on the spot while the camera and LiDAR watch for movement, ${Math.max(0, Math.round(r.survey.until - sim.t))} s to go.`
   if (r.state === 'observing') {
     const k = sim.tracks.find((q) => q.id === r.trackId)
     return k ? `I'm watching ${k.id} (${k.label}) from about ${OBSERVE_DIST} m: I keep my distance and log how it moves.` : "I'm watching something that moves on its own, from a safe distance."
@@ -3286,6 +3352,514 @@ function answerQuestion(t, targets, to, replyTo, source) {
     return
   }
   addChat('fleet', 'operator', fleetAnswer(topic), 'reply', source, null, replyTo)
+}
+
+// ---------------------------------------------------------------------------
+// Version 6: commands that name a place, choosing between candidates, surveys
+
+const SURVEY_S = 30 // sim seconds turning slowly on the spot
+const PLACE_NOUN = {
+  water: ['body of water', 'bodies of water'],
+  vent: ['thermal vent', 'thermal vents'],
+  mineral: ['mineral deposit', 'mineral deposits'],
+  ice: ['ice patch', 'ice patches'],
+  trace: ['organic trace', 'organic traces'],
+  spire: ['spire grove', 'spire groves'],
+  lifeform: ['herd', 'herds'],
+  lander: ['lander', 'landers'],
+  id: ['target', 'targets'],
+}
+// Checked in order: "ice deposit" is ice, not a mineral.
+const PLACE_WORDS = [
+  ['water', /\b(water(?:\s+source)?|lakes?|ponds?|streams?|rivers?|creeks?|liquid|shore(?:line)?)\b/],
+  ['ice', /\b(ice|icy|frost)\b/],
+  ['vent', /\b(vents?|geysers?|thermal)\b/],
+  ['trace', /\b(traces?|organics?)\b/],
+  ['mineral', /\b(minerals?|deposits?|ore|outcrops?)\b/],
+  ['spire', /\b(spires?|crystals?|groves?)\b/],
+  ['lifeform', /\b(herds?|lifeforms?|creatures?|grazers?|animals?)\b/],
+  ['lander', /\b(lander|base)\b/],
+]
+const ACTION_RE = /\b(go|head|drive|move|navigate|travel|investigate|survey|check|look|explore|visit|inspect|examine|study|approach|return|come|take|scout|search|observe|watch)\b/
+const SURVEY_RE = /\b(investigate|survey|look around|look for|signs? of|search|study|examine|inspect|scan|check for|observe)\b/
+const POLITE_PLACE_RE = new RegExp(ADDR + String.raw`(?:(?:can|could|would|will|shall)\s+(?:we|you|u|someone|somebody|one of you)\b|let'?s\b|let us\b|i (?:want|need|'d like|would like) (?:you|someone|a rover|one of you) to\b|please\b)`)
+const DIR_RE = /\b(north[- ]?east|north[- ]?west|south[- ]?east|south[- ]?west|north|south|east|west)(?:ern|erly|wards?)?\b/
+const ORD = { first: 1, '1st': 1, one: 1, second: 2, '2nd': 2, two: 2, third: 3, '3rd': 3, three: 3 }
+
+// "go to the water source", "can we investigate the lake for signs of life", "rover 3,
+// survey the spires", "take a look at t7". Null when the text is not such an order (a
+// question about a place stays a question).
+function parsePlace(t) {
+  let kind = null
+  let id = null
+  const mid = /\b(t\d+)\b/.exec(t)
+  if (mid) {
+    kind = 'id'
+    id = mid[1]
+  } else {
+    for (const [k, re] of PLACE_WORDS) {
+      if (re.test(t)) {
+        kind = k
+        break
+      }
+    }
+  }
+  if (!kind || !ACTION_RE.test(t)) return null
+  if (!POLITE_PLACE_RE.test(t) && QWORD_RE.test(t)) return null // "did you check the vent?" asks
+  const survey = SURVEY_RE.test(t)
+  if (kind === 'lander' && !survey) return null // "go back to the lander" is the return order
+  return { kind, id, survey, life: /\b(life|living|alive|organisms?|biology|biosignatures?)\b/.test(t), qual: parseQualifier(t) }
+}
+
+function ordinalIn(t) {
+  let m = /\b(first|second|third|1st|2nd|3rd)\b/.exec(t)
+  if (m) return ORD[m[1]]
+  m = /(?:\bnumber|\bno\.?|\boption|\bmarker|#)\s*(\d)\b/.exec(t)
+  if (m) return Number(m[1])
+  m = /^\s*(?:the\s+)?(?:(one|two|three)|(\d))(?:\s+(?:one|please))?\s*[.!]?\s*$/.exec(t)
+  if (m) return m[2] ? Number(m[2]) : ORD[m[1]]
+  return null
+}
+
+function parseQualifier(t) {
+  if (/\b(nearest|closest)\b/.test(t) && !/\b(?:nearest|closest)\s+to\b/.test(t)) return { by: 'nearest' }
+  if (/\b(farthest|furthest)\b/.test(t)) return { by: 'farthest' }
+  if (/\b(biggest|largest|bigger|larger)\b/.test(t)) return { by: 'biggest' }
+  if (/\b(smallest|smaller|tiny)\b/.test(t)) return { by: 'smallest' }
+  if (/\b(newest|latest|most recent|last (?:one )?(?:found|seen))\b/.test(t)) return { by: 'newest' }
+  const near = /\b(?:near|by|next to|closest to|nearest to)\s+(?:the\s+)?(lander|base|rover\s*(\d+)|r(\d+))\b/.exec(t)
+  if (near) return { by: 'near', who: near[2] || near[3] ? `r${near[2] || near[3]}` : 'lander' }
+  const n = ordinalIn(t)
+  if (n) return { by: 'ord', n }
+  const d = DIR_RE.exec(t)
+  if (d) return { by: 'dir', dir: d[1].replace(/^(north|south)[- ]?(east|west)$/, '$1-$2') }
+  return null
+}
+
+const distTo = (a, c) => Math.hypot(a.x - c.x, a.y - c.y)
+const capital = (s) => s[0].toUpperCase() + s.slice(1)
+
+// What the fleet knows that matches, never ground truth it has not sensed.
+function waterCandidates() {
+  const out = []
+  for (const wi of sim.identified) {
+    const w = world.water[wi]
+    const xs = w.outline.map((p) => p[0])
+    const ys = w.outline.map((p) => p[1])
+    const across = Math.round(Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)))
+    let x
+    let y
+    if (w.kind === 'river') {
+      const seen = world.cover[wi].filter((c) => c.seen)
+      const mx = seen.reduce((s, c) => s + c.x, 0) / Math.max(1, seen.length)
+      const my = seen.reduce((s, c) => s + c.y, 0) / Math.max(1, seen.length)
+      const c = seen.sort((a, b) => Math.hypot(a.x - mx, a.y - my) - Math.hypot(b.x - mx, b.y - my))[0] || { x: xs[0], y: ys[0] }
+      x = c.x
+      y = c.y
+    } else {
+      x = xs.reduce((s, v) => s + v, 0) / xs.length
+      y = ys.reduce((s, v) => s + v, 0) / ys.length
+    }
+    const what = w.kind === 'river' ? 'stream' : across < 11 ? 'pond' : 'lake'
+    out.push({ kind: 'water', wi, x, y, size: across, t: sim.identifiedAt.get(wi) ?? 0, base: w.kind === 'river' ? 'Stream' : `${capital(what)} ${across} m across`, name: w.kind === 'river' ? 'the stream' : `the ${what} ${across} m across` })
+  }
+  return out
+}
+
+function targetCandidates(kind) {
+  return [...sim.discovered.values()]
+    .filter((t) => t.kind === kind)
+    .map((t) => ({ kind: 'target', id: t.id, x: t.x, y: t.y, size: t.value ?? 0, t: t.found_t, standoff: 1.4, base: `${capital(KIND_LABEL[t.kind])} ${t.id}`, name: `the ${KIND_LABEL[t.kind]} ${t.id}` }))
+}
+
+function cluster(points, within) {
+  const groups = []
+  for (const p of points) {
+    const g = groups.find((q) => Math.hypot(q.x - p.x, q.y - p.y) < within)
+    if (g) {
+      g.items.push(p)
+      g.x = g.items.reduce((s, q) => s + q.x, 0) / g.items.length
+      g.y = g.items.reduce((s, q) => s + q.y, 0) / g.items.length
+    } else groups.push({ x: p.x, y: p.y, items: [p] })
+  }
+  return groups
+}
+
+function spireCandidates() {
+  const known = world.spires.filter((sp) => sim.spireSeen.has(`${sp.id}:up`) || sim.spireSeen.has(`${sp.id}:down`))
+  return cluster(known, 9).map((g) => {
+    const n = g.items.length
+    return { kind: 'spire', x: g.x, y: g.y, size: n, t: 0, standoff: 4, base: n > 1 ? `Grove of ${n} spires` : `Spire ${g.items[0].id}`, name: n > 1 ? `the grove of ${n} spires` : `the spire ${g.items[0].id}` }
+  })
+}
+
+function herdCandidates() {
+  const live = cluster(
+    sim.tracks.filter((k) => k.status === 'tracking'),
+    10,
+  ).map((g) => ({ kind: 'herd', x: g.x, y: g.y, size: g.items.length, t: Math.max(...g.items.map((k) => k.last_seen)), standoff: OBSERVE_DIST, base: g.items.length > 1 ? `Herd of ${g.items.length}, tracking now` : `${g.items[0].id}, tracking now`, name: 'the herd' }))
+  // Places herds were observed earlier (the rovers remember their sightings).
+  const seen = []
+  for (const r of sim.rovers) for (const s of r.st.sightings) seen.push(s)
+  for (const g of cluster(seen, 12)) {
+    if (live.some((c) => Math.hypot(c.x - g.x, c.y - g.y) < 14)) continue
+    const t = Math.max(...g.items.map((s) => s.t))
+    live.push({ kind: 'herd', x: g.x, y: g.y, size: g.items.length, t, standoff: OBSERVE_DIST, base: `Herd seen ${agoText(t)}`, name: `the place a herd was seen ${agoText(t)}` })
+  }
+  return live
+}
+
+function placeCandidates(place) {
+  if (place.kind === 'water') return waterCandidates()
+  if (place.kind === 'spire') return spireCandidates()
+  if (place.kind === 'lifeform') return herdCandidates()
+  if (place.kind === 'lander') return [{ kind: 'lander', x: LANDER.x, y: LANDER.y, size: 0, t: 0, standoff: LANDER.radius + 2.5, base: 'The lander', name: 'the lander' }]
+  if (place.kind === 'id') {
+    const t = sim.discovered.get(place.id)
+    return t ? targetCandidates(t.kind).filter((c) => c.id === t.id) : []
+  }
+  return targetCandidates(place.kind)
+}
+
+function knownLine() {
+  const parts = []
+  if (sim.identified.size) parts.push(plural(sim.identified.size, 'body of water', 'bodies of water'))
+  for (const k of ['vent', 'mineral', 'ice', 'trace']) {
+    const n = targetCandidates(k).length
+    if (n) parts.push(plural(n, PLACE_NOUN[k][0], PLACE_NOUN[k][1]))
+  }
+  const g = spireCandidates().length
+  if (g) parts.push(plural(g, 'spire grove'))
+  const h = herdCandidates().length
+  if (h) parts.push(plural(h, 'herd'))
+  return parts.length ? `Known: ${parts.join(', ')}.` : 'The fleet has not catalogued any places yet.'
+}
+
+// One candidate picked by a qualifier ("the nearest", "the one near the lander"), or null.
+function applyQualifier(cands, q, rover) {
+  if (!q || !cands.length) return null
+  const by = (f) => cands.reduce((a, b) => (f(b) < f(a) ? b : a))
+  switch (q.by) {
+    case 'nearest':
+      return by((c) => distTo(rover, c))
+    case 'farthest':
+      return by((c) => -distTo(rover, c))
+    case 'biggest':
+    case 'smallest': {
+      if (cands.every((c) => c.size === cands[0].size)) return null
+      return by((c) => (q.by === 'biggest' ? -c.size : c.size))
+    }
+    case 'newest':
+      return by((c) => -c.t)
+    case 'near': {
+      const ref = q.who === 'lander' ? LANDER : sim.rovers.find((r) => r.id === q.who)
+      return ref ? by((c) => distTo(ref, c)) : null
+    }
+    case 'ord': {
+      const sorted = [...cands].sort((a, b) => distTo(rover, a) - distTo(rover, b))
+      return sorted[q.n - 1] || null
+    }
+    case 'dir': {
+      const [ux, uy] = DIRS[q.dir] || [0, 0]
+      let best = null
+      let bestAlong = 0.5
+      for (const c of cands) {
+        const d = distTo(rover, c) || 1
+        const along = ((c.x - rover.x) * ux + (c.y - rover.y) * uy) / d
+        if (along > bestAlong) {
+          bestAlong = along
+          best = c
+        }
+      }
+      return best
+    }
+    default:
+      return null
+  }
+}
+
+function placeLabel(c, rover) {
+  const d = Math.round(distTo(rover, c))
+  if (d < 3) return `${c.base}, right here`
+  const dir = compass(c.x - rover.x, c.y - rover.y)
+  return Math.hypot(c.x - LANDER.x, c.y - LANDER.y) < 12 && c.kind !== 'lander' ? `${c.base} near the lander, ${d} m ${dir}` : `${c.base}, ${d} m ${dir} of me`
+}
+
+// A spot a rover may stop at: on the map, dry, off the lander, out of known soft ground,
+// boulders and spires, and not on ground the fleet measured too steep.
+function placeOk(x, y) {
+  const lim = MAP_SIZE / 2 - 1.5
+  if (Math.abs(x) > lim || Math.abs(y) > lim || waterAt(x, y) >= 0) return false
+  if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + 1) return false
+  if (sim.softZones.some((z) => Math.hypot(z[0] - x, z[1] - y) < z[2] + 0.8)) return false
+  if (sim.rocks.some((rk) => rk.seen && Math.hypot(rk.x - x, rk.y - y) < rk.r + 1)) return false
+  for (const sp of world.spires) {
+    const [x0, y0, x1, y1] = spireSegment(sp)
+    if (segDist(x, y, x0, y0, x1, y1) < sp.radius + 1.2) return false
+  }
+  const k = idx(toI(x), toJ(y))
+  return !(sim.known[k] && sim.mslope[k] >= sim.slopeLimit)
+}
+
+function standoffPoint(cx, cy, dist, rover) {
+  const a0 = Math.atan2(rover.y - cy, rover.x - cx)
+  for (const extra of [0, 1.5, 3]) {
+    for (let k = 0; k < 16; k++) {
+      const a = a0 + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8)
+      const x = cx + Math.cos(a) * (dist + extra)
+      const y = cy + Math.sin(a) * (dist + extra)
+      if (placeOk(x, y)) return [r1(x), r1(y)]
+    }
+  }
+  return null
+}
+
+// For water: the shore point about 3 m from the edge that is closest to the rover.
+function shorePoint(c, rover) {
+  const w = world.water[c.wi]
+  let best = null
+  for (let k = 0; k < 48; k++) {
+    const ux = Math.cos((k / 48) * Math.PI * 2)
+    const uy = Math.sin((k / 48) * Math.PI * 2)
+    for (let r = 0.5; r < 70; r += 0.5) {
+      const x = c.x + ux * r
+      const y = c.y + uy * r
+      if (pointInPoly(x, y, w.outline) || distToPoly(x, y, w.outline) < 3) continue
+      if (placeOk(x, y)) {
+        const d = Math.hypot(x - rover.x, y - rover.y)
+        if (!best || d < best.d) best = { x, y, d }
+      }
+      break
+    }
+  }
+  return best ? [r1(best.x), r1(best.y)] : null
+}
+
+function cmdGoPlace(rover, c, survey, replyTo, life = false) {
+  const busy = unavailable(rover)
+  if (busy) return ['refuse', busy]
+  const goal = c.kind === 'water' ? shorePoint(c, rover) : standoffPoint(c.x, c.y, c.standoff ?? 3, rover)
+  if (!goal) return ['refuse', `I can't find a safe spot next to ${c.name} on what the fleet has mapped.`]
+  const low = lowBatteryRefusal(rover, goal[0], goal[1], c.name)
+  if (low) return ['refuse', low]
+  if (rover.state === 'observing') endObserve(rover, null)
+  rover.survey = null
+  const len = goTo(rover, goal[0], goal[1], 'exploring', (l) => `Operator: ${survey ? 'survey' : 'go to'} ${c.name}. Route ${l} m.`, 'operator')
+  if (len === null) return ['refuse', `No safe route to ${c.name} on what I know: slopes over ${sim.slopeLimit} deg or water block the way.`]
+  rover.placeTask = { name: c.name, kind: c.kind, wi: c.wi, x: c.x, y: c.y, goal, survey, life, replyTo }
+  const spot = c.kind === 'water' ? `a spot on the shore 3 m from the water, ${at(goal[0], goal[1])}` : c.kind === 'herd' ? `the observation point ${OBSERVE_DIST} m from it, ${at(goal[0], goal[1])}` : `next to it, ${at(goal[0], goal[1])}`
+  return ['ack', `Heading to ${c.name} at ${at(c.x, c.y)}: ${spot}, ${len} m.${survey ? ` Then I'll stop and survey for about ${SURVEY_S} s.` : ''}`]
+}
+
+// More than one candidate and nothing to choose between them: ask (choose_place).
+function askPlace(rover, cands, place, replyTo, source) {
+  const top = [...cands].sort((a, b) => distTo(rover, a) - distTo(rover, b)).slice(0, 3)
+  const options = top.map((c, i) => ({ id: `p${i + 1}`, label: placeLabel(c, rover), x: r1(c.x), y: r1(c.y) }))
+  options.push({ id: 'cancel', label: 'Never mind' })
+  const noun = PLACE_NOUN[place.kind] || ['place', 'places']
+  const question = `I know ${plural(cands.length, noun[0], noun[1])}${cands.length > 3 ? ' (the 3 closest are on the map)' : ''}. Which one${place.survey ? ' should I survey' : ''}?`
+  const deadline = requestDeadline()
+  const q = { id: `q${sim.nextRequest++}`, rover: rover.id, t: sim.t, question, options, default: deadline === null ? null : 'cancel', deadline, kind: 'place', hold: true, at: [rover.x, rover.y], place: { cands: top, survey: place.survey, life: place.life, replyTo } }
+  rover.request = q
+  sim.requests.push(q)
+  planner.asked++
+  addChat(rover.id, 'operator', question, 'question', source, q.id, replyTo)
+  addEvent(rover.id, 'info', `Operator named a place that matches ${plural(cands.length, noun[0], noun[1])}. Holding here and asking which one.`, null, 'operator')
+}
+
+function applyPlace(rover, q, option) {
+  if (option === 'cancel') return ['ack', `OK, never mind. ${rover.goal ? 'Carrying on with what I was doing.' : 'Back to exploring.'}`]
+  const c = q.place.cands[Number(String(option).slice(1)) - 1]
+  if (!c) return ['refuse', 'I lost track of that option.']
+  return cmdGoPlace(rover, c, q.place.survey, q.place.replyTo, q.place.life)
+}
+
+// The open place question an operator message could be answering.
+function openPlaceRequest(targets, to) {
+  const open = sim.requests.filter((q) => q.kind === 'place')
+  if (!open.length) return null
+  if (to !== 'all') return open.find((q) => q.rover === to) || null
+  return open[open.length - 1]
+}
+
+const PICK_STOP = new Set(['that', 'this', 'please', 'rover', 'there', 'near', 'from', 'with', 'water', 'body', 'bodies', 'across', 'about', 'north', 'south', 'east', 'west', 'lander', 'them', 'okay', 'yeah', 'sure', 'want', 'choose', 'pick', 'take', 'then', 'head', 'drive', 'right', 'here', 'thanks'])
+
+// Which option operator text picks: "p2", "the second one", "number 3", "the one near
+// the lander", "the nearest", "the stream", "never mind". Null when it picks none.
+function pickOption(t, q) {
+  const places = q.options.filter((o) => Number.isFinite(o.x))
+  if (/\b(never ?mind|cancel|forget (?:it|that)|none of them|neither|no thanks)\b/.test(t) && q.options.some((o) => o.id === 'cancel')) return 'cancel'
+  const id = /\b(p\d)\b/.exec(t)
+  if (id && q.options.some((o) => o.id === id[1])) return id[1]
+  const n = ordinalIn(t)
+  if (n) return places[n - 1]?.id ?? null
+  if (/\b(?:the\s+)?last one\b/.test(t)) return places[places.length - 1]?.id ?? null
+  // Softer picks only when the text is not some other order ("explore north", "hold").
+  if (parseCommand(t).cmd !== 'unclear') return null
+  const rover = sim.rovers.find((r) => r.id === q.rover)
+  const cands = q.place.cands.slice(0, places.length)
+  const qual = parseQualifier(t)
+  if (rover && qual) {
+    const c = applyQualifier(cands, qual, rover)
+    if (c) return places[cands.indexOf(c)]?.id ?? null
+  }
+  for (const w of t.match(/[a-z]{4,}/g) || []) {
+    if (PICK_STOP.has(w)) continue
+    const hits = places.filter((o) => o.label.toLowerCase().includes(w))
+    if (hits.length === 1) return hits[0].id
+  }
+  return null
+}
+
+function respondPlace(place, targets, to, source, replyTo) {
+  const single = to !== 'all' && targets.length === 1 ? targets[0] : null
+  const say = (rover, [kind, text]) => addChat(rover.id, 'operator', text, kind, source, null, replyTo)
+  const sayFleet = (kind, text) => addChat('fleet', 'operator', text, kind, source, null, replyTo)
+  let cands = placeCandidates(place)
+  if (!cands.length) {
+    const text = place.kind === 'id' ? `I don't know any target called ${place.id}. ${knownLine()}` : `I don't know any ${PLACE_NOUN[place.kind][1]} yet. ${knownLine()}`
+    if (single) say(single, ['refuse', text])
+    else sayFleet('refuse', text)
+    return
+  }
+  if (single?.request) {
+    // A new place order replaces this rover's open place question; other questions come first.
+    if (single.request.kind !== 'place' || single.request.pending) return say(single, ['refuse', "I'm waiting for your answer to my question first. Answer it, then ask again."])
+    resolveRequest(single.request, 'cancelled')
+  }
+  const free = (r) => !unavailable(r) && !r.request && !r.survey
+  const pool = single ? [single] : targets.filter(free)
+  if (!pool.length) return sayFleet('refuse', `Every rover is busy right now (charging, rebooting, surveying or waiting for your answer). ${knownLine()}`)
+  const nearest = (r) => Math.min(...cands.map((c) => distTo(r, c)))
+  let rover = single || [...pool].sort((a, b) => nearest(a) - nearest(b))[0]
+  const picked = applyQualifier(cands, place.qual, rover)
+  if (picked) cands = [picked]
+  if (cands.length === 1) {
+    const c = cands[0]
+    if (!single && targets.length > 1) {
+      rover = [...pool].sort((a, b) => distTo(a, c) - distTo(b, c))[0]
+      sayFleet('info', `${rover.name} is closest (${Math.round(distTo(rover, c))} m), heading there.`)
+    }
+    say(rover, cmdGoPlace(rover, c, place.survey, replyTo, place.life))
+    return
+  }
+  askPlace(rover, cands, place, replyTo, source)
+}
+
+// Arrived where a place order sent it: survey, or stay a little and say so.
+function arrivePlace(rover) {
+  const p = rover.placeTask
+  if (!p) return false
+  rover.placeTask = null
+  if (!rover.goal || Math.hypot(rover.goal[0] - p.goal[0], rover.goal[1] - p.goal[1]) > 1.5) return false
+  rover.goal = null
+  rover.path = []
+  if (p.survey) {
+    rover.state = 'investigating'
+    rover.targetId = null
+    rover.survey = { ...p, start: sim.t, until: sim.t + SURVEY_S, seen: new Set(), spun: 0 }
+    addEvent(rover.id, 'info', `At ${p.name}. Surveying: turning slowly through 360 deg for ${SURVEY_S} s while the camera and LiDAR watch for movement.`, [rover.x, rover.y], 'operator')
+    return true
+  }
+  addChat(rover.id, 'operator', `I'm at ${p.name}, ${Math.round(Math.hypot(p.x - rover.x, p.y - rover.y))} m from its centre. Staying here for 20 s, then back to exploring.`, 'info', 'rules', null, p.replyTo)
+  rover.state = 'idle'
+  rover.timer = 20
+  return true
+}
+
+function stepSurvey(rover, dt) {
+  const s = rover.survey
+  rover.speed = Math.max(0, rover.speed - dt * 2)
+  rover.path = []
+  if (lowBattery(rover, 0.22)) {
+    finishSurvey(rover, 'battery')
+    startReturn(rover)
+    return
+  }
+  if (!rover.hold) {
+    const w = (Math.PI * 2) / SURVEY_S
+    rover.yaw = wrapAngle(rover.yaw + w * dt)
+    s.spun += w * dt
+  }
+  const range = lidarRange()
+  for (const k of sim.tracks) if (k.status === 'tracking' && Math.hypot(k.x - rover.x, k.y - rover.y) <= range + 0.5) s.seen.add(k.id)
+  // Something moving during the survey starts the normal lifeform observation.
+  const k = s.seen.size ? sim.tracks.find((q) => s.seen.has(q.id) && q.status === 'tracking' && !q.observer) : null
+  if (k) {
+    finishSurvey(rover, 'moved')
+    startObserve(rover, k, 'watch')
+    return
+  }
+  if (sim.t >= s.until) finishSurvey(rover, 'done')
+}
+
+// The survey report: what moved and what the rover saw, from its own sensing only.
+function finishSurvey(rover, why) {
+  const s = rover.survey
+  rover.survey = null
+  rover.state = 'idle'
+  rover.timer = 1.5
+  const secs = Math.round(sim.t - s.start)
+  const turned = Math.min(360, Math.round((s.spun * 180) / Math.PI))
+  const parts = []
+  if (why === 'battery') parts.push(`Survey of ${s.name} cut short after ${secs} s (turned ${turned} deg): battery ${pctOf(rover.battery)}, heading back to charge.`)
+  else if (why === 'moved') parts.push(`Survey of ${s.name}: something moved ${secs} s in (turned ${turned} deg).`)
+  else parts.push(`Survey of ${s.name} done: turned 360 deg over ${secs} s with the camera and LiDAR.`)
+  const moving = [...s.seen].map((id) => sim.tracks.find((q) => q.id === id)).filter(Boolean)
+  if (moving.length) {
+    const k = moving[0]
+    parts.push(`LiDAR saw ${plural(moving.length, 'moving object')}: ${k.id}, ${k.label}, ${Math.round(Math.hypot(k.x - rover.x, k.y - rover.y))} m ${compass(k.x - rover.x, k.y - rover.y)}.${why === 'moved' ? ` Watching it from here, never closer than ${OBSERVE_DIST} m.` : ''}`)
+  } else parts.push('Nothing moved: the LiDAR returns stayed put through the whole turn.')
+  const seen = []
+  if (s.kind === 'water' && s.wi != null) {
+    const d = Math.max(0, Math.round(distToPoly(rover.x, rover.y, world.water[s.wi].outline)))
+    seen.push(`The camera shows the water ${d} m away: a flat surface with wind ripples and nothing floating or moving in it.`)
+  }
+  const near = [...sim.discovered.values()].filter((t) => Math.hypot(t.x - rover.x, t.y - rover.y) < 12).sort((a, b) => Math.hypot(a.x - rover.x, a.y - rover.y) - Math.hypot(b.x - rover.x, b.y - rover.y))
+  if (near.length) seen.push(`Within 12 m: ${near.slice(0, 3).map((t) => `the ${KIND_LABEL[t.kind]} ${t.id}, ${Math.round(Math.hypot(t.x - rover.x, t.y - rover.y))} m ${compass(t.x - rover.x, t.y - rover.y)}`).join('; ')}.`)
+  const spires = world.spires.filter((sp) => sp.standing && Math.hypot(sp.x - rover.x, sp.y - rover.y) < 12).length
+  if (spires) seen.push(`${plural(spires, 'crystal spire')} in view.`)
+  if (!seen.length) seen.push('Around me: bare regolith and rock, nothing the fleet has catalogued within 12 m.')
+  parts.push(...seen)
+  if (s.life) {
+    const trace = near.find((t) => t.kind === 'trace')
+    if (moving.length) parts.push('That movement is the only sign of life I picked up here.')
+    else if (trace) parts.push(`No movement, but the organic trace ${trace.id} is a possible sign of life: worth a swab.`)
+    else parts.push('No signs of life here: no movement and no organic traces within 12 m.')
+  }
+  addChat(rover.id, 'operator', parts.join(' '), 'info', gemmaReady() ? 'gemma' : 'rules', null, s.replyTo)
+  addEvent(rover.id, moving.length ? 'discovery' : 'info', `Survey of ${s.name} finished: ${moving.length ? `${plural(moving.length, 'moving object')} seen` : 'nothing moving'}.`, [rover.x, rover.y], 'operator')
+}
+
+// Mock-only test hook: the fleet learns every lake, target and spire at once.
+function revealAll(b) {
+  const all = !b || (b.water == null && b.targets == null && b.spires == null)
+  if (all || b.water) {
+    world.water.forEach((w, wi) => {
+      if (!sim.identified.has(wi)) {
+        sim.identified.add(wi)
+        sim.identifiedAt.set(wi, sim.t)
+      }
+      revealCover(wi, { x: 0, y: 0 }, 1e9)
+    })
+  }
+  if (all || b.targets) {
+    for (const t of world.targets) {
+      if (sim.discovered.has(t.id)) continue
+      const r = sim.rovers.reduce((a, q) => (Math.hypot(q.x - t.x, q.y - t.y) < Math.hypot(a.x - t.x, a.y - t.y) ? q : a))
+      sim.discovered.set(t.id, { ...t, status: 'found', found_by: r.id, found_t: r1(sim.t), assigned: null })
+    }
+  }
+  if (all || b.spires) {
+    for (const sp of world.spires) {
+      const key = `${sp.id}:${sp.standing ? 'up' : 'down'}`
+      if (sim.spireSeen.has(key)) continue
+      sim.spireSeen.add(key)
+      const [x0, y0, x1, y1] = spireSegment(sp)
+      markFootprint(sim.pendingCells, x0, y0, x1, y1, sp.radius)
+    }
+  }
+  return { ok: true, water: sim.identified.size, targets: sim.discovered.size, spires: sim.spireSeen.size }
 }
 
 // ---------------------------------------------------------------------------
@@ -3826,6 +4400,7 @@ const server = http.createServer((req, res) => {
       sim.firstLifeAsked = b?.armed === false
       return { ok: true, armed: !sim.firstLifeAsked }
     },
+    '/api/_mock/reveal': (b) => revealAll(b),
     '/api/_mock/battery': (b) => {
       const rover = sim.rovers.find((r) => r.id === b?.rover)
       if (!rover || !Number.isFinite(b?.battery)) throw new HttpError(400, 'Body: {"rover": "r1", "battery": 0.3}')

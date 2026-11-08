@@ -35,6 +35,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `redshift/visuals.py` | The look (visual only): procedural regolith texture, rock grain, solar cells, a hazy sky cube with a low sun, lights, haze colours and materials. In the camera, science targets look like natural features with the dashboard colours as accents (a vent is a low mound with a dark mouth and an orange rim, a mineral an angular outcrop with violet crystal veins, ice a glossy white-blue patch, a trace a thin film with lime specks), spires are faceted violet crystals and grazers have segmented, softly glowing green bodies. These are massless, non-colliding geoms in group 4: LiDAR, the spectrometer, the tracker and machine vision still use the original marker capsules and bodies (the camera's look frames leave the target capsules out). |
 | `redshift/memory.py` | Each rover's mission memory, updated where things happen: where it mapped (compass sector and distance band around the lander), distance, targets found and sampled, hazards met and how it handled them, lifeforms observed, notable events, its goal and why. Gives the `stats` in every tick. |
 | `redshift/answers.py` | Answers to the operator's questions: a fact sheet per rover (and for the fleet), the facts Gemma may use, and rule-based answers for every topic. |
+| `redshift/places.py` | Commands that name a place (protocol v6): finds the known places of a kind from fleet knowledge only (water bodies, found targets, mapped spires, herds, hazard sites, the lander), applies qualifiers (nearest, biggest, north, the second one, near rover 2), finds a safe goal next to a place, writes short labels and reads which option a chat answer picks. |
 | `redshift/gemma.py` | Talks to the local Gemma model (Ollama), or a fake model for demos and tests: prompts, answer checks, timeouts, a keyword parser for typed commands. |
 | `redshift/advisor.py` | Tier 2: asks Gemma at the right moments, applies its advice when it is safe, runs the operator chat (commands and questions) and the questions to the operator. |
 | `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
@@ -48,6 +49,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `tests/test_brain.py` | Tier 2 with the fake model: goal switches, anomaly checks, questions, every chat command, Gemma offline, v3 messages, speed and budget. |
 | `tests/test_v4.py` | Water (a hole in the map, identified, avoided, the water sensor failsafe), spire fall and replan, motion tracks, observing a lifeform at a safe distance, the first-sighting question, point-and-click hazards and every 400, sampling, tubes and the cache, and the v4 message fields. |
 | `tests/test_v5.py` | Questions: intent (questions vs commands), Gemma's answer checks (a bad number or id falls back to the rules), grounded rule answers for every topic, fleet vs per-rover replies, `reply_to`, `stats`, camera sizes up to 1280 x 720. |
+| `tests/test_v6.py` | Place commands: polite orders vs questions, place parsing (keyword parser and checked Gemma answers), the resolver and its qualifiers, "nothing known", the closest free rover, `choose_place` answered by `POST /api/answer` and by chat, the survey and its report, requests that never expire by default (and the countdown when `OPERATOR_TIMEOUT_S` is above 0). |
 
 `test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
 numbers) written for the old 80 m world, so they run with `MAP_SIZE` 80 and the v4 features (water,
@@ -84,7 +86,8 @@ curl -X POST localhost:8000/api/chat -d '{"text": "rover 2, check out the area n
 curl -X POST localhost:8000/api/chat -d '{"text": "go to 10, -5", "rover": "r1"}'
 curl -X POST localhost:8000/api/chat -d '{"text": "rover 2, what have you found?"}'
 curl -X POST localhost:8000/api/chat -d '{"text": "everyone, report battery"}'
-curl -X POST localhost:8000/api/answer -d '{"id": "q1", "option": "reroute"}'
+curl -X POST localhost:8000/api/chat -d '{"text": "can we investigate the water source again for signs of life"}'
+curl -X POST localhost:8000/api/answer -d '{"id": "q1", "option": "reroute"}'     # or "p2" for a choose_place
 ```
 
 Change the world while it runs:
@@ -153,7 +156,7 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `GEMMA_FAKE` | 0 | 1 = fake model (fixed rules, 0.5 s delay): demos and tests without Ollama |
 | `GEMMA_BUDGET_MS` | 3000 | stated latency budget per Gemma call (answers after `GEMMA_TIMEOUT_S`, 4 s, are dropped) |
 | `GEMMA_ASK_EVERY_S` | 20 | a rover asks Gemma about its goal at most this often (sim s), or when it reaches a goal |
-| `OPERATOR_TIMEOUT_S` | 20 | wall seconds a question waits for the operator before the rover takes the safe default |
+| `OPERATOR_TIMEOUT_S` | 0 | 0 = questions never expire: the rover holds until the operator answers. Above 0: wall seconds before it takes the safe default |
 | `OPERATOR_ASK_BELOW` | 0.75 | Gemma confidence below this makes the rover ask the operator |
 | `OPERATOR_ASK_FIRST` | 1 | the first anomaly after start or reset always asks the operator (reliable demo trigger) |
 | `CAMERA_SHADOWS` | 1 | 0 = camera renders without the sun's shadows (about 3 times faster with software OpenGL) |
@@ -314,8 +317,8 @@ Where Gemma helps:
    `ask_operator`), or it is the first anomaly since start or reset, the rover asks in the chat with
    2 or 3 safe options and its camera picture, and holds position while it waits (it only moves if
    staying is the danger: backing out of soft ground or liquid, heading home on a low battery, or
-   making room for a creature that came too close). No answer in 20 s: it takes the safest option and
-   says so.
+   making room for a creature that came too close). Questions wait for the answer (with
+   `OPERATOR_TIMEOUT_S` above 0 the rover takes the safest option after that many seconds and says so).
 4. **Lifeforms.** When a rover starts observing something that moves, Gemma gets the camera picture
    and the track numbers and says whether it is a lifeform, with a short label and what to do
    (approach to observe, observe from here, ignore). See "Lifeforms".
@@ -336,6 +339,21 @@ Where Gemma helps:
    why; anything else: "I can't answer that: I only know what my own sensors and memory recorded").
    Replies are `kind: "reply"` with `reply_to` and `source` gemma or rules.
 
+7. **Places (protocol v6).** "go to the water source", "can we investigate the water source again for any
+   signs of life around there", "rover 3, survey the spires", "take a look at t7", "go to the biggest
+   lake", "check out the vent near rover 2". Polite forms with an action ("can we", "could you", "let's",
+   "I want you to", "please") are commands; "can you see any water?" is still a question. The place comes
+   from fleet knowledge only (`places.py`). One match, or a qualifier that picks one: the named rover, or
+   the closest free one ("I'm the closest free rover (18 m). Heading to the lake's shore at ..."), drives
+   to a safe spot next to it through the normal go-to checks (for water about 3 m from the edge on its
+   side, for a herd the 6 m observation standoff). With investigate ("investigate", "survey", "look
+   around", "signs of life") it then stops, turns slowly through 360 deg for about 30 s with the LiDAR
+   tracker on, and reports what moved and what it saw (`kind: "info"`, `reply_to` the command); something
+   moving starts the normal lifeform observation. Several matches: a `choose_place` request with numbered
+   options (with x, y for the map) and "Never mind"; the rover holds until you pick one in the UI or type
+   "the second one", "p2", "the one near the lander" or "the lake". Nothing known: the fleet says so and
+   lists what it knows.
+
 **Hold** shows as state `idle` with goal `null` and a chat note ("r1: holding at (12, -4), say resume
 to continue"). A held rover still watches its battery: if it would not get home otherwise, it leaves
 the hold and says so.
@@ -345,7 +363,7 @@ driving, then trigger a rockfall (UI hazard button, or
 `curl -X POST localhost:8000/api/hazard -d '{"type": "rockfall"}'`). Within a few seconds the rover
 that sees the new rocks asks "New rocks block my path 3 m ahead ... Gemma thinks: rock (confidence
 0.80). What should I do?" with Go around / Approach slowly / Wait and its camera picture. Answer in
-the UI (or `POST /api/answer`), or wait 20 s for the safe default. Only the first anomaly after
+the UI (or `POST /api/answer`); with `OPERATOR_TIMEOUT_S` above 0 it takes the safe default after that long. Only the first anomaly after
 start or reset asks for sure; after a reset it asks again. `OPERATOR_ASK_BELOW=1.01` makes every
 anomaly ask (one question per rover per minute at most).
 

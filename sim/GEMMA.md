@@ -80,9 +80,10 @@ about 0.9 m tall). Gemma thinks: rock (confidence 0.80). What should I do?
 
 While it waits the rover holds position. It only moves if staying put is the danger: backing out of
 soft ground or liquid, heading home on a low battery, or making room for a creature that came closer
-than the planetary protection distance. Your answer is applied ("r2: going around, thanks."). No answer in
-20 wall seconds (`OPERATOR_TIMEOUT_S`): it takes the safest option and says so ("r2: no reply in
-20 s, taking the safe option: go around."). If Gemma is offline the rules still ask about the first
+than the planetary protection distance. Your answer is applied ("r2: going around, thanks."). By default
+the question waits for you (`OPERATOR_TIMEOUT_S` 0, `expires_in` null). With `OPERATOR_TIMEOUT_S` above 0
+the rover takes the safest option after that many wall seconds and says so ("r2: no reply in 20 s, taking
+the safe option: go around."). A new command for that rover also settles its question. If Gemma is offline the rules still ask about the first
 anomaly, without Gemma's guess. At most one open question per rover, two for the fleet, and one
 question per rover per minute.
 
@@ -104,7 +105,7 @@ lifeform, six legs, about 1.2 m (confidence 0.80). Follow it or keep exploring?
 ```
 
 While it waits, the rover watches from where it is. "Observe from here" is the safe default: the
-rover never gets closer. No answer in 20 s: it takes that. Demo: `curl -X POST
+rover never gets closer. With `OPERATOR_TIMEOUT_S` above 0 it takes that when the time is up. Demo: `curl -X POST
 localhost:8000/api/hazard -d '{"type": "lifeform"}'` (or click a spot with x and y).
 
 ### Goal choice with samples
@@ -155,13 +156,23 @@ most relevant facts, so its answers are grounded too.
 | go to x, y | A* within the slope limit, then battery there and back with the margin; drives there (state `exploring`, goal = the point), then explores again. Refuses outside the map, in soft ground, on blocked or too steep ground, without a path, or without the battery ("r1: can't, battery 22% would not get me there and back (needs about 41% with the 15% margin).") |
 | explore north (or any of 8 directions) | for 3 minutes that rover prefers frontiers that way (and only picks up targets that way) |
 | sample t4 | checks the target is known and free and the battery is enough, then goes to sample it |
+| go to the water source, investigate the lake for signs of life, survey the spires, take a look at t7 | `go_to_place` (protocol v6): the place is resolved from fleet knowledge only; one match (or nearest, biggest, north, the second one, near rover 2): a safe spot next to it through the go to checks, and with investigate a 30 s survey and a report; several: a `choose_place` request; none: what the fleet knows |
 | return home | goes back to the lander and charges (a rover backing out of trouble finishes that first) |
 | hold | parks where it is: state `idle`, goal `null`, chat note "say resume to continue". Not allowed while it is returning on low battery. A held rover leaves the hold by itself if its battery would not get it home otherwise |
 | resume | back to full autonomy (cancels holds, trips, directions and operator returns) |
 | avoid x, y radius r | that circle is off limits for the whole fleet, mapped or not (refused over the lander pad or a rover) |
 | anything unclear | a question back |
 
-No rover named: go to and sample pick the nearest rover that can do it, explore picks the free rover
+**Place commands (protocol v6).** Polite orders ("can we investigate ...", "could you check ...", "let's
+survey ...", "I want you to ...") are commands; real questions ("can you see any water?") stay questions,
+in Gemma's reading and in the keyword cross-check. Gemma's `go_to_place` is checked like every command:
+place, qualifier and near_rover from fixed lists, ids that exist; anything invalid and the keyword parser
+decides. The operator's own place words win over Gemma's place, and a Gemma `go_to` without coordinates in
+the message (often the rover's own position, which used to give "Where should r1 go?") becomes the place
+command. A place command goes to the rover the text or the UI names; Gemma's rover guess is ignored.
+
+No rover named: go to and sample pick the nearest rover that can do it, a place command the closest free
+rover (not faulted, not returning on a low battery, not charging below 50%), explore picks the free rover
 with the most charge, hold, resume and return mean all rovers. Each command gets exactly one reply.
 Gemma's small-model mistakes are caught: a "go to" the rover's own position, or a direction with no
 coordinates ("go check out the area north of the lander"), becomes "explore north"; echoed "ack:"
@@ -255,7 +266,7 @@ drops questions still queued about the old world.
 | `GEMMA_KEEP_ALIVE` | 30m | how long Ollama keeps the model in memory between calls |
 | `GEMMA_MIN_CONFIDENCE` | 0.55 | below this Gemma's answer itself becomes ask_operator (commands: unclear) |
 | `GEMMA_ASK_EVERY_S` | 20 | a rover asks about its goal at most this often (sim s), or when it reaches a goal |
-| `OPERATOR_TIMEOUT_S` | 20 | wall seconds a question waits before the safe default |
+| `OPERATOR_TIMEOUT_S` | 0 | 0 = questions wait for the operator; above 0: wall seconds before the safe default |
 | `OPERATOR_ASK_BELOW` | 0.75 | Gemma confidence below this: ask the operator |
 | `OPERATOR_ASK_FIRST` | 1 | the first anomaly after start or reset always asks the operator |
 
@@ -295,7 +306,7 @@ other_rover, crater_edge, clear, unknown), `res.action`, `res.model_action`. Des
 (`gp.submit_description(rover, t, perception, observation, jpeg)`): `res.classification` (lifeform,
 rock, other_rover, dust, unknown), `res.label`, `res.action` (approach, observe, ignore, or
 ask_operator when unsure). Commands:
-`res.command` (`go_to`, `explore_direction`, `sample_target`, `return_home`, `hold`, `resume`,
+`res.command` (`go_to`, `go_to_place` with place, target_id, qualifier, ordinal, near_rover, investigate, `explore_direction`, `sample_target`, `return_home`, `hold`, `resume`,
 `avoid_area`, `question` with `topic`, `unclear` with `question`). Answers: `res.answer` (Gemma's
 checked text, or the caller's rule answer in a fallback).
 
@@ -306,7 +317,9 @@ checked text, or the caller's rule answer in a fallback).
 | `redshift/gemma.py` | planner, Ollama and fake backends, prompts, JSON schemas, answer checks, command parser |
 | `redshift/advisor.py` | tier 2 wiring: goal choice, anomaly checks with the camera, operator questions, chat commands and answers |
 | `redshift/memory.py`, `redshift/answers.py` | each rover's mission memory; fact sheets, the facts for Gemma, rule-based answers |
+| `redshift/places.py` | place commands: known places from fleet knowledge, qualifiers, safe goals, labels, chat picks |
 | `tests/test_gemma.py` | gemma.py against a stub Ollama server on port 8400 |
 | `tests/test_brain.py` | tier 2 in the running sim with the fake model and the keyword parser |
 | `tests/test_v5.py` | questions: intent, answer checks, grounded rule answers, routing, `reply_to` |
+| `tests/test_v6.py` | place commands: polite orders, place parsing and Gemma's checked answers, resolver, `choose_place`, survey report, no expiry |
 | `scripts/gemma_bench.py` | latency and quality bench against a real Ollama |

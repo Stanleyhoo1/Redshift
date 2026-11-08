@@ -316,9 +316,18 @@ export function sanitizeRequests(list, prev, now, simT, speed) {
     if (!isObj(q) || q.id == null) continue
     const id = String(q.id)
     const was = old.get(id)
+    // v6: an option may name a place on the map (`x`, `y`), e.g. a `choose_place` candidate.
     const options = (Array.isArray(q.options) ? q.options : [])
       .filter((o) => (isObj(o) && o.id != null) || typeof o === 'string')
-      .map((o) => (typeof o === 'string' ? { id: o, label: o } : { id: String(o.id), label: o.label == null ? String(o.id) : String(o.label) }))
+      .map((o) => {
+        if (typeof o === 'string') return { id: o, label: o }
+        const out = { id: String(o.id), label: o.label == null ? String(o.id) : String(o.label) }
+        if (Number.isFinite(o.x) && Number.isFinite(o.y)) {
+          out.x = o.x
+          out.y = o.y
+        }
+        return out
+      })
     const left = num(q.expires_in, null)
     let deadline = left === null ? null : now + Math.max(0, left)
     if (was && was.deadline !== null && deadline !== null && deadline > was.deadline - 0.05 && deadline < was.deadline + 2) deadline = was.deadline
@@ -328,6 +337,8 @@ export function sanitizeRequests(list, prev, now, simT, speed) {
     const next = {
       id,
       rover: q.rover == null ? null : String(q.rover),
+      // v6: "anomaly" | "lifeform" | "choose_place" (null from older sims)
+      kind: typeof q.kind === 'string' && q.kind ? q.kind : null,
       t,
       question: q.question == null ? '' : String(q.question),
       options,

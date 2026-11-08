@@ -67,6 +67,8 @@ CREATURE_STOP_M = 3.5      # any rover stops if a tracked creature is this close
 VERB = {"drill": "drilled a core from", "scoop": "scooped ice from", "sniffer": "sniffed the gas at",
         "swab": "swabbed the trace at"}
 BRAKE_KV = 400.0       # wheel brake stiffness while the motor controller is down (normal servo: motor_kv)
+SURVEY_S = 30.0        # protocol v6: survey on arrival with "investigate" (sim s) ...
+SURVEY_W = 0.55        # ... turn command in place (rad/s), corrected so a full circle takes about 26 s
 
 
 def wrap(a: float) -> float:
@@ -223,6 +225,8 @@ class Rover:
         self.advisor = None                # set by the sim; rover_tick() runs after each decision cycle
         self.held = False                  # operator "hold": parked in state idle until "resume"
         self.op_goal = None                # operator go_to point (x, y)
+        self.op_task = None                # protocol v6: the place behind op_goal {"label", "investigate", "cid", ...}
+        self.survey = None                 # protocol v6: surveying on arrival (stop, turn 360 deg, LiDAR tracker on)
         self.op_fails = 0
         self.dir_bias = None               # operator "explore <dir>": (unit x, unit y, until t)
         self.sticky_goal = None            # frontier picked by Gemma: kept until reached or gone
@@ -941,6 +945,10 @@ class Rover:
             self.end_observing(t, "interrupted", quiet=True)     # held, faulted or sent elsewhere
         elif self.state == "observing" and self.obs is None:
             self.state = "exploring"
+        if self.survey is not None and (self.state != "exploring" or self.held or self.op_goal is not None):
+            self.end_survey(t, self.state if self.state != "exploring" else "new command")
+        if self.op_task is not None and self.op_goal is None:
+            self.op_task = None                # the operator trip ended some other way (home, hold, resume)
         if self.state in DRIVING and self._check_immersion(t):
             self._apply()
             return
@@ -999,7 +1007,12 @@ class Rover:
             return
 
         if self.state == "exploring":
-            self._explore(t)
+            if self.survey is not None:
+                if self._survey(t):
+                    self._apply()
+                    return
+            else:
+                self._explore(t)
         elif self.state == "investigating":
             if self._investigate(t):
                 self._apply()
@@ -1289,6 +1302,13 @@ class Rover:
             self.op_goal = None
             self.goal, self.path = None, []
             self.next_goal_try = t
+            task, self.op_task = self.op_task, None
+            if task is not None:               # a place the operator named (protocol v6)
+                if task.get("investigate"):
+                    self.start_survey(t, task)
+                if self.advisor is not None:
+                    self.advisor.on_place_arrived(self, task, t)
+                return
             self._say(t, f"{self.id}: arrived at ({gx:g}, {gy:g}). Back to exploring.")
             self.fleet.log(t, "info", f"{self.id} reached the operator's point ({gx:.0f}, {gy:.0f}). "
                                       f"Back to exploring.", self.id, at=(gx, gy), source="operator")
@@ -1307,6 +1327,7 @@ class Rover:
             self.plan_t = t
             if self.op_fails >= 3:
                 self.op_goal = None
+                self.op_task = None
                 self.goal, self.path = None, []
                 self.next_goal_try = t
                 self._say(t, f"{self.id}: no safe path to ({gx:g}, {gy:g}) any more "
@@ -1526,6 +1547,80 @@ class Rover:
         self.hist.clear()
         self.fleet.log(t, "info", f"{self.id} rebooted. Back online.", self.id, at=(self.x, self.y))
         self.mem.note_outcome("fault", f"rebooted after {t - getattr(self, 'fault_t0', t):.0f} s", t, 600.0)
+
+    # ================================================================== surveying a place (protocol v6)
+    def start_survey(self, t: float, task: dict) -> None:
+        """Arrived at a place the operator asked to investigate: stop and turn slowly through 360 deg (so the
+        camera sweeps the area) for about SURVEY_S while the LiDAR tracker watches for movement. State stays
+        "exploring"; goal and path are empty. Ends in end_survey (the advisor writes the report)."""
+        self.survey = {"t0": t, "last_yaw": self.yaw, "turned": 0.0, "label": task.get("label", "the place"),
+                       "cid": task.get("cid"), "qid": task.get("qid"), "at": task.get("at"), "tracks": {},
+                       "targets": {}, "mapped0": self.mem.mapped_cells, "observing": None}
+        self.goal, self.path = None, []
+        self.sticky_goal = None
+        self.fleet.log(t, "info", f"{self.id} surveying {self.survey['label']} for the operator: turning slowly "
+                                  f"through 360 deg for about {SURVEY_S:.0f} s.", self.id, at=(self.x, self.y),
+                       source="operator")
+
+    def _survey(self, t: float) -> bool:
+        """One survey cycle (a few microseconds: the tracks near the rover and the spectrometer reading).
+        Returns True if it set the motor command."""
+        from .fleet import compass
+        sv = self.survey
+        for tr in self.fleet.tracker.near(self.x, self.y, self.lidar_eff + 4.0, t):
+            if t - tr.last_seen > 1.0:
+                continue
+            px, py = tr.predict(t)
+            d = math.hypot(px - self.x, py - self.y)
+            e = sv["tracks"].get(tr.id)
+            if e is None:
+                e = sv["tracks"][tr.id] = {"id": tr.id, "dist": d, "dir": compass(px - self.x, py - self.y),
+                                           "speed": tr.speed, "size": tr.size, "label": tr.label}
+            else:
+                if d < e["dist"]:
+                    e["dist"], e["dir"] = d, compass(px - self.x, py - self.y)
+                e["speed"], e["size"], e["label"] = max(e["speed"], tr.speed), tr.size, tr.label
+            # something moves on its own: the normal observation flow (Gemma's look, maybe the operator)
+            if tr.observer is None and not tr.ignored and tr.speed >= 0.08 and self.can_observe(t, tr):
+                sv["observing"] = tr.id
+                self.end_survey(t, "observing")
+                self.start_observing(t, tr)
+                return True
+        if self.spectro is not None:
+            k, dk = self.spectro
+            sv["targets"][k] = min(dk, sv["targets"].get(k, math.inf))
+        sv["turned"] += abs(wrap(self.yaw - sv["last_yaw"]))
+        sv["last_yaw"] = self.yaw
+        el = t - sv["t0"]
+        if (el >= SURVEY_S and sv["turned"] >= 2.0 * math.pi - 0.15) or el >= SURVEY_S + 15.0:
+            self.end_survey(t, "done")
+            self._set_cmd(0.0, 0.0)
+            return True
+        hold = (self.question_hold and not self._may_move_while_asking(t)) or t < self.pause_until
+        self.goal, self.path = None, []
+        # closed loop on the IMU heading: skid steer turns in place slower than commanded at low wheel speed
+        plan = min(2.0 * math.pi, 2.0 * math.pi * el / (SURVEY_S - 4.0))
+        w = 0.0 if sv["turned"] >= 2.0 * math.pi else max(0.3, min(1.0, SURVEY_W + 1.5 * (plan - sv["turned"])))
+        self._set_cmd(0.0, 0.0 if hold else w)
+        return True
+
+    def end_survey(self, t: float, why: str) -> None:
+        """why: "done", "observing", "new command", or the state that interrupted it (returning, idle, ...)."""
+        sv, self.survey = self.survey, None
+        if sv is None:
+            return
+        self.next_goal_try = self.next_goal_eval = t
+        if why == "observing" and self.obs is not None:
+            sv["observing"] = sv["observing"] or self.obs["track"]
+            tr = self.fleet.tracker.get(sv["observing"])
+            if tr is not None and tr.id not in sv["tracks"]:
+                from .fleet import compass
+                px, py = tr.predict(t)
+                sv["tracks"][tr.id] = {"id": tr.id, "dist": math.hypot(px - self.x, py - self.y),
+                                       "dir": compass(px - self.x, py - self.y), "speed": tr.speed, "size": tr.size,
+                                       "label": tr.label}
+        if self.advisor is not None:
+            self.advisor.survey_report(self, sv, t, why)
 
     # ================================================================== lifeforms: observe from a safe distance
     def can_observe(self, t: float, tr) -> bool:

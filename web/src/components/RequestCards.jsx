@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { appStore, nowSeconds, useSim } from '../state/store.js'
 import { camDown, fetchImage, freshUrl } from '../net/connection.js'
 import { cleanMsg } from '../lib/format.js'
-import { optionLabel, sendAnswer, useAnswer } from '../lib/answers.js'
+import { autoDefault, clearPlaceHover, hasPlaces, hoverKey, isWaiting, optionLabel, placeChipProps, placeNumbers, sendAnswer, setPlaceHover, useAnswer, usePlaceHover } from '../lib/answers.js'
 import { useNow } from '../lib/useNow.js'
+import { useHudRect } from '../lib/useHudRect.js'
 import { CAM_RETRY_DOWN, LidarRadar, cameraProblem } from './SensorPanel.jsx'
 import { SourceTag } from './Planner.jsx'
 
@@ -11,6 +12,10 @@ import { SourceTag } from './Planner.jsx'
 // interpret what it senses asks the operator, and takes the safe default when nobody
 // answers in time. One prominent card under the hazard bar; more open questions queue
 // beneath it as slim strips.
+// Version 6: a request may wait for the operator (`expires_in` null: no countdown, no
+// default; the rover holds position), and a `choose_place` request names candidate
+// places (options with x, y): numbered chips here, numbered markers on the map, and a
+// small top-down map in place of the camera picture.
 
 const IMG_PERIOD = 500 // ms between camera frames while a question is open
 const GHOST_ANSWERED = 2.6 // s the confirmation stays after an answer
@@ -150,6 +155,73 @@ function RequestImage({ q, size }) {
   )
 }
 
+// v6: a top-down sketch of the asking rover and the numbered candidates (north up), in
+// place of the camera picture for a `choose_place` request. Hover and click like the chips.
+const PM_W = 160
+const PM_H = 120
+function PlaceMap({ q, color, answer }) {
+  const at = useSim((s) => {
+    const r = s.rovers[q.rover]
+    return r ? `${Math.round(r.x)},${Math.round(r.y)}` : ''
+  })
+  const lander = useSim((s) => s.lander)
+  const hover = usePlaceHover()
+  const nums = placeNumbers(q)
+  const places = q.options.filter((o) => nums[o.id])
+  const rover = at ? at.split(',').map(Number) : null
+  const pts = places.map((o) => [o.x, o.y])
+  if (rover) pts.push(rover)
+  let x0 = Infinity
+  let x1 = -Infinity
+  let y0 = Infinity
+  let y1 = -Infinity
+  for (const [x, y] of pts) {
+    x0 = Math.min(x0, x)
+    x1 = Math.max(x1, x)
+    y0 = Math.min(y0, y)
+    y1 = Math.max(y1, y)
+  }
+  const span = Math.max(x1 - x0, ((y1 - y0) * PM_W) / PM_H, 16)
+  const k = (PM_W - 36) / span
+  const cx = (x0 + x1) / 2
+  const cy = (y0 + y1) / 2
+  const sx = (x) => PM_W / 2 + (x - cx) * k
+  const sy = (y) => PM_H / 2 - (y - cy) * k
+  const pending = answer?.state === 'pending' || answer?.state === 'sent'
+  const lx = lander ? sx(lander.x) : -99
+  const ly = lander ? sy(lander.y) : -99
+  return (
+    <figure className="rq-img rq-map" style={{ '--c': color }}>
+      <svg viewBox={`0 0 ${PM_W} ${PM_H}`} role="group" aria-label="Where the candidates are, north up">
+        {lx > 4 && lx < PM_W - 4 && ly > 4 && ly < PM_H - 4 && <rect className="rq-map-lander" x={lx - 3} y={ly - 3} width="6" height="6" rx="1.2" />}
+        {rover &&
+          places.map((o) => <line key={o.id} className="rq-map-line" x1={sx(rover[0])} y1={sy(rover[1])} x2={sx(o.x)} y2={sy(o.y)} data-hl={hover === hoverKey(q.id, o.id) || undefined} />)}
+        {places.map((o) => {
+          const key = hoverKey(q.id, o.id)
+          return (
+            <g
+              key={o.id}
+              className="rq-map-pin"
+              data-hl={hover === key || undefined}
+              data-chosen={(answer?.option === o.id && pending) || undefined}
+              transform={`translate(${sx(o.x)} ${sy(o.y)})`}
+              onMouseEnter={() => setPlaceHover(key)}
+              onMouseLeave={() => clearPlaceHover(key)}
+              onClick={() => !pending && sendAnswer(q.id, o.id)}
+            >
+              <title>{o.label}</title>
+              <circle r="9" />
+              <text dy="3.6">{nums[o.id]}</text>
+            </g>
+          )
+        })}
+        {rover && <circle className="rq-map-rover" cx={sx(rover[0])} cy={sy(rover[1])} r="4.2" />}
+      </svg>
+      <figcaption className="rq-img-cap">Map, north up</figcaption>
+    </figure>
+  )
+}
+
 // Smooth countdown between ticks: one rAF loop writes the bar's scale directly.
 function CountdownBar({ q, frozen }) {
   const fill = useRef(null)
@@ -171,7 +243,7 @@ function CountdownBar({ q, frozen }) {
     return () => cancelAnimationFrame(raf)
   }, [q.deadline, q.total, frozen])
   return (
-    <div className="rq-bar" aria-hidden="true">
+    <div className="rq-bar" data-wait={(q.deadline === null && !frozen) || undefined} aria-hidden="true">
       <i ref={fill} />
     </div>
   )
@@ -221,13 +293,14 @@ function Outcome({ kind, q, name, answer, ghost }) {
   return (
     <p className="rq-out" data-kind="closed" role="status">
       <CheckIcon />
-      <span>Question closed: answered on another screen, or no longer needed.</span>
+      <span>Question closed: answered in Comms or on another screen, or no longer needed.</span>
     </p>
   )
 }
 
 function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
   const answer = useAnswer(q.id)
+  const hover = usePlaceHover()
   const name = meta?.name || q.rover || 'A rover'
   const left = q.deadline === null ? null : Math.max(0, q.deadline - now)
   const pending = answer?.state === 'pending'
@@ -235,10 +308,20 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
   const fromAnswer = answer?.state === 'sent' ? 'answered' : answer?.state === 'error' && answer.status === 409 ? 'late' : null
   let kind = fromAnswer || ghost?.kind || null
   if (kind === 'sending' && answer?.state === 'error') kind = 'closed'
-  const def = optionLabel(q, q.default)
+  const auto = autoDefault(q)
+  const def = optionLabel(q, auto)
+  const waiting = isWaiting(q)
+  const places = hasPlaces(q)
+  const nums = places ? placeNumbers(q) : null
+  const color = meta?.color || '#8d99aa'
+  let hint
+  if (waiting && places) hint = `${name} holds position until you choose. Click a numbered marker on the map, a choice here, or reply in Comms ("the second one").`
+  else if (waiting) hint = `${name} holds position until you answer.`
+  else if (auto) hint = `Moving cautiously until you answer. With no answer it takes the safe default: ${def.toLowerCase()}.`
+  else hint = 'Moving cautiously until you answer.'
   return (
-    <section className="hud hud-request" style={{ '--rover': meta?.color || '#8d99aa' }} data-kind={kind || 'open'} aria-label={`${name} asks the operator`}>
-      <RequestImage q={q} size={imgSize} />
+    <section className="hud hud-request" style={{ '--rover': color }} data-kind={kind || 'open'} data-wait={(waiting && !kind) || undefined} aria-label={`${name} asks the operator`}>
+      {places ? <PlaceMap q={q} color={color} answer={answer} /> : <RequestImage q={q} size={imgSize} />}
       <div className="rq-main">
         <header className="rq-head">
           <span className="rover-dot" aria-hidden="true" />
@@ -253,6 +336,12 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
               <small> s</small>
             </span>
           )}
+          {!kind && waiting && (
+            <span className="rq-wait" title="No time limit: the rover waits for your answer">
+              <i aria-hidden="true" />
+              Waiting for you
+            </span>
+          )}
         </header>
         <p className="rq-q">{cleanMsg(q.question, q.rover, byId)}</p>
         {kind ? (
@@ -261,18 +350,31 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
           <>
             <div className="rq-opts" role="group" aria-label="Answer">
               {q.options.map((o) => {
-                const isDefault = o.id === q.default
+                const isDefault = o.id === auto
+                const n = nums?.[o.id]
                 return (
                   <button
                     key={o.id}
                     type="button"
                     className="rq-opt"
                     data-default={isDefault || undefined}
+                    data-place={n ? true : undefined}
                     aria-busy={(pending && answer.option === o.id) || undefined}
                     disabled={pending}
                     onClick={() => sendAnswer(q.id, o.id)}
+                    title={n ? `${o.label} (marker ${n} on the map)` : undefined}
+                    {...placeChipProps(q, o, hover)}
                   >
-                    <span className="rq-opt-label">{o.label}</span>
+                    {n ? (
+                      <span className="rq-opt-row">
+                        <b className="place-num" aria-hidden="true">
+                          {n}
+                        </b>
+                        <span className="rq-opt-label">{o.label}</span>
+                      </span>
+                    ) : (
+                      <span className="rq-opt-label">{o.label}</span>
+                    )}
                     {isDefault && (
                       <span className="rq-safe">
                         <ShieldIcon />
@@ -288,9 +390,7 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
                 {answer.error}
               </p>
             ) : (
-              <p className="rq-hint">
-                Moving cautiously until you answer. With no answer it takes the safe default{def ? `: ${def.toLowerCase()}` : ''}.
-              </p>
+              <p className="rq-hint">{hint}</p>
             )}
           </>
         )}
@@ -308,8 +408,8 @@ function RequestStrip({ q, meta, byId, now, onOpen }) {
       <span className="rover-dot" aria-hidden="true" />
       <b>{name}</b>
       <span className="rq-strip-q">{cleanMsg(q.question, q.rover, byId)}</span>
-      {left !== null && <span className="rq-strip-left">{Math.ceil(left)} s</span>}
-      <i className="rq-strip-bar" style={{ transform: `scaleX(${q.total && left !== null ? Math.max(0, Math.min(1, left / q.total)) : 1})` }} aria-hidden="true" />
+      {left !== null ? <span className="rq-strip-left">{Math.ceil(left)} s</span> : <span className="rq-strip-wait">waiting</span>}
+      <i className="rq-strip-bar" data-wait={left === null || undefined} style={{ transform: `scaleX(${q.total && left !== null ? Math.max(0, Math.min(1, left / q.total)) : 1})` }} aria-hidden="true" />
     </button>
   )
 }
@@ -326,6 +426,7 @@ export function RequestCards({ onSelect }) {
   const shown = useRef(null) // id of the request in the committed main card
   const now = useNow(250, requests.length > 0 || !!ghost)
   const compact = useCompact()
+  const stackRef = useHudRect('requests') // v6: the camera keeps place candidates out from under the card
   const byId = useMemo(() => Object.fromEntries(meta.map((m) => [m.id, m])), [meta])
 
   // When the question in the main card leaves the open list, keep it on screen for a
@@ -385,7 +486,7 @@ export function RequestCards({ onSelect }) {
     setPick(id)
   }
   return (
-    <div className="rq-stack">
+    <div className="rq-stack" ref={stackRef}>
       <RequestCard
         key={main.id}
         q={main}

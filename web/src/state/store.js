@@ -67,6 +67,9 @@ export const appStore = createStore({
   // A large viewer over everything: { kind: 'camera', rover, view } or
   // { kind: 'sensors', rover, focus: 'lidar' | 'motion' | 'compute' }, or null.
   modal: null,
+  // v6: the place candidate under the pointer, `${requestId}:${optionId}`, shared by the
+  // map markers, the request card and the chat chips so each lights the others.
+  placeHover: null,
 })
 
 export function dispatchSim(msg) {
@@ -92,4 +95,4 @@ export const trackPoses = new Map()
 // { left, top, right, bottom } per panel, or null when the panel is not shown. Written
 // by the panels (useHudRect), read by the camera rig every frame to keep the picture
 // centred in the space the panels leave free.
-export const hudLayout = { controls: null, hazards: null, sensors: null, version: 0 }
+export const hudLayout = { controls: null, hazards: null, sensors: null, requests: null, version: 0 }

@@ -12,7 +12,7 @@ services:
       GEMMA_URL: ${GEMMA_URL:-http://host.docker.internal:11434}
       GEMMA_MODEL: ${GEMMA_MODEL:-gemma4:e2b}
       GEMMA_FAKE: ${GEMMA_FAKE:-0}
-      OPERATOR_TIMEOUT_S: ${OPERATOR_TIMEOUT_S:-20}
+      OPERATOR_TIMEOUT_S: ${OPERATOR_TIMEOUT_S:-0}
       CAMERA_SHADOWS: ${CAMERA_SHADOWS:-1}
     # Lets the container reach Ollama running on your machine (Docker Desktop and plain Docker on Linux/WSL).
     extra_hosts:
