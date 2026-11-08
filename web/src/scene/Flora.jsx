@@ -5,6 +5,7 @@ import { useSim } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { groundAt, knownAt } from './ground.js'
 import { reducedMotion } from './sceneConstants.js'
+import { FLORA } from '../lib/terrainTheme.js'
 
 // v7 alien flora (PROTOCOL.md, `features.flora` and `fleet.flora_zones`). Fungal trees: a thin pale
 // stalk under a wide violet or teal cap with a soft glowing rim. Bushes: a few glowing lime bulbs
@@ -15,8 +16,9 @@ import { reducedMotion } from './sceneConstants.js'
 const MAX = 128
 const BULBS = 3
 const HIDDEN = new THREE.Matrix4().makeScale(0, 0, 0)
-const VIOLET = new THREE.Color(0.56, 0.24, 0.86)
-const TEAL = new THREE.Color(0.12, 0.74, 0.7)
+// Hex colours are sRGB, so the caps keep their saturation once converted to linear.
+const VIOLET = new THREE.Color(FLORA.violet)
+const TEAL = new THREE.Color(FLORA.teal)
 const _m = new THREE.Matrix4()
 const _p = new THREE.Vector3()
 const _s = new THREE.Vector3()
@@ -81,7 +83,12 @@ export function Flora({ reality }) {
         for (let b = 0; b < BULBS && nb < MAX * BULBS; b++) {
           const a = p.hue * 6.28 + b * 2.1
           const s = 0.14 + 0.1 * p.radius
-          _m.compose(_p.set(p.x + 0.6 * p.radius * Math.cos(a), gz + 0.6 * p.height + 0.2 * b * s, -(p.y + 0.6 * p.radius * Math.sin(a))), _q.identity(), _s.set(s, s, s))
+          // A tight clump sitting on the ground, each bulb a little higher than the last, so
+          // none floats in the air with nothing under it.
+          const off = 0.45 * s * (b + 1)
+          const bx = p.x + off * Math.cos(a)
+          const by = p.y + off * Math.sin(a)
+          _m.compose(_p.set(bx, groundAt(bx, by) + s * (0.75 + 0.35 * b), -by), _q.identity(), _s.set(s, s, s))
           bulb.current.setMatrixAt(nb++, _m)
         }
       }

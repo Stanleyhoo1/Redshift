@@ -1,0 +1,122 @@
+/* v7 terrain legend: a small heading and swatches matching the 3D colours. */
+
+.legend-terrain {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.legend-sub {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.legend-terrain .legend-row {
+  margin-top: 5px;
+  padding-top: 0;
+  border-top: 0;
+  gap: 5px 12px;
+  max-width: 300px;
+}
+
+.sw-t-tree {
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 7px 7px 1px 1px;
+  background: linear-gradient(90deg, var(--c), var(--c2));
+  box-shadow: 0 0 5px var(--c);
+}
+
+.sw-t-bush {
+  width: 9px;
+  height: 9px;
+  margin: 0 1.5px;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: 0 0 6px var(--c);
+}
+
+.sw-t-keep {
+  border-radius: 50%;
+  border: 2px dashed var(--c);
+}
+
+.sw-t-ice {
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #ffffff, var(--c) 55%, #9cc4e6);
+}
+
+.sw-t-icez {
+  border-radius: 50%;
+  border: 2px dashed var(--c);
+  background: repeating-linear-gradient(135deg, var(--c) 0 2px, transparent 2px 4px);
+  opacity: 0.9;
+}
+
+.sw-t-geyser {
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--c2) 0 28%, var(--c) 32% 70%, transparent 74%);
+  box-shadow: 0 -4px 5px -2px var(--c2);
+}
+
+.sw-t-dune {
+  border-radius: 3px;
+  background: repeating-linear-gradient(160deg, var(--c) 0 3px, var(--c2) 3px 5px);
+}
+
+.sw-t-mesa {
+  height: 10px;
+  margin-top: 2px;
+  border-radius: 1px;
+  background: linear-gradient(180deg, var(--c) 0 30%, var(--c2) 30%);
+  clip-path: polygon(18% 0, 82% 0, 100% 100%, 0 100%);
+}
+
+.sw-t-canyon {
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--c2) 0 25%, var(--c) 25% 75%, var(--c2) 75%);
+}
+
+.sw-t-pit {
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--c) 0 50%, var(--c2) 56% 70%, transparent 74%);
+}
+
+.sw-t-boulders {
+  background:
+    radial-gradient(circle at 28% 34%, var(--c) 0 22%, transparent 25%),
+    radial-gradient(circle at 70% 30%, var(--c) 0 17%, transparent 20%),
+    radial-gradient(circle at 52% 74%, var(--c) 0 25%, transparent 28%);
+}
+
+/* On short screens a stacked terrain list would push the legend up into the controls panel,
+   so the terrain entries move into a second column beside the rest of the legend. */
+@media (max-height: 860px) {
+  .hud-legend:has(.legend-terrain) {
+    display: grid;
+    grid-template-columns: auto auto;
+    align-content: start;
+  }
+
+  .hud-legend:has(.legend-terrain) > * {
+    grid-column: 1;
+  }
+
+  .hud-legend > .legend-terrain {
+    grid-column: 2;
+    grid-row: 1 / span 8;
+    margin: 0 0 0 14px;
+    padding: 0 0 0 14px;
+    border-top: 0;
+    border-left: 1px solid var(--line);
+  }
+
+  .legend-terrain .legend-row {
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 6px 12px;
+    margin-top: 7px;
+  }
+}
