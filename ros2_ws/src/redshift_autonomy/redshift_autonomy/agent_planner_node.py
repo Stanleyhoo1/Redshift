@@ -1,6 +1,7 @@
-"""Per-robot agent: rover (FSM + frontier selection + gravity-aware A* + pure pursuit + safe-hold recovery)
-or scout (aerial survey + altitude hold + hazard scans). Publishes cmd_vel, planned_path, agent_state,
-edge_telemetry, fleet coordination messages and the traceable decision log."""
+"""Per-robot agent: rover (FSM + frontier selection + gravity-aware A* + pure pursuit + safe-hold recovery +
+battery conservation from its own solar readings) or scout (aerial survey + altitude hold + hazard scans + wind
+descent from its own drift). Publishes cmd_vel, planned_path, agent_state, edge_telemetry, fleet coordination
+messages and the traceable decision log."""
 from __future__ import annotations
 
 import collections
@@ -27,11 +28,13 @@ from .brain_bridge import (CAPPED_DRIVES, BrainAltitude, BrainCap, DropGuard, al
 from .edge_budget import PROFILES, EdgeBudget
 from .grid_map import slope_from_elevation
 from .physics_model import RoverPhysics
-from .rover_health import DroneHealth, RoverHealth
+from .rover_health import DroneHealth, PowerSaver, RoverHealth
 from .planning import (RING, add_keepout, astar, build_costmap, cell_to_world, cells_to_world, clearance_mask,
-                       find_frontiers, first_block, path_conflicts, path_length_m, pure_pursuit, reachable_from,
-                       score_frontiers, standoff_cells, world_to_cell, wrap)
+                       find_frontiers, first_block, is_detour, path_conflicts, path_length_m, prefer_tight,
+                       pure_pursuit, reachable_from, score_frontiers, standoff_cells, world_to_cell, wrap)
 from .ros_utils import image_to_numpy, quat_to_rpy
+from .vision import pillar_report
+from .wind import WindDescent, WindEstimator, clear_texts, descent_texts, wind_feedforward
 
 MAP_QOS = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
                      durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
@@ -44,6 +47,7 @@ BORDER_M = 3.0               # sector edge keep-out (the heightmap ends there)
 SCOUT_LEASH_M = 40.0         # scout surveys within reach of the rovers it supports
 STANDOFF_M = 2.2             # rescue A* goal: preferred distance from the damaged rover's centre (2.0–2.45 m band)
 RESCUE_TRIES = 4             # A* attempts per rescue plan, best stand-off cells first
+RESCUE_MOVE_M = 1.5          # a quiet re-plan that moves the stand-off this far is traced (a new side, a new route)
 PEER_DISC_M = 0.9            # teammates are lethal discs in the planning cost map (the map filters their returns)
 PEER_FRESH_S = 2.0
 SOS_FRESH_S = 4.0
@@ -55,6 +59,10 @@ START_BATTERY = {'rover_0': 82.0, 'rover_1': 91.0}
 BRAIN_REPLAN_STATES = ('EXPLORING', 'CAUTION', 'RESCUE_TRANSIT')   # SLOW_AND_REPLAN → quiet re-plan in these
 BRAIN_AGL_STATES = ('SURVEY', 'FLY_TO_SCAN')   # scout states that fly an advisory cruise AGL (never take-off / scan)
 AGL_HOLD_STATES = BRAIN_AGL_STATES + ('SCANNING',)   # ... plus a scan, which holds the AGL it started at
+BLOCK_DET_M = 5.0            # camera detections within this range of the blocking cell's distance describe the block
+PILLAR_MEMORY_S = 2.0        # a PILLAR seen this recently (sim s) still describes a block (frames classify it on/off)
+PILLAR_ID_GAP_S = 30.0       # a PILLAR sighting after this long (sim s) without one is a new identification (trace)
+POWER_DRIVES = ('follow', 'dock')   # drives slowed by battery conservation (never the recovery reverse or back-off)
 
 
 class MapView:
@@ -275,6 +283,9 @@ class RoverAgent(AgentBase):
         self.rescuer_available = any(role_of(x) == 'recovery' for x in self.peers_list)
         self.health = RoverHealth(r, self.g, battery_pct=START_BATTERY.get(r, 85.0),
                                   tip_alarm_deg=self.limits.tip_alarm_deg, physics=self.physics)
+        self.power = PowerSaver()           # battery conservation from our own solar / irradiance readings
+        self._pillars: list = []            # (t_sim, range_m) of recent PILLAR detections (see PILLAR_MEMORY_S)
+        self._pillar_seen_t: float | None = None   # sim time of the last PILLAR sighting (PILLAR_ID_GAP_S)
         self.accel = (0.0, 0.0, 0.0)
         self.peers: dict = {}               # teammate → (x, y, yaw, t_sim) from their odometry (fleet link)
         self.sos_seen: dict = {}            # SOS id → (msg, t_sim)
@@ -301,6 +312,7 @@ class RoverAgent(AgentBase):
         self.goal = None            # (x, y)
         self.goal_rc = None
         self.goal_kind = 'frontier'
+        self._rescue_tight = False  # the last rescue route was planned at 0.3 m clearance
         self._blacklist: dict = {}
         self._visited_science: list = []
         self.frontiers_left = True
@@ -372,10 +384,33 @@ class RoverAgent(AgentBase):
     def on_hw(self, m: String):
         try:
             d = json.loads(m.data)
-            self.health.on_hw_status(self.now_s(), d.get('wheel_health') or [1.0] * 4, d.get('faults') or [],
-                                     float(d.get('solar_w') or 0.0))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
+            solar = float(d.get('solar_w') or 0.0)
+            self.health.on_hw_status(self.now_s(), d.get('wheel_health') or [1.0] * 4, d.get('faults') or [], solar)
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            return
+        ev = self.power.update(self.now_s(), solar, d.get('irradiance'), self.health.battery_pct)
+        if ev is not None:
+            # battery conservation (speed only: the edge budget throttles perception on its own load rule)
+            tx = self.power.texts(ev)
+            self.trace('power_save' if ev == 'enter' else 'power_restored', ['DIAG'], tx['input'], tx['reasoning'],
+                       tx['confidence'], tx['action'], tx['severity'], force=True)
+
+    def on_det(self, m: String):
+        t0 = self.det_t
+        super().on_det(m)
+        if self.det_t == t0 or not isinstance(self.det, dict):
+            return                          # not parsed
+        now = self.det_t
+        self._pillars = [(t, rng) for t, rng in self._pillars if now - t <= PILLAR_MEMORY_S]
+        seen = [d for d in self.det.get('detections', [])
+                if isinstance(d, dict) and d.get('cls') == 'PILLAR' and d.get('range_m')]
+        self._pillars += [(now, float(d['range_m'])) for d in seen]
+        if seen:
+            if self._pillar_seen_t is None or now - self._pillar_seen_t > PILLAR_ID_GAP_S:
+                tx = pillar_report(max(seen, key=lambda d: float(d.get('conf') or 0.0)))
+                self.trace('pillar_identified', ['CAM', 'DEPTH'], tx['input'], tx['reasoning'], tx['confidence'],
+                           tx['action'], 'warn', force=True)
+            self._pillar_seen_t = now
 
     def on_peer(self, robot: str, m: Odometry):
         p = m.pose.pose
@@ -490,7 +525,9 @@ class RoverAgent(AgentBase):
         The teammate is planned as an uninflated keep-out (its footprint + our radius): the stand-off is meant to be
         close to it, and its usual peer disc + inflation ring (≈2.0–2.5 m) would reject a quarter of the cells at
         2.2 m on open ground, and all of them beside another hazard. Cells outside our reachable region are skipped
-        without running A*."""
+        without running A*. When nothing routes at full clearance, or only a long detour does (a gap the inflation
+        rings close), the stand-offs are also tried at 0.3 m clearance (cores still lethal) and the shorter way taken
+        (planning.prefer_tight). A quiet re-plan that moves the stand-off is traced: the operator sees every switch."""
         txy = self.rescue_target_xy()
         if txy is None or self.pose is None:
             self._set_path(None)
@@ -498,36 +535,54 @@ class RoverAgent(AgentBase):
         tx, ty = txy
         peer = self.fsm.rescue['peer'] if self.fsm.rescue else None
         target = (peer, txy)
-        cm = self._costmap(target=target)
+        old_goal = self.goal if self.goal_kind == 'rescue' else None
         base = math.atan2(self.pose[1] - ty, self.pose[0] - tx)
+        direct = math.hypot(self.pose[0] - tx, self.pose[1] - ty)
         t0 = time.perf_counter()
         start = self.map.cell(self.pose[0], self.pose[1])
-        cells = standoff_cells(cm, txy, base, r_pref=STANDOFF_M)
-        reach = reachable_from(cm, start)
-        usable = [rc for rc in cells if reach[rc]]
+
+        def first_route(tight):
+            cm = self._costmap(tight=tight, target=target)
+            cells = standoff_cells(cm, txy, base, r_pref=STANDOFF_M)
+            reach = reachable_from(cm, start)
+            usable = [rc for rc in cells if reach[rc]]
+            for rc in usable[:RESCUE_TRIES]:
+                path, st, _ = self._plan(rc, cm, target=target)
+                if path is not None:
+                    return (rc, path, st), len(cells), len(usable)
+            return None, len(cells), len(usable)
+
+        best, n_cells, n_usable = first_route(False)
         tight = False
-        if not usable:
-            # boxed in by inflation rings (the case _plan's tight retry covers): try 0.3 m clearance, cores still lethal
-            cm_t = self._costmap(tight=True, target=target)
-            cells_t = standoff_cells(cm_t, txy, base, r_pref=STANDOFF_M)
-            reach_t = reachable_from(cm_t, start)
-            usable_t = [rc for rc in cells_t if reach_t[rc]]
-            if usable_t:
-                cm, cells, usable, tight = cm_t, cells_t, usable_t, True
-        for rc in usable[:RESCUE_TRIES]:
-            path, st, _ = self._plan(rc, cm, target=target)
-            if path is None:
-                continue
+        if best is None or is_detour(best[2]['length_m'], direct):
+            alt, n_cells_t, n_usable_t = first_route(True)
+            if prefer_tight(best[2]['length_m'] if best else None, alt[2]['length_m'] if alt else None, direct):
+                if best is not None and (visible or not self._rescue_tight):
+                    self.trace('tight_clearance', ['MAP'],
+                               f'Rescue route at {self.radius:.1f} m clearance is a {best[2]["length_m"]:.0f} m '
+                               f'detour for a teammate {direct:.0f} m away',
+                               'Inflation rings close the direct gap; core hazards still excluded', 0.7,
+                               f'Taking the {alt[2]["length_m"]:.0f} m route at 0.3 m clearance', 'warn')
+                best, tight = alt, True
+            elif best is None:
+                n_cells, n_usable = max(n_cells, n_cells_t), max(n_usable, n_usable_t)
+        if best is not None:
+            rc, path, st = best
+            self._rescue_tight = tight
             gx, gy = self.map.xy(rc)
+            dm = math.hypot(gx - old_goal[0], gy - old_goal[1]) if old_goal is not None else 0.0
+            moved = dm > RESCUE_MOVE_M
             self.goal, self.goal_rc, self.goal_kind = (gx, gy), rc, 'rescue'
             self._set_path(path)
             self._last_replan = self.now_s()
-            if visible:
+            if visible or moved:
                 side = math.degrees(math.atan2(gy - ty, gx - tx)) % 360
                 self.trace('rescue_route', ['MAP', 'FLEET'],
                            f'{unit_label(peer or "?")} at ({tx:.1f}, {ty:.1f}); stand-off '
                            f'{math.hypot(gx - tx, gy - ty):.1f} m on the {side:.0f}° side',
-                           f'Gravity-aware A* over the shared map at {self.g:.1f} g', 0.9,
+                           f'Gravity-aware A* over the shared map at {self.g:.1f} g'
+                           + (f'; stand-off moved {dm:.1f} m since the last plan' if moved else ''),
+                           0.9,
                            f'Rescue route {st["length_m"]:.1f} m ({st["expansions"]} nodes, {st["ms"]:.0f} ms)'
                            + (' at 0.3 m clearance' if tight or st.get('tight') else ''),
                            latency_ms=(time.perf_counter() - t0) * 1000, force=True)
@@ -535,8 +590,8 @@ class RoverAgent(AgentBase):
             return True
         if visible:
             self.trace('rescue_noroute', ['MAP', 'FLEET'],
-                       f'No route to a stand-off beside {unit_label(peer or "?")}: {len(cells)} free cells '
-                       f'2.0–2.45 m from it, {len(usable)} in this rover\'s reachable region',
+                       f'No route to a stand-off beside {unit_label(peer or "?")}: {n_cells} free cells '
+                       f'2.0–2.45 m from it, {n_usable} in this rover\'s reachable region',
                        'Hazards or their inflation enclose the teammate or this rover on the current map', 0.7,
                        'Holding; re-planning as the map grows', 'warn')
         self._set_path(None)
@@ -739,16 +794,24 @@ class RoverAgent(AgentBase):
         n_obs = int((win == gm.OBSTACLE).sum())
         n_haz = int((win == gm.HAZARD).sum())
         n_perm = int((win == gm.PERMANENT).sum())
-        rocks = [d for d in (self.det or {}).get('detections', []) if d.get('cls') == 'ROCK'
-                 and d.get('range_m') and abs(d['range_m'] - dist) < 5.0]
-        sens = ['LIDAR', 'MAP'] + (['CAM'] if rocks else [])
+        near = [d for d in (self.det or {}).get('detections', []) if d.get('range_m')
+                and abs(d['range_m'] - dist) < BLOCK_DET_M]
+        rocks = [d for d in near if d.get('cls') == 'ROCK']
+        now = self.now_s()
+        pillar = any(d.get('cls') == 'PILLAR' for d in near) or any(
+            now - t <= PILLAR_MEMORY_S and abs(rng - dist) < BLOCK_DET_M for t, rng in self._pillars)
+        sens = ['LIDAR', 'MAP'] + (['CAM'] if rocks or pillar else [])
         if n_perm >= max(n_obs, n_haz):
             return f'Permanent hazard zone {dist:.1f} m ahead on route', ('MAP', 'FLEET'), 0.95
-        if n_obs >= n_haz:
-            txt = f'{n_obs} obstacle cells {dist:.1f} m ahead across path (LiDAR step > 0.30 m)'
-            if rocks:
+        if n_obs >= n_haz or pillar:
+            # a fallen pillar's flanks may map as step/slope cells: the camera says what it is
+            n_cells = n_obs + (n_haz if pillar else 0)
+            txt = f'{n_cells} obstacle cells {dist:.1f} m ahead across path (LiDAR step > 0.30 m)'
+            if pillar:
+                txt += '; camera confirms a fallen pillar'
+            elif rocks:
                 txt += f'; camera confirms {len(rocks)} boulder{"s" if len(rocks) > 1 else ""}'
-            conf = min(0.98, 0.75 + 0.03 * n_obs + 0.05 * len(rocks))
+            conf = min(0.98, 0.75 + 0.03 * n_obs + 0.05 * len(rocks) + (0.1 if pillar else 0.0))
             return txt, tuple(sens), conf
         sl = float(np.nanmax(self.map.slope[max(0, r - n):r + n + 1, max(0, c - n):c + n + 1]))
         return (f'Slope {sl:.1f}° mapped {dist:.1f} m ahead > {self.limits.max_slope_deg:.1f}° limit at {self.g:.1f} g',
@@ -937,8 +1000,9 @@ class RoverAgent(AgentBase):
         x, y, yaw = self.pose
         v = w = 0.0
         self._cap_applied = False
+        ps = self.power.speed_scale if out.drive in POWER_DRIVES else 1.0   # ≤ 1: never above the FSM's speed
         if out.drive == 'follow' and self.path_xy is not None:
-            vmax = self.limits.v_max * out.speed_scale
+            vmax = self.limits.v_max * out.speed_scale * ps
             v, w, idx, done = pure_pursuit(self.pose, self.path_xy, lookahead=1.5, v_max=vmax, w_max=self.w_max)
             v, w = self.brain_cap.apply(v, w, self.now_s(), self.fsm.state)   # advisory: never faster than local
             self._cap_applied = True
@@ -957,7 +1021,7 @@ class RoverAgent(AgentBase):
                 if abs(alpha) > 0.35:
                     v, w = 0.0, float(np.clip(1.5 * alpha, -0.5, 0.5))
                 elif rng > DOCK_M - 0.05 and near >= rng - DOCK_CLEAR_M:
-                    v = self.limits.v_max * out.speed_scale
+                    v = self.limits.v_max * out.speed_scale * ps
                     w = float(np.clip(1.5 * alpha, -0.4, 0.4))
             v, w = self.brain_cap.apply(v, w, self.now_s(), self.fsm.state)   # operator caps only while docking
             self._cap_applied = True
@@ -989,7 +1053,7 @@ class RoverAgent(AgentBase):
         st = {'robot': self.robot, 'type': 'rover', 'state': self.fsm.state,
               'mode': out.mode if out else 'FUSED', 'goal': list(self.goal) if self.goal else None,
               'goal_kind': self.goal_kind, 'speed': round(speed, 3),
-              'v_limit': round(self.limits.v_max * (out.speed_scale if out else 1.0), 3),
+              'v_limit': round(self.limits.v_max * (out.speed_scale if out else 1.0) * self.power.speed_scale, 3),
               'cmd': [round(self.cmd[0], 3), round(self.cmd[1], 3)],
               'tilt': {'roll_deg': round(self.roll, 2), 'pitch_deg': round(self.pitch, 2)},
               'slip': round(self.slip, 3), 'breadcrumbs': self.fsm.breadcrumb_count(),
@@ -1000,7 +1064,8 @@ class RoverAgent(AgentBase):
               'role': self.role, 'name': self.name, 'health': self.health.state().as_dict(),
               'rescue': self._rescue_info(), 'v_cmd': round(self.cmd[0], 3), 'v_wheel': round(self.v_wheel, 3),
               'v_ground': round(tw.linear.x, 3) if tw else 0.0,
-              'brain_cap': self.brain_cap.info(self.now_s(), self.fsm.state, self._cap_applied), 't': time.time()}
+              'brain_cap': self.brain_cap.info(self.now_s(), self.fsm.state, self._cap_applied),
+              'power_save': self.power.active, 'wind_mps': None, 'wind_descent': False, 't': time.time()}
         self.pub_state.publish(String(data=json.dumps(st)))
 
     def _rescue_info(self):
@@ -1029,6 +1094,9 @@ class ScoutAgent(AgentBase):
         r = self.robot
         self.cruise = float(self.spec.get('cruise_agl_m', 12.0))
         self.vz_max = float(self.spec.get('vz_max', 2.0))
+        # air-relative speed limit: guidance flies at CRUISE_V / DASH_V over the ground; the wind feed-forward may
+        # add up to this much against a storm (a multirotor holds station in wind well above its survey speed)
+        self.v_air_max = float(self.spec.get('v_air_max', 18.0))
         self.fsm = ScoutFSM(r, cruise_agl=self.cruise, max_slope_deg=self.limits.max_slope_deg)
         self.health = DroneHealth(r, self.g, battery_pct=96.0, mass_kg=float(self.spec.get('mass_kg', 2.0)))
         self._t_health = None
@@ -1049,6 +1117,10 @@ class ScoutAgent(AgentBase):
         self._lawn = self._lawnmower()
         self.brain_alt = BrainAltitude(r)
         self._agl_cmd = self.cruise            # AGL the altitude hold is flying to (cruise or the advisory one)
+        self.wind = WindEstimator()            # wind from our own drift: odometry vs the commands we published
+        self.wind_rule = WindDescent()         # local, authoritative: strong wind → fly lower
+        self._cmd_body = (0.0, 0.0)            # last published horizontal cmd_vel (body frame)
+        self._guide_body = (0.0, 0.0)          # ... without the wind feed-forward (the estimator's transient gate)
         self._brain_guard = DropGuard(self.get_logger().warning)
         self.create_subscription(String, '/brain/decision', self.on_brain, 10)
         self.rover_xy: dict = {}
@@ -1112,18 +1184,46 @@ class ScoutAgent(AgentBase):
         agl = self.brain_alt.offer(d, self.now_s())
         if agl is None:
             return
-        tx = altitude_trace(agl, d, self.fsm.state in BRAIN_AGL_STATES)
+        tx = altitude_trace(agl, d, self.fsm.state in BRAIN_AGL_STATES, self.wind_rule.target_agl(self.cruise))
         self.trace('brain_cap', ['FLEET'], tx['input'], tx['reasoning'], tx['confidence'], tx['action'],
                    tx['severity'], force=True)   # one per decision (rate-limited upstream): a lifted stop must show
 
+    def cruise_setpoint(self) -> float:
+        """AGL flown while surveying / flying to a scan: the advisory AGL (else the cruise), and never above the local
+        wind descent's while it is active (the lower of the two wins)."""
+        agl = self.brain_alt.target(self.now_s())
+        agl = self.cruise if agl is None else agl
+        wind = self.wind_rule.target_agl(self.cruise)
+        return agl if wind is None else min(agl, wind)
+
     def agl_target(self) -> float:
-        """Altitude-hold set-point. The advisory AGL applies only while surveying / flying to a scan: take-off keeps
-        the cruise AGL (its completion test is 90 % of it) and a scan holds the altitude it started at."""
+        """Altitude-hold set-point. The advisory AGL and the wind descent apply only while surveying / flying to a
+        scan: take-off keeps the cruise AGL (its completion test is 90 % of it) and a scan holds the altitude it
+        started at."""
         if self.fsm.state == 'SCANNING':
             return self._agl_cmd
-        agl = self.brain_alt.target(self.now_s()) if self.fsm.state in BRAIN_AGL_STATES else None
-        self._agl_cmd = self.cruise if agl is None else agl
+        self._agl_cmd = self.cruise_setpoint() if self.fsm.state in BRAIN_AGL_STATES else self.cruise
         return self._agl_cmd
+
+    def update_wind(self, now: float):
+        """Wind estimate from our odometry vs the last cmd_vel we published, then the local descent rule."""
+        tw = getattr(self, 'odom_twist', None)
+        if tw is None or self.pose is None:
+            return
+        c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+        vx, vy = tw.linear.x, tw.linear.y                # odometry twist: body frame (both world backends)
+        self.wind.update(now, (c * vx - s * vy, s * vx + c * vy), self._cmd_body, self.pose[2],
+                         guidance_body_xy=self._guide_body)
+        ev = self.wind_rule.update(now, self.wind.speed if self.wind.ready else None)
+        if ev == 'descend':
+            tx = descent_texts(self.wind.speed, self.wind.bearing, self.cruise_setpoint(),
+                               applies_now=self.fsm.state in BRAIN_AGL_STATES)
+            self.trace('wind_descent', ['ODOM', 'IMU'], tx['input'], tx['reasoning'], tx['confidence'], tx['action'],
+                       tx['severity'], force=True)
+        elif ev == 'clear':
+            tx = clear_texts(self.wind.speed, self.cruise_setpoint())
+            self.trace('wind_clear', ['ODOM', 'IMU'], tx['input'], tx['reasoning'], tx['confidence'], tx['action'],
+                       tx['severity'], force=True)
 
     def scan_stats(self, xy, radius=4.0):
         m = self.map
@@ -1178,9 +1278,10 @@ class ScoutAgent(AgentBase):
         if self.pose is None:
             return
         now = self.now_s()
+        self.update_wind(now)
         dt = 0.0 if self._t_health is None else min(1.0, max(0.0, now - self._t_health))
         self._t_health = now
-        self.health.step(now, dt, airborne=self.agl > 0.5, compute_w=self.edge_power_w)
+        self.health.step(now, dt, airborne=self.agl > 0.5, compute_w=self.edge_power_w, wind_mps=self.wind.speed)
         x, y, yaw = self.pose
         inp = ScoutInputs(now=now, pose=(x, y, self.z), altitude_agl=self.agl, goal_reached=self.goal_reached,
                           scan_request=self.pending_req, frontiers_left=self.frontiers_left)
@@ -1224,7 +1325,12 @@ class ScoutAgent(AgentBase):
             vx = vy = 0.0
         # body frame (yaw held near zero)
         c, s = math.cos(yaw), math.sin(yaw)
-        self.send_cmd(c * vx + s * vy, -1.0 * wrap(yaw), -s * vx + c * vy, vz)
+        self._guide_body = (c * vx + s * vy, -s * vx + c * vy)
+        if self.agl > 0.5 and self.wind.ready:
+            # lean into our own wind estimate (odometry vs commands), so guidance holds over the ground in a storm
+            vx, vy = wind_feedforward((vx, vy), self.wind.vector, self.v_air_max)
+        self._cmd_body = (c * vx + s * vy, -s * vx + c * vy)
+        self.send_cmd(self._cmd_body[0], -1.0 * wrap(yaw), self._cmd_body[1], vz)
         self.planner_ms = 0.8 * self.planner_ms + 0.2 * (time.perf_counter() - t_start) * 1000
 
     def _toward(self, tx, ty, vmax):
@@ -1251,7 +1357,8 @@ class ScoutAgent(AgentBase):
               'v_cmd': None, 'v_wheel': None, 'v_ground': round(speed, 3),
               'brain_agl': self.brain_alt.info(self.now_s(),
                                                self._agl_cmd if self.fsm.state in AGL_HOLD_STATES else None),
-              't': time.time()}
+              'wind_mps': round(self.wind.speed, 1) if self.wind.ready else None,
+              'wind_descent': self.wind_rule.active, 'power_save': False, 't': time.time()}
         self.pub_state.publish(String(data=json.dumps(st)))
 
 

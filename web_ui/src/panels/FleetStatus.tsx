@@ -1,13 +1,19 @@
+import type { ReactNode } from 'react'
 import { brainChips } from '../lib/brain'
 import { useRobotIds } from '../lib/hooks'
 import { fmt, robotName, robotShort } from '../lib/format'
 import { batteryTone, healthTone } from '../lib/sensors'
 import { useStore } from '../lib/store'
-import { BRAIN_CHIP_COLOR, C, robotColor, stateColor, TONE_COLOR } from '../lib/theme'
+import { powerSave, WIND_ENTER_MPS, windReading } from '../lib/storm'
+import { BRAIN_CHIP_COLOR, C, robotColor, sensorColor, stateColor, TONE_COLOR } from '../lib/theme'
 import { FleetGlyph } from '../screens/prelaunch/ConfigFields'
 import { StatePill } from '../ui/Panel'
 
-/** One chip per robot: callsign, state, health and battery. Critical units flash red. Click to select. */
+/**
+ * One chip per robot: callsign, state, health and battery. Critical units flash red. Click to select. Modes the robot
+ * inferred from its own sensors follow the gauges: a rover's POWER SAVE (with its measured solar power), the drone's
+ * WIND DESCENT (with its own wind estimate; a strong estimate alone shows as text).
+ */
 export function FleetStatus() {
   const ids = useRobotIds()
   return (
@@ -33,12 +39,18 @@ function FleetChip({ id }: { id: string }) {
   const chip = brainChips(r)[0] ?? null
   const brain = chip?.text ?? null
   const brainColor = chip ? BRAIN_CHIP_COLOR[chip.tone] : C.dim
+  const pwr = powerSave(r)
+  const wind = windReading(r)
+  const notes = [
+    pwr ? `power save, solar ${fmt(pwr.solar_w, 0)} W` : '',
+    wind?.mps != null ? `wind ${fmt(wind.mps, 1)} m/s${wind.descent ? ', wind descent' : ''}` : wind?.descent ? 'wind descent' : '',
+  ].filter(Boolean)
   return (
     <button
       role="listitem"
       onClick={() => useStore.getState().selectRobot(id)}
       aria-pressed={selected}
-      title={`${name}${h ? `: health ${fmt(h.pct, 0)} %, battery ${fmt(h.battery_pct, 0)} %` : ''}${brain ? `; brain ${brain}` : ''}`}
+      title={`${name}${h ? `: health ${fmt(h.pct, 0)} %, battery ${fmt(h.battery_pct, 0)} %` : ''}${brain ? `; brain ${brain}` : ''}${notes.length ? `; ${notes.join('; ')}` : ''}`}
       className={`flex h-10 min-w-0 items-center gap-2 rounded-[3px] border px-2 text-left transition-colors ${
         crit ? 'animate-crit-flash border-ha bg-ha/20' : selected ? 'border-rule-2 bg-bay-2' : 'border-transparent hover:border-rule'
       }`}
@@ -58,6 +70,20 @@ function FleetChip({ id }: { id: string }) {
           ) : (
             <span>{isScout ? `${(r.altitude_agl ?? 0).toFixed(0)} m up` : `${r.speed.toFixed(2)} m/s`}</span>
           )}
+          {pwr && (
+            <ModeTag color={sensorColor('PWR')}>
+              POWER SAVE{pwr.solar_w != null ? <span className="num font-[600]">{pwr.solar_w.toFixed(0)} W</span> : null}
+            </ModeTag>
+          )}
+          {wind?.descent ? (
+            <ModeTag color={sensorColor('WIND')}>
+              WIND DESCENT{wind.mps != null ? <span className="num font-[600]">{wind.mps.toFixed(0)} m/s</span> : null}
+            </ModeTag>
+          ) : wind?.show && wind.mps != null ? (
+            <span className="shrink-0 font-[650] whitespace-nowrap" style={{ color: wind.mps > WIND_ENTER_MPS ? C.nad : sensorColor('WIND') }}>
+              wind {wind.mps.toFixed(0)} m/s
+            </span>
+          ) : null}
           {brain && (
             <span className="min-w-0 truncate font-[650]" style={{ color: brainColor }} aria-label={`Brain ${brain}`}>
               {brain}
@@ -66,6 +92,18 @@ function FleetChip({ id }: { id: string }) {
         </span>
       </span>
     </button>
+  )
+}
+
+/** Compact mode annunciator for the chip's second line (the fault-code tag style, so the top bar stays narrow). */
+function ModeTag({ color, children }: { color: string; children: ReactNode }) {
+  return (
+    <span
+      className="font-cond inline-flex shrink-0 items-center gap-1 rounded-[2px] px-1 py-[2px] text-[10px] leading-none font-[750] tracking-[0.03em] whitespace-nowrap"
+      style={{ color, boxShadow: `inset 0 0 0 1px ${color}88`, backgroundColor: `${color}14` }}
+    >
+      {children}
+    </span>
   )
 }
 

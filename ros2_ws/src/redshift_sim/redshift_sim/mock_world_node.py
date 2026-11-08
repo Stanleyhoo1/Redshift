@@ -2,9 +2,14 @@
 
 Publishes exactly the raw topics the bridge produces (names, types, frame ids, encodings, rates, point-cloud
 layout, no-return encoding; see scripts/check_topics.py), driven by mock_dynamics and rendered by mock_render
-from the same seeded terrain.npz, and implements /world/command `spawn_rockslide`, `jolt`, `set_speed`,
-`critical_damage` and `repair` with the same /world/events echoes. Physics and IMU run at 100 Hz in one callback
-group, sensor rendering in another, so camera/LiDAR rendering never stalls the IMU stream.
+from the same seeded terrain.npz, and implements /world/command `spawn_rockslide`, `pillar_collapse`, `jolt`,
+`set_speed`, `critical_damage` and `repair` with the same /world/events echoes. Physics and IMU run at 100 Hz in one
+callback group, sensor rendering in another, so camera/LiDAR rendering never stalls the IMU stream.
+
+Pillar collapse (scene_events §1.1): armed and deferred exactly like a rockslide (rockslide_due), then a basalt column
+beside the route topples across it. Its chunks are scene obstacles moved every physics step along the analytic fall
+(PillarFall) until it lies on the ground, where they stay: they block, and LiDAR, depth and RGB see them like boulders.
+Dust-storm wind: `/world/env_state` `wind_mps` (+ `kind`) drives the scouts' StormWind drift at their own AGL.
 
 Simulated rover hardware (rover_hw, docs/protocol.md §8): the drivetrain fault is applied inside the dynamics and
 `/<rover>/hw_status` is published at 5 Hz of simulated time. Every robot is also a body in the rendered scene, so the
@@ -43,8 +48,8 @@ from .mock_dynamics import RoverSim, ScoutSim
 from .mock_render import Scene, camera_intrinsics, camera_rotation, robot_body, rpy_matrix
 from .render_pool import RenderPool, scene_objects
 from .robot_models import ROVER_SPEC, SCOUT_SPEC
-from .rover_hw import REPAIR_RANGE_M, REPAIR_S, hw_status_dict, planar_distance, solar_output
-from .scene_events import rockslide_due, rockslide_layout
+from .rover_hw import REPAIR_RANGE_M, REPAIR_S, StormWind, hw_status_dict, planar_distance, solar_output
+from .scene_events import PILLAR, PillarFall, pillar_footprint, pillar_layout, rockslide_due, rockslide_layout
 from .sim_pacing import SimPacer
 from .terrain_gen import Terrain
 
@@ -93,6 +98,7 @@ class Robot:
         self.exclude = frozenset(self.body_ids)       # a robot's sensors never see its own body
         self.path = None
         self.slide_armed: float | None = None   # sim time a rockslide was requested (rockslide_due)
+        self.pillar_armed: float | None = None  # sim time a pillar collapse was requested (same deferral)
         self.cam_hz = float(spec.get('camera_hz', 10.0))
         self.fx, self.cx, self.cy = camera_intrinsics(spec['camera_w'], spec['camera_h'], spec['camera_hfov'])
         self.scale = node.render_scale if self.rover else 1.0
@@ -156,6 +162,9 @@ class MockWorld(Node):
         for rb in self.robots:
             rb.place_body(self.scene, rb.state)
         self.dust_level = 0.0
+        self.wind_mps = 0.0                               # storm wind at WIND_REF_AGL_M (env_state, ramped)
+        self.env_kind: str | None = None                  # 'dust_storm' | 'dust' | None
+        self._storm = 0                                   # storms so far: seeds each one's gusts
         self.create_subscription(String, '/world/env_state', self.on_env, 10, callback_group=self.cmd_group)
         self.events = self.create_publisher(String, '/world/events', 10)
         self.create_subscription(String, '/world/command', self.on_command, 10, callback_group=self.cmd_group)
@@ -172,6 +181,8 @@ class MockWorld(Node):
         self._last = time.monotonic()
         self._due = {}                                    # (robot, stream) → next simulated time
         self._slide = 0
+        self._pillar = 0
+        self._falls: list[tuple[list[int], PillarFall]] = []   # toppling pillars: (scene object ids, fall)
         procs = int(gp('render_procs').value)
         self.render = RenderPool(self.scene, AUTO_RENDER_PROCS if procs < 0 else procs)
         if self.render.error is not None:
@@ -201,10 +212,27 @@ class MockWorld(Node):
         return Time(sec=sec, nanosec=int((t - sec) * 1e9))
 
     def on_env(self, msg: String):
+        """Dust level (solar panel) and storm wind (the scouts' drift) from sensor_effects_node's env_state."""
         try:
-            self.dust_level = float(json.loads(msg.data).get('dust_level') or 0.0)
+            env = json.loads(msg.data)
+            dust = float(env.get('dust_level') or 0.0)
+            wind = max(0.0, float(env.get('wind_mps') or 0.0))
+            kind = env.get('kind')
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
-            pass
+            return
+        self.dust_level = dust
+        if wind > 0.0 and self.wind_mps <= 0.0:          # a new storm: its own gusts, the fixed bearing
+            self._storm += 1
+            field = StormWind(seed=self._storm)
+            for rb in self.robots:
+                if not rb.rover:
+                    rb.sim.wind_field = field
+            self.get_logger().info(f'storm #{self._storm} ({kind or "wind"}) begins: wind ramping up from {wind:.1f} '
+                                   f'm/s at 12 m AGL, blowing toward {math.degrees(field.toward):.0f}° (ENU)')
+        self.wind_mps, self.env_kind = wind, kind
+        for rb in self.robots:
+            if not rb.rover:
+                rb.sim.wind = wind
 
     def emit(self, ev: dict):
         ev.setdefault('t', time.time())
@@ -229,7 +257,7 @@ class MockWorld(Node):
             t = self.pacer.t
             if dt > 0.0:
                 self._step(dt, t)
-            objs = scene_objects(self.scene) if due else None   # boulders, falling rocks, robot bodies now
+            objs = scene_objects(self.scene) if due else None   # boulders, falling rocks, pillars, robots now
             for name, kind in due:                        # sample the frame at exactly its due time
                 rb = self.by_name[name]
                 with self.lock:
@@ -240,6 +268,7 @@ class MockWorld(Node):
 
     def _step(self, dt: float, t: float):
         self.scene.update(t)
+        self._move_pillars(t)
         stamp = self.stamp(t)
         for rb in self.robots:
             if rb.rover and rb.hw.update(t):
@@ -251,6 +280,8 @@ class MockWorld(Node):
             rb.place_body(self.scene, s)
             if rb.slide_armed is not None:
                 self._try_rockslide(rb, t)
+            if rb.pillar_armed is not None:
+                self._try_pillar(rb, t)
             for ev in (rb.sim.pop_events() if rb.rover else ()):
                 if ev['op'] == 'jolt':
                     self.get_logger().info(f'jolt {rb.name}: released at roll {ev["release_roll_deg"]:.1f} deg')
@@ -335,8 +366,13 @@ class MockWorld(Node):
                 self.emit({'op': 'spawn_rockslide', 'ok': False, 'robot': cmd.get('robot'), 'detail': 'unknown rover'})
                 return
             if rb.slide_armed is None:
-                rb.slide_armed = self.sim_t
-                self._try_rockslide(rb, self.sim_t)
+                rb.slide_armed = self.sim_t     # released by the physics thread (_step), which owns the scene
+        elif op == 'pillar_collapse':
+            if rb is None or not rb.rover:
+                self.emit({'op': 'pillar_collapse', 'ok': False, 'robot': cmd.get('robot'), 'detail': 'unknown rover'})
+                return
+            if rb.pillar_armed is None:
+                rb.pillar_armed = self.sim_t     # released by the physics thread (_step), which owns the scene
         elif op == 'jolt':
             if rb is None or not rb.rover:
                 self.emit({'op': 'jolt', 'ok': False, 'robot': cmd.get('robot'), 'detail': 'unknown rover'})
@@ -376,6 +412,36 @@ class MockWorld(Node):
                                + (f' (waited {waited:.1f} s for the next route)' if waited > 0 else ''))
         self.emit({'op': 'spawn_rockslide', 'ok': True, 'robot': rb.name, 'impact': [float(v) for v in impact],
                    'rocks': [[float(v) for v in r] for r in rocks], 'waited_s': round(waited, 2)})
+
+    def _try_pillar(self, rb: Robot, t: float):
+        """Release the armed pillar once rockslide_due: it stands beside the route ahead and topples across it."""
+        s = rb.state
+        waited = t - rb.pillar_armed
+        if not rockslide_due(rb.path, (s['x'], s['y'], s['yaw']), waited):
+            return
+        rb.pillar_armed = None
+        lay = pillar_layout(rb.path, (s['x'], s['y'], s['yaw']), seed=self._pillar)
+        self._pillar += 1
+        fall = PillarFall(lay, t, self.scene.height_at, g=self.scene.g)
+        c, r = fall.centres(t)
+        ids = self.scene.add_objects(c, np.full(len(c), r), np.asarray(PILLAR['albedo_rgb'], np.float64) / 255.0)
+        self._falls.append((ids, fall))
+        base, tip = pillar_footprint(lay)
+        self.get_logger().info(f'pillar #{self._pillar} beside {rb.name} path at {np.round(base, 1)} toppling across '
+                               f'it at {np.round(lay["cross"], 1)} (lands in {fall.t_land:.2f} s)'
+                               + (f' (waited {waited:.1f} s for the next route)' if waited > 0 else ''))
+        self.emit({'op': 'pillar_collapse', 'ok': True, 'robot': rb.name, 'base': [float(v) for v in base],
+                   'tip': [float(v) for v in tip], 'cross': [float(v) for v in lay['cross']],
+                   'height_m': lay['height_m'], 'radius_m': lay['radius_m'], 'waited_s': round(waited, 2)})
+
+    def _move_pillars(self, t: float):
+        """Advance every toppling pillar's chunks to time t; a landed pillar stays where it lies."""
+        if not self._falls:
+            return
+        for ids, fall in self._falls:
+            c, _ = fall.centres(t)
+            self.scene.set_object_centres(ids, c)
+        self._falls = [f for f in self._falls if not f[1].landed]
 
     def _repair(self, rb: Robot | None, cmd: dict):
         by = self.by_name.get(cmd.get('by'))

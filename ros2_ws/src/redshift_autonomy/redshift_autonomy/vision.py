@@ -4,7 +4,7 @@
   ground plane is fitted and per-pixel residual height separates positive obstacles (boulders),
   negative obstacles (craters) and steep surface patches (slopes).
 * Colour second: HSV gates confirm boulders (low-saturation grey vs. rust regolith) and find cyan
-  science crystals.
+  science crystals. A long, low, thin and dark obstacle bump is a fallen basalt pillar (PILLAR).
 * Uncertainty: image sharpness/contrast/noise and LiDAR return statistics are compared with
   baselines learned in clear conditions, so degradation is *measured*, never assumed.
 """
@@ -17,7 +17,20 @@ import cv2
 import numpy as np
 
 CLS_COLORS = {'ROCK': (255, 150, 40), 'CRATER': (220, 70, 255), 'SCIENCE': (40, 235, 255), 'SLOPE': (255, 60, 60),
-              'ROVER': (110, 255, 150)}
+              'ROVER': (110, 255, 150), 'PILLAR': (255, 120, 200)}
+CLS_LABELS = {'PILLAR': 'FALLEN PILLAR'}    # burned-in label text where it differs from the class name
+DEFAULT_CLASSES = ('ROCK', 'PILLAR', 'CRATER', 'SCIENCE', 'SLOPE')
+# PILLAR: an obstacle bump that is long and low in world units, dark, and one straight body
+PILLAR_MIN_EXTENT_M = 2.5              # horizontal extent in view (bbox width at the bump's depth)
+PILLAR_MIN_ASPECT = 2.5                # extent / height (bbox height at that depth)
+PILLAR_MAX_V = 0.35 * 255              # median HSV V of its pixels: dark basalt; boulders are lighter grey
+PILLAR_MIN_RESID_M = 0.12              # height above the ground plane of a pillar's pixels (as for grey rock pixels)
+ROCK_MAX_S = 140                       # HSV S of rock pixels (grey, ~50-100 under the warm light) vs rust regolith
+                                       # (~175+): only a bump's rock pixels are judged as a pillar
+PILLAR_MAX_THICK_M = 0.25              # band across its long axis holding most of its surface: a trunk shows less
+                                       # than its radius (≈ 0.1-0.22 m), touching, staggered boulders ≳ 0.3 m
+PILLAR_MIN_PTS = 20                    # depth points needed to measure that spread
+PILLAR_CORE_FRAC = 0.8                 # share of a pillar's points within that band
 DAMAGED_COLOR = (255, 40, 60)
 ROVER_BOX_M = (1.0, 0.62, 0.55)        # length, width, height envelope of a rover (wheels included)
 TEAMMATE_DEPTH_TOL_M = 0.9
@@ -126,11 +139,52 @@ def _components(mask: np.ndarray, min_area: int):
             yield labels == k, stats[k]
 
 
+def trunk_thickness(pts_xy, frac: float = PILLAR_CORE_FRAC) -> float:
+    """Width (m) of the narrowest band across the principal (long) axis of ground-plane points that holds `frac` of
+    them; inf with too few points. A boulder touching a trunk in the image is a minority and falls outside it."""
+    q = np.asarray(pts_xy, np.float64).reshape(-1, 2)
+    if len(q) < PILLAR_MIN_PTS:
+        return math.inf
+    q = q - q.mean(axis=0)
+    _, vec = np.linalg.eigh(q.T @ q)
+    across = np.sort(q @ vec[:, 0])        # eigenvector of the smallest eigenvalue: across the long axis
+    k = int(math.ceil(frac * len(across)))
+    return float((across[k - 1:] - across[:len(across) - k + 1]).min())
+
+
+def pillar_test(extent_m: float, height_m: float, thick_m: float, v_median: float) -> bool:
+    """Fallen pillar: long (extent), low (extent / height), one thin straight body and dark basalt."""
+    return (extent_m >= PILLAR_MIN_EXTENT_M and extent_m >= PILLAR_MIN_ASPECT * max(height_m, 1e-6)
+            and thick_m <= PILLAR_MAX_THICK_M and v_median <= PILLAR_MAX_V)
+
+
+def pillar_report(det: dict) -> dict | None:
+    """Decision-trace texts for the camera's identification of a fallen pillar, from one detections-JSON entry
+    ({cls: PILLAR, conf, range_m, bearing_rad, world_xy}); None for anything else. LiDAR usually blocks the route
+    first (the trunk is a step > 0.30 m before it has finished falling); this records what the camera says it is."""
+    if not isinstance(det, dict) or det.get('cls') != 'PILLAR' or not det.get('range_m'):
+        return None
+    rng, conf = float(det['range_m']), float(det.get('conf') or 0.0)
+    deg = math.degrees(float(det.get('bearing_rad') or 0.0))
+    where = 'ahead' if abs(deg) < 15.0 else f'{abs(deg):.0f}° {"left" if deg > 0 else "right"}'
+    xy = det.get('world_xy')
+    at = f' at ({xy[0]:.1f}, {xy[1]:.1f})' if isinstance(xy, (list, tuple)) and len(xy) == 2 else ''
+    return {'input': f'Fallen pillar {rng:.1f} m {where}{at}, confidence {conf:.2f}',
+            'reasoning': ('Camera + depth: one long, low, straight, dark body lying across the ground: a toppled '
+                          'basalt pillar, not a line of boulders'),
+            'confidence': round(min(0.99, conf), 2),
+            'action': 'Trunk kept lethal on the map; any route across it re-plans around the whole length'}
+
+
 def detect_objects(rgb, depth, cam: CameraModel, cam_pitch: float, cam_h: float, pose=None,
                    cam_conf: float = 1.0, max_range: float = 15.0, slope_limit_deg: float = 20.0,
-                   use_camera: bool = True, classes=('ROCK', 'CRATER', 'SCIENCE', 'SLOPE'), rock_h: float = 0.25,
+                   use_camera: bool = True, classes=DEFAULT_CLASSES, rock_h: float = 0.25,
                    tophat_px: int = 0, min_rock_px: int | None = None, rock_gray_min: float = 0.0):
-    """Returns a list of Detection sorted by confidence (bbox in rgb pixel coordinates)."""
+    """Returns a list of Detection sorted by confidence (bbox in rgb pixel coordinates).
+
+    Obstacle bumps are ROCK, or PILLAR when the camera is in use and `pillar_test` passes: extent and height from
+    the bbox at the bump's median planar depth and the intrinsics, thickness from its depth points, darkness from
+    its pixels. In a forward view only: a nadir view's bbox height is ground length, not height."""
     dh, dw = depth.shape
     if rgb.shape[:2] != (dh, dw):
         rgb_s = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA)
@@ -186,21 +240,46 @@ def detect_objects(rgb, depth, cam: CameraModel, cam_pitch: float, cam_h: float,
                 st[cv2.CC_STAT_WIDTH] * bx_scale, st[cv2.CC_STAT_HEIGHT] * by_scale)
         dets.append(Detection(cls, float(min(0.99, conf)), bbox, r, bearing, wxy, sources, slope))
 
-    if 'ROCK' not in classes:
+    want_rock = 'ROCK' in classes
+    want_pillar = 'PILLAR' in classes and use_camera     # darkness is a camera measurement
+    if not (want_rock or 'PILLAR' in classes):
         rock_mask = np.zeros_like(rock_mask)
     if 'CRATER' not in classes:
         neg = np.zeros_like(neg)
     if 'SCIENCE' not in classes:
         sci = np.zeros_like(sci)
-    for m, st in _components(rock_mask, int(25 * area_scale) if min_rock_px is None else min_rock_px):
+
+    def rock(m, st):
         area = st[cv2.CC_STAT_AREA] / area_scale
         frac_gray = float(grayish[m].mean())
         mres = float(resid[m].mean())
         if frac_gray < rock_gray_min and mres < 0.6:
-            continue        # low bump with regolith colour: terrain texture, not a boulder
+            return          # low bump with regolith colour: terrain texture, not a boulder
         conf = 0.55 + 0.2 * min(1.0, area / 150) + 0.15 * frac_gray + 0.1 * min(1.0, mres / 0.6)
         conf *= 0.6 + 0.4 * (cam_conf if use_camera else 0.5)
         make('ROCK', m, st, conf, ['DEPTH', 'CAM'] if use_camera and frac_gray > 0.3 else ['DEPTH'])
+
+    min_px = int(25 * area_scale) if min_rock_px is None else min_rock_px
+    pillar_px = np.zeros_like(rock_mask)
+    if want_pillar:
+        # rock-coloured (not rust regolith) pixels standing above the ground, at the grey-rock height: the low notches
+        # between a trunk's sections stay connected, and terrain bumps merged with it in rock_mask do not count
+        cand = valid & (resid > PILLAR_MIN_RESID_M) & (S <= ROCK_MAX_S)
+        for pm, pst in _components(cand, min_px):
+            if not (pm & rock_mask).any():
+                continue        # not part of an obstacle bump
+            z = float(np.median(depth[pm]))                       # planar depth = pinhole Z
+            ext, hgt = pst[cv2.CC_STAT_WIDTH] * z / cam_d.fx, pst[cv2.CC_STAT_HEIGHT] * z / cam_d.fy
+            v_med = float(np.median(V[pm]))
+            if pillar_test(ext, hgt, trunk_thickness(P[pm][:, :2]), v_med):
+                area = pst[cv2.CC_STAT_AREA] / area_scale
+                conf = (0.6 + 0.15 * min(1.0, ext / (2 * PILLAR_MIN_EXTENT_M)) + 0.1 * min(1.0, area / 150)
+                        + 0.1 * (1.0 - v_med / PILLAR_MAX_V))
+                make('PILLAR', pm, pst, conf * (0.6 + 0.4 * cam_conf), ['DEPTH', 'CAM'])
+                pillar_px |= pm
+    if want_rock:       # the rest of each bump (boulders, terrain alongside a trunk) as before
+        for m, st in _components(rock_mask & ~pillar_px, min_px):
+            rock(m, st)
     for m, st in _components(neg & ~rock_mask, int(60 * area_scale)):
         area = st[cv2.CC_STAT_AREA] / area_scale
         conf = 0.5 + 0.3 * min(1.0, area / 400) + 0.2 * min(1.0, -float(resid[m].mean()) / 0.8)
@@ -215,7 +294,7 @@ def detect_objects(rgb, depth, cam: CameraModel, cam_pitch: float, cam_h: float,
     nby, nbx = (dh // blk, dw // blk) if 'SLOPE' in classes else (0, 0)
     steep = np.zeros((nby, nbx), bool)
     slopes = np.zeros((nby, nbx))
-    obstacle_px = rock_mask | neg
+    obstacle_px = rock_mask | neg | pillar_px
     for i in range(nby):
         for j in range(nbx):
             sl = (slice(i * blk, (i + 1) * blk), slice(j * blk, (j + 1) * blk))
@@ -511,7 +590,7 @@ def annotate(rgb, dets, info: dict):
             lines = [t.strip() for t in d.label.strip('[]').split('|')]
             lines[-1] += rng
         else:
-            lines = [f'{d.cls} {d.conf:.2f}{rng}{extra}']
+            lines = [f'{CLS_LABELS.get(d.cls, d.cls)} {d.conf:.2f}{rng}{extra}']
         sizes = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)[0] for t in lines]
         lh = max(sz[1] for sz in sizes) + 4
         ty = max(lh * len(lines), y - 2)

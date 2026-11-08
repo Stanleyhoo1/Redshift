@@ -6,7 +6,8 @@ import pytest
 from redshift_autonomy.physics_model import RoverPhysics
 from redshift_autonomy.planning import (RING, add_keepout, astar, build_costmap, cell_to_world, cells_to_world,
                                         clearance_mask, core_escape_mask,
-                                        find_frontiers, first_block, path_blocked, path_conflicts, pure_pursuit,
+                                        find_frontiers, first_block, is_detour, path_blocked, path_conflicts,
+                                        prefer_tight, pure_pursuit,
                                         reachable_from, score_frontiers, standoff_cells, world_to_cell)
 
 RES = 0.5
@@ -341,3 +342,13 @@ def test_pure_pursuit_turns_toward_path():
     assert v > 0 and w > 0 and not done
     v, w, idx, done = pure_pursuit((4.0, 5.0, 1.0), path, lookahead=1.5, v_max=0.8)
     assert done and v == 0.0
+
+
+def test_prefer_tight_only_for_a_long_detour_it_shortens_or_when_nothing_else_routes():
+    assert prefer_tight(None, 20.0, 10.0)                  # no route at full clearance
+    assert not prefer_tight(None, None, 10.0)
+    assert not prefer_tight(30.0, 12.0, 10.0)              # 30 m for a 10 m gap is no detour (limit 2.5 × 10 + 10)
+    assert prefer_tight(100.0, 50.0, 10.0)                 # a 100 m loop vs. 50 m at 0.3 m clearance
+    assert not prefer_tight(100.0, 70.0, 10.0)             # the tight route must save ≥ 40 %
+    assert not prefer_tight(100.0, None, 10.0)
+    assert is_detour(35.5, 10.0) and not is_detour(35.0, 10.0)

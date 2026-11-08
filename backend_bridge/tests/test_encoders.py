@@ -121,3 +121,52 @@ def test_robot_telemetry_carries_brain_cap_and_scout_agl():
     s = RobotCache('scout_0')
     s.agent_state = {'state': 'SURVEY', 'brain_agl': {'agl_m': 8.0, 'remaining_s': 55.0}}
     assert robot_telemetry(s)['brain_agl'] == {'agl_m': 8.0, 'remaining_s': 55.0}
+
+
+# ---------------------------------------------------------------------------------------------------- Phase 3
+def test_robot_telemetry_passes_power_save_and_drone_wind_through():
+    c = RobotCache('rover_0')
+    t = robot_telemetry(c)
+    assert t['power_save'] is False and t['wind_mps'] is None and t['wind_descent'] is False
+    c.agent_state = {'state': 'EXPLORING', 'power_save': True}
+    assert robot_telemetry(c)['power_save'] is True
+    c.agent_state = {'state': 'EXPLORING', 'power_save': 'yes'}           # malformed → off, never a crash
+    assert robot_telemetry(c)['power_save'] is False
+    s = RobotCache('scout_0')
+    s.agent_state = {'state': 'SURVEY', 'wind_mps': 13.237, 'wind_descent': True}
+    t = robot_telemetry(s)
+    assert t['wind_mps'] == 13.24 and t['wind_descent'] is True and t['power_save'] is False
+    for bad in (float('nan'), 'gale', True, [1], 10 ** 400):
+        s.agent_state = {'state': 'SURVEY', 'wind_mps': bad}
+        assert robot_telemetry(s)['wind_mps'] is None, bad
+
+
+def test_env_telemetry_carries_storm_kind_and_wind():
+    from backend_bridge.encoders import env_telemetry
+    assert env_telemetry({}) == {'dust_level': 0.0, 'seismic': False, 'kind': None, 'wind_mps': 0.0}
+    env = {'dust_level': 0.62, 'seismic': False, 'remaining_s': 30.0, 'kind': 'dust_storm', 'wind_mps': 8.7}
+    assert env_telemetry(env) == {'dust_level': 0.62, 'seismic': False, 'kind': 'dust_storm', 'wind_mps': 8.7}
+    assert env_telemetry({'dust_level': 0.85, 'seismic': True, 'kind': 'dust'})['kind'] == 'dust'
+    junk = env_telemetry({'dust_level': None, 'seismic': 0, 'kind': 'tornado', 'wind_mps': 'gale'})
+    assert junk == {'dust_level': 0.0, 'seismic': False, 'kind': None, 'wind_mps': 0.0}
+    assert env_telemetry({'wind_mps': -3.0, 'kind': 7})['wind_mps'] == 0.0
+
+
+def test_detections_reach_telemetry_compactly_including_pillar():
+    from backend_bridge.encoders import MAX_DETECTIONS
+    c = RobotCache('rover_0')
+    assert robot_telemetry(c)['detections'] == []
+    c.detections = {'mode': 'FUSED', 'detections': [
+        {'cls': 'PILLAR', 'conf': 0.874, 'bbox': [10, 80, 220, 30], 'range_m': 6.234, 'bearing_rad': 0.1,
+         'world_xy': [3.111, -2.0], 'sources': ['DEPTH', 'CAM']},
+        {'cls': 'ROCK', 'conf': 0.9, 'range_m': None, 'world_xy': None},
+        'junk', {'conf': 0.5}, {'cls': 'ROVER', 'conf': 0.93, 'range_m': 2.4, 'world_xy': [1, 2], 'robot': 'rover_1',
+                                'damaged': True, 'label': 'PERCEIVED: DAMAGED UNIT ROVER_2'}]}
+    d = robot_telemetry(c)['detections']
+    assert d[0] == {'cls': 'PILLAR', 'conf': 0.87, 'range_m': 6.23, 'world_xy': [3.11, -2.0]}
+    assert d[1] == {'cls': 'ROCK', 'conf': 0.9, 'range_m': None, 'world_xy': None}
+    assert [x['cls'] for x in d] == ['PILLAR', 'ROCK', 'ROVER']          # malformed entries dropped
+    c.detections = {'detections': [{'cls': 'ROCK', 'conf': 0.8}] * (MAX_DETECTIONS + 5)}
+    assert len(robot_telemetry(c)['detections']) == MAX_DETECTIONS
+    c.detections = {'detections': 'nope'}
+    assert robot_telemetry(c)['detections'] == []

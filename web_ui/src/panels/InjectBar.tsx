@@ -3,17 +3,19 @@ import { api } from '../lib/api'
 import { useRescue, useRobotIds, useTick } from '../lib/hooks'
 import { robotName, robotShort } from '../lib/format'
 import { isLiveStatus, useStore } from '../lib/store'
+import { isDustStorm } from '../lib/storm'
 import { C } from '../lib/theme'
 import type { OkResponse } from '../lib/types'
 
-type Kind = 'rockslide' | 'anomaly' | 'tip' | 'damage'
+type Kind = 'rockslide' | 'pillar' | 'anomaly' | 'storm' | 'tip' | 'damage'
 
 interface Result {
   ok: boolean
   text: string
 }
 
-const COOLDOWN_MS: Record<Kind, number> = { rockslide: 10000, anomaly: 30000, tip: 25000, damage: 30000 }
+// a storm lasts 45 s (§10.6), so its button stays down a little longer than the storm itself
+const COOLDOWN_MS: Record<Kind, number> = { rockslide: 10000, pillar: 12000, anomaly: 30000, storm: 50000, tip: 25000, damage: 30000 }
 /** §8.9 / demo script: the debris strike always hits Scout Rover 1 so Heavy Recovery Rover 2 can rescue it. */
 const DAMAGE_TARGET = 'rover_0'
 
@@ -23,6 +25,8 @@ export function InjectBar() {
   const selected = useStore((s) => s.selectedRobot)
   const status = useStore((s) => s.telemetry?.mission.status ?? s.status?.status)
   const dust = useStore((s) => s.telemetry?.mission.env.dust_level ?? 0)
+  const storm = useStore((s) => isDustStorm(s.telemetry?.mission.env)) && dust > 0
+  const wind = useStore((s) => s.telemetry?.mission.env.wind_mps ?? null)
   const [target, setTarget] = useState<string | null>(null)
   const live = isLiveStatus(status)
   const rescue = useRescue()
@@ -41,7 +45,7 @@ export function InjectBar() {
       <div className="mb-2 flex items-baseline justify-between gap-3 px-0.5">
         <h2 className="font-cond text-[17px] leading-none font-[800] text-bone @min-[860px]:text-[18px]">Inject unscripted change</h2>
         <div className="flex flex-wrap items-center gap-1 text-[11.5px] text-haze">
-          {rovers.length > 1 ? 'Rockslide and tip target' : null}
+          {rovers.length > 1 ? 'Rockslide, pillar and tip target' : null}
           {rovers.length > 1 &&
             rovers.map((r) => (
               <button
@@ -57,7 +61,8 @@ export function InjectBar() {
           {!rovers.length && <span className="text-dim">No rover online</span>}
         </div>
       </div>
-      <div className="grid grid-cols-2 gap-x-2 @min-[620px]:grid-cols-4">
+      {/* top row: hazards dropped on the target rover; bottom row: the weather, then the headline failure */}
+      <div className="grid grid-cols-2 gap-x-2 @min-[620px]:grid-cols-3">
         <InjectButton
           kind="rockslide"
           title="Spawn Meteor / Rockslide Ahead"
@@ -68,13 +73,13 @@ export function InjectBar() {
           run={() => api.injectRockslide(rover)}
         />
         <InjectButton
-          kind="anomaly"
-          title="Trigger High-G Seismic / Dust Anomaly"
-          sub={dust > 0 ? `Dust storm active, level ${dust.toFixed(2)}` : 'Dust haze for 25 s, 4 s tremor'}
-          color={C.ochre}
-          icon={<DustIcon />}
-          disabled={!live}
-          run={() => api.injectAnomaly({})}
+          kind="pillar"
+          title="Pillar Collapse Ahead"
+          sub={rover ? `Basalt pillar topples across ${robotShort(rover)}'s path` : 'Needs a rover'}
+          color={C.pillar}
+          icon={<PillarIcon />}
+          disabled={!live || !rover}
+          run={() => api.injectPillar(rover)}
         />
         <InjectButton
           kind="tip"
@@ -84,6 +89,24 @@ export function InjectBar() {
           icon={<TipIcon />}
           disabled={!live || !rover}
           run={() => api.injectTip(rover)}
+        />
+        <InjectButton
+          kind="anomaly"
+          title="Trigger High-G Seismic / Dust Anomaly"
+          sub={dust > 0 && !storm ? `Dust haze active, level ${dust.toFixed(2)}` : 'Dust haze for 25 s, 4 s tremor'}
+          color={C.ochre}
+          icon={<DustIcon />}
+          disabled={!live}
+          run={() => api.injectAnomaly({})}
+        />
+        <InjectButton
+          kind="storm"
+          title="Dust Storm (Solar Blackout + High Wind)"
+          sub={storm ? `Storm active${wind ? `, wind ${wind.toFixed(0)} m/s` : ''}` : 'Solar −85 %, 14 m/s wind for 45 s'}
+          color={C.storm}
+          icon={<StormIcon />}
+          disabled={!live}
+          run={() => api.injectStorm()}
         />
         <InjectButton
           kind="damage"
@@ -193,6 +216,26 @@ const DustIcon = () => (
     <path d="M3 15 H25 a3.5 3.5 0 1 1 -3.5 3.5" />
     <path d="M3 21 H13" />
     <path d="M2 27 L6 24 L9 27 L13 23 L16 27 L20 24 L23 27 L28 24" strokeWidth="1.5" />
+  </svg>
+)
+const PillarIcon = () => (
+  <svg width="30" height="30" viewBox="0 0 30 30" aria-hidden fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+    <path d="M5 4 V26" strokeDasharray="2 2.5" opacity="0.45" />
+    <g transform="rotate(52 5 26)">
+      <rect x="2.5" y="4" width="5" height="22" rx="1.2" fill="currentColor" fillOpacity="0.25" />
+    </g>
+    <path d="M10 6.5 a19 19 0 0 1 12 8" opacity="0.6" />
+    <path d="M2 27 H28" />
+    <path d="M22 22 v5 M26 21 v6" strokeWidth="1.4" opacity="0.7" />
+  </svg>
+)
+const StormIcon = () => (
+  <svg width="30" height="30" viewBox="0 0 30 30" aria-hidden fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+    <circle cx="10" cy="9" r="4" fill="currentColor" fillOpacity="0.25" />
+    <path d="M10 1.5 v2 M3.5 9 h-2 M5 4 l-1.4 -1.4 M15 4 l1.4 -1.4" strokeWidth="1.5" opacity="0.6" />
+    <path d="M3 15 L17 3" />
+    <path d="M6 18 H22 a3.5 3.5 0 1 0 -3.5 -3.5" />
+    <path d="M3 23 H25 a3.5 3.5 0 1 1 -3.5 3.5" />
   </svg>
 )
 const DamageIcon = () => (

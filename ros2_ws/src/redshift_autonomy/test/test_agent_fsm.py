@@ -339,6 +339,21 @@ def test_rescue_transit_ignores_target_in_lidar_corridor_and_docks_on_perceived_
     assert {'docked', 'repair_start'} <= set(x['kind'] for x in out.traces)
 
 
+def test_any_reached_stand_off_starts_docking():
+    """A stand-off cell lies up to r_max from the teammate and pursuit stops within goal_tol of it, so the rover can
+    stop r_max + goal_tol out. Docking must start from there, or the rover re-plans the same 0.7 m route forever."""
+    import inspect
+    from redshift_autonomy.agent_fsm import DOCK_START_M
+    from redshift_autonomy.planning import pure_pursuit, standoff_cells
+    r_max = inspect.signature(standoff_cells).parameters['r_max'].default
+    tol = inspect.signature(pure_pursuit).parameters['goal_tol'].default
+    assert DOCK_START_M >= r_max + tol + 0.2          # + margin: the SOS pose is reported, not measured
+    fsm = rescuer()
+    fsm.step(inp(0.1, sos=SOS, rescue_range_m=10.0))
+    out = fsm.step(inp(0.2, sos=SOS, rescue_range_m=r_max + tol, goal_reached=True))
+    assert out.state == 'RESCUE_DOCKING' and out.drive == 'dock'
+
+
 def test_repair_completes_backs_off_and_resumes():
     fsm = rescuer()
     fsm.step(inp(0.1, sos=SOS, rescue_range_m=10.0))

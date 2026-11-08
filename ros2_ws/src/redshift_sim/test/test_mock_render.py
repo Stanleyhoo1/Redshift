@@ -202,3 +202,86 @@ def test_robot_bodies_do_not_block_motion():
     sc.add_rocks([(10.0, 0.0, 0.8)], t=-10.0)
     sc.update(0.0)
     assert sc.blocked(10.0, 0.0, 0.5)
+
+
+# ---------------------------------------------------------------- moving obstacles (the falling pillar's chunks)
+def test_a_moved_object_blocks_and_is_hit_at_its_new_place_not_the_old():
+    from redshift_sim.render_pool import scene_objects
+    sc = flat_scene()
+    ids = sc.add_objects([(5.0, 0.0, 0.4), (5.0, 0.6, 0.4)], radii=[0.4, 0.4], albedo=(0.2, 0.19, 0.18))
+    assert len(ids) == 2 and all(sc.kind[i] == Scene.ROCK for i in ids)
+    assert sc.radii[ids[0]] == pytest.approx([0.4, 0.4, 0.4])
+    ray_o, ray_d = np.array([[0.0, 0.0, 0.4]]), np.array([[1.0, 0.0, 0.0]])
+    t, kind, _, obj = sc.raycast(ray_o, ray_d, 0.1, 30.0)
+    assert kind[0] == Scene.ROCK and obj[0] == ids[0] and t[0] == pytest.approx(4.6, abs=0.01)
+    assert sc.blocked(5.0, 0.0, 0.5)
+    sc.set_object_centres(ids, [(5.0, 8.0, 0.4), (5.0, 8.6, 0.4)])
+    t, kind, _, _ = sc.raycast(ray_o, ray_d, 0.1, 30.0)
+    assert kind[0] == Scene.NONE                                        # gone from the old place…
+    assert not sc.blocked(5.0, 0.0, 0.5) and sc.blocked(5.0, 8.0, 0.5)  # …and solid at the new one
+    t, kind, _, obj = sc.raycast(np.array([[0.0, 8.0, 0.4]]), ray_d, 0.1, 30.0)
+    assert kind[0] == Scene.ROCK and obj[0] == ids[0] and t[0] == pytest.approx(4.6, abs=0.01)
+    snap = scene_objects(sc)                                            # what the render workers receive
+    assert snap['c'][ids[1]] == pytest.approx([5.0, 8.6, 0.4])
+
+
+def test_moved_objects_keep_their_height_through_rockslide_updates_and_block_only_once_down():
+    sc = flat_scene()
+    sc.add_rocks([(20.0, 0.0, 0.8)], t=0.0, drop_m=4.0)                 # a falling boulder: update() rewrites z
+    ids = sc.add_objects([(5.0, 0.0, 3.0)], radii=[0.4], albedo=(0.2, 0.19, 0.18))
+    sc.update(0.1)
+    assert sc.c[ids[0]][2] == pytest.approx(3.0)
+    assert not sc.blocked(5.0, 0.0, 0.5)                                # in the air: not on the ground yet
+    sc.set_object_centres(ids, [(5.0, 0.0, 0.4)])
+    sc.update(0.2)
+    assert sc.c[ids[0]][2] == pytest.approx(0.4) and sc.blocked(5.0, 0.0, 0.5)
+
+
+def _ahead_view(sc, yaw, ids):
+    """Rover camera frame at the origin facing `yaw`: (rgb, depth, mask of the pixels showing objects `ids`)."""
+    from redshift_sim.mock_render import _camera_rays
+    Rb = rpy_matrix(0.0, 0.0, yaw)
+    R = camera_rotation(Rb, ROVER_SPEC['camera_pitch_rad'])
+    o = np.array([0.0, 0.0, ROVER_SPEC['base_height_m']]) + Rb @ np.array(ROVER_SPEC['camera_xyz'])
+    rgb, depth = camera_frame(sc, o, R, 320, 240, ROVER_SPEC['camera_hfov'], 40.0, scale=1.0)
+    _, _, _, obj = sc.raycast(o, _camera_rays(320, 240, float(ROVER_SPEC['camera_hfov']), 1.0) @ R.T, 0.1, 40.0)
+    return rgb, depth, np.isin(obj, ids).reshape(240, 320)
+
+
+def _fallen_pillar_scene(yaw):
+    from redshift_sim.scene_events import PILLAR, PillarFall, pillar_layout
+    sc = flat_scene()
+    path = np.array([[0.0, 0.0], [30.0 * math.cos(yaw), 30.0 * math.sin(yaw)]])
+    lay = pillar_layout(path, (0.0, 0.0, yaw), seed=1)                   # trunk across the route 8 m ahead
+    fall = PillarFall(lay, 0.0, sc.height_at, g=sc.g)
+    c, r = fall.centres(0.0)
+    ids = sc.add_objects(c, radii=np.full(len(c), r), albedo=np.array(PILLAR['albedo_rgb']) / 255.0)
+    c, _ = fall.centres(fall.t_land + 0.1)
+    sc.set_object_centres(ids, c)
+    assert fall.landed
+    return sc, ids, lay, path
+
+
+def test_fallen_pillar_is_a_wide_obstacle_in_camera_depth_and_lidar_darker_than_boulders():
+    from redshift_sim.scene_events import rockslide_layout
+    for yaw in (0.0, math.pi):                                          # facing away from / into the sun
+        sc, ids, lay, path = _fallen_pillar_scene(yaw)
+        assert sc.blocked(*lay['cross'], 0.5) and sc.blocked(*lay['base'], 0.5)
+        rgb, depth, trunk = _ahead_view(sc, yaw, ids)
+        cols = np.flatnonzero(trunk.any(axis=0))
+        assert trunk.sum() > 1500 and cols.max() - cols.min() > 150    # one wide band across the image
+        assert np.median(depth[trunk]) == pytest.approx(7.4, abs=0.5)  # planar depth of its near side
+        v_trunk = np.median(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[..., 2][trunk])
+        # the rockslide's boulders at the same place, under the same light: a lighter grey
+        slide = flat_scene()
+        rocks, _ = rockslide_layout(path, (0.0, 0.0, yaw), ahead_m=8.0, seed=1)
+        rids = slide.add_rocks(rocks, t=-10.0)
+        slide.update(0.0)
+        rgb_r, _, rock = _ahead_view(slide, yaw, rids)
+        v_rock = np.median(cv2.cvtColor(rgb_r, cv2.COLOR_RGB2HSV)[..., 2][rock])
+        assert v_trunk <= 0.35 * 255 and v_trunk < 0.75 * v_rock, (yaw, v_trunk, v_rock)
+    sc, ids, lay, _ = _fallen_pillar_scene(0.0)
+    pts = lidar_scan(sc, np.array([0.0, 0.0, ROVER_SPEC['base_height_m']]) + np.array(ROVER_SPEC['lidar_xyz']),
+                     np.eye(3), ROVER_SPEC, exclude=())
+    fwd = np.linalg.norm(pts[:, 170:191], axis=2)                       # beams ±10° around straight ahead
+    assert (np.isfinite(fwd) & (np.abs(fwd - 7.8) < 0.6)).sum() >= 20

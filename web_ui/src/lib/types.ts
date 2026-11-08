@@ -1,5 +1,6 @@
-// Mirrors docs/protocol.md (v1 + §8 fleet health / SOS / rescue + the advisory Gemma brain). Keep in sync with that
-// file — it is the source of truth. Every §8 / brain field is optional at runtime: older backends omit it.
+// Mirrors docs/protocol.md (v1 + §8 fleet health / SOS / rescue + §9 the advisory Gemma brain + §10 pillar collapse /
+// dust storm). Keep in sync with that file — it is the source of truth. Every §8–§10 field is optional at runtime:
+// older backends omit it.
 
 export type XY = [number, number]
 export type XYZ = [number, number, number]
@@ -291,10 +292,19 @@ export interface RobotTelemetry {
   brain_cap?: BrainCap | null
   /** scout: the active advisory cruise altitude, null when none */
   brain_agl?: BrainAgl | null
+  // §10.3 / §10.6 (absent on older backends)
+  /** rovers: battery-conservation mode, inferred from the rover's own hw_status power readings */
+  power_save?: boolean | null
+  /** scout: its own wind estimate from drift (commanded vs odometry velocity), m/s; null until estimated */
+  wind_mps?: number | null
+  /** scout: the automatic wind descent is holding it lower */
+  wind_descent?: boolean | null
+  /** latest /perception/detections, compact (≤ 16; [] before the first) */
+  detections?: CompactDetection[] | null
 }
 
-// §3.2 + §8.8 detections (not forwarded on /ws today; documented for completeness)
-export type DetectionClass = 'ROCK' | 'CRATER' | 'SCIENCE' | 'SLOPE' | 'ROVER'
+// §3.2 + §8.8 + §10.2 detections (the full form stays on ROS; telemetry carries CompactDetection)
+export type DetectionClass = 'ROCK' | 'CRATER' | 'SCIENCE' | 'SLOPE' | 'ROVER' | 'PILLAR'
 export interface Detection {
   cls: DetectionClass | string
   conf: number
@@ -308,10 +318,23 @@ export interface Detection {
   damaged?: boolean
   label?: string
 }
+/** §10.6 telemetry robots.<r>.detections: what the robot's own perception reports right now. */
+export interface CompactDetection {
+  cls: DetectionClass | string
+  conf: number
+  range_m: number | null
+  world_xy: XY | null
+}
 
+/** §10.1 env_state kind: a plain dust anomaly, or the dust storm (solar blackout + high wind); null when clear. */
+export type EnvKind = 'dust_storm' | 'dust'
 export interface MissionEnv {
   dust_level: number
   seismic: number | boolean
+  /** §10.6 (absent on older backends) */
+  kind?: EnvKind | string | null
+  /** §10.6 storm reference wind at 12 m AGL, ramped like the dust level; 0 when calm */
+  wind_mps?: number | null
 }
 
 export interface MissionTelemetry {
@@ -374,7 +397,28 @@ export interface AnomalyEvent {
   op: 'anomaly'
   ok: boolean
   dust_level: number
-  until_t: number
+  duration_s?: number
+  /** the UI dev harness reports the end time instead of the duration */
+  until_t?: number
+  /** §10.1: echoed for the dust storm */
+  kind?: EnvKind | string | null
+  wind_mps?: number
+  t: number
+}
+/** §10.1: a basalt pillar toppling across the robot's planned route. */
+export interface PillarCollapseEvent {
+  op: 'pillar_collapse'
+  ok: boolean
+  robot: string
+  base: XY
+  /** planned footprint tip = base + height × fall direction */
+  tip: XY
+  /** the route point it falls across */
+  cross: XY
+  height_m: number
+  radius_m: number
+  waited_s?: number
+  detail?: string
   t: number
 }
 export interface ScanRequestEvent {
@@ -455,6 +499,7 @@ export type WorldEvent =
   | RockslideEvent
   | JoltEvent
   | AnomalyEvent
+  | PillarCollapseEvent
   | ScanRequestEvent
   | ScanCompleteEvent
   | HazardMarkEvent

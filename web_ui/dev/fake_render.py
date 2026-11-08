@@ -157,6 +157,10 @@ def b64_jpeg(img: np.ndarray, q: int = 72) -> str:
 
 
 RESCUE_BGR = (61, 255, 198)  # #c6ff3d, the UI's rescue colour
+DUST_BGR = (92, 140, 196)    # plain dust haze
+STORM_BGR = (48, 88, 205)    # docs/protocol.md §10.1 STORM_RGB (205, 88, 48), the dust storm's orange-red
+PILLAR_BGR = (18, 19, 20)    # §10.1 basalt albedo (20, 19, 18)
+PILLAR_BOX_BGR = (200, 120, 255)  # §10.2 FALLEN PILLAR box colour (255, 120, 200)
 
 
 def depth_colormap(depth: np.ndarray, near: float = 0.0, far: float = 25.0) -> np.ndarray:
@@ -170,9 +174,12 @@ def depth_colormap(depth: np.ndarray, near: float = 0.0, far: float = 25.0) -> n
 
 def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: list, dust: float,
                  seismic: bool, label: str, mode: str, unc: float, rng: np.random.Generator,
-                 others: list | None = None, want_depth: bool = False):
+                 others: list | None = None, want_depth: bool = False, storm: bool = False,
+                 pillar_chunks: set | None = None):
     """RGB frame (BGR array). `others` = teammate rovers [{x, y, short, damaged, lock}]; with want_depth
-    also returns the colour-mapped depth frame of the same view."""
+    also returns the colour-mapped depth frame of the same view. `storm` hazes orange-red instead of brown;
+    rocks whose (x, y) is in `pillar_chunks` are drawn as dark basalt under one FALLEN PILLAR box."""
+    pillar_chunks = pillar_chunks or set()
     W, H, hfov, pitch, cam_h = 320, 240, math.radians(80), math.radians(-12), 1.0
     f = (W / 2) / math.tan(hfov / 2)
     u, v = np.meshgrid(np.arange(W, dtype=np.float32) - W / 2, np.arange(H, dtype=np.float32) - H / 2)
@@ -210,16 +217,17 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
         fwd = dx * math.cos(yaw) + dy * math.sin(yaw)
         lat = -dx * math.sin(yaw) + dy * math.cos(yaw)
         if 1.5 <= fwd <= 22 and abs(math.atan2(lat, fwd)) <= hfov / 2:
-            seen.append((fwd, lat, r))
+            seen.append((fwd, lat, r, (x, y) in pillar_chunks))
     mates = []
     for o in others or []:
         dx, dy = o["x"] - pose["x"], o["y"] - pose["y"]
         fwd = dx * math.cos(yaw) + dy * math.sin(yaw)
         lat = -dx * math.sin(yaw) + dy * math.cos(yaw)
         if 0.6 <= fwd <= 24 and abs(math.atan2(lat, fwd)) <= hfov / 2 + 0.3:
-            seen.append((fwd, lat, -1.0))
+            seen.append((fwd, lat, -1.0, False))
             mates.append((fwd, o))
-    for fwd, lat, r in sorted(seen, key=lambda q: q[0], reverse=True):  # paint far to near
+    pbox = None  # union of the visible pillar chunks: x0, y0, x1, y1, nearest range
+    for fwd, lat, r, pil in sorted(seen, key=lambda q: q[0], reverse=True):  # paint far to near
         cx = W / 2 - f * lat / fwd
         base = H / 2 - f * math.tan(math.atan(-cam_h / fwd) - pitch)
         if r < 0:  # a teammate rover: wheels, chassis, mast
@@ -241,15 +249,22 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
             continue
         rad = f * r / fwd
         cy = base - rad * 0.7
-        cv2.ellipse(img, (int(cx), int(cy)), (max(2, int(rad)), max(2, int(rad * 0.75))), 0, 0, 360, (70, 66, 80), -1, cv2.LINE_AA)
-        cv2.ellipse(img, (int(cx - rad * 0.25), int(cy - rad * 0.25)), (max(1, int(rad * 0.55)), max(1, int(rad * 0.35))), 0, 0, 360, (110, 104, 122), -1, cv2.LINE_AA)
+        body, lit = (PILLAR_BGR, (62, 64, 70)) if pil else ((70, 66, 80), (110, 104, 122))
+        cv2.ellipse(img, (int(cx), int(cy)), (max(2, int(rad)), max(2, int(rad * 0.75))), 0, 0, 360, body, -1, cv2.LINE_AA)
+        cv2.ellipse(img, (int(cx - rad * 0.25), int(cy - rad * 0.25)), (max(1, int(rad * 0.55)), max(1, int(rad * 0.35))), 0, 0, 360, lit, -1, cv2.LINE_AA)
         if depth is not None:
             cv2.ellipse(depth, (int(cx), int(cy)), (max(2, int(rad)), max(2, int(rad * 0.75))), 0, 0, 360, float(fwd), -1)
+        if pil:
+            q = (cx - rad * 1.05, cy - rad * 0.9, cx + rad * 1.05, cy + rad * 0.85, fwd)
+            pbox = q if pbox is None else (min(pbox[0], q[0]), min(pbox[1], q[1]), max(pbox[2], q[2]), max(pbox[3], q[3]), min(pbox[4], fwd))
+            continue
         boxes.append((cx - rad * 1.1, cy - rad * 0.95, rad * 2.2, rad * 1.8, fwd, 0.78 + 0.2 * min(1, r), None))
+    if pbox is not None:
+        boxes.append((pbox[0], pbox[1], pbox[2] - pbox[0], pbox[3] - pbox[1], pbox[4], 0.86, "PILLAR"))
 
     if dust > 0:
-        tan = np.full_like(img, (92, 140, 196))
-        img = cv2.addWeighted(img, 1 - 0.62 * dust, tan, 0.62 * dust, 0)
+        k = (0.75 if storm else 0.62) * dust
+        img = cv2.addWeighted(img, 1 - k, np.full_like(img, STORM_BGR if storm else DUST_BGR), k, 0)
         img = cv2.GaussianBlur(img, (0, 0), 0.4 + 2.6 * dust)
         img = np.clip(img.astype(np.int16) + rng.normal(0, 14 * dust, img.shape).astype(np.int16), 0, 255).astype(np.uint8)
     if seismic:
@@ -260,12 +275,14 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
     for bx, by, bw, bh, rng_m, conf, mate in sorted(boxes, key=lambda b: b[4]):
         if mode == "LIDAR_ONLY":
             conf *= 0.55
-        col = (56, 178, 255) if mate is None else RESCUE_BGR
+        pil, mate = mate == "PILLAR", mate if isinstance(mate, dict) else None
+        col = PILLAR_BOX_BGR if pil else (56, 178, 255) if mate is None else RESCUE_BGR
         p0, p1 = (int(bx), int(by)), (int(bx + bw), int(by + bh))
-        cv2.rectangle(img, p0, p1, col, 2 if mate is not None and mate.get("lock") else 1, cv2.LINE_AA)
+        cv2.rectangle(img, p0, p1, col, 2 if pil or (mate is not None and mate.get("lock")) else 1, cv2.LINE_AA)
         if mate is not None and mate.get("lock"):
             banner = mate.get("lock")
-        text = f"ROCK {conf:.2f}  {rng_m:.1f} m" if mate is None else f"ROVER {mate['short']} {conf:.2f}  {rng_m:.1f} m{'  DAMAGED' if mate.get('damaged') else ''}"
+        text = (f"FALLEN PILLAR {conf:.2f}  {rng_m:.1f} m" if pil else f"ROCK {conf:.2f}  {rng_m:.1f} m" if mate is None
+                else f"ROVER {mate['short']} {conf:.2f}  {rng_m:.1f} m{'  DAMAGED' if mate.get('damaged') else ''}")
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.33, 1)
         tx = int(min(max(2, p0[0]), W - tw - 2))
         ty = p0[1] - 4 if p0[1] - 4 - th > 2 else p1[1] + th + 4
@@ -292,7 +309,7 @@ def rover_camera(t: Terrain, tex: np.ndarray, px_m: float, pose: dict, rocks: li
 
 def scout_camera(tex: np.ndarray, px_m: float, size_m: float, pose: dict, science: list, perm: list,
                  scanning: bool, dust: float, label: str, rovers: list | None = None,
-                 terrain: Terrain | None = None, alt: float = 12.0, want_depth: bool = False):
+                 terrain: Terrain | None = None, alt: float = 12.0, want_depth: bool = False, storm: bool = False):
     W, H, foot = 320, 240, 24.0
     s = (W / foot) * px_m  # output px per texture px
     cx_t = (pose["x"] + size_m / 2) / px_m
@@ -304,8 +321,8 @@ def scout_camera(tex: np.ndarray, px_m: float, size_m: float, pose: dict, scienc
     img = cv2.warpAffine(tex, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 30, 34))
     img = cv2.flip(img, 0)  # texture row 0 is south; image row 0 must be "ahead"
     if dust > 0:
-        tan = np.full_like(img, (92, 140, 196))
-        img = cv2.addWeighted(img, 1 - 0.5 * dust, tan, 0.5 * dust, 0)
+        k = (0.62 if storm else 0.5) * dust
+        img = cv2.addWeighted(img, 1 - k, np.full_like(img, STORM_BGR if storm else DUST_BGR), k, 0)
 
     def to_px(x: float, y: float) -> tuple[int, int]:
         q = M @ np.array([(x + size_m / 2) / px_m, (y + size_m / 2) / px_m, 1.0])

@@ -86,6 +86,10 @@ export const api = {
   injectTip: (robot?: string) => post<OkResponse>('/api/inject/tip', robot ? { robot } : {}),
   /** §8.9: debris strike → critical damage on `robot` (default: the first rover) */
   injectDamage: (robot?: string) => post<OkResponse>('/api/inject/damage', robot ? { robot } : {}),
+  /** §10.6: a basalt pillar topples across `robot`'s planned route (default: the first rover) */
+  injectPillar: (robot?: string) => post<OkResponse>('/api/inject/pillar', robot ? { robot } : {}),
+  /** §10.6: dust storm, solar blackout + high wind (the backend defaults: 45 s, 14 m/s, dust level 1.0) */
+  injectStorm: (body: { duration_s?: number; wind_mps?: number } = {}) => post<OkResponse>('/api/inject/storm', body),
   setSpeed: (speed: number) => post<OkResponse & { speed?: number }>('/api/sim/speed', { speed }),
   /** Operator command for the advisory brain (409 when no mission runs). `robot` null = the brain's default rover. */
   command: (text: string, robot: string | null) => post<CommandResponse>('/api/command', { text, robot }),

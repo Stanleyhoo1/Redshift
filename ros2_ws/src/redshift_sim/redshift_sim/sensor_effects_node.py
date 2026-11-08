@@ -5,6 +5,9 @@ Dust anomaly (level L ramps in/out over ~1.5 s):
   RGB   haze toward dust colour (0.65·L), blur σ = 1 + 3L, sensor noise σ = 25L, drifting particles
   depth visibility clip at 4 + 36(1 − L) m, 40·L % dropout, range noise
   LiDAR 25·L % dropout, range noise σ = 0.08·L m, 2·L % near-field dust backscatter returns
+Dust storm (anomaly kind `dust_storm`, protocol §10.1): the same model at the storm's level, except the RGB haze goes
+  toward orange-red STORM_RGB at 0.75·L; its wind (`wind_mps`, ramped like the dust level) is published on
+  /world/env_state for the world backends, which push the drone with it.
 Seismic: accelerometer/gyro vibration on the IMU.
 The autonomy stack never reads the dust flag — it must infer degradation from the data itself.
 """
@@ -23,7 +26,115 @@ from sensor_msgs.msg import Image, Imu, PointCloud2
 from std_msgs.msg import String
 
 DUST_RGB = np.array([170, 120, 80], np.float32)   # RGB order used on rgb8 images below
+STORM_RGB = np.array([205, 88, 48], np.float32)   # dust storm: orange-red
+STORM_KIND = 'dust_storm'
+HAZE = {'dust': (DUST_RGB, 0.65), STORM_KIND: (STORM_RGB, 0.75)}   # kind → (haze colour, strength per unit level)
 RAMP_S = 1.5
+PARTICLES = 60                                     # drifting dust streaks at full level
+PARTICLE_RGB = (235, 205, 165)
+# command defaults: a plain anomaly as before; a storm as the backend's /api/inject/storm sends it
+DUST_DEFAULTS = {'dust_level': 0.85, 'duration_s': 25.0, 'seismic_s': 4.0, 'wind_mps': 0.0}
+STORM_DEFAULTS = {'dust_level': 1.0, 'duration_s': 45.0, 'seismic_s': 0.0, 'wind_mps': 14.0}
+WIND_MAX_MPS = 40.0                                # clamp on a commanded storm wind
+
+
+def _num(v, default: float, lo: float, hi: float) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return float(np.clip(x, lo, hi)) if math.isfinite(x) else default
+
+
+def anomaly_params(cmd: dict) -> dict:
+    """Validated parameters of an `anomaly` command: {kind, dust_level, duration_s, seismic_s, wind_mps}. Kind is
+    `dust_storm` or `dust` (no or any other kind: the plain anomaly, which never carries wind). A missing or bad
+    value takes its kind's default."""
+    kind = STORM_KIND if cmd.get('kind') == STORM_KIND else 'dust'
+    d = STORM_DEFAULTS if kind == STORM_KIND else DUST_DEFAULTS
+    return {'kind': kind,
+            'dust_level': _num(cmd.get('dust_level', d['dust_level']), d['dust_level'], 0.0, 1.0),
+            'duration_s': _num(cmd.get('duration_s', d['duration_s']), d['duration_s'], 0.0, math.inf),
+            'seismic_s': _num(cmd.get('seismic_s', d['seismic_s']), d['seismic_s'], 0.0, math.inf),
+            'wind_mps': _num(cmd.get('wind_mps', d['wind_mps']), d['wind_mps'], 0.0, WIND_MAX_MPS)
+            if kind == STORM_KIND else 0.0}
+
+
+def haze_tint(img: np.ndarray, level: float, kind: str | None = None, bgr: bool = False) -> np.ndarray:
+    """Blend a float HxWx3 frame toward the haze colour of `kind`: brown DUST_RGB at 0.65·L for plain dust (or no
+    kind), orange-red STORM_RGB at 0.75·L for a dust storm. `bgr` = the frame is in BGR order."""
+    rgb, k = HAZE.get(kind, HAZE['dust'])
+    a = k * float(level)
+    return img * (1 - a) + (rgb[::-1] if bgr else rgb) * a
+
+
+def degrade_rgb(img: np.ndarray, level: float, kind: str | None, rng: np.random.Generator, particles: np.ndarray,
+                bgr: bool = False) -> np.ndarray:
+    """One uint8 HxWx3 camera frame through the dust: haze_tint, blur σ = 1 + 3L, sensor noise σ = 25L and drifting
+    particles (`particles`: PARTICLES×4 state in [0, 1), advanced in place). Returns uint8."""
+    out = haze_tint(img.astype(np.float32), level, kind, bgr)
+    out = cv2.GaussianBlur(out, (0, 0), 1.0 + 3.0 * level)
+    out += rng.normal(0, 25.0 * level, out.shape).astype(np.float32)
+    h, w = out.shape[:2]
+    p = particles
+    p[:, 0] = (p[:, 0] + 0.02 + 0.03 * p[:, 2]) % 1.0
+    p[:, 1] = (p[:, 1] + 0.004 * (p[:, 3] - 0.5)) % 1.0
+    for k in range(int(PARTICLES * level)):
+        x0, y0 = int(p[k, 0] * w), int(p[k, 1] * h)
+        cv2.line(out, (x0, y0), (x0 + int(4 + 8 * p[k, 2]), y0 + 1), PARTICLE_RGB, 1, cv2.LINE_AA)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _ramp(value: float, goal: float, step: float) -> float:
+    return min(goal, value + step) if goal > value else max(goal, value - step)
+
+
+class Atmosphere:
+    """The anomaly state behind every stream (simulated time): dust level L and storm wind, both ramped over RAMP_S,
+    the seismic window, and the anomaly kind, which stays set until the dust has fully settled again."""
+
+    def __init__(self):
+        self.target = 0.0
+        self.level = 0.0
+        self.until = 0.0
+        self.seismic_until = 0.0
+        self.kind: str | None = None
+        self.wind_peak = 0.0          # the storm's wind_mps (0 for plain dust)
+        self.wind = 0.0
+        self._wind_rate = 0.0         # m/s per s: the wind reaches its peak (or calm) in RAMP_S, like the dust level
+
+    def command(self, cmd: dict, now: float) -> dict:
+        """Start an anomaly at `now`; returns the /world/events echo (the node adds `t`)."""
+        p = anomaly_params(cmd)
+        self.kind = p['kind']
+        self.target = p['dust_level']
+        self.until = now + p['duration_s']
+        self.seismic_until = now + p['seismic_s']
+        self.wind_peak = p['wind_mps']
+        self._wind_rate = max(self.wind_peak, self.wind) / RAMP_S
+        return {'op': 'anomaly', 'ok': True, 'dust_level': self.target, 'duration_s': p['duration_s'],
+                'kind': self.kind, 'wind_mps': self.wind_peak}
+
+    def clear(self, now: float) -> None:
+        self.until = now
+        self.seismic_until = now
+
+    def seismic(self, now: float) -> bool:
+        return now < self.seismic_until
+
+    def step(self, now: float, dt: float) -> None:
+        dt = max(0.0, dt)
+        active = now < self.until
+        self.level = _ramp(self.level, self.target if active else 0.0, dt / RAMP_S)
+        self.wind = _ramp(self.wind, self.wind_peak if active else 0.0, dt * self._wind_rate)
+        if not active and self.level == 0.0 and self.wind == 0.0:
+            self.kind = None
+
+    def env_state(self, now: float) -> dict:
+        """The /world/env_state payload (protocol §10.1): read by the world backends, never by the autonomy."""
+        return {'dust_level': round(self.level, 3), 'seismic': self.seismic(now),
+                'remaining_s': round(self.until - now, 1) if now < self.until else None,
+                'kind': self.kind, 'wind_mps': round(self.wind, 2)}
 
 
 class SensorEffects(Node):
@@ -37,10 +148,7 @@ class SensorEffects(Node):
         self.publish_env = bool(self.get_parameter('publish_env').value)
         self.rng = np.random.default_rng(abs(hash(self.robot)) % 2 ** 32)
         r = self.robot
-        self.target = 0.0
-        self.level = 0.0
-        self.until = 0.0
-        self.seismic_until = 0.0
+        self.atm = Atmosphere()
         self._last_t = self.now_s()
         self.pub_img = self.create_publisher(Image, f'/{r}/camera/image', qos_profile_sensor_data)
         self.pub_depth = self.create_publisher(Image, f'/{r}/camera/depth', qos_profile_sensor_data)
@@ -55,7 +163,7 @@ class SensorEffects(Node):
         self.env_pub = self.create_publisher(String, '/world/env_state', 10)
         self.events = self.create_publisher(String, '/world/events', 10)
         self.create_timer(0.1, self.tick)
-        self._particles = self.rng.random((60, 4)).astype(np.float32)
+        self._particles = self.rng.random((PARTICLES, 4)).astype(np.float32)
 
     def now_s(self) -> float:
         """Simulated time (use_sim_time): durations and ramps follow the simulation speed."""
@@ -67,56 +175,38 @@ class SensorEffects(Node):
             cmd = json.loads(msg.data)
         except json.JSONDecodeError:
             return
+        if not isinstance(cmd, dict):
+            return
         now = self.now_s()
         if cmd.get('op') == 'anomaly':
-            self.target = float(np.clip(cmd.get('dust_level', 0.85), 0.0, 1.0))
-            dur = float(cmd.get('duration_s', 25.0))
-            self.until = now + dur
-            self.seismic_until = now + float(cmd.get('seismic_s', 4.0))
+            ev = self.atm.command(cmd, now)
             if self.publish_env:
-                self.events.publish(String(data=json.dumps({'op': 'anomaly', 'ok': True, 'dust_level': self.target,
-                                                            'duration_s': dur, 't': time.time()})))
+                self.events.publish(String(data=json.dumps(dict(ev, t=time.time()))))
         elif cmd.get('op') == 'clear_anomaly':
-            self.until = now
-            self.seismic_until = now
+            self.atm.clear(now)
 
     def tick(self):
         now = self.now_s()
         dt = max(0.0, now - self._last_t)
         self._last_t = now
-        goal = self.target if now < self.until else 0.0
-        step = dt / RAMP_S
-        self.level = min(goal, self.level + step) if goal > self.level else max(goal, self.level - step)
+        self.atm.step(now, dt)
         if self.publish_env:
-            self.env_pub.publish(String(data=json.dumps({'dust_level': round(self.level, 3),
-                                                         'seismic': now < self.seismic_until,
-                                                         'remaining_s': round(self.until - now, 1) if now < self.until else None})))
+            self.env_pub.publish(String(data=json.dumps(self.atm.env_state(now))))
 
     # ------------------------------------------------------------------ streams
     def on_image(self, msg: Image):
-        L = self.level
+        L = self.atm.level
         if L < 0.02 or msg.encoding not in ('rgb8', 'bgr8'):
             self.pub_img.publish(msg)
             return
-        img = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3).astype(np.float32)
-        dust = DUST_RGB if msg.encoding == "rgb8" else DUST_RGB[::-1]
-        img = img * (1 - 0.65 * L) + dust * (0.65 * L)
-        img = cv2.GaussianBlur(img, (0, 0), 1.0 + 3.0 * L)
-        img += self.rng.normal(0, 25.0 * L, img.shape).astype(np.float32)
-        h, w = img.shape[:2]
-        p = self._particles
-        p[:, 0] = (p[:, 0] + 0.02 + 0.03 * p[:, 2]) % 1.0
-        p[:, 1] = (p[:, 1] + 0.004 * (p[:, 3] - 0.5)) % 1.0
-        for k in range(int(60 * L)):
-            x0, y0 = int(p[k, 0] * w), int(p[k, 1] * h)
-            cv2.line(img, (x0, y0), (x0 + int(4 + 8 * p[k, 2]), y0 + 1), (235, 205, 165), 1, cv2.LINE_AA)
+        img = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
         out = Image(header=msg.header, height=msg.height, width=msg.width, encoding=msg.encoding,
                     is_bigendian=msg.is_bigendian, step=msg.step)
-        out.data = np.clip(img, 0, 255).astype(np.uint8).tobytes()
+        out.data = degrade_rgb(img, L, self.atm.kind, self.rng, self._particles, bgr=msg.encoding == 'bgr8').tobytes()
         self.pub_img.publish(out)
 
     def on_depth(self, msg: Image):
-        L = self.level
+        L = self.atm.level
         if L < 0.02 or msg.encoding != '32FC1':
             self.pub_depth.publish(msg)
             return
@@ -131,7 +221,7 @@ class SensorEffects(Node):
         self.pub_depth.publish(out)
 
     def on_points(self, msg: PointCloud2):
-        L = self.level
+        L = self.atm.level
         if L < 0.02:
             self.pub_pts.publish(msg)
             return
@@ -168,7 +258,7 @@ class SensorEffects(Node):
 
     def on_imu(self, msg: Imu):
         t = self.now_s()
-        if t >= self.seismic_until:
+        if not self.atm.seismic(t):
             self.pub_imu.publish(msg)
             return
         a = msg.linear_acceleration

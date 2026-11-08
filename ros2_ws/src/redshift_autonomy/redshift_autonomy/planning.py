@@ -263,6 +263,26 @@ def reachable_from(cm: CostMap, start) -> np.ndarray:
     return labels == labels[sr, sc]
 
 
+DETOUR_X, DETOUR_M = 2.5, 10.0   # a route longer than 2.5 × the straight-line distance + 10 m is a detour
+TIGHT_GAIN = 0.6                 # ... that a 0.3 m clearance route at most this fraction of its length replaces
+
+
+def is_detour(length_m: float, direct_m: float) -> bool:
+    """A route of `length_m` to a goal `direct_m` away in a straight line is a long way round."""
+    return length_m > DETOUR_X * direct_m + DETOUR_M
+
+
+def prefer_tight(normal_m, tight_m, direct_m: float) -> bool:
+    """Take the 0.3 m clearance route (lengths in m, None = no route) instead of the full-clearance one? When nothing
+    routes at full clearance, or when that route is a long detour (a gap the inflation rings close) and the tight one
+    saves at least 40 % of it. Core hazards stay lethal either way."""
+    if tight_m is None:
+        return False
+    if normal_m is None:
+        return True
+    return is_detour(normal_m, direct_m) and tight_m < TIGHT_GAIN * normal_m
+
+
 def standoff_cells(cm: CostMap, target_xy, approach_rad: float, r_min: float = 2.0, r_max: float = 2.45,
                    r_pref: float = 2.2, step_deg: float = 15.0) -> list:
     """Every plannable cell (outside lethal cores and inflation rings) whose centre lies r_min..r_max from a teammate,

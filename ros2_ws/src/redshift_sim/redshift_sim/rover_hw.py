@@ -1,5 +1,6 @@
 """Simulated rover hardware shared by both world backends (pure; no ROS): drivetrain health, motor-controller
-currents, the solar panel and the debris-strike profile (docs/protocol.md §8.2, §8.3, §8.5).
+currents, the solar panel, the debris-strike profile (docs/protocol.md §8.2, §8.3, §8.5) and the dust-storm wind
+on the drone.
 
 The drivetrain fault is applied by the *world*, before the wheels: the mock scales the command inside its dynamics,
 Gazebo scales it in world_interface_node's `cmd_vel` → `cmd_vel_hw` relay. The autonomy only learns about it from
@@ -29,6 +30,9 @@ Model, kept deliberately simple:
   No roll torque, and the push is applied at the centre of mass (force_offset): lifting one side would land the
   same way. Persistent wrenches accumulate in gz-sim (ApplyLinkWrench), so the mid-pulse switch is published as a
   delta wrench and the end as /wrench/clear.
+* Storm wind (the drone only): a power-law shear profile, wind_at(h) = wind_ref·clip(h / 12 m, 0.05, 2)^0.6, so lower
+  is calmer, along a fixed world bearing per storm with ±25 % gusts at 0.3 Hz (StormWind, seeded phase). The world
+  adds it to the drone's commanded velocity; the drone only learns it from its own odometry (cmd vs. measured).
 """
 from __future__ import annotations
 
@@ -61,6 +65,15 @@ SOLAR_PEAK_W = 220.0
 SUN_ELEVATION_DEG = 55.0
 SUN_AZIMUTH_DEG = math.degrees(math.atan2(-0.35, 0.55))   # toward the sun: −SUN_DIR of mock_render / world.sdf
 DUST_EXTINCTION = 0.85
+
+# --- storm wind (drone) -----------------------------------------------------------------------------------------
+WIND_SHEAR_EXP = 0.6                 # power-law wind-shear exponent (rough terrain, stormy boundary layer)
+WIND_REF_AGL_M = 12.0                # wind_mps of /world/env_state is the wind at this height (the drone's cruise AGL)
+WIND_AGL_CLIP = (0.05, 2.0)          # h / WIND_REF_AGL_M is clipped to this range (no calm at 0 m, no runaway aloft)
+STORM_WIND_TOWARD_DEG = 30.0         # world direction (ENU, ccw from +x east) the storm blows toward: compass 060°,
+                                     # i.e. a wind "from 240°" (west-south-west), as the drone's trace reports it
+GUST_FRAC = 0.25                     # gust amplitude, fraction of the mean wind
+GUST_HZ = 0.3                        # gust frequency
 
 # --- debris strike (critical_damage) -------------------------------------------------------------------------
 STRIKE = {
@@ -135,6 +148,34 @@ def solar_output(dust_level: float, roll_rad: float, pitch_rad: float, yaw_rad: 
     n = (cy * sp * cr + sy * sr, sy * sp * cr - cy * sr, cp * cr)
     inc = max(0.0, n[0] * SUN_VEC[0] + n[1] * SUN_VEC[1] + n[2] * SUN_VEC[2])
     return SOLAR_PEAK_W * irr * inc, irr
+
+
+# --- storm wind ----------------------------------------------------------------------------------------------------
+def wind_at(h_agl: float, wind_ref_mps: float) -> float:
+    """Mean wind speed (m/s) at h_agl metres above ground: wind_ref·clip(h / WIND_REF_AGL_M, 0.05, 2)^WIND_SHEAR_EXP."""
+    lo, hi = WIND_AGL_CLIP
+    return float(wind_ref_mps) * min(hi, max(lo, float(h_agl) / WIND_REF_AGL_M)) ** WIND_SHEAR_EXP
+
+
+class StormWind:
+    """World-frame wind of one storm: wind_at shear along a fixed bearing, times a gust factor 1 ± GUST_FRAC at
+    GUST_HZ whose phase is seeded per storm (deterministic for a given seed)."""
+
+    def __init__(self, seed: int = 0, toward_deg: float = STORM_WIND_TOWARD_DEG, gust_frac: float = GUST_FRAC):
+        self.toward = math.radians(toward_deg)
+        self.gust_frac = float(gust_frac)
+        self.phase = float(np.random.default_rng(seed).uniform(0.0, 2.0 * math.pi))
+
+    def gust(self, t: float) -> float:
+        """Gust factor at simulated time t."""
+        return 1.0 + self.gust_frac * math.sin(2.0 * math.pi * GUST_HZ * float(t) + self.phase)
+
+    def vector(self, t: float, h_agl: float, wind_ref_mps: float) -> tuple[float, float]:
+        """(wx, wy) m/s, world frame, at h_agl above ground and time t."""
+        if wind_ref_mps <= 0.0:
+            return 0.0, 0.0
+        v = wind_at(h_agl, wind_ref_mps) * self.gust(t)
+        return v * math.cos(self.toward), v * math.sin(self.toward)
 
 
 # --- drivetrain --------------------------------------------------------------------------------------------------

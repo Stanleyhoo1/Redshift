@@ -24,6 +24,7 @@ SCOUT_SPEC = {
     'mass_kg': 2.0, 'camera_xyz': [0.0, 0.0, -0.08], 'camera_pitch_rad': math.pi / 2,
     'camera_hfov': 1.571, 'camera_w': 160, 'camera_h': 120, 'camera_hz': 5.0, 'camera_far': 40.0,
     'cruise_agl_m': 12.0, 'v_max': 4.0, 'vz_max': 2.0,
+    'v_air_max': 18.0,      # air-relative limit: survey guidance <= v_max, plus wind feed-forward in a storm
 }
 
 

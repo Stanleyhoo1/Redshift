@@ -172,3 +172,67 @@ def test_backing_into_a_rock_is_not_an_impact_at_any_step_size():
         peak = max(peak, float(np.linalg.norm(r.snapshot()['accel'])) / 9.80665 - 2.2)
     assert r.x == pytest.approx(-2.0 + 0.8 + FOOTPRINT_R, abs=0.02)   # it reached the rock and stalled there
     assert peak < 1.2                                       # rover_health's SHOCK_G: not an impact
+
+
+# ---------------------------------------------------------------- storm wind on the drone (spec §1.2)
+def _world_v(snap):
+    c, s = math.cos(snap['yaw']), math.sin(snap['yaw'])
+    vx, vy, vz = snap['v_body']
+    return np.array([c * vx - s * vy, s * vx + c * vy, vz])
+
+
+def test_scout_drifts_downwind_by_the_sheared_wind_at_its_own_altitude():
+    from redshift_sim.rover_hw import STORM_WIND_TOWARD_DEG, StormWind, wind_at
+    sc = ramp_scene(0.0, size=600.0, n=121)
+    u = np.array([math.cos(math.radians(STORM_WIND_TOWARD_DEG)), math.sin(math.radians(STORM_WIND_TOWARD_DEG))])
+    for agl in (12.0, 8.0):
+        s = ScoutSim('scout_0', SCOUT_SPEC, (0.0, 0.0, agl, 0.3), g_mult=2.2)
+        s.wind_field = StormWind(seed=0, gust_frac=0.0)
+        out = run(s, sc, 1.0)
+        assert np.linalg.norm(_world_v(out[-1])) < 1e-6                     # calm: hovers in place
+        s.wind = 14.0                                                        # env_state wind_mps at 12 m AGL
+        out = run(s, sc, 4.0)
+        v = _world_v(out[-1])
+        assert v[:2] == pytest.approx(wind_at(agl, 14.0) * u, abs=0.05)      # odometry reads the drift…
+        assert s.vel_world() == pytest.approx(v, abs=1e-9)
+        assert abs(v[2]) < 1e-9 and s.z == pytest.approx(agl, abs=1e-6)      # …horizontal only
+        moved = np.array([s.x, s.y]) / max(1e-9, math.hypot(s.x, s.y))
+        assert moved == pytest.approx(u, abs=1e-3)                           # blown downwind
+    assert wind_at(8.0, 14.0) < 0.8 * wind_at(12.0, 14.0)                    # lower is calmer
+
+
+def test_scout_wind_drift_adds_to_its_own_command_and_gusts():
+    from redshift_sim.rover_hw import GUST_FRAC, StormWind, wind_at
+    sc = ramp_scene(0.0, size=600.0, n=121)
+    s = ScoutSim('scout_0', SCOUT_SPEC, (0.0, 0.0, 12.0, 0.0), g_mult=2.2)
+    s.wind_field = StormWind(seed=2)
+    s.wind = 14.0
+    out = run(s, sc, 12.0, v=3.0)                                            # commanded 3 m/s along +x
+    speeds = np.array([np.linalg.norm(_world_v(q)[:2] - np.array([3.0, 0.0])) for q in out[400:]])
+    base = wind_at(12.0, 14.0)
+    assert speeds.min() >= base * (1 - GUST_FRAC) - 0.1 and speeds.max() <= base * (1 + GUST_FRAC) + 0.1
+    assert speeds.max() - speeds.min() > base * GUST_FRAC                   # it gusts
+
+
+def test_scout_on_its_skids_is_not_blown_away():
+    sc = ramp_scene(0.0)
+    s = ScoutSim('scout_0', SCOUT_SPEC, (0.0, 0.0, 0.05, 0.0), g_mult=2.2)
+    s.wind = 14.0
+    run(s, sc, 3.0)
+    assert math.hypot(s.x, s.y) < 1e-6 and np.linalg.norm(s.vel_world()) < 1e-6
+
+
+def test_wind_steps_from_env_state_never_spike_the_scout_imu():
+    # env_state arrives at 10 Hz, so wind_mps ramps up in steps; the pacer splits physics steps at sensor due times
+    sc = ramp_scene(0.0, size=600.0, n=121)
+    s = ScoutSim('scout_0', SCOUT_SPEC, (0.0, 0.0, 12.0, 0.0), g_mult=2.2)
+    t, peak = 0.0, 0.0
+    for k in range(600):
+        s.wind = min(14.0, 14.0 * math.floor(t / 0.1) * 0.1 / 1.5)          # 1.5 s ramp in 0.1 s steps
+        s.cmd = (0.0, 0.0, 0.0, 0.0)
+        dt = 1e-5 if k % 2 else DT - 1e-5
+        s.step(dt, sc, t)
+        t += dt
+        peak = max(peak, float(np.hypot(*s.snapshot()['accel'][:2])))
+    # following a 14 m/s ramp over 1.5 s is a ≈ 1 g push; a velocity step over a 10 µs step would read ~10⁴ g
+    assert peak < 1.5 * 9.80665

@@ -87,10 +87,11 @@ class FakeLink:
     def __init__(self):
         self.cmds, self.stats, self.env, self.sim = [], {}, {}, (None, None)
         self.op_cmds, self.op_listeners, self.brain = [], 1, None
+        self.cmd_listeners = 1
 
     def publish_command(self, cmd):
         self.cmds.append(cmd)
-        return 1
+        return self.cmd_listeners
 
     def publish_operator_command(self, cmd):
         self.op_cmds.append(cmd)
@@ -397,3 +398,104 @@ def test_ros_link_brain_status_with_a_huge_integer_t_never_breaks_telemetry():
     link._on_brain_status(SimpleNamespace(data='{"enabled": true, "t": ' + '9' * 400 + '}'))
     st = link.brain_status()                        # float() of that 't' overflows: it ages from its arrival instead
     assert st is not None and st['stale'] is False and st['enabled'] is True
+
+
+# ---------------------------------------------------------------------------------------------------- Phase 3
+def test_pillar_inject_targets_a_running_rover(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    monkeypatch.setattr(appmod.hub, 'link', link)
+    monkeypatch.setattr(appmod.hub, 'mgr', mgr)
+    c = TestClient(appmod.app)
+    r = c.post('/api/inject/pillar', json={}).json()
+    assert r['ok'] and set(r) == {'ok', 'detail'} and 'rover_0' in r['detail']
+    assert link.cmds == [{'op': 'pillar_collapse', 'robot': 'rover_0'}]
+    assert c.post('/api/inject/pillar').json()['ok']                       # no body at all: the first rover
+    assert c.post('/api/inject/pillar', json={'robot': 'rover_1'}).json()['ok']
+    assert link.cmds[-1] == {'op': 'pillar_collapse', 'robot': 'rover_1'}
+    assert c.post('/api/inject/pillar', json={'robot': 'scout_0'}).json() == {'ok': False,
+                                                                             'detail': "Unknown rover 'scout_0'"}
+    assert c.post('/api/inject/pillar', json=[1, 2]).status_code == 422
+    assert len(link.cmds) == 3
+    link.cmd_listeners = 0
+    r = c.post('/api/inject/pillar', json={}).json()
+    assert r == {'ok': False, 'detail': 'World is not listening on /world/command'}
+    mgr.status = 'launching'
+    assert c.post('/api/inject/pillar', json={}).json() == {'ok': False, 'detail': 'No running mission'}
+    assert len(link.cmds) == 4
+
+
+def test_storm_inject_sends_a_dust_storm_anomaly(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    monkeypatch.setattr(appmod.hub, 'link', link)
+    monkeypatch.setattr(appmod.hub, 'mgr', mgr)
+    c = TestClient(appmod.app)
+    r = c.post('/api/inject/storm', json={}).json()
+    assert r['ok'] and set(r) == {'ok', 'detail'} and '45 s' in r['detail']
+    assert link.cmds == [{'op': 'anomaly', 'kind': 'dust_storm', 'dust_level': 1.0, 'duration_s': 45.0,
+                          'seismic_s': 0.0, 'wind_mps': 14.0}]
+    assert json.loads(json.dumps(link.cmds)) == link.cmds                   # plain JSON on the wire
+    assert c.post('/api/inject/storm').json()['ok']                         # no body: the defaults
+    r = c.post('/api/inject/storm', json={'duration_s': 20, 'wind_mps': 10.5}).json()
+    assert r['ok'] and link.cmds[-1]['duration_s'] == 20.0 and link.cmds[-1]['wind_mps'] == 10.5
+    assert link.cmds[-1]['dust_level'] == 1.0 and link.cmds[-1]['kind'] == 'dust_storm'
+    for bad in ({'duration_s': 999}, {'duration_s': 1}, {'wind_mps': -1}, {'wind_mps': 50}, {'wind_mps': 'gale'}):
+        r = c.post('/api/inject/storm', json=bad)
+        assert r.status_code == 422 and isinstance(r.json()['detail'], str), bad
+    assert c.post('/api/inject/storm', json=['x']).status_code == 422
+    assert len(link.cmds) == 3                                              # nothing invalid reached the world
+    link.cmd_listeners = 0
+    assert c.post('/api/inject/storm', json={}).json()['ok'] is False
+    mgr.status = 'idle'
+    assert c.post('/api/inject/storm', json={}).json() == {'ok': False, 'detail': 'No running mission'}
+    assert len(link.cmds) == 4
+
+
+def test_plain_anomaly_inject_is_unchanged(monkeypatch):
+    link, mgr = FakeLink(), FakeMgr()
+    monkeypatch.setattr(appmod.hub, 'link', link)
+    monkeypatch.setattr(appmod.hub, 'mgr', mgr)
+    assert TestClient(appmod.app).post('/api/inject/anomaly', json={}).json()['ok']
+    assert link.cmds == [{'op': 'anomaly', 'dust_level': 0.85, 'duration_s': 25.0, 'seismic_s': 4.0}]
+
+
+def test_mission_env_passes_storm_kind_and_wind_through():
+    link, mgr = FakeLink(), FakeMgr()
+    hub = Hub()
+    hub.link, hub.mgr = link, mgr
+    assert hub.mission_dict()['env'] == {'dust_level': 0.0, 'seismic': False, 'kind': None, 'wind_mps': 0.0}
+    link.env = {'dust_level': 0.62, 'seismic': False, 'remaining_s': 30.0, 'kind': 'dust_storm', 'wind_mps': 8.7}
+    assert hub.mission_dict()['env'] == {'dust_level': 0.62, 'seismic': False, 'kind': 'dust_storm', 'wind_mps': 8.7}
+
+
+def test_ros_link_env_state_ignores_malformed_messages():
+    from types import SimpleNamespace
+
+    from backend_bridge.ros_link import RosLink
+    link = RosLink.__new__(RosLink)                 # callbacks only: no rclpy node
+    link.lock = threading.RLock()
+    link.reset()
+    assert link.env == {'dust_level': 0.0, 'seismic': False, 'remaining_s': None, 'kind': None, 'wind_mps': 0.0}
+    st = {'dust_level': 0.4, 'seismic': False, 'remaining_s': 40.0, 'kind': 'dust_storm', 'wind_mps': 5.6}
+    link._on_env(SimpleNamespace(data=json.dumps(st)))
+    assert link.env == st and 'env' in link.first_global
+    for bad in ('{oops', '[1, 2]', '3', 'null'):
+        link._on_env(SimpleNamespace(data=bad))
+        assert link.env == st, bad
+    link.reset()                                    # a new mission starts calm
+    assert link.env['kind'] is None and link.env['wind_mps'] == 0.0
+
+
+def test_ros_link_robot_json_cache_ignores_non_objects():
+    from types import SimpleNamespace
+
+    from backend_bridge.encoders import RobotCache, robot_telemetry
+    from backend_bridge.ros_link import RosLink
+    link = RosLink.__new__(RosLink)                 # callbacks only: no rclpy node
+    link.lock = threading.RLock()
+    c = RobotCache('rover_0')
+    link._json(c, 'agent_state', SimpleNamespace(data='{"state": "EXPLORING", "power_save": true}'))
+    for bad in ('[1, 2]', '{oops', '7'):
+        link._json(c, 'agent_state', SimpleNamespace(data=bad))
+        link._json(c, 'detections', SimpleNamespace(data=bad))
+    t = robot_telemetry(c)
+    assert t['state'] == 'EXPLORING' and t['power_save'] is True and t['detections'] == []

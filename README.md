@@ -11,6 +11,7 @@ A fleet of two rovers and an aerial drone maps an unexplored sector of a 2.2 g S
 - **Recovery:**
   - *Tip/slip:* a safe-hold routine retreats, marks the hazard and sends the drone to inspect it.
   - *Critical damage:* a crippled rover holds safe and broadcasts an SOS. The recovery rover drives over and docks once its own camera, depth and LiDAR confirm the damaged unit. It runs a field repair, and both rovers go back to mapping.
+- **Changes it has to work out for itself:** a basalt pillar topples across a rover's route, and a dust storm blacks out the solar panel and blows hard aloft. LiDAR blocks the route while the trunk is still falling, and the camera then names it a fallen pillar. Each robot infers the storm from its own sensors: the rover from its camera confidence and its pyranometer, the drone from its drift.
 - **Advisory agent brain:** after the local layer has acted, Google's **Gemma** (`gemma-4-26b-a4b-it`, in the cloud) reviews each hazard, low-confidence spell, damage report, SOS and typed operator command. It may only make a robot safer: slow it, hold it, refuse a command, or move the drone. Without a key or a network, local rules answer in the same format, and the HUD says which one decided.
 
 Each robot's onboard computer is simulated against a real edge-compute power budget. A FastAPI + rclpy bridge streams the fleet into a React + Three.js **Mission Control**. Its 3D globe reveals the sector as it is mapped. It also shows live sensor feeds, a Sense → Reason → Act trace for every decision, and the agent brain panel with an operator command box. Inject buttons let you change the world in the middle of a run.
@@ -65,7 +66,7 @@ Above what the machine can render, the mission still runs correctly, only slower
 
 ## The 60-second demo
 
-The brief asks for one continuous take of at most a minute, with perception on screen next to the actions and at least one unscripted change. At 1× the full rescue does not fit in the same minute as the other beats, so there are two takes.
+The brief asks for one continuous take of at most a minute, with perception on screen next to the actions and at least one unscripted change. At 1× everything does not fit in one minute, so there are three takes: adaptation (A), the fleet self-rescue (B), and the pillar collapse and dust storm (C).
 
 **Take A: adaptation, from deploy to wrap-up**
 
@@ -89,7 +90,18 @@ The brief asks for one continuous take of at most a minute, with perception on s
 | 0:52 | (autonomous) | Rover 1's own motor diagnostics read nominal → health back to ~90 % |
 | 0:57 | (autonomous) | Rover 2 backs off 2 m; both rovers resume mapping |
 
-**Operator commands (fit into either take).** Type into the *Agent brain* panel, or use its presets:
+**Take C: pillar collapse and dust storm.** Start with Rover 1 driving its route and select ROVER_1's camera.
+
+| Time (Gazebo 1×) | Action | What you see |
+|---|---|---|
+| 0:00 | **Pillar Collapse Ahead** | A 6 m basalt pillar beside the route topples across it, 8 m ahead (lands in ≈ 1.3 s) |
+| 0:03 | (autonomous) | LiDAR: `Path blocked` while the trunk settles → A* re-plans around its whole length; the camera boxes **FALLEN PILLAR** → `pillar_identified`; Gemma reviews the new hazard (`SLOW_AND_REPLAN`, ~2 s) |
+| 0:12 | **Dust Storm (Solar Blackout + High Wind)** | Every camera hazes orange-red; camera confidence ~0.2 → **CAUTION**: LiDAR-only at 35 % speed (3 s) |
+| 0:17 | (autonomous) | Solar ~190 W → ~28 W (−85 %) on the rover's own pyranometer → `power_save`: battery conservation, × 0.6 speed |
+| 0:20 | (autonomous) | The drone measures ~13 m/s from 240° from its own drift → `wind_descent` from 12 m to 8 m AGL, leaning into the wind to hold its track |
+| 0:57 | (autonomous) | The 45 s storm passes: `power_restored`, `wind_clear`, fused navigation back (~8–19 s after the dust falls) |
+
+**Operator commands (fit into any take).** Type into the *Agent brain* panel, or use its presets:
 - *drive at full speed into the rockslide* → **REJECT_UNSAFE_COMMAND** about 2 s later, with Gemma's one-sentence reason;
 - *slow down to 0.2 m/s* → the planner applies a 0.20 m/s cap for 60 s, shown as *applied* in the panel;
 - *stop* → the rover stops at once: a stop never waits for the cloud;
@@ -102,6 +114,7 @@ Weights are the official Agentverse 2026 Robotics Track ones.
 **Perception-driven action (25 %): every decision traces to what was perceived**
 - *Local OpenCV perception (`vision.py`).*
   - Boulders: depth-geometry bumps confirmed by colour.
+  - Fallen pillars: an obstacle bump that is long (≥ 2.5 m and ≥ 2.5× its height), one straight trunk (≤ 0.25 m thick across its axis) and dark basalt. A line of boulders is not a pillar. The first sighting is traced as `pillar_identified` and goes to the brain as a new hazard.
   - Craters: depth pits.
   - Science crystals: cyan in HSV.
   - Steep patches: local plane fits.
@@ -119,6 +132,8 @@ Weights are the official Agentverse 2026 Robotics Track ones.
 **Adaptation to change (25 %): scene changes mid-run, the fleet visibly re-plans**
 - *Rockslide.* Boulders drop across the rover's *current* planned path, 7 m ahead. With less route left they land closer, so never past its end; within 4 m of its goal they wait for its next route. LiDAR obstacle evidence blocks the path → visible `REPLANNING` → a new A* route (+Δ m, nodes, ms).
 - *Dust / seismic anomaly.* A sensor-effects layer hazes, blurs and adds noise to RGB; drops returns and adds backscatter to LiDAR; vibrates the IMU. The rover's FSM switches to LiDAR-only, with slower speed and extra inflation, and returns to fused navigation when its sensors say the air has cleared.
+- *Pillar collapse.* A 6 m basalt pillar standing 2.8 m beside the rover's route topples across it, 8 m ahead (a real rigid body in Gazebo: ≈ 1.3 s to land at 2.2 g). LiDAR blocks the route while it falls → A* re-plans around the whole trunk; the camera boxes **FALLEN PILLAR** a moment later and Gemma reviews the new hazard.
+- *Dust storm (solar blackout + high wind).* The cameras haze orange-red and camera confidence falls below 0.5 → CAUTION at 35 % speed. The pyranometer and panel read ~85 % less → battery conservation at × 0.6 speed, ended only when the panel is charging again. Wind grows with height (shear exponent 0.6). The drone estimates it from its own drift (commanded vs. measured velocity), descends from 12 m to 8 m AGL, and leans into the estimated wind so it keeps its track.
 - *Debris strike.* A real force on the chassis (the IMU measures it) plus drivetrain faults drops health below 15 %. The damaged rover goes SAFE-HOLD → SOS. The recovery rover drops its frontier, re-plans to a stand-off beside it, and docks on perception.
 
 **Operational autonomy within an edge budget (15 %)**
@@ -128,6 +143,7 @@ Weights are the official Agentverse 2026 Robotics Track ones.
 - *Gravity-aware physics.* `physics_model.py` derives the climbable slope from wheel torque, soil traction (Mohr–Coulomb) and the static tip angle at the selected g.
   - The same torque limit is written into the Gazebo wheel joints, so the simulated rover stalls exactly where the planner says it cannot climb.
   - At 1 g the limit is about 37° (traction-bound). At 2.2 g it is 16.9° (torque-bound).
+- *Power and wind, decided on board.* `rover_health.PowerSaver` decides battery conservation from the rover's own solar and irradiance readings; `wind.py` estimates the wind from the drone's drift and sets its descent and feed-forward. Neither waits on the brain.
 - *Sensible when unsure (`agent_fsm.py`).* High uncertainty → CAUTION; tip (roll or pitch past the alarm angle), slip (wheel odometry vs. measured motion) or critical health → SAFE-HOLD. No safety reaction waits on the network.
 - *An advisory brain that knows its place* (`gemma_agent_brain.py`, `brain_bridge.py`, `fleet_brain_node.py`):
   - **Authority stays on board.** By the time an event reaches the brain, the FSM, A* and safety layer have already acted. `validate()` keeps an answer only if it makes things safer:
@@ -152,7 +168,7 @@ Weights are the official Agentverse 2026 Robotics Track ones.
 **Ambition & technical quality (15 %)**
 - Two simulator backends behind one topic contract (Gazebo Harmonic, and a numpy mock world rendered in worker processes), checked against each other by `check_topics.py`.
 - Everything runs on simulated time at a selectable speed.
-- 434 Python and 98 TypeScript unit tests. The end-to-end smoke test drives every injected change, the full rescue and the operator commands on both backends, with the live Gemma advisor.
+- 539 Python and 122 TypeScript unit tests. The end-to-end smoke test drives every injected change (including the pillar collapse and the dust storm), the full rescue and the operator commands on both backends, with the live Gemma advisor.
 
 **Pre-launch configuration and fog-of-war globe**
 - *Configuration:* sector size, gravity 1–3 g (feeds both the Gazebo `<gravity>` and the planner), fleet of 1–2 rovers + 0–1 drone (default 2 + 1), edge profile, simulator backend, seed, simulation speed, agent brain on/off (it warns when no API key is set).
@@ -215,8 +231,8 @@ Without Gazebo, `start_all.sh` warns and only the mock backend works. Without RO
 ## Testing
 
 ```bash
-python3 -m pytest -q                                   # 434 unit tests: autonomy, brain, sim, backend
-(cd web_ui && npm run typecheck && npm test)           # TypeScript + 98 vitest tests
+python3 -m pytest -q                                   # 539 unit tests: autonomy, brain, sim, backend
+(cd web_ui && npm run typecheck && npm test)           # TypeScript + 122 vitest tests
 python3 backend_bridge/scripts/smoke_test.py --backend mock     # end-to-end against a running backend
 python3 backend_bridge/scripts/smoke_test.py --backend gazebo
 python3 backend_bridge/scripts/smoke_test.py --backend gazebo --rovers 1 --speed 2   # 1 rover, 2× simulation speed
@@ -235,15 +251,26 @@ The smoke test drives the same REST and WebSocket traffic as the UI (default fle
    - Rover 1 `repaired` → `repair_complete` → both `resume`;
    - the world accepted the repair within 1.6 m, and both rovers are mapping again;
 7. operator commands: an unsafe one is rejected; a slow-down sets a cap of at most 0.2 m/s that the rover's planner reports as applied; a stop is decided immediately and the rover halts; *resume at full speed* clears the cap;
-8. the achieved real-time factor matches `--speed`, mission time follows simulated time, and a live speed change takes effect;
-9. unique trace ids;
-10. abort, with no simulator process left.
+8. Phase 3 (`--skip-phase3` leaves it out):
+   - pillar collapse → the world event, a `path_blocked` and a PILLAR detection on the fallen trunk's footprint (either order), a re-plan after that block, and a brain decision on the new hazard;
+   - dust storm → CAUTION with camera confidence below 0.5, measured solar power down ≥ 80 %, `power_save`, the drone's `wind_descent` and its measured AGL ≤ 9.5 m; once the dust falls, `power_restored`, `wind_clear` and fused navigation again;
+   - neither was read as critical damage;
+9. the achieved real-time factor matches `--speed`, mission time follows simulated time, and a live speed change takes effect;
+10. unique trace ids;
+11. abort, with no simulator process left.
 
 The brain checks pass whichever brain answered (Gemma, or the local rules with `--brain off`, no key or a rate limit). Each check says which brain decided, the model, the measured round-trip and the tokens.
 
 Timeouts are in simulated seconds: below 1× they are stretched to wall time.
 
 Latest runs (2 rovers + drone, 1×, with the live Gemma advisor):
+- **Gazebo 65/65 with Phase 3, after the docking and detour fixes below.** Pacing RTF 0.77.
+  - Pillar collapse → `path_blocked` (LiDAR) in 2.5 s, re-planned at once; the camera identified the PILLAR 5.0 m away after 3.2 s (confidence 0.90); Gemma's `SLOW_AND_REPLAN` (cap 0.44 m/s) on the block at 4.6 s, and on the identified pillar at 14.7 s, once the gap between hazard reviews had passed.
+  - Dust storm → CAUTION in 2.8 s with camera confidence 0.20; the rover's measured solar power fell 169 W → 25 W (−85 %), `power_save` after 5.0 s; the drone measured 13.3 m/s from 240° and began `wind_descent` after 7.8 s, down from 12.1 m to 9.4 m AGL after 9.6 s. After the storm: fused navigation after 10.6 s, `power_restored` after 16.1 s, `wind_clear` after 19.1 s.
+  - Rescue: the rescuer drove a 41 m route (shortened to 26 m by a re-plan on the grown map), started docking 2.8 m out after 110 s, docked at 1.44 m after 123 s, and both rovers were mapping again after 137 s. This run did not need the new detour fallback; that rule is covered by unit tests.
+  - Operator commands: the unsafe one was rejected in 2.1 s; the 0.20 m/s cap was applied; the stop was decided in 0.02 s and the rover halted 0.8 s later. 18 brain decisions (16 by Gemma), median round-trip 2.07 s.
+  - Local authority at work: in the storm, Gemma once answered `SLOW_AND_REPLAN` with a 2.76 m/s "cap", above the rover's 0.83 m/s limit. A brain cap only ever lowers the local speed, so it had no effect.
+- **Mock 64/64 with Phase 3** (Gazebo has one extra check: no fallback to mock), pacing RTF 0.98. Pillar → `path_blocked` in 1.6 s, PILLAR identified 5.7 m away after 1.9 s; storm → CAUTION in 1.8 s, `power_save` after 3.2 s (−86 % solar), `wind_descent` after 4.3 s at 11.3 m/s from 240°. Rescue docked at 1.44 m after 82 s on a camera + depth + LiDAR lock; both rovers mapping again after 92 s.
 - **Gazebo 49/50, after the core-escape fix below.** Every behaviour check passed; the pacing check failed at RTF 0.72 (see below).
   - The strike site left a single reachable stand-off cell, 46 m from the rescuer. It got there after 148 s, docked at 1.43 m after 162 s, and both rovers were mapping again after 173 s.
   - Operator commands: the unsafe one was rejected in 2.1 s; the 0.20 m/s cap was applied; the stop was decided in 0.01 s; *resume at full speed* → Gemma `SLOW_AND_REPLAN` at 0.83 m/s and the cap was lifted. 13 brain decisions (12 by Gemma), median round-trip 2.05 s.
@@ -270,6 +297,12 @@ When a check fails, the smoke test prints the rover's state, the world event and
 - **Mock only: a gentle stall read as a 263 g impact.** The pacer splits physics steps at sensor due times, so a step can last microseconds; backing into a rock zeroed the ground speed in one step, and the accelerometer read that velocity step divided by the step length. The health model wrote the rover off after an ordinary recovery reverse. The mock accelerometer now follows the stall through ≈ 50 ms of tyre compliance.
 - **A lost rescue re-plan.** `rescue_start` arrived 0.1 s after RESUMING's re-plan, and the 1 s re-plan rate limit dropped it, so the rescuer first drove its old frontier route away from its teammate. A request inside the gap is now held and served when the gap ends.
 - **A rescuer that slid into its own no-go zone.** When the strike landed, Rover 2 was itself recovering from a slip 1.3 m from the sector's south edge. It had reversed only 1.4 m up a 9° slope in 15 s and marked a 1 m zone. When it took the SOS, it turned in place on that slope at 2.2 g, skidded, and slid 1.5 m back downhill, wheels stopped, into the middle of its zone. A start inside a lethal core had no way out, so every retry ended in `rescue_noroute`. Now a robot standing on core cells may cross the blob it stands in, at most 3 m from where it is and at a high cost, so it leaves by the shortest way and never crosses any other obstacle. Those cells don't halt the route afterwards, and the escape is traced as `core_escape`.
+- **A rescuer that stopped 3.0 m short (mock).** The stand-off ring reaches 2.45 m from the damaged rover, and pursuit counts a goal as reached within 0.6 m, so the rescuer can stop up to 3.05 m out. Docking started only within 3.0 m. Rover 2 stopped 3.00 m away and re-planned the same 0.7 m route for 100 s, until the 150 s transit timeout. Docking now starts within 3.3 m, and a unit test ties that limit to the ring and the pursuit tolerance.
+- **A 100 m rescue detour.** On a quiet re-plan, 12 s into a 16 m rescue, the rescuer switched to a stand-off on the far side of its teammate without saying so. It drove a loop of more than 100 m and timed out. The near-side stand-offs had stopped routing at full 0.6 m clearance on the grown map, and the planner takes the first stand-off that routes, however long the way. Now a rescue route longer than 2.5 × the straight-line distance + 10 m is also planned at 0.3 m clearance (core hazards stay lethal), and the tight route is taken if it is at least 40 % shorter. A quiet re-plan that moves the stand-off more than 1.5 m is traced (`rescue_route`).
+- **A Gazebo pillar the camera called a boulder.** Gazebo's camera is gamma-encoded and renders brighter than the mock, so the trunk's median brightness read V 102–120, above the dark-basalt gate (89). The pillar now has the albedo of fresh basalt (≈ 0.08), which reads V ≈ 60 in Gazebo.
+- **LiDAR names the block before the camera names the pillar.** The LiDAR sees the trunk while it is still settling, so `path_blocked` comes first and cites only LiDAR. The camera's first PILLAR identification is now its own trace, `pillar_identified`. It goes to the brain as a new hazard; while the block's review holds the 10 s gap between hazard reviews, it waits and outranks any lower-priority event. The smoke test accepts the two in either order, as long as the PILLAR detection lies on the fallen trunk's footprint.
+- **Test only: a pillar behind the camera.** The route turned back right after the inject, so the camera faced away from the trunk. The smoke test now injects only when the route 8 m ahead lies within 25° of the heading.
+- **Test only: one failure taking later checks down.** Phase 3 used to run before the strike, and the fallen trunk plus storm clutter once left Rover 1 in a pocket the rescuer could not reach. Phase 3 now runs last. If a rescue does not finish, the operator commands and Phase 3 run on whichever rover is mapping, rather than on the one still waiting for help.
 - **Test only: a strike where no rescue was possible.** The smoke test struck Rover 1 wherever it happened to be. Once, that was a pocket enclosed by steep cells, rockslide boulders, hazard zones and the 3 m sector-edge band: no stand-off cell was reachable even at 0.3 m clearance out to 6 m, so `rescue_noroute` was the correct answer. The smoke test now decodes the live map and waits until a free stand-off 2.0–2.45 m from Rover 1 is reachable from Rover 2 before it strikes.
 
 ## Repository layout

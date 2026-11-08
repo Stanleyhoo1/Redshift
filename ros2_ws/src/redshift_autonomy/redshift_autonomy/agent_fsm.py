@@ -42,7 +42,8 @@ CORRIDOR_COOLDOWN_S = 3.0
 CRUMB_SPACING_M = 0.5
 # critical damage → SOS → rescue (docs/protocol.md §8.6)
 CRIT_HOLD_S = 1.0
-DOCK_START_M = 3.0             # stand-off reached (A* goal) within this centre distance → perception-guided docking
+DOCK_START_M = 3.3             # stand-off reached (A* goal) within this centre distance → perception-guided docking:
+                               # the stand-off ring reaches 2.45 m and pursuit stops within 0.6 m of it (≤ 3.05 m)
 DOCK_NEAR_M = 2.4              # ... or this close regardless of the path (the stand-off is 2.2 m out)
 DOCK_M = 1.45                  # docked: centre distance (the world accepts a repair within 1.6 m)
 DOCK_SCALE = 0.18              # ≈0.15 m/s at 2.2 g

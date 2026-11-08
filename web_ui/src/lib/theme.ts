@@ -2,6 +2,8 @@
 // Semantic colours sit on real spectral emission lines: Hβ 486 nm (info), O III 501 nm (nominal),
 // Na D 589 nm (caution), Hα 656 nm (critical). The planet itself lives at the red end.
 // Rescue sits at 555 nm, the peak of human photopic sensitivity: the hi-vis yellow-green of rescue gear.
+// Phase 3 hazards take the colour the operator then sees them in: the dust storm the orange-red of its haze
+// (sensor_effects STORM_RGB, lifted for text on the dark bays), the pillar the pink of its FALLEN PILLAR box.
 import type { BrainChipTone } from './brain'
 import type { Tone } from './sensors'
 import type { SensorTag, Severity } from './types'
@@ -24,6 +26,8 @@ export const C = {
   rust: '#b5482a',
   ochre: '#d39a4a',
   basalt: '#2a2326',
+  storm: '#ec6a3c',
+  pillar: '#ff78c8',
 } as const
 
 export const SEVERITY_COLOR: Record<Severity, string> = {
@@ -51,6 +55,7 @@ export const SENSOR_COLOR: Record<SensorTag, string> = {
 const GROUP_COLOR: Record<string, string> = {
   PWR: '#f2dc6b',
   ALT: '#c9b8ff',
+  WIND: '#9fd6f2',
 }
 
 export function sensorColor(tag: string): string {

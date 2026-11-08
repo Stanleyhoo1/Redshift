@@ -2,11 +2,20 @@
 """End-to-end smoke test of a running backend (the same REST + WebSocket traffic the web UI produces).
 
     python3 backend_bridge/scripts/smoke_test.py [--url http://127.0.0.1:8000] [--backend mock|gazebo] [--speed 1.0]
-                                                 [--brain on|off]
+                                                 [--brain on|off] [--skip-phase3]
 
 Deploys a mission, checks telemetry / camera / LiDAR / map streams and exploration progress, then runs the three
 unscripted changes (rockslide, dust anomaly, tip/slip jolt) and checks the agents' traced responses, and finally
 aborts and checks no simulator process is left. Exit code 0 = every check passed.
+
+Phase 3 (docs/protocol.md §10; --skip-phase3 leaves it out) follows the operator commands:
+- a basalt pillar topples across rover_0's path: the world event, then within 25 s a path_blocked that names the
+  pillar, or a path_blocked plus a PILLAR detection on the pillar's footprint (either order: LiDAR usually blocks
+  the route while the trunk is still falling); a re-plan after that block, and a novel_hazard brain decision;
+- a 45 s dust storm: CAUTION within 6 s with the camera confidence below 0.5, rover_0's measured solar power down
+  ≥ 80 % against its median just before, power_save; with a drone, wind_descent within 25 s and its measured AGL
+  ≤ 9.5 m within 35 s (injected only once the drone is above that). Once the dust level in mission.env falls,
+  power_restored, wind_clear and caution_exit; then nothing from either change was read as critical damage.
 
 The advisory brain (docs/protocol.md §9) is checked too: a novel_hazard decision after the rockslide, a
 critical_damage / peer_sos decision after the strike, and operator commands at the end (an unsafe one rejected, a
@@ -24,10 +33,13 @@ import argparse
 import asyncio
 import base64
 import json
+import math
+import statistics
 import subprocess
 import sys
 import time
 
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -42,6 +54,7 @@ from backend_bridge.mission_manager import CLEANUP_PATTERNS  # noqa: E402
 # what the rockslide raises on the rover (brain_bridge event mapping): its blocked path, or the hazard it marks
 ROCKSLIDE_TRIGGERS = ('path_blocked', 'hazard_marked')
 ROCKSLIDE_WORDS = ('obstacle', 'boulder', 'rockslide')
+PILLAR_WORDS = ('pillar', 'obstacle', 'boulder')     # a trigger text that names the fallen trunk (or its chunks)
 # FSM states whose drive is 'follow' along the planned path / 'dock' — the only drives a brain cap limits
 FOLLOW_STATES = ('EXPLORING', 'CAUTION', 'RESCUE_TRANSIT')
 DOCK_STATES = ('RESCUE_DOCKING',)
@@ -56,15 +69,26 @@ def first_decision(decisions, t_start: float, pred, slack: float = 0.0):
     return next(((rx, d) for rx, d in decisions if rx >= t_start - slack and pred(d)), None)
 
 
-def rockslide_decision(d: dict, rover: str) -> bool:
-    """A novel_hazard decision for `rover` that the rockslide raised: triggered by the blocked path or the marked
-    hazard, or whose trigger text names the obstacle — not some other hazard (a slope) that happened meanwhile."""
+def hazard_decision(d: dict, rover: str, words: tuple) -> bool:
+    """A novel_hazard decision for `rover` that an injected obstacle raised: triggered by the blocked path or the
+    marked hazard, or whose trigger text names the obstacle — not some other hazard (a slope) that happened
+    meanwhile."""
     if not isinstance(d, dict) or d.get('robot') != rover or d.get('event') != 'novel_hazard':
         return False
     if d.get('trigger') in ROCKSLIDE_TRIGGERS:
         return True
     text = str(d.get('trigger_input') or '').lower()
-    return any(w in text for w in ROCKSLIDE_WORDS)
+    return any(w in text for w in words)
+
+
+def rockslide_decision(d: dict, rover: str) -> bool:
+    """A novel_hazard decision for `rover` that the rockslide raised."""
+    return hazard_decision(d, rover, ROCKSLIDE_WORDS)
+
+
+def pillar_decision(d: dict, rover: str) -> bool:
+    """A novel_hazard decision for `rover` that the fallen pillar raised (same triggers as the rockslide's)."""
+    return hazard_decision(d, rover, PILLAR_WORDS)
 
 
 def drive_of(st: dict) -> tuple[bool, str]:
@@ -134,6 +158,189 @@ def rescue_room(cls: np.ndarray, meta: dict, target_xy, rescuer_xy) -> tuple[boo
     return reach > 0, f'{int(cand.sum())} free stand-off cells beside the target, {reach} reachable by the rescuer'
 
 
+# ---------------------------------------------------------------------------------------- phase 3: pillar and storm
+SERIES_LEN = 1800              # telemetry samples kept per followed reading: ≈ 2 min of the 15 Hz stream
+SOLAR_DROP_MIN = 0.80          # storm: the rover's measured solar power must fall at least this much (85 % modelled)
+SOLAR_BASELINE_MIN_W = 20.0    # a baseline below this is no sunlit reference to measure a drop against
+SOLAR_BEFORE_S = 5.0           # wall seconds of solar_w samples just before the storm: their median is the baseline
+SOLAR_AFTER_S = 1.5            # wall seconds of the latest samples whose median is compared with it
+STORM_PEAK_MIN = 0.5           # mission.env dust level the storm must reach before its end can be read
+STORM_FALL_FRAC = 0.9          # the storm is clearing once the level falls below this fraction of its peak
+STORM_CLEAR_LEVEL = 0.02       # mission.env dust level below which sensor_effects passes the raw streams through
+STORM_CAM_MAX = 0.5            # storm: the rover's camera confidence must fall below this
+DRONE_AGL_MAX = 9.5            # storm: the drone's measured AGL must come down to this (wind descent 12 → 8 m)
+STORM_S = 45.0                 # /api/inject/storm's default duration (sim s); the anomaly event's echo overrides it
+# timeouts, simulated seconds (stretched to wall time below 1×, like every other timeout here)
+PILLAR_EVENT_S = 12.0          # near its goal the world holds the pillar ≤ 8 s for the rover's next route
+PILLAR_BLOCK_S = 25.0          # the injection → path_blocked naming the pillar, or a PILLAR detection
+PILLAR_REPLAN_S = 20.0         # that block → replanned (as for the rockslide)
+PILLAR_FOOTPRINT_M = 2.5       # a PILLAR detection's world_xy this close to the base → tip segment is the fallen trunk
+PILLAR_AHEAD_M, PILLAR_VIEW_DEG = 8.0, 25.0   # inject once the route 8 m on lies in the camera's view (hfov 80°)
+PILLAR_AIM_S = 60.0            # ... waiting at most this long for that (then inject anyway, and say so)
+PILLAR_BRAIN_S = 35.0          # the injection → the novel_hazard decision: the block ≤ 25 s plus a cloud round-trip
+STORM_CAUTION_S = 6.0          # the injection → caution_enter with the camera confidence below STORM_CAM_MAX
+STORM_SOLAR_S = 10.0           # the injection → solar_w down: 1.5 s ramp, then hw_status and agent_state at 5 Hz
+STORM_POWER_S = 12.0           # the injection → power_save: PowerSaver enters after 2 s below irradiance 0.35
+WIND_DESCENT_S = 25.0          # the injection → the drone's wind_descent trace
+DRONE_AGL_S = 35.0             # the injection → the drone's measured AGL ≤ DRONE_AGL_MAX
+STORM_CLEAR_S = 30.0           # the storm's end → power_restored (5 s dwell), wind_clear (5 s), caution_exit
+STORM_OVER_S = 20.0            # then at most this long for the air to clear and every rover to leave CAUTION
+
+
+def telemetry_values(st: dict) -> dict:
+    """The readings the Phase 3 checks follow over time, from one WS telemetry robots.<r> entry: the measured solar
+    power (health, from hw_status), camera confidence, the drone's AGL and its own wind estimate (None = absent)."""
+    return {'solar_w': _num((st.get('health') or {}).get('solar_w')),
+            'camera_conf': _num((st.get('uncertainty') or {}).get('camera_conf')),
+            'altitude_agl': _num(st.get('altitude_agl')), 'wind_mps': _num(st.get('wind_mps'))}
+
+
+def values_since(series, t0: float, t1: float = math.inf) -> list:
+    """Values of (wall epoch, value) samples with t0 ≤ t < t1."""
+    return [v for t, v in series if t0 <= t < t1]
+
+
+def median(xs) -> float | None:
+    return statistics.median(xs) if xs else None
+
+
+def first_at_most(series, t0: float, limit: float):
+    """First (wall epoch, value) sample since t0 whose value is ≤ limit, else None."""
+    return next(((t, v) for t, v in series if t >= t0 and v <= limit), None)
+
+
+def remaining(t0: float, timeout: float, now: float) -> float:
+    """Wall seconds left of a timeout that started at t0 (several checks share one deadline from an injection)."""
+    return max(0.0, t0 + timeout - now)
+
+
+def solar_drop(before: list, after: list) -> tuple[float | None, str]:
+    """Fractional drop of the rover's measured solar power, median against median: the panel's attitude swings a
+    single sample by ±20 % as the rover drives. (None, why) without samples or without a sunlit baseline."""
+    b, a = median(before), median(after)
+    if b is None:
+        return None, 'no solar_w samples just before the storm'
+    if b < SOLAR_BASELINE_MIN_W:
+        return None, f'baseline only {b:.0f} W (< {SOLAR_BASELINE_MIN_W:.0f} W): no sunlit reference'
+    if a is None:
+        return None, f'{b:.0f} W before, no samples since'
+    drop = 1.0 - a / b
+    return drop, f'{b:.0f} W → {a:.0f} W ({-100 * drop:+.0f} %, medians of {len(before)} / {len(after)} samples)'
+
+
+def storm_end(levels, t0: float) -> float | None:
+    """Wall time the storm began to clear, from (wall epoch, mission.env.dust_level) samples: the first one since t0
+    below STORM_FALL_FRAC of the running peak once that peak has reached STORM_PEAK_MIN; None while it lasts."""
+    peak = 0.0
+    for t, v in levels:
+        if t < t0:
+            continue
+        if peak >= STORM_PEAK_MIN and v < STORM_FALL_FRAC * peak:
+            return t
+        peak = max(peak, v)
+    return None
+
+
+def first_sighting(frames, cls: str, t0: float, where=None):
+    """First (wall epoch, detection) of class `cls` in (wall epoch, telemetry detections) frames since t0 (and, with
+    `where`, for which where(detection) holds)."""
+    for t, dets in frames:
+        if t >= t0:
+            hit = next((d for d in dets if isinstance(d, dict) and d.get('cls') == cls
+                        and (where is None or where(d))), None)
+            if hit is not None:
+                return t, hit
+    return None
+
+
+def class_counts(frames, t0: float) -> dict:
+    """How many telemetry frames since t0 carried each detection class (for the failure report)."""
+    out: dict = {}
+    for t, dets in frames:
+        if t >= t0:
+            for c in {d.get('cls') for d in dets if isinstance(d, dict) and isinstance(d.get('cls'), str)}:
+                out[c] = out.get(c, 0) + 1
+    return out
+
+
+def names_pillar(tr: dict | None) -> bool:
+    return 'pillar' in str((tr or {}).get('input') or '').lower()
+
+
+def pillar_block(traces, rover: str, t0: float, slack: float = 0.5) -> dict | None:
+    """The rover's path_blocked trace since t0 that names the pillar, else its first path_blocked since t0."""
+    blocked = [tr for tr in traces if tr.get('robot') == rover and tr.get('kind') == 'path_blocked'
+               and tr.get('t', 0) >= t0 - slack]
+    return next((tr for tr in blocked if names_pillar(tr)), blocked[0] if blocked else None)
+
+
+def route_ahead(path, pose: dict, along_m: float = PILLAR_AHEAD_M, fov_deg: float = PILLAR_VIEW_DEG) -> bool:
+    """Does the route point along_m along the planned path lie in front of the rover's camera: within fov_deg of its
+    heading and at least 0.8 · along_m away in a straight line (a route that turns back first does not count)?"""
+    try:
+        x0, y0, yaw = float(pose['x']), float(pose['y']), float(pose['yaw'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    acc, (px, py) = 0.0, (x0, y0)
+    for q in path or ():
+        acc += math.hypot(q[0] - px, q[1] - py)
+        px, py = q[0], q[1]
+        if acc >= along_m:
+            off = (math.atan2(py - y0, px - x0) - yaw + math.pi) % (2 * math.pi) - math.pi
+            return abs(math.degrees(off)) <= fov_deg and math.hypot(px - x0, py - y0) >= 0.8 * along_m
+    return False
+
+
+def on_footprint(xy, ev: dict, tol_m: float = PILLAR_FOOTPRINT_M) -> bool:
+    """Is world point xy within tol_m of the fallen pillar's footprint (the event's base → tip segment)?"""
+    try:
+        (px, py), (ax, ay), (bx, by) = xy, ev['base'], ev['tip']
+    except (KeyError, TypeError, ValueError):
+        return False
+    dx, dy = bx - ax, by - ay
+    u = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / max(dx * dx + dy * dy, 1e-9)))
+    return math.hypot(px - (ax + u * dx), py - (ay + u * dy)) <= tol_m
+
+
+def pillar_verdict(blocked: dict | None, sighting, t0: float) -> tuple[bool, str]:
+    """The pillar is perceived when it blocks the path and the camera identifies it: a path_blocked trace that names
+    it ("camera confirms a fallen pillar"), or a path_blocked since the injection plus a PILLAR detection on the
+    pillar's footprint since then, in either order (LiDAR usually blocks the route while the trunk is still falling,
+    the camera names it a moment later). A sighting without a block, or a block nobody identified, is not enough.
+    (ok, detail)."""
+    blk = f"path_blocked {blocked['t'] - t0:.1f} s: {blocked.get('input')}" if blocked else 'no path_blocked'
+    det = None
+    if sighting is not None:
+        ts, d = sighting
+        det = f"PILLAR identified {ts - t0:.1f} s at {d.get('range_m')} m (conf {d.get('conf')})"
+    if names_pillar(blocked):
+        return True, blk + (f'; {det}' if det else '')
+    if det is None:
+        return False, (f"path_blocked {blocked['t'] - t0:.1f} s without naming the pillar: {blocked.get('input')}"
+                       if blocked else 'no path_blocked') + '; no PILLAR detection on its footprint since the inject'
+    if blocked is None:
+        return False, f'{det}; but no path_blocked since the inject'
+    first, then = (blk, det) if blocked['t'] <= ts else (det, blk)
+    return True, f'{first}; {then}'
+
+
+def descent_verdict(agl0, hit, t0: float, limit: float) -> tuple[bool, str]:
+    """The drone came down to ≤ limit from above it: one already that low at the injection shows no descent.
+    hit = the first (wall epoch, AGL) ≤ limit since t0, or None. (ok, detail)."""
+    if not isinstance(agl0, (int, float)) or agl0 <= limit:
+        return False, f'AGL {agl0} m at the inject, not above {limit} m: no descent to show'
+    if hit is None:
+        return False, f'AGL {agl0:.1f} m at the inject, never ≤ {limit} m since'
+    return True, f'{hit[0] - t0:.1f} s: {agl0:.1f} → {hit[1]:.1f} m AGL'
+
+
+def path_distance(pt, path) -> float | None:
+    """Planar distance from pt to the nearest point of a [[x, y], …] path (None without either)."""
+    if not pt or not path:
+        return None
+    return min(math.hypot(pt[0] - q[0], pt[1] - q[1]) for q in path)
+
+
 class Stream:
     def __init__(self):
         self.status: dict = {}
@@ -148,6 +355,23 @@ class Stream:
         self._last_sample = 0.0
         self.last_map: dict | None = None
         self._map_snaps = 0
+        self.series: dict = {}            # (robot | 'env', reading) → (wall epoch, value) per telemetry frame
+        self.dets: dict = {}              # robot → (wall epoch, compact detections) per frame that carried any
+
+    def _push(self, key: tuple, t: float, v):
+        if v is not None:
+            self.series.setdefault(key, deque(maxlen=SERIES_LEN)).append((t, v))
+
+    def _record(self, msg: dict):
+        """Follow the readings a single telemetry frame cannot show: a drop, a sighting, the storm's end."""
+        t = time.time()
+        self._push(('env', 'dust_level'), t, _num(((msg.get('mission') or {}).get('env') or {}).get('dust_level')))
+        for r, st in (msg.get('robots') or {}).items():
+            for key, v in telemetry_values(st).items():
+                self._push((r, key), t, v)
+            dets = st.get('detections')
+            if isinstance(dets, list) and dets:
+                self.dets.setdefault(r, deque(maxlen=SERIES_LEN)).append((t, dets))
 
     def map_snapshot(self, why: str):
         """Into the timeline: the latest planet map layers (R elevation, G class × 40, B reveal age) with meta."""
@@ -167,10 +391,12 @@ class Stream:
             robots[r] = {'state': st.get('state'), 'xy': [p.get('x'), p.get('y')], 'yaw': p.get('yaw'),
                          'rescue': st.get('rescue'), 'health': (st.get('health') or {}).get('pct'),
                          'goal': st.get('goal'), 'sensors': st.get('sensors'), 'brain_cap': st.get('brain_cap'),
-                         'brain_agl': st.get('brain_agl')}
+                         'brain_agl': st.get('brain_agl'), 'mode': st.get('mode'),
+                         'solar_w': (st.get('health') or {}).get('solar_w'), 'power_save': st.get('power_save'),
+                         'wind_mps': st.get('wind_mps'), 'wind_descent': st.get('wind_descent')}
         m = msg.get('mission') or {}
         self.timeline.append({'w': w, 'type': 'sample', 'sim_t': m.get('sim_time_s'), 'rtf': m.get('rtf'),
-                              'robots': robots, 'brain': m.get('brain')})
+                              'robots': robots, 'brain': m.get('brain'), 'env': m.get('env')})
 
     def feed(self, msg: dict):
         t = msg.get('type')
@@ -182,13 +408,15 @@ class Stream:
             self.status = msg
         elif t == 'telemetry':
             self.telemetry = msg
+            self._record(msg)
             self._sample(msg)
         elif t == 'trace':
             self.traces.append(msg['entry'])
             self.timeline.append({'w': time.monotonic(), 'type': 'trace', 'entry': msg['entry']})
-            if msg['entry'].get('kind') == 'rescue_noroute' and self._map_snaps < 3:
-                self._map_snaps += 1
-                self.map_snapshot('rescue_noroute')
+            kind = msg['entry'].get('kind')
+            if kind in ('rescue_start', 'rescue_abort') or (kind == 'rescue_noroute' and self._map_snaps < 3):
+                self._map_snaps += kind == 'rescue_noroute'
+                self.map_snapshot(kind)              # the map a rescue planned on / gave up on, for a replay
         elif t == 'event':
             self.events.append(msg['event'])
             self.timeline.append({'w': time.monotonic(), 'type': 'event', 'event': msg['event']})
@@ -297,6 +525,15 @@ class Smoke:
                                 'status': r.status_code, 'response': body})
         return (body.get('id') if r.status_code == 200 and body.get('ok') else None), t, (r.status_code, body)
 
+    async def mapping_rover(self, rovers: list, states: tuple, k: float, what: str) -> str:
+        """The first rover (rover_0 first) in one of `states` within 30 s, else rover_0: a rescue that did not finish
+        must not take the later checks down with it."""
+        x, _ = await self.wait(lambda: next((r for r in rovers if self.robot(r).get('state') in states), None), 30 * k)
+        x = x or rovers[0]
+        if x != rovers[0]:
+            print(f'  [INFO] {what} on {x}: {rovers[0]} is {self.robot(rovers[0]).get("state")}', flush=True)
+        return x
+
     async def operator_sequence(self, rover: str, k: float):
         """Operator commands through the advisory brain: unsafe → rejected, slow-down → capped, stop → immediate."""
         await self.wait(lambda: self.robot(rover).get('state') in ('EXPLORING', 'CAUTION', 'REPLANNING'), 20 * k)
@@ -348,7 +585,7 @@ class Smoke:
         cleared = operator_cap_cleared(self.robot(rover))
         if hit and not cleared:                                  # 5 Hz agent_state lag
             cleared = bool((await self.wait(lambda: operator_cap_cleared(self.robot(rover)), 3 * k))[0])
-        print(f'  [INFO] operator: "resume at full speed" → '
+        print('  [INFO] operator: "resume at full speed" → '
               + (self.brain_desc(hit[1]) if hit else f'no decision within {10 * k:.0f} s (POST → {resp})')
               + f"; {rover} operator cap " + ('cleared' if cleared else 'still set')
               + f" (brain_cap={self.robot(rover).get('brain_cap')})", flush=True)
@@ -428,6 +665,176 @@ class Smoke:
                    f"{target} {self.robot(target).get('state')} health {h.get('pct')}%, "
                    f"{rescuer} {self.robot(rescuer).get('state')}")
 
+    # ------------------------------------------------------------------ phase 3: pillar collapse, dust storm
+    def env(self) -> dict:
+        return self.mission().get('env') or {}
+
+    async def wait_by(self, pred, t0: float, timeout: float, poll: float = 0.1):
+        """wait() against the deadline t0 + timeout (wall) that several checks of one injection share; pred is tried
+        at least once more, so a check whose budget an earlier one used up still sees what has already happened."""
+        v, _ = await self.wait(pred, remaining(t0, timeout, time.time()), poll)
+        return v if v else pred()
+
+    def robot_diag(self, t: float, robot: str, n: int = 10) -> str:
+        """A robot's state now, the environment, and its last n trace kinds since t (the failure report)."""
+        st = self.robot(robot)
+        h = st.get('health') or {}
+        if robot.startswith('scout'):
+            now = (f"state={st.get('state')} AGL={st.get('altitude_agl')} wind_mps={st.get('wind_mps')} "
+                   f"wind_descent={st.get('wind_descent')} brain_agl={st.get('brain_agl')}")
+        else:
+            now = (f"state={st.get('state')} mode={st.get('mode')} uncertainty={st.get('uncertainty')} "
+                   f"power_save={st.get('power_save')} solar_w={h.get('solar_w')} battery={h.get('battery_pct')}%")
+        kinds = [f"{x['kind']}@{x.get('state')}" for x in self.s.traces if x['robot'] == robot and x['t'] >= t - 0.5]
+        return f'now {now}; env={self.env()}; {robot} traces since (last {n}): {kinds[-n:]}'
+
+    def pillar_event(self, t: float) -> dict | None:
+        return next((e for e in self.s.events if e.get('op') == 'pillar_collapse' and e.get('t', 0) >= t - 1), None)
+
+    def pillar_diag(self, t: float, rover: str, before: dict) -> str:
+        """Why the pillar was not perceived: rover state/path at injection, where the pillar fell, what the rover's
+        perception reported and what it traced since."""
+        pose, path = before.get('pose') or {}, before.get('path') or []
+        ev = self.pillar_event(t) or {}
+        near = path_distance(ev.get('cross'), path)
+        since = [f"{tr['kind']}@{tr.get('state')}" for tr in self.s.traces
+                 if tr['robot'] == rover and tr['t'] >= t - 0.5]
+        return (f"at inject: state={before.get('state')} path_pts={len(path)} pose=({pose.get('x', 0):.1f},"
+                f"{pose.get('y', 0):.1f}); pillar base={ev.get('base')} tip={ev.get('tip')} cross={ev.get('cross')} "
+                f"({'?' if near is None else f'{near:.1f}'} m from the path), held {ev.get('waited_s')} s; "
+                f"detections since (frames per class): {class_counts(self.s.dets.get(rover, ()), t) or 'none'}; "
+                f"now state={self.robot(rover).get('state')}; traces since: {since[:8]}")
+
+    async def pillar_sequence(self, rover: str, k: float):
+        """A basalt pillar topples across the rover's planned path: perceived (camera / depth / LiDAR), the path
+        blocked and re-planned around it, and a brain decision on the new hazard."""
+        # "as the rover approaches": inject when the route ahead is in the camera's view, not behind a turn
+        aimed, _ = await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING'
+                                   and route_ahead(self.robot(rover).get('path'), self.robot(rover).get('pose')),
+                                   PILLAR_AIM_S * k)
+        if not aimed:
+            print(f'  [INFO] pillar: no route ahead in the camera view within {PILLAR_AIM_S:.0f} s; injecting anyway',
+                  flush=True)
+        before = self.robot(rover)
+        t = time.time()
+        r = (await self.http.post('/api/inject/pillar', json={'robot': rover})).json()
+        self.check('pillar collapse injected', r.get('ok'), r.get('detail', ''))
+        ev, dt = await self.wait(lambda: self.pillar_event(t), PILLAR_EVENT_S * k)
+        ok = bool(ev and ev.get('ok'))
+        held = _num((ev or {}).get('waited_s'))
+        self.check('pillar_collapse world event', ok,
+                   f"{dt:.1f} s: base {ev.get('base')} → tip {ev.get('tip')}, across the route at {ev.get('cross')}"
+                   + (f' (held {held:.1f} s for the next route)' if held else '') if ok else
+                   f"{(ev or {}).get('detail', 'no event')}; {self.pillar_diag(t, rover, before)}")
+        if not ok:                       # no pillar in the world: nothing to perceive, re-plan or advise on
+            return
+        seen: dict = {'tr': None, 'det': None}
+
+        def perceived():                 # the block naming the pillar, or a block and a PILLAR sighting on its footprint
+            seen['det'] = first_sighting(self.s.dets.get(rover, ()), 'PILLAR', t,
+                                         where=lambda d: on_footprint(d.get('world_xy'), ev))
+            seen['tr'] = pillar_block(self.s.traces, rover, t)
+            return pillar_verdict(seen['tr'], seen['det'], t)[0]
+        await self.wait_by(perceived, t, PILLAR_BLOCK_S * k)
+        ok, why = pillar_verdict(seen['tr'], seen['det'], t)
+        self.check('pillar perceived → path_blocked', ok, why if ok else f'{why}; {self.pillar_diag(t, rover, before)}')
+        if not ok:                       # a re-plan with no pillar block to answer would prove nothing
+            self.check('pillar: re-planned route', False, 'no path_blocked caused by the pillar to re-plan from')
+        else:
+            t_blk = seen['tr']['t']
+            tr, _ = await self.wait(lambda: self.trace_after(t_blk, rover, ('replanned',)), PILLAR_REPLAN_S * k)
+            self.check('pillar: re-planned route', tr is not None,
+                       f"{tr['t'] - t_blk:.1f} s after the block ({tr['t'] - t:.1f} s): {tr['action']}" if tr
+                       else self.robot_diag(t, rover))
+        # only decisions received after the injection whose trigger is the fallen pillar itself
+        hit = await self.wait_brain(t, lambda d: pillar_decision(d, rover), PILLAR_BRAIN_S * k, slack=0.0)
+        other = [f"{d.get('trigger')}: {str(d.get('trigger_input') or '')[:50]}" for rx, d in self.s.brain
+                 if rx >= t and d.get('robot') == rover and d.get('event') == 'novel_hazard']
+        self.check('brain: novel_hazard decision after the pillar collapse', bool(hit),
+                   f"{hit[0] - t:.1f} s, trigger {hit[1].get('trigger')}: {self.brain_desc(hit[1])}" if hit else
+                   f'novel_hazard decisions for {rover} since the injection, by trigger: {other or "none"}; '
+                   + self.brain_recent())
+
+    async def storm_sequence(self, rover: str, drone: str | None, rovers: list, k: float):
+        """A dust storm (solar blackout + high wind) that each robot infers from its own sensors: CAUTION from the
+        camera's confidence, battery conservation from the measured solar power, the drone's descent from its own
+        drift; then every one of them undone once the storm has passed."""
+        await self.wait(lambda: self.robot(rover).get('state') == 'EXPLORING', 30 * k)
+        if drone:                        # inject at survey altitude, so the descent has somewhere to come down from
+            await self.wait(lambda: (_num(self.robot(drone).get('altitude_agl')) or 0.0) > DRONE_AGL_MAX + 1.0, 30 * k)
+        agl0 = _num(self.robot(drone).get('altitude_agl')) if drone else None
+        t = time.time()
+        before = values_since(self.s.series.get((rover, 'solar_w'), ()), t - SOLAR_BEFORE_S, t)
+        r = (await self.http.post('/api/inject/storm', json={})).json()
+        self.check('storm injected', r.get('ok'), r.get('detail', ''))
+
+        def echo() -> dict:              # the anomaly event: kind, wind and how long the world will blow
+            return next((e for e in self.s.events if e.get('op') == 'anomaly' and e.get('t', 0) >= t - 1), {})
+        # 1. CAUTION on the camera's own confidence, which the orange-red haze drives below 0.5
+        cam: dict = {'min': None}
+
+        def caution():
+            c = values_since(self.s.series.get((rover, 'camera_conf'), ()), t)
+            cam['min'] = min(c) if c else None
+            tr = self.trace_after(t, rover, ('caution_enter',))
+            return tr if tr and cam['min'] is not None and cam['min'] < STORM_CAM_MAX else None
+        tr = await self.wait_by(caution, t, STORM_CAUTION_S * k)
+        entered = self.trace_after(t, rover, ('caution_enter',))
+        self.check(f'storm → CAUTION ≤ {STORM_CAUTION_S:.0f} s, camera confidence < {STORM_CAM_MAX}', tr is not None,
+                   f"{tr['t'] - t:.1f} s: {tr['input']}; camera confidence min {cam['min']:.2f}, "
+                   f"mode {self.robot(rover).get('mode')}" if tr else
+                   f"caution_enter {'%.1f s' % (entered['t'] - t) if entered else 'not traced'}, camera confidence "
+                   f"min since the inject {cam['min']}; storm event {echo() or 'none'}; {self.robot_diag(t, rover)}")
+        # 2. the rover's measured solar power (hw_status → health.solar_w), median just before vs the latest samples
+        sol: dict = {'v': (None, 'no samples yet')}
+
+        def dropped():
+            after = values_since(self.s.series.get((rover, 'solar_w'), ()), max(t, time.time() - SOLAR_AFTER_S))
+            sol['v'] = solar_drop(before, after)
+            return sol['v'][0] is not None and sol['v'][0] >= SOLAR_DROP_MIN
+        ok = await self.wait_by(dropped, t, STORM_SOLAR_S * k)
+        self.check(f'storm: {rover} measured solar power drops ≥ {100 * SOLAR_DROP_MIN:.0f} %', bool(ok),
+                   f"{time.time() - t:.1f} s: {sol['v'][1]}" + ('' if ok else f'; {self.robot_diag(t, rover)}'))
+        # 3. battery conservation, from the same power readings
+        tr = await self.wait_by(lambda: self.trace_after(t, rover, ('power_save',)), t, STORM_POWER_S * k)
+        self.check(f'storm: {rover} power_save (battery conservation)', tr is not None,
+                   f"{tr['t'] - t:.1f} s: {tr['input']} → {tr['action']}" if tr else self.robot_diag(t, rover))
+        # 4. the drone estimates the wind from its own drift and comes down by itself
+        if drone:
+            tr = await self.wait_by(lambda: self.trace_after(t, drone, ('wind_descent',)), t, WIND_DESCENT_S * k)
+            self.check(f'storm: drone wind_descent ≤ {WIND_DESCENT_S:.0f} s', tr is not None,
+                       f"{tr['t'] - t:.1f} s: {tr['input']} → {tr['action']}" if tr else
+                       f'storm event {echo() or "none"}; {self.robot_diag(t, drone)}')
+            hit = await self.wait_by(lambda: first_at_most(self.s.series.get((drone, 'altitude_agl'), ()), t,
+                                                           DRONE_AGL_MAX), t, DRONE_AGL_S * k)
+            ok, why = descent_verdict(agl0, hit, t, DRONE_AGL_MAX)
+            self.check(f'storm: drone AGL ≤ {DRONE_AGL_MAX} m ≤ {DRONE_AGL_S:.0f} s', ok,
+                       why if ok else f'{why}; {self.robot_diag(t, drone)}')
+        # 5. after the storm (its end read from the falling dust level, so the checks follow the simulated storm
+        #    however the simulation is paced), everything is undone before the next change starts
+        dur = _num(echo().get('duration_s')) or STORM_S
+        end = await self.wait_by(lambda: storm_end(self.s.series.get(('env', 'dust_level'), ()), t), t,
+                                 (2 * dur + 15) * k, poll=0.25)
+        t_from, t_dl = (end, end) if end is not None else (t, time.time())
+        since = 'after the storm' if end is not None else 'after the inject (no storm end seen in mission.env)'
+        chain = [(rover, 'power_restored', f'storm clears: {rover} power_restored')]
+        chain += [(drone, 'wind_clear', 'storm clears: drone wind_clear')] if drone else []
+        chain += [(rover, 'caution_exit', 'storm clears → fused navigation restored')]
+        for robot, kind, name in chain:
+            tr = await self.wait_by(lambda robot=robot, kind=kind: self.trace_after(t_from, robot, (kind,)),
+                                    t_dl, STORM_CLEAR_S * k)
+            self.check(name, tr is not None, f"{tr['t'] - t_from:.1f} s {since}: {tr['input']}" if tr else
+                       f'{time.time() - t_from:.1f} s {since}: {self.robot_diag(t, robot)}')
+
+        def over():                      # the speed change and the pacing check must not run in the storm's tail
+            return (_num(self.env().get('dust_level')) or 0.0) <= STORM_CLEAR_LEVEL and all(
+                self.robot(x).get('state') != 'CAUTION' and self.robot(x).get('mode') != 'LIDAR_ONLY' for x in rovers)
+        ok, dt = await self.wait(over, STORM_OVER_S * k)
+        print('  [INFO] storm over: ' + (f'air clear and no rover in CAUTION ({dt:.1f} s after the checks)' if ok else
+              f"still not clear after {dt:.0f} s: env={self.env()}, "
+              + ', '.join(f"{x} {self.robot(x).get('state')}/{self.robot(x).get('mode')}" for x in rovers)
+              + '; going on anyway'), flush=True)
+
     def mission(self) -> dict:
         return (self.s.telemetry or {}).get('mission') or {}
 
@@ -442,7 +849,7 @@ class Smoke:
         return seen['rtf']
 
     async def run(self, backend: str, sector: str, rover: str = 'rover_0', speed: float = 1.0, rovers: int = 2,
-                  brain: bool = True) -> bool:
+                  brain: bool = True, phase3: bool = True) -> bool:
         print(f'Redshift smoke test against {self.url} (backend={backend}, sector={sector}, speed={speed:g}×, '
               f'brain={"on" if brain else "off"})', flush=True)
         k = 1.0 / min(speed, 1.0)            # stretch simulated-time timeouts to wall time below 1×
@@ -570,7 +977,23 @@ class Smoke:
                 await self.rescue_sequence('rover_0', 'rover_1', k)
 
             # ---- operator commands through the advisory brain (after the rescue / the tip recovery)
-            await self.operator_sequence('rover_0', k)
+            rovers = [x for x in robots if x.startswith('rover')]
+            await self.operator_sequence(await self.mapping_rover(rovers, ('EXPLORING', 'CAUTION', 'REPLANNING'), k,
+                                                                  'Operator commands'), k)
+
+            # ---- Phase 3 unscripted changes: a pillar topples across the path, then a dust storm (solar blackout +
+            #      high wind). They come last: a fallen trunk plus a storm can leave rover_0 in a pocket no rescuer
+            #      can reach, which would test the strike site rather than the rescue.
+            if phase3:
+                t3 = time.time()
+                p3 = await self.mapping_rover(rovers, ('EXPLORING',), k, 'Phase 3')
+                await self.pillar_sequence(p3, k)
+                await self.storm_sequence(p3, next((x for x in robots if x.startswith('scout')), None), rovers, k)
+                late = [tr for tr in self.s.traces if tr['kind'] in ('critical_damage', 'sos') and tr['t'] >= t3 - 0.5]
+                self.check('no critical damage from the pillar or the storm', not late,
+                           '; '.join(f"{tr['robot']} {tr['state']} {tr['kind']}: {tr['input'][:80]}" for tr in late[:3]))
+            else:
+                print('  [INFO] Phase 3 checks (pillar collapse, dust storm) skipped (--skip-phase3)', flush=True)
 
             # ---- live speed change mid-mission
             alt = 0.5 * speed if speed > 0.75 else 2.0 * speed     # a target every backend can reach (mock ≈ 1.1× max)
@@ -614,10 +1037,13 @@ def main():
     ap.add_argument('--dump', type=Path, metavar='JSONL',
                     help='write every trace, event and brain decision plus 1 Hz per-robot pose / state samples here '
                          '(for post-mortems)')
+    ap.add_argument('--skip-phase3', action='store_true',
+                    help='skip the Phase 3 changes (pillar collapse, dust storm with solar blackout and high wind)')
     a = ap.parse_args()
     smoke = Smoke(a.url)
     try:
-        ok = asyncio.run(smoke.run(a.backend, a.sector, speed=a.speed, rovers=a.rovers, brain=a.brain == 'on'))
+        ok = asyncio.run(smoke.run(a.backend, a.sector, speed=a.speed, rovers=a.rovers, brain=a.brain == 'on',
+                                   phase3=not a.skip_phase3))
     finally:
         if a.dump:
             smoke.s.map_snapshot('end')

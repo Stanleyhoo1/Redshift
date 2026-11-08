@@ -26,6 +26,7 @@ from .vision import (CLEAR_AIR_LIDAR, CameraModel, ImageQualityBaseline, LidarBa
 
 TEAMMATE_MAX_M = 25.0
 TEAMMATE_FRESH_S = 1.0
+OBSTACLE_CLASSES = ('ROCK', 'PILLAR')      # obstacle bumps a teammate's chassis could be mistaken for
 
 
 class Perception(Node):
@@ -222,8 +223,9 @@ class Perception(Node):
             pitch = math.pi / 2
             cam_h = scout_h if scout_h and scout_h > 0.5 else 12.0
         if self.rtype == 'rover':
-            kw = {'max_range': 15.0}
-        else:   # nadir view: rocks + science only, terrain undulation removed (~3 m high-pass)
+            kw = {'max_range': 15.0}          # default classes, PILLAR included
+        else:   # nadir view: rocks + science only, terrain undulation removed (~3 m high-pass). No PILLAR: its
+            # extent / height test needs a forward view (from overhead a fallen trunk is reported as ROCK)
             px_m = cam_h / cam.fx * (cam.width / d_small.shape[1])     # ground metres per depth pixel
             kw = {'max_range': 40.0, 'classes': ('ROCK', 'SCIENCE') if cam_h > 3.0 else (), 'rock_h': 0.3,
                   'tophat_px': int(np.clip(1.6 / max(px_m, 1e-3), 2, 15)),      # ~1.6 m radius kernel
@@ -234,12 +236,13 @@ class Perception(Node):
             cam_xyz = (self.spec.get('camera_xyz', [0.45, 0.0, 0.5]) if self.rtype == 'rover'
                        else self.spec.get('camera_xyz', [0.0, 0.0, -0.08]))
             mates = self.teammates(cam, depth, pitch, cam_xyz, now)
-            if mates:      # a teammate's chassis is not a boulder: drop rock boxes centred inside a teammate box
+            if mates:      # a teammate's chassis is not an obstacle: drop rock / pillar boxes centred inside its box
                 def inside(d, m):
                     x, y, w, h = d.bbox
                     mx, my, mw, mh = m.bbox
                     return mx <= x + w / 2 <= mx + mw and my <= y + h / 2 <= my + mh
-                dets = mates + [d for d in dets if not (d.cls == 'ROCK' and any(inside(d, m) for m in mates))]
+                dets = mates + [d for d in dets
+                                if not (d.cls in OBSTACLE_CLASSES and any(inside(d, m) for m in mates))]
         st['detect'] = (time.perf_counter() - t1) * 1000
         st['lidar'] = getattr(self, '_lidar_ms', 0.0)
 

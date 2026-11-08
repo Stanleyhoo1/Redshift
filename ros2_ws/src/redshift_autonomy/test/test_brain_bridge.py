@@ -44,7 +44,7 @@ def decision(**kw):
 
 
 # ---------------------------------------------------------------------------------------------------- event mapping
-@pytest.mark.parametrize('kind', ['path_blocked', 'slope_hazard', 'hazard_marked'])
+@pytest.mark.parametrize('kind', ['path_blocked', 'slope_hazard', 'hazard_marked', 'pillar_identified'])
 def test_hazard_traces_are_novel_hazards(kind):
     spec = event_for_trace(trace(kind, input='Boulder field 6.8 m ahead'), ROBOTS, 'rover_1')
     assert spec == EventSpec('novel_hazard', 'rover_0', kind, 'Boulder field 6.8 m ahead',
@@ -853,3 +853,90 @@ def test_an_event_uses_the_fsm_state_its_trace_was_raised_in():
     moving = hub.context(bb.EventSpec('novel_hazard', 'rover_0', 'path_blocked', 'x', state='REPLANNING'))
     assert moving['state'] == 'REPLANNING' and moving['speed_limit_mps'] == pytest.approx(0.94)
     assert hub.context(bb.EventSpec('novel_hazard', 'rover_0', 'path_blocked', 'x'))['state'] == 'EXPLORING'
+
+
+# ---------------------------------------------------------------------------------------------------- Phase 3
+WIND_INPUT = 'Wind 13.2 m/s from 240° estimated from drift (cmd vs odometry)'
+
+
+def test_wind_descent_is_low_confidence_for_the_drone():
+    spec = event_for_trace(trace('wind_descent', robot='scout_0', input=WIND_INPUT, state='SURVEY'), ROBOTS, 'rover_1')
+    assert spec == EventSpec('low_confidence', 'scout_0', 'wind_descent', WIND_INPUT, hazard=WIND_INPUT,
+                             state='SURVEY')
+    assert event_for_trace(trace('wind_clear', robot='scout_0'), ROBOTS) is None       # easing wind: nothing to ask
+    assert event_for_trace(trace('power_save'), ROBOTS) is None                        # battery rides on the context
+    assert event_for_trace(trace('power_restored'), ROBOTS) is None
+
+
+def test_wind_descent_context_carries_the_drones_wind_and_marks_it_affected():
+    hub, _, _ = make_hub()
+    hub.on_state('scout_0', json.dumps(state('scout_0', 'SURVEY', 4.0, altitude_agl=11.8, wind_mps=13.4,
+                                             wind_descent=True)))
+    spec = event_for_trace(trace('wind_descent', robot='scout_0', input=WIND_INPUT, state='SURVEY'), ROBOTS)
+    ctx = hub.context(spec)
+    assert ctx['wind_mps'] == pytest.approx(13.4)                  # the drone's own estimate, from its agent_state
+    assert ctx['fleet']['drone_affected'] is True and ctx['fleet']['drone'] == 'scout_0'
+    assert ctx['fleet']['drone_agl_m'] == pytest.approx(11.8) and ctx['robot_type'] == 'scout'
+    d = deterministic_fallback('low_confidence', ctx)
+    assert d.action == ALTITUDE and d.target_robot == 'scout_0' and 6.0 <= d.target_altitude_m <= 20.0
+    # agent_state without an estimate yet (the trace is newer): the trace's own reading
+    hub.on_state('scout_0', json.dumps(state('scout_0', 'SURVEY', 4.0, altitude_agl=12.0)))
+    assert hub.context(spec)['wind_mps'] == pytest.approx(13.2)
+    assert bb.wind_from_text('no number here') is None
+
+
+def test_rover_events_carry_no_wind_or_drone_flag():
+    hub, _, _ = make_hub()
+    hub.on_state('scout_0', json.dumps(state('scout_0', 'SURVEY', 4.0, altitude_agl=8.0, wind_mps=13.0)))
+    ctx = hub.context(event_for_trace(trace('caution_enter'), ROBOTS))
+    assert 'wind_mps' not in ctx and 'drone_affected' not in ctx['fleet']
+    d = deterministic_fallback('low_confidence', ctx)
+    assert d.action != ALTITUDE                                    # a rover's dust spell still slows the rover
+
+
+def test_hub_wind_descent_to_an_altitude_decision_the_drone_takes():
+    hub, out, _ = make_hub()
+    hub.on_state('scout_0', json.dumps(state('scout_0', 'SURVEY', 4.0, altitude_agl=12.0, wind_mps=13.2)))
+    assert hub.on_trace(json.dumps(trace('wind_descent', robot='scout_0', input=WIND_INPUT,
+                                         state='SURVEY'))).event == 'low_confidence'
+    assert hub.poll() == 1
+    d, tr = out['decisions'][0], out['traces'][0]
+    assert (d['event'], d['robot'], d['trigger'], d['action'], d['target_robot']) == (
+        'low_confidence', 'scout_0', 'wind_descent', ALTITUDE, 'scout_0')
+    assert d['target_altitude_m'] == pytest.approx(8.0) and d['trigger_input'] == WIND_INPUT
+    assert tr['robot'] == 'scout_0' and 'wind' in tr['reasoning'].lower()
+    alt = BrainAltitude('scout_0')
+    assert alt.offer(parse_decision(json.dumps(d)), 0.0) == pytest.approx(8.0)
+
+
+def test_pillar_block_is_a_novel_hazard_naming_the_fallen_pillar():
+    txt = '14 obstacle cells 6.2 m ahead across path (LiDAR step > 0.30 m); camera confirms a fallen pillar'
+    hub, out, _ = make_hub()
+    spec = hub.on_trace(json.dumps(trace('path_blocked', input=txt)))
+    assert spec.event == 'novel_hazard' and 'fallen pillar' in spec.hazard
+    hub.poll()
+    d = out['decisions'][0]
+    assert d['trigger'] == 'path_blocked' and 'fallen pillar' in d['trigger_input'] and d['action'] == SLOW
+
+
+def test_altitude_trace_says_when_the_wind_descent_holds_the_drone_lower():
+    d = decision(action=ALTITUDE, event='low_confidence', target_robot='scout_0', robot='scout_0')
+    tx = bb.altitude_trace(10.0, d, True, wind_agl_m=8.0)
+    assert 'wind descent keeps 8 m AGL' in tx['action']
+    assert 'wind' not in bb.altitude_trace(6.0, d, True, wind_agl_m=8.0)['action']      # the brain's is lower
+    assert 'wind' not in bb.altitude_trace(10.0, d, True)['action']
+
+
+def test_a_pillar_identification_outranks_the_block_it_explains():
+    """LiDAR blocks the route first; the camera's "fallen pillar" a moment later is deferred behind it and must win
+    over a later slope warning, and over the block it explains."""
+    from redshift_autonomy.brain_bridge import EventGate, trigger_priority
+    blk = event_for_trace(trace('path_blocked', input='10 obstacle cells 6.4 m ahead'), ROBOTS, 'rover_1')
+    ident = event_for_trace(trace('pillar_identified', input='Fallen pillar 5.4 m ahead'), ROBOTS, 'rover_1')
+    slope = event_for_trace(trace('slope_hazard', input='Slope 18° ahead'), ROBOTS, 'rover_1')
+    assert trigger_priority(ident) > trigger_priority(blk) > trigger_priority(slope)
+    gate = EventGate()
+    gate.submitted(blk, 0.0)
+    gate.defer(ident, 0.5)
+    gate.defer(slope, 1.0)
+    assert gate.due(5.0) == [] and gate.due(10.1) == [ident]

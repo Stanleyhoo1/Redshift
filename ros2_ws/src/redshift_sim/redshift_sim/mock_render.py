@@ -4,7 +4,8 @@ science crystals that Gazebo renders, published in Gazebo's exact sensor convent
 * Heightfield: Lipschitz-safe ray marching (step = height-above-terrain / max closing rate, with a range-
   proportional minimum step) and two secant refinements on the crossing.
 * Objects: boulders and crystals as yawed ellipsoids, intersected analytically after a bounding-sphere cull.
-  Rockslide boulders fall from `drop_m` and are added at runtime.
+  Rockslide boulders fall from `drop_m` and are added at runtime; the falling pillar's chunks are obstacles the mock
+  world moves itself every physics step (`add_objects` / `set_object_centres`).
 * Robots: every robot is a few yawed ellipsoids (kind ROBOT, `robot_body`) moved every physics step, so each robot's
   camera and LiDAR see the others; a sensor excludes its own body (`exclude=` object ids). Robots are not obstacles
   to `Scene.blocked` (no robot–robot collision in the mock).
@@ -190,6 +191,29 @@ class Scene:
         return self._add(np.column_stack([r[:, :2], gz + radii[:, 2]]), radii, np.arange(len(r)) * 0.9,
                          np.tile([shade, 0.98 * shade, 0.96 * shade], (len(r), 1)), np.zeros((len(r), 3)), self.ROCK,
                          drop=drop_m, t_spawn=t)
+
+    def add_objects(self, centres, radii, albedo, kind: int | None = None) -> list[int]:
+        """Obstacles the caller moves itself (the falling pillar's chunks): kind ROCK unless given, so they collide
+        (`blocked`) and show in LiDAR, depth and RGB like boulders. `radii`: (n,) spheres or (n, 3) ellipsoid radii;
+        `albedo`: (3,) or (n, 3). Move them with set_object_centres."""
+        c = np.asarray(centres, np.float64).reshape(-1, 3)
+        m = len(c)
+        if not m:
+            return []
+        rad = np.asarray(radii, np.float64)
+        rad = np.repeat(rad.reshape(-1, 1), 3, axis=1) if rad.ndim < 2 else rad.reshape(-1, 3)
+        alb = np.broadcast_to(np.asarray(albedo, np.float32).reshape(-1, 3), (m, 3))
+        return self._add(c, np.broadcast_to(rad, (m, 3)), np.zeros(m), alb, np.zeros((m, 3), np.float32),
+                         self.ROCK if kind is None else kind)
+
+    def set_object_centres(self, ids, centres) -> None:
+        """Move objects to new world centres (n, 3): raycast, shading and `blocked` see them there from now on, and
+        nothing of them stays behind. Physics thread only, like set_body_pose: renderers work on scene_objects
+        snapshots taken on that thread, so a frame sees every chunk at one instant."""
+        ids = np.asarray(ids, np.int64)
+        c = np.asarray(centres, np.float64).reshape(-1, 3)
+        self.rest_z[ids] = c[:, 2]                     # update() rewrites c[:, 2] from rest_z
+        self.c[ids] = c
 
     def add_body(self, parts) -> list[int]:
         """Add a robot body (robot_body parts) as ROBOT objects at the origin; place it with set_body_pose."""

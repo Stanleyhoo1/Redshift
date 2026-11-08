@@ -19,6 +19,8 @@ export interface SensorSample {
   v_ground: number | null
   slip: number | null
   altitude_agl: number | null
+  /** drone only: its own wind estimate from drift (§10.3) */
+  wind_mps: number | null
   battery_pct: number | null
   solar_w: number | null
   load_w: number | null
@@ -58,6 +60,7 @@ export function sampleOf(r: RobotTelemetry, t: number): SensorSample {
     v_ground: num(s?.v_ground) ?? num(r.speed),
     slip: scout ? null : (num(s?.slip) ?? num(r.slip)),
     altitude_agl: num(s?.altitude_agl) ?? num(r.altitude_agl),
+    wind_mps: scout ? num(r.wind_mps) : null,
     battery_pct: num(h?.battery_pct),
     solar_w: num(h?.solar_w),
     load_w: num(h?.load_w),

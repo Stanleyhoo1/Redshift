@@ -25,6 +25,9 @@ from fake_render import b64_jpeg, lidar_points, map_png_b64, physics_preview, ro
 from fake_world import OPTIONS, World
 
 DIST = Path(__file__).resolve().parent.parent / "dist"
+# docs/protocol.md §10.1 / §10.6
+PILLAR_H, PILLAR_R, PILLAR_SIDE, PILLAR_AHEAD, PILLAR_LAND_S = 6.0, 0.35, 2.8, 8.0, 1.65
+STORM_S, STORM_WIND = 45.0, 14.0
 
 
 class Hub:
@@ -158,11 +161,13 @@ class Hub:
         w = self.world
         env = w.env
         if env["dust_level"] > 0 and now > env["until_t"]:
-            env["dust_level"] = 0.0
+            env.update({"dust_level": 0.0, "kind": None, "wind_mps": 0.0})
         env["seismic"] = now < env.get("seismic_until", 0)
         for item in [p for p in self.pending_rocks if p[0] <= now]:
             self.pending_rocks.remove(item)
             w.rocks.extend(item[1])
+            if len(item) > 3 and item[3] == "pillar":
+                w.pillars.append(item[1])
             w.rock_version += 1
             w.refresh_truth()
             w.reveal(item[2][0], item[2][1], 4.5, now)
@@ -345,7 +350,20 @@ class Hub:
             # §8.7
             "role": a.role, "name": a.name, "health": a.health_json(), "rescue": self._rescue_json(a),
             "sensors": a.sensors_json(self.world, self.rovers + self.scouts),
+            # §10.3 / §10.6
+            "power_save": a.kind == "rover" and a.power_save,
+            "wind_mps": round(a.wind_est, 2) if a.kind == "scout" and a.alt > 1.0 else None,
+            "wind_descent": a.kind == "scout" and a.wind_descent,
+            "detections": self._detections(a),
         }
+
+    def _detections(self, a) -> list:
+        """Compact §10.6 detections: a landed pillar in a rover's camera view."""
+        rng_m = self.world.pillar_ahead(a.x, a.y, a.yaw) if a.kind == "rover" else None
+        if rng_m is None:
+            return []
+        return [{"cls": "PILLAR", "conf": round(0.86 * (1 - 0.4 * self.world.env["dust_level"]), 2), "range_m": round(rng_m, 1),
+                 "world_xy": [round(a.x + rng_m * math.cos(a.yaw), 2), round(a.y + rng_m * math.sin(a.yaw), 2)]}]
 
     async def _emit(self, tick: int, now: float):
         w = self.world
@@ -353,7 +371,10 @@ class Hub:
         mission = {"status": self.status, "backend": self.backend, "elapsed_s": round(now - self.t_run, 1), "percent_mapped": st["percent"],
                    "sim_speed": self.speed, "rtf": self.speed, "sim_time_s": round(now - self.t_run, 2),
                    "science_found": len(w.found_science), "hazard_cells": st["hazard_cells"],
-                   "env": {"dust_level": w.env["dust_level"], "seismic": w.env["seismic"]}, "config": self.config}
+                   "env": {"dust_level": w.env["dust_level"], "seismic": w.env["seismic"],
+                           "kind": w.env["kind"] if w.env["dust_level"] > 0 else None,
+                           "wind_mps": w.env["wind_mps"] if w.env["dust_level"] > 0 else 0.0},
+                   "config": self.config}
         await self.broadcast({"type": "telemetry", "t": round(now, 3), "mission": mission, "robots": {a.id: self.robot_json(a) for a in self.rovers + self.scouts}})
         for tr in w.out_traces:
             await self.broadcast({"type": "trace", "entry": tr})
@@ -367,6 +388,8 @@ class Hub:
         agents = {a.id: a for a in self.rovers + self.scouts}
         full, low = tick % 2 == 0, tick % 4 == 0
         rgb, dep, lids = {}, {}, {}
+        storm = w.env["kind"] == "dust_storm" and w.env["dust_level"] > 0
+        pillar_chunks = {(c[0], c[1]) for chunks in w.pillars for c in chunks}
         for rid, a in agents.items():
             sel = rid in wanted
             if not (low or (full and sel)):
@@ -377,10 +400,10 @@ class Hub:
                      for o in self.rovers if o is not a]
             if a.kind == "rover":
                 out = rover_camera(w.terrain, w.tex, w.px_m, pose, w.rocks, w.env["dust_level"], w.env["seismic"], a.id, a.mode, a.unc, w.rng,
-                                   others=mates, want_depth=sel and full)
+                                   others=mates, want_depth=sel and full, storm=storm, pillar_chunks=pillar_chunks)
             else:
                 out = scout_camera(w.tex, w.px_m, w.L, pose, w.terrain.science, w.perm, a.state == "SCANNING", w.env["dust_level"], a.id,
-                                   rovers=mates, terrain=w.terrain, alt=a.alt, want_depth=sel and full)
+                                   rovers=mates, terrain=w.terrain, alt=a.alt, want_depth=sel and full, storm=storm)
             img, depth = out if isinstance(out, tuple) else (out, None)
             rgb[rid] = json.dumps({"type": "camera", "robot": rid, "kind": "rgb", "jpeg_b64": b64_jpeg(img), "t": round(now, 3)})
             if depth is not None:
@@ -429,9 +452,39 @@ class Hub:
             return {"ok": False, "detail": "No running mission"}
         now = time.time()
         lvl, dur = float(dust if dust is not None else 0.85), float(duration if duration is not None else 25)
-        self.world.env.update({"dust_level": lvl, "until_t": now + dur, "seismic_until": now + 4})
+        self.world.env.update({"dust_level": lvl, "until_t": now + dur, "seismic_until": now + 4, "kind": "dust", "wind_mps": 0.0})
         self.world.event({"op": "anomaly", "ok": True, "dust_level": lvl, "until_t": round(now + dur, 2)})
         return {"ok": True, "detail": f"Dust {lvl:.2f} for {dur:.0f} s with a 4 s tremor"}
+
+    def inject_pillar(self, rid: str | None) -> dict:
+        """§10.1: a 6 m basalt pillar 2.8 m off the route topples across it; its chunks land as obstacles."""
+        r = self._rover(rid)
+        if not r or not self.world or self.status != "running":
+            return {"ok": False, "detail": "No running mission with that rover"}
+        w = self.world
+        ahead = [p for p in r.path if 6.0 <= math.hypot(p[0] - r.x, p[1] - r.y) <= PILLAR_AHEAD]
+        cx, cy = ahead[-1] if ahead else (r.x + PILLAR_AHEAD * math.cos(r.yaw), r.y + PILLAR_AHEAD * math.sin(r.yaw))
+        k = r.path.index(ahead[-1]) if ahead else -1
+        tx, ty = ((r.path[k + 1][0] - r.path[k][0]), (r.path[k + 1][1] - r.path[k][1])) if 0 <= k < len(r.path) - 1 else (math.cos(r.yaw), math.sin(r.yaw))
+        n = math.hypot(tx, ty) or 1.0
+        side = 1.0 if w.rng.random() < 0.5 else -1.0
+        ux, uy = side * ty / n, -side * tx / n          # fall direction: across the route, from the base's side
+        bx, by = cx - PILLAR_SIDE * ux, cy - PILLAR_SIDE * uy
+        tip = (bx + PILLAR_H * ux, by + PILLAR_H * uy)
+        chunks = [[round(bx + ux * d, 2), round(by + uy * d, 2), round(PILLAR_R * 1.15, 2)] for d in np.linspace(0.3, PILLAR_H - 0.3, 9)]
+        w.event({"op": "pillar_collapse", "ok": True, "robot": r.id, "base": [round(bx, 2), round(by, 2)], "tip": [round(tip[0], 2), round(tip[1], 2)],
+                 "cross": [round(cx, 2), round(cy, 2)], "height_m": PILLAR_H, "radius_m": PILLAR_R, "waited_s": 0.0})
+        self.pending_rocks.append((time.time() + PILLAR_LAND_S, chunks, (cx, cy), "pillar"))
+        return {"ok": True, "detail": f"Basalt pillar toppling across {r.id} planned path"}
+
+    def inject_storm(self, duration: float | None, wind: float | None) -> dict:
+        if not self.world or self.status != "running":
+            return {"ok": False, "detail": "No running mission"}
+        now = time.time()
+        dur, mps = float(duration if duration is not None else STORM_S), float(wind if wind is not None else STORM_WIND)
+        self.world.env.update({"dust_level": 1.0, "until_t": now + dur, "kind": "dust_storm", "wind_mps": mps})
+        self.world.event({"op": "anomaly", "ok": True, "kind": "dust_storm", "dust_level": 1.0, "duration_s": dur, "wind_mps": mps})
+        return {"ok": True, "detail": f"Dust storm for {dur:.0f} s: solar blackout, {mps:.0f} m/s wind"}
 
     def inject_damage(self, rid: str | None) -> dict:
         r = self._rover(rid)
@@ -490,6 +543,15 @@ def build_app(hub: Hub) -> FastAPI:
     @app.post("/api/inject/tip")
     async def tip(body: dict | None = None):
         return JSONResponse(hub.inject_tip((body or {}).get("robot")))
+
+    @app.post("/api/inject/pillar")
+    async def pillar(body: dict | None = None):
+        return JSONResponse(hub.inject_pillar((body or {}).get("robot")))
+
+    @app.post("/api/inject/storm")
+    async def storm(body: dict | None = None):
+        b = body or {}
+        return JSONResponse(hub.inject_storm(b.get("duration_s"), b.get("wind_mps")))
 
     @app.post("/api/inject/damage")
     async def damage(body: dict | None = None):

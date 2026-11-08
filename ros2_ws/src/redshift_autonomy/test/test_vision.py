@@ -1,12 +1,13 @@
+import json
 import math
 
 import cv2
 import numpy as np
 import pytest
 
-from redshift_autonomy.vision import (CameraModel, ImageQualityBaseline, LidarBaseline, annotate,
-                                      camera_points_body, detect_objects, fuse_uncertainty, image_quality,
-                                      lidar_corridor, lidar_quality)
+from redshift_autonomy.vision import (CLS_COLORS, CLS_LABELS, PILLAR_MAX_THICK_M, CameraModel, ImageQualityBaseline,
+                                      LidarBaseline, annotate, camera_points_body, detect_objects, fuse_uncertainty,
+                                      image_quality, lidar_corridor, lidar_quality, pillar_test, trunk_thickness)
 
 W, H = 160, 120
 CAM = CameraModel.from_hfov(W, H, math.radians(80))
@@ -269,6 +270,159 @@ def test_detect_objects_class_subset_and_highpass_nadir():
     assert detect_objects(rgb, depth, cam, math.pi / 2, 12.0, classes=()) == []
 
 
+# ---------------------------------------------------------------------- fallen pillar (PILLAR)
+BASALT = (20, 19, 18)                  # scene_events.PILLAR albedo: fresh basalt
+LIGHT_GREY = (150, 147, 143)           # boulders: lighter grey
+SUN_L = np.array([-0.45, 0.25, 0.85]) / np.linalg.norm([-0.45, 0.25, 0.85])     # behind the camera, high
+
+
+def _hit_sphere(d, c, r):
+    """Nearest positive ray parameter (planar depth) of rays `d` (H, W, 3) on a sphere at `c` (camera frame)."""
+    a = (d * d).sum(-1)
+    b = (d * c).sum(-1)
+    disc = b * b - a * (float(np.dot(c, c)) - r * r)
+    with np.errstate(invalid='ignore'):
+        t = (b - np.sqrt(disc)) / a
+    ok = (disc > 0) & (t > 0.1)
+    return np.where(ok, t, np.inf), (d * np.where(ok, t, 0.0)[..., None] - c) / r
+
+
+def _hit_trunk(d, x0, half_len, r, yaw=0.0):
+    """A cylinder lying on the ground centred x0 ahead, its axis across the view (along y) turned by `yaw`."""
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rot = np.array([[cy, sy, 0.0], [-sy, cy, 0.0], [0.0, 0.0, 1.0]])     # camera-levelled → trunk frame
+    o = rot @ np.array([-x0, 0.0, CAM_H - r])                          # camera in the trunk frame
+    dt = d @ rot.T
+    a = dt[..., 0] ** 2 + dt[..., 2] ** 2
+    b = -(dt[..., 0] * o[0] + dt[..., 2] * o[2])
+    disc = b * b - a * (o[0] ** 2 + o[2] ** 2 - r * r)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        t = (b - np.sqrt(disc)) / a
+    ok = (disc > 0) & (t > 0.1) & (np.abs(o[1] + dt[..., 1] * t) < half_len)
+    t = np.where(ok, t, np.inf)
+    n = np.where(ok[..., None], o + dt * np.where(ok, t, 0.0)[..., None], 0.0)
+    n[..., 1] = 0.0
+    return t, (n / r) @ rot
+
+
+def render_solids(solids, seed=0):
+    """Clear frame plus solids [('trunk', (x0, half_len, r[, yaw]), rgb) | ('sphere', (x, y, r), rgb)], Lambert-lit."""
+    rgb, depth = render(seed=seed)
+    img = rgb.astype(np.float64)
+    t = np.where(np.isfinite(depth), depth, np.inf).astype(np.float64)
+    d = np.stack(rays(), axis=-1)
+    rng = np.random.default_rng(seed + 1)
+    for kind, geo, col in solids:
+        if kind == 'trunk':
+            ts, n = _hit_trunk(d, *geo)
+        else:
+            x, y, r = geo
+            ts, n = _hit_sphere(d, np.array([x, y, -CAM_H + 0.7 * r]), r)
+        hit = ts < t
+        t = np.where(hit, ts, t)
+        lam = np.clip(n[hit] @ SUN_L, 0.0, 1.0)[:, None]
+        img[hit] = np.array(col) * (0.55 + 0.6 * lam) + rng.normal(0, 2, (int(hit.sum()), 3))
+    depth = np.where(np.isfinite(t) & (t < 30), t, np.nan).astype(np.float32)
+    return np.clip(img, 0, 255).astype(np.uint8), depth
+
+
+def test_dark_fallen_trunk_is_a_pillar():
+    rgb, depth = render_solids([('trunk', (7.0, 3.0, 0.35), BASALT)])
+    dets = detect_objects(rgb, depth, CAM, PITCH, CAM_H, pose=(0.0, 0.0, 0.0))
+    pillars = [d for d in dets if d.cls == 'PILLAR']
+    assert len(pillars) == 1 and 'ROCK' not in classes(dets)
+    p = pillars[0]
+    assert p.conf > 0.8 and p.sources == ['DEPTH', 'CAM']
+    assert p.range_m == pytest.approx(6.8, abs=0.7) and abs(p.bearing_rad) < 0.1
+    assert p.world_xy[0] == pytest.approx(6.8, abs=0.7)
+    assert p.bbox[2] > 3 * p.bbox[3]                       # wide and low in the image
+    d = json.loads(json.dumps(p.as_dict()))                # detections JSON carries the class
+    assert d['cls'] == 'PILLAR' and d['sources'] == ['DEPTH', 'CAM'] and 'label' not in d
+    for x0, yaw in ((4.0, 0.0), (12.0, 0.0), (7.0, math.radians(35))):      # near, far, lying obliquely
+        rgb, depth = render_solids([('trunk', (x0, 3.0, 0.35, yaw), BASALT)])
+        assert classes(detect_objects(rgb, depth, CAM, PITCH, CAM_H)) == ['PILLAR'], (x0, yaw)
+
+
+def test_light_grey_wide_bump_is_a_rock_not_a_pillar():
+    rgb, depth = render_solids([('trunk', (7.0, 3.0, 0.35), LIGHT_GREY)])
+    dets = detect_objects(rgb, depth, CAM, PITCH, CAM_H)
+    assert 'PILLAR' not in classes(dets) and 'ROCK' in classes(dets)
+    rgb, depth = render(rock=(6.0, 2.5, 0.8))              # a wide boulder face, lighter grey
+    assert {'ROCK'} == {d.cls for d in detect_objects(rgb, depth, CAM, PITCH, CAM_H)}
+
+
+def test_line_of_separate_boulders_is_not_a_pillar():
+    light = [('sphere', (7.0, y, 0.45), LIGHT_GREY) for y in (-3.0, -1.5, 0.0, 1.5, 3.0)]
+    rgb, depth = render_solids(light)
+    dets = detect_objects(rgb, depth, CAM, PITCH, CAM_H)
+    assert 'PILLAR' not in classes(dets) and classes(dets).count('ROCK') >= 3
+    # touching, staggered boulders in shadow merge into one wide, dark bump: still bulky, so still boulders
+    dark = [('sphere', (7.0 + dx, y, r), BASALT)
+            for dx, y, r in ((0.3, -2.6, 0.7), (-0.35, -1.4, 0.55), (0.4, -0.1, 0.8), (-0.3, 1.2, 0.6),
+                             (0.25, 2.5, 0.75))]
+    rgb, depth = render_solids(dark)
+    dets = detect_objects(rgb, depth, CAM, PITCH, CAM_H)
+    assert 'PILLAR' not in classes(dets) and 'ROCK' in classes(dets)
+
+
+def test_pillar_needs_the_camera_and_respects_the_class_list():
+    rgb, depth = render_solids([('trunk', (7.0, 3.0, 0.35), BASALT)])
+    blind = detect_objects(rgb, depth, CAM, PITCH, CAM_H, use_camera=False)      # LIDAR_ONLY: geometry only
+    assert classes(blind) == ['ROCK'] and blind[0].sources == ['DEPTH']
+    assert classes(detect_objects(rgb, depth, CAM, PITCH, CAM_H, classes=('ROCK', 'SCIENCE'))) == ['ROCK']
+    assert classes(detect_objects(rgb, depth, CAM, PITCH, CAM_H, classes=('PILLAR',))) == ['PILLAR']
+    assert detect_objects(rgb, depth, CAM, PITCH, CAM_H, classes=('SCIENCE',)) == []
+
+
+def test_trunk_thickness_separates_one_body_from_a_staggered_line():
+    rng = np.random.default_rng(0)
+    s = rng.uniform(-3, 3, 400)
+    trunk = np.c_[7.0 + rng.uniform(-0.3, 0.0, 400), s] @ np.array([[0.8, 0.6], [-0.6, 0.8]])   # oblique trunk
+    assert trunk_thickness(trunk) < PILLAR_MAX_THICK_M
+    centres = np.c_[7.0 + np.array([0.3, -0.35, 0.4, -0.3, 0.25]), np.linspace(-2.6, 2.5, 5)]
+    line = np.vstack([c + rng.normal(0, 0.25, (80, 2)) for c in centres])
+    assert trunk_thickness(line) > PILLAR_MAX_THICK_M
+    assert math.isinf(trunk_thickness(trunk[:5]))          # too few points to tell
+
+
+def test_pillar_test_thresholds():
+    assert pillar_test(5.0, 0.6, 0.2, 40.0)
+    assert not pillar_test(2.0, 0.6, 0.2, 40.0)            # too short
+    assert not pillar_test(3.0, 1.5, 0.2, 40.0)            # extent / height < 2.5: a mound, not a trunk
+    assert not pillar_test(5.0, 0.6, 0.2, 0.36 * 255)      # lighter than dark basalt
+    assert not pillar_test(5.0, 0.6, 0.5, 40.0)            # bulky: a line of boulders
+
+
+def test_annotate_draws_the_fallen_pillar_box():
+    rgb, depth = render_solids([('trunk', (7.0, 3.0, 0.35), BASALT)])
+    dets = detect_objects(rgb, depth, CAM, PITCH, CAM_H)
+    out = annotate(rgb, dets, {'mode': 'FUSED'})
+    assert CLS_LABELS['PILLAR'] == 'FALLEN PILLAR' and CLS_COLORS['PILLAR'] == (255, 120, 200)
+    assert (out.reshape(-1, 3) == CLS_COLORS['PILLAR']).all(axis=1).sum() > 50
+
+
+def storm(rgb, level=1.0, seed=2):
+    """sensor_effects' dust storm: haze toward orange-red STORM_RGB at 0.75·L, blur and noise as for dust."""
+    out = rgb.astype(np.float64) * (1 - 0.75 * level) + np.array([205, 88, 48], np.float64) * 0.75 * level
+    out = cv2.GaussianBlur(out, (0, 0), 1.0 + 3 * level)
+    out += np.random.default_rng(seed).normal(0, 25 * level, out.shape)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def test_storm_tint_lowers_camera_confidence():
+    rgb, depth = render_solids([('trunk', (7.0, 3.0, 0.35), BASALT), ('sphere', (5.0, -2.0, 0.4), LIGHT_GREY)])
+    base = ImageQualityBaseline()
+    for _ in range(5):
+        base.update(image_quality(rgb))
+    clear = base.confidence(image_quality(rgb))
+    stormy = base.confidence(image_quality(storm(rgb)))
+    assert clear > 0.85 and stormy < 0.5 and stormy < clear - 0.35
+    assert base.confidence(image_quality(storm(rgb, 0.4))) > stormy        # stronger storm, lower confidence
+    # the haze washes the dark basalt out: no PILLAR claimed through it, but the depth bump is still an obstacle
+    dets = detect_objects(storm(rgb), depth, CAM, PITCH, CAM_H, cam_conf=stormy)
+    assert 'PILLAR' not in classes(dets) and 'ROCK' in classes(dets)
+
+
 # ---------------------------------------------------------------------- teammate perception
 from redshift_autonomy.vision import CameraModel as _CM, depth_colormap, project_box, teammate_detection  # noqa: E402
 
@@ -342,3 +496,14 @@ def test_depth_colormap_near_is_warm_and_missing_is_black():
     assert near[0] > near[2]                     # RGB: near → red
     assert far[2] >= far[0]                      # far → blue
     assert none.sum() == 0
+
+
+def test_pillar_report_describes_where_the_camera_saw_the_trunk():
+    from redshift_autonomy.vision import pillar_report
+    tx = pillar_report({'cls': 'PILLAR', 'conf': 0.864, 'range_m': 5.43, 'bearing_rad': -0.1, 'world_xy': [-37.2, -40.1]})
+    assert tx['input'] == 'Fallen pillar 5.4 m ahead at (-37.2, -40.1), confidence 0.86'
+    assert tx['confidence'] == 0.86 and 'not a line of boulders' in tx['reasoning'] and 're-plans' in tx['action']
+    side = pillar_report({'cls': 'PILLAR', 'conf': 0.7, 'range_m': 7.0, 'bearing_rad': 0.5})
+    assert side['input'] == 'Fallen pillar 7.0 m 29° left, confidence 0.70'
+    assert pillar_report({'cls': 'ROCK', 'conf': 0.9, 'range_m': 4.0}) is None
+    assert pillar_report({'cls': 'PILLAR', 'conf': 0.9, 'range_m': None}) is None and pillar_report(None) is None

@@ -17,6 +17,7 @@ import functools
 import json
 import math
 import numbers
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -28,10 +29,11 @@ from .gemma_agent_brain import (ACTIONS, ALTITUDE, CLARIFY, DEFAULT_MODEL, DEPLO
 from .trace import TraceBuilder
 
 # ---------------------------------------------------------------------------------------------------- event mapping
-HAZARD_KINDS = ('path_blocked', 'slope_hazard', 'hazard_marked')   # → novel_hazard
+HAZARD_KINDS = ('path_blocked', 'slope_hazard', 'hazard_marked', 'pillar_identified')   # → novel_hazard
 LOW_CONFIDENCE_KINDS = ('caution_enter',)                          # the FSM's CAUTION entry → low_confidence
+WIND_KINDS = ('wind_descent',)              # the drone's local wind descent → low_confidence for that drone
 # EventGate: which deferred trigger of the same (robot, event) is kept (higher wins; ties keep the first deferred)
-TRIGGER_PRIORITY = {'path_blocked': 2, 'hazard_marked': 2, 'slope_hazard': 1}
+TRIGGER_PRIORITY = {'pillar_identified': 3, 'path_blocked': 2, 'hazard_marked': 2, 'slope_hazard': 1}   # what the obstacle is beats that it blocks
 DRONE_TYPES = ('scout', 'drone', 'uav', 'aerial')
 DRONE_ONLY_TEXT = 'Drones take altitude commands only; select a rover for speed or stop commands'
 WARN_EVERY_S = 5.0             # DropGuard: at most one "dropped a message" warning per this many seconds
@@ -40,6 +42,7 @@ MIN_INTERVAL_S = {'novel_hazard': 10.0, 'low_confidence': 10.0, 'critical_damage
                   'operator_command': 0.5}
 TEXT_MAX = 200                 # operator command length (backend validates the same bound)
 INPUT_MAX = 160                # trace input carried as hazard / damage / trigger text
+WIND_TEXT_RE = re.compile(r'\bwind\s+(\d+(?:\.\d+)?)\s*m/s', re.I)   # "Wind 13.2 m/s from 240° ..." (wind_descent)
 
 # FSM states in which the rover is holding or not under path-following control: the effective local limit is 0
 HOLD_STATES = ('BOOT', 'SAFE_HOLD', 'AWAIT_RESCUE', 'REPAIRING', 'AWAIT_SCOUT', 'RECOVERY_REVERSE',
@@ -133,6 +136,12 @@ class EventSpec:
         return self.robot, self.event
 
 
+def wind_from_text(text) -> float | None:
+    """Wind speed (m/s) quoted in a wind_descent trace input, or None."""
+    m = WIND_TEXT_RE.search(str(text or ''))
+    return _num(float(m.group(1))) if m else None
+
+
 def is_brain_trace(trace: dict) -> bool:
     """Traces the brain path itself produced (brain_advice from fleet_brain_node, brain_cap from the planners)."""
     return 'brain' in trace or str(trace.get('kind', '')).startswith('brain_')
@@ -142,7 +151,8 @@ def event_for_trace(trace, robots, recovery_rover: str | None = None) -> EventSp
     """Map an /agent_decision_trace entry to a brain event, or None.
 
     path_blocked / slope_hazard / hazard_marked → novel_hazard (hazard = the trace input); caution_enter →
-    low_confidence; critical_damage → critical_damage for the damaged rover; sos (active) → peer_sos for the
+    low_confidence; wind_descent (the drone's own local descent) → low_confidence for that drone (hazard = the
+    trace input); critical_damage → critical_damage for the damaged rover; sos (active) → peer_sos for the
     recovery rover with the SOS robot as peer (none when there is no recovery rover or it is the one in trouble).
     Brain traces and traces from robots outside the fleet are ignored."""
     if not isinstance(trace, dict) or is_brain_trace(trace):
@@ -156,6 +166,8 @@ def event_for_trace(trace, robots, recovery_rover: str | None = None) -> EventSp
         return EventSpec('novel_hazard', robot, kind, text, hazard=text or None, state=fsm)
     if kind in LOW_CONFIDENCE_KINDS:
         return EventSpec('low_confidence', robot, kind, text, state=fsm)
+    if kind in WIND_KINDS:
+        return EventSpec('low_confidence', robot, kind, text, hazard=text or None, state=fsm)
     if kind == 'critical_damage':
         return EventSpec('critical_damage', robot, kind, text, damage=text or None, state=fsm)
     if kind == 'sos' and trace.get('status', 'active') == 'active':
@@ -247,11 +259,13 @@ def build_context(robot: str, *, states: dict, edge: dict | None = None, percept
                   env: dict | None = None, recovery_rover: str | None = None, drone: str | None = None,
                   v_max_mps: float | None = None, hazard: str | None = None, damage: str | None = None,
                   peer: str | None = None, known_hazards=(), operator_text: str | None = None,
-                  edge_profile: str | None = None) -> dict:
+                  edge_profile: str | None = None, wind_mps: float | None = None,
+                  drone_affected: bool = False) -> dict:
     """Context dict for gemma_agent_brain from the robot's latest messages (`states` = every robot's latest
     agent_state, None/missing when unknown or stale; `perception` = its latest /perception/detections).
     `v_max_mps` is rounded like agent_state v_limit (3 decimals), so full speed at the full local limit is equal to
-    the limit, not a hair above it."""
+    the limit, not a hair above it. `wind_mps` (the drone's own estimate) and `drone_affected` (fleet.drone_affected)
+    are set only for an event about weather on the drone (wind_descent)."""
     st = states.get(robot) if isinstance(states.get(robot), dict) else {}
     health = st.get('health') if isinstance(st.get('health'), dict) else {}
     ctx = {'robot': robot, 'robot_type': st.get('type') or ('rover' if robot.startswith('rover') else 'scout'),
@@ -271,10 +285,11 @@ def build_context(robot: str, *, states: dict, edge: dict | None = None, percept
         damage = ', '.join(str(f) for f in faults[:4])
     ctx.update(hazard=hazard, damage=damage, peer=peer, known_hazards=list(known_hazards) or None,
                dust=bool((_num((env or {}).get('dust_level')) or 0.0) >= DUST_LEVEL),
-               operator_text=operator_text, edge_profile=edge_profile)
+               operator_text=operator_text, edge_profile=edge_profile, wind_mps=_num(wind_mps))
     dst = states.get(drone) if drone and isinstance(states.get(drone), dict) else {}
     fleet = {'recovery_rover': recovery_rover or None, 'recovery_available': recovery_available(recovery_rover, states),
-             'drone': drone or None, 'drone_agl_m': _num(dst.get('altitude_agl'))}
+             'drone': drone or None, 'drone_agl_m': _num(dst.get('altitude_agl')),
+             'drone_affected': True if drone_affected else None}
     ctx['fleet'] = {k: v for k, v in fleet.items() if v is not None}
     return {k: v for k, v in ctx.items() if v is not None}
 
@@ -580,11 +595,17 @@ class BrainHub:
             states[spec.robot] = st
         st = states.get(spec.robot) or {}
         v_max = self.rover_v_max if spec.robot.startswith('rover') else st.get('v_limit')
+        wind, affected = None, False
+        if spec.trigger in WIND_KINDS:
+            # the drone's own estimate (its agent_state), else the reading quoted in the trace that raised the event
+            wind = _num(st.get('wind_mps'))
+            wind, affected = (wind if wind is not None else wind_from_text(spec.trigger_input)), True
         return build_context(spec.robot, states=states, edge=self.edges.get(spec.robot, now, STATE_FRESH_S),
                              perception=self.percep.get(spec.robot, now, PERCEPTION_FRESH_S), env=self.env,
                              recovery_rover=self.recovery, drone=self.drone, v_max_mps=v_max, hazard=spec.hazard,
                              damage=spec.damage, peer=spec.peer, known_hazards=self.hazards.names(),
-                             operator_text=operator_text, edge_profile=self.edge)
+                             operator_text=operator_text, edge_profile=self.edge, wind_mps=wind,
+                             drone_affected=affected)
 
     def submit_event(self, spec: EventSpec):
         now = self.clock()
@@ -893,14 +914,17 @@ class BrainAltitude:
         return {'agl_m': a, 'remaining_s': round(max(0.0, self.until - now), 1), 'applied': applied}
 
 
-def altitude_trace(agl: float, d: dict, applies_now: bool) -> dict:
-    """Texts for the scout's "brain_cap" trace when it accepts an advisory cruise AGL."""
+def altitude_trace(agl: float, d: dict, applies_now: bool, wind_agl_m: float | None = None) -> dict:
+    """Texts for the scout's "brain_cap" trace when it accepts an advisory cruise AGL. `wind_agl_m` = the local wind
+    descent's set-point while it is active (the scout flies the lower of the two)."""
     who = _who(d.get('source', ''))
     event = str(d.get('event') or '?')
     what = 'an operator command' if event == 'operator_command' else f"a {event.replace('_', ' ')} event"
     action = f'Cruise altitude {agl:.0f} m AGL for {ALTITUDE_S:.0f} s by {what} ({who})'
     if not applies_now:
         action += '; applies once surveying (take-off / scan altitude unchanged)'
+    if wind_agl_m is not None and wind_agl_m < agl - 0.05:
+        action += f'; the local wind descent keeps {wind_agl_m:.0f} m AGL while the wind lasts (the lower applies)'
     quote = f": '{_short(d.get('command_text'), 80)}'" if d.get('command_text') else ''
     return {'input': f'/brain/decision {ALTITUDE} for {event}{quote}',
             'reasoning': _short(d.get('reasoning_trace'), 300) or 'advisory brain decision',

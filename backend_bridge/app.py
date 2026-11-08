@@ -21,7 +21,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstra
 
 from . import _paths  # noqa: F401
 from .config_schema import MissionConfig, options, physics_preview
-from .encoders import lidar_points_body, png_b64, robot_telemetry
+from .encoders import env_telemetry, lidar_points_body, png_b64, robot_telemetry
 from .mission_manager import ROOT, MissionManager
 from .ros_link import HAVE_ROS, RosLink
 from redshift_autonomy.agent_fsm import display_name
@@ -36,6 +36,11 @@ OTHER_CAM_HZ = 4.0          # camera tiles of the robots a client is not focused
 CLIENT_QUEUE = 240        # ≈ 7 s of outbound frames; a client further behind than that is disconnected
 SEND_TIMEOUT_S = 2.0
 LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1'}
+# "Dust Storm (Solar Blackout + High Wind)" (docs/protocol.md §10.1): full dust, so solar transmittance drops 85 %,
+# no tremor; duration (sim s) and the 12 m-AGL reference wind (m/s) may be overridden in the request body
+STORM_DUST_LEVEL = 1.0
+STORM_DURATION_S = 45.0
+STORM_WIND_MPS = 14.0
 
 
 def _finite(v):
@@ -215,7 +220,7 @@ class Hub:
                 'sim_speed': self.speed, 'rtf': None if rtf is None else round(rtf, 2),
                 'percent_mapped': float(st.get('percent', 0.0)), 'science_found': len(st.get('science', [])),
                 'hazard_cells': int(st.get('hazard_cells', 0)),
-                'env': {'dust_level': float(env.get('dust_level', 0.0)), 'seismic': bool(env.get('seismic', False))},
+                'env': env_telemetry(env),
                 'brain': self.link.brain_status() if self.link else None,
                 'config': m.config.model_dump() if m.config else None}
 
@@ -306,6 +311,12 @@ class AnomalyBody(BaseModel):
     model_config = ConfigDict(extra='ignore')
     dust_level: float = Field(0.85, ge=0.0, le=1.0)
     duration_s: float = Field(25.0, ge=3.0, le=120.0)
+
+
+class StormBody(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    duration_s: float = Field(STORM_DURATION_S, ge=3.0, le=120.0)
+    wind_mps: float = Field(STORM_WIND_MPS, ge=0.0, le=20.0)
 
 
 # operator text for the advisory brain: 1-200 characters once trimmed; runs of whitespace (newlines, tabs) collapse
@@ -441,6 +452,31 @@ async def api_anomaly(request: Request):
     res = hub.command({'op': 'anomaly', 'dust_level': body.dust_level, 'duration_s': body.duration_s, 'seismic_s': 4.0})
     return res if not res['ok'] else {'ok': True,
                                       'detail': f'Dust {body.dust_level:.2f} for {body.duration_s:.0f} s with a 4 s tremor'}
+
+
+@app.post('/api/inject/pillar')
+async def api_pillar(request: Request):
+    body, err = await parse_body(request, RobotBody)
+    if err:
+        return err
+    r, msg = hub.running_rover(body.robot)
+    if msg:
+        return {'ok': False, 'detail': msg}
+    res = hub.command({'op': 'pillar_collapse', 'robot': r})
+    return res if not res['ok'] else {'ok': True, 'detail': f'Basalt pillar toppling across {r} planned path'}
+
+
+@app.post('/api/inject/storm')
+async def api_storm(request: Request):
+    body, err = await parse_body(request, StormBody)
+    if err:
+        return err
+    if hub.mgr.status not in ('running', 'degraded'):
+        return {'ok': False, 'detail': 'No running mission'}
+    res = hub.command({'op': 'anomaly', 'kind': 'dust_storm', 'dust_level': STORM_DUST_LEVEL,
+                       'duration_s': body.duration_s, 'seismic_s': 0.0, 'wind_mps': body.wind_mps})
+    return res if not res['ok'] else {
+        'ok': True, 'detail': f'Dust storm for {body.duration_s:.0f} s: solar blackout, {body.wind_mps:.0f} m/s wind'}
 
 
 @app.post('/api/inject/tip')

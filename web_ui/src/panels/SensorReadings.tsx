@@ -4,9 +4,10 @@ import { faultLabel, fmt, fmtHours, fmtSigned, robotName } from '../lib/format'
 import { SENSOR_WINDOW_S, sensorHistory } from '../lib/history'
 import { autoRange, batteryTone, healthTone, sparkSegments, sparkY, timeToEmptyH, type Range, type SensorKey, type SensorSample, type Tone } from '../lib/sensors'
 import { useStore } from '../lib/store'
-import { C, TONE_COLOR } from '../lib/theme'
+import { powerSave, WIND_ENTER_MPS, windReading } from '../lib/storm'
+import { C, sensorColor, TONE_COLOR } from '../lib/theme'
 import type { RobotTelemetry } from '../lib/types'
-import { Panel, SensorChip } from '../ui/Panel'
+import { Badge, Panel, SensorChip } from '../ui/Panel'
 
 const SPAN = SENSOR_WINDOW_S
 
@@ -109,6 +110,27 @@ function channels(r: RobotTelemetry, gravity: number): Channel[] {
           minSpan: 4,
           include: [0],
         },
+        // §10.3: the drone's own estimate from drift (commanded vs odometry velocity); shown once it reports one
+        ...(windReading(r)
+          ? [
+              {
+                group: 'WIND',
+                label: 'Wind, estimated',
+                series: [{ key: 'wind_mps', color: sensorColor('WIND') }],
+                value: (s: SensorSample) => (
+                  <>
+                    {fmt(s.wind_mps, 1)}
+                    <Unit>m/s</Unit>
+                  </>
+                ),
+                // amber from where the drone's own descent rule starts counting
+                tone: (s: SensorSample): Tone => (s.wind_mps != null && s.wind_mps > WIND_ENTER_MPS ? 'warn' : 'ok'),
+                minSpan: 4,
+                include: [0],
+                refs: [WIND_ENTER_MPS],
+              } satisfies Channel,
+            ]
+          : []),
       ]
     : [
         {
@@ -275,6 +297,7 @@ export function SensorReadings() {
       ) : (
         <>
           <HealthStrip robot={robot} hist={hist} ts={ts} tEnd={tEnd} />
+          <ModeStrip robot={robot} />
           <dl className="grid grid-cols-[44px_minmax(0,1fr)_auto_minmax(64px,0.95fr)] items-center gap-x-2 px-3 pt-1 pb-2" aria-label="Sensor channels">
             {channels(robot, gravity).map((ch, k, all) => {
               const first = k === 0 || all[k - 1].group !== ch.group
@@ -328,6 +351,38 @@ function Spark({ ch, hist, ts, tEnd, tone, H = 18 }: { ch: Channel; hist: readon
         )),
       )}
     </svg>
+  )
+}
+
+/** Modes the robot entered on its own readings (§10.3): a rover's battery conservation, the drone's wind descent. */
+function ModeStrip({ robot }: { robot: RobotTelemetry }) {
+  const pwr = powerSave(robot)
+  const wind = windReading(robot)
+  if (!pwr && !wind?.descent) return null
+  return (
+    <div className="flex flex-col gap-1 border-b border-rule/70 px-3 py-1.5 text-[11.5px] text-haze">
+      {pwr && (
+        <p className="flex min-w-0 items-center gap-1.5">
+          <Badge color={sensorColor('PWR')}>POWER SAVE</Badge>
+          <span className="num truncate">
+            solar <span className="text-bone">{fmt(pwr.solar_w, 0)} W</span>: battery conservation, slower drive
+          </span>
+        </p>
+      )}
+      {wind?.descent && (
+        <p className="flex min-w-0 items-center gap-1.5">
+          <Badge color={sensorColor('WIND')}>WIND DESCENT</Badge>
+          <span className="num truncate">
+            {wind.mps != null ? (
+              <>
+                wind <span className="text-bone">{fmt(wind.mps, 1)} m/s</span> from drift:{' '}
+              </>
+            ) : null}
+            flying lower, out of the shear
+          </span>
+        </p>
+      )}
+    </div>
   )
 }
 

@@ -1,14 +1,17 @@
+import { useRef } from 'react'
 import { useRobotIds, useSelected, useTick } from '../lib/hooks'
 import { fmt, robotName, robotShort } from '../lib/format'
 import { healthTone } from '../lib/sensors'
 import { useStore, type CameraFrame } from '../lib/store'
+import { detectionLabel, pillarSighting } from '../lib/storm'
 import { C, stateColor, TONE_COLOR } from '../lib/theme'
-import type { CameraKind } from '../lib/types'
+import type { CameraKind, CompactDetection } from '../lib/types'
 import { FleetGlyph } from '../screens/prelaunch/ConfigFields'
 import { Badge, Panel, StatePill } from '../ui/Panel'
 
 const STALE_MS = 1500
 const TILE_STALE_MS = 2500 // non-selected robots stream at ≤ 4 Hz
+const PILLAR_HOLD_MS = 1500 // a pillar the detector drops for a frame or two keeps its callout
 
 const isLive = (f: CameraFrame | undefined, ms: number) => !!f && performance.now() - f.receivedAt < ms
 
@@ -76,6 +79,9 @@ function MainView() {
       : null
   const locked = !!rescuer?.locked
   const sos = robot?.state === 'AWAIT_RESCUE'
+  // §10.2: the RGB frame carries the burned-in FALLEN PILLAR box; this callout comes from the same detections and
+  // also names it over the depth view
+  const pillar = useHeldSighting(sel, pillarSighting(robot))
 
   return (
     <div className="relative aspect-[4/3] w-full overflow-hidden bg-[#0f0c1e] [@media(max-height:960px)]:aspect-[16/10]">
@@ -104,6 +110,12 @@ function MainView() {
         )}
         {live && <Badge color={C.bone}>{fmt(frame?.fps, 1)} fps</Badge>}
         {kind === 'depth' && <Badge color="#b3a4ff">DEPTH</Badge>}
+        {pillar && (
+          <Badge color={C.pillar}>
+            {detectionLabel('PILLAR')}
+            {pillar.range_m != null ? <span className="num font-[650]">{fmt(pillar.range_m, 1)} m</span> : null}
+          </Badge>
+        )}
       </div>
       {/* one badge, most important first, so the frame's own labels stay readable */}
       <div className="absolute top-2 right-2">
@@ -141,6 +153,15 @@ function MainView() {
       )}
     </div>
   )
+}
+
+/** The latest sighting of the selected robot, held for PILLAR_HOLD_MS after the detector last reported it. */
+function useHeldSighting(robot: string | null, d: CompactDetection | null): CompactDetection | null {
+  const last = useRef<{ robot: string | null; d: CompactDetection; at: number } | null>(null)
+  const now = performance.now()
+  if (last.current && last.current.robot !== robot) last.current = null
+  if (d) last.current = { robot, d, at: now }
+  return last.current && now - last.current.at < PILLAR_HOLD_MS ? last.current.d : null
 }
 
 /** Viewfinder corners while the recovery rover's perception holds a lock on its teammate. */

@@ -16,6 +16,10 @@ BATTERY_START = {"rover_0": 0.82, "rover_1": 0.91, "scout_0": 0.96}
 DAMAGED_WHEELS = [0.08, 0.35, 0.05, 0.30]
 DAMAGE_FAULTS = ["DRIVE_FL_OVERCURRENT", "DRIVE_RL_ENCODER_LOST"]
 LOCK_LABEL = "[PERCEIVED: DAMAGED UNIT {short} | DOCKING FOR REPAIR]"
+# docs/protocol.md §10.3: rover_health.PowerSaver and wind.WindDescent thresholds (the harness plays them on wall time)
+PS_ENTER_IRR, PS_ENTER_S, PS_EXIT_IRR, PS_EXIT_S, PS_SPEED = 0.35, 2.0, 0.6, 5.0, 0.6
+WD_ENTER_MPS, WD_ENTER_S, WD_EXIT_MPS, WD_EXIT_S = 8.0, 2.0, 5.0, 5.0
+CRUISE_AGL, WIND_AGL = 12.0, 8.0
 
 
 def wrap(a: float) -> float:
@@ -60,6 +64,12 @@ class Agent:
         self.peak_g = 0.0
         self.rescue: dict | None = None  # §8.7 telemetry block
         self._edge: dict = {}
+        self.irr = 0.93
+        self.power_save = False      # §10.3 battery conservation (rovers)
+        self._ps_since: float | None = None
+        self.wind_est = 0.0          # §10.3 the drone's own wind estimate
+        self.wind_descent = False
+        self._wd_since: float | None = None
 
     def power(self, w: World, dt: float):
         """Battery integration: solar − (avionics + edge compute + drive / hover)."""
@@ -67,10 +77,11 @@ class Agent:
         edge_w = float(self._edge.get("power_w", 10.0)) if self._edge else 10.0
         if self.kind == "scout":
             self.solar_w = 0.0
-            self.load_w = (60.0 * w.g ** 1.5 if self.alt > 0.5 else 8.0) + edge_w + float(w.rng.normal(0, 1.5))
+            self.load_w = (60.0 * w.g ** 1.5 + 0.25 * self.wind_est ** 2 if self.alt > 0.5 else 8.0) + edge_w + float(w.rng.normal(0, 1.5))
         else:
             tilt = math.radians(math.hypot(self.roll, self.pitch))
             irr = 0.93 * (1 - 0.85 * dust) * (1 + float(w.rng.normal(0, 0.006)))
+            self.irr = irr
             self.solar_w = max(0.0, 220.0 * irr * max(0.0, math.cos(tilt)))
             self.load_w = 25.0 + edge_w + w.limits["energy_j_per_m"] * abs(self.speed) + float(w.rng.normal(0, 0.8))
         self.battery_wh = min(self.capacity_wh, max(0.0, self.battery_wh + (self.solar_w - self.load_w) * dt / 3600.0))
@@ -106,6 +117,28 @@ class Agent:
     def drive_pct(self) -> float:
         return 100.0
 
+    def power_mode(self, w: World, now: float):
+        """§10.3 battery conservation from the rover's own irradiance, with the PowerSaver hysteresis."""
+        want = self.irr > PS_EXIT_IRR if self.power_save else self.irr < PS_ENTER_IRR
+        if not want:
+            self._ps_since = None
+            return
+        self._ps_since = self._ps_since if self._ps_since is not None else now
+        if now - self._ps_since < (PS_EXIT_S if self.power_save else PS_ENTER_S):
+            return
+        self._ps_since = None
+        self.power_save = not self.power_save
+        batt = 100 * self.battery_wh / self.capacity_wh
+        clear_w, drop = 220 * 0.93, 100 * (1 - self.irr / 0.93)  # level panel under a clear sky
+        if self.power_save:
+            w.trace(self.id, self.state, "power_save", ["DIAG"],
+                    f"Solar {self.solar_w:.0f} W (was {clear_w:.0f} W, −{drop:.0f} %), irradiance {self.irr:.2f}, battery {batt:.0f} %",
+                    f"Irradiance below {PS_ENTER_IRR} for {PS_ENTER_S:.0f} s: the panel cannot cover the drive load", 0.93,
+                    f"Battery conservation: speed ×{PS_SPEED}", "warn")
+        else:
+            w.trace(self.id, self.state, "power_restored", ["DIAG"], f"Irradiance {self.irr:.2f}, solar {self.solar_w:.0f} W, battery {batt:.0f} %",
+                    f"Irradiance above {PS_EXIT_IRR} for {PS_EXIT_S:.0f} s", 0.95, "Normal speed and perception rate restored")
+
     def set_state(self, s: str, now: float):
         self.state, self.state_t = s, now
 
@@ -136,6 +169,7 @@ class Agent:
             self.speed = v * max(0.0, math.cos(err)) ** 2
             self.v_cmd = self.speed
         else:
+            v *= PS_SPEED if self.power_save else 1.0
             self.v_cmd = v * max(0.25, math.cos(err))
             self.speed = self.v_cmd * self.drive_factor() * (1 - min(0.9, getattr(self, "slip", 0.0)))
         sgn = -1.0 if reverse else 1.0
@@ -339,6 +373,7 @@ class Rover(Agent):
         self.slip = 0.7 if (self.jolt_t is not None and now - self.jolt_t < 0.8) else 0.03 + 0.002 * abs(pitch) + float(w.rng.uniform(0, 0.01))
         self.imu_accel(w, now, extra)
         self.power(w, dt)
+        self.power_mode(w, now)
         if not self.faults and self.repair_t0 is None:  # slow wear on healthy wheels
             self.wheel_health = [min(1.0, max(0.95, h + float(w.rng.normal(0, 0.0004)))) for h in self.wheel_health]
         if self.repair_t0 is not None and not self.repair_done:  # §8.5 repair: ramp to 1.0 over 4 s
@@ -526,6 +561,13 @@ class Rover(Agent):
         """Blocked: stop and announce. The new route is computed in REPLANNING after 1.2 s."""
         self.set_state("REPLANNING", now)
         self.speed = 0.0
+        pillar = w.pillar_ahead(self.x, self.y, self.yaw)
+        if pillar is not None:  # §10.4: the camera confirms the fallen trunk
+            w.trace(self.id, "REPLANNING", "path_blocked", ["LIDAR", "DEPTH", "CAM"],
+                    f"Obstacle {pillar:.1f} m ahead across path; camera confirms a fallen pillar",
+                    "Long, low, dark depth bump across the corridor; step height 0.7 m > 0.30 m clearance",
+                    0.9, "Stop and re-plan A* around the obstacle", "warn", 43.0)
+            return
         w.trace(self.id, "REPLANNING", "path_blocked", ["LIDAR", "CAM"],
                 f"Boulder field {float(w.rng.uniform(5.5, 7.5)):.1f} m ahead across path ({int(w.rng.integers(4, 7))} objects)",
                 f"Corridor occupancy {float(w.rng.uniform(0.7, 0.9)):.2f}; step height {float(w.rng.uniform(0.7, 1.0)):.1f} m > 0.30 m clearance",
@@ -603,6 +645,7 @@ class Scout(Agent):
         self.pitch = float(w.rng.normal(0, 0.8)) - 3.0 * min(1.0, self.speed / 3.0)
         self.gyro = [round(float(w.rng.normal(0, 0.03)), 3) for _ in range(3)]
         self.unc += ((0.12 + 0.3 * w.env["dust_level"]) - self.unc) * min(1.0, dt)
+        self._wind(w, dt, now)
         st = self.state
         if st == "BOOT" and now - self.state_t > 1.0:
             self.set_state("TAKEOFF", now)
@@ -612,9 +655,11 @@ class Scout(Agent):
                 self.set_state("SURVEY", now)
                 self._next_lane(w)
         elif st == "SURVEY":
+            self._hold_agl(dt)
             if self.follow(dt, 3.0):
                 self._next_lane(w)
         elif st == "FLY_TO_SCAN":
+            self._hold_agl(dt)
             if self.follow(dt, 12.0):
                 self.set_state("SCANNING", now)
                 self.orbit_c = tuple(self.req["xy"]) if self.req else (self.x, self.y)
@@ -648,6 +693,34 @@ class Scout(Agent):
         if math.hypot(self.trail[-1][0] - self.x, self.trail[-1][1] - self.y) > 1.0:
             self.trail.append([round(self.x, 2), round(self.y, 2)])
             del self.trail[:-300]
+
+    def _wind(self, w: World, dt: float, now: float):
+        """§10.3 drift estimate (shear: wind_at = ref · clip(h / 12, 0.05, 2) ^ 0.6, ±25 % gusts) and the descent rule."""
+        ref = float(w.env.get("wind_mps") or 0.0) if w.env["dust_level"] > 0 else 0.0
+        at = ref * min(2.0, max(0.05, self.alt / CRUISE_AGL)) ** 0.6 if self.alt > 0.5 else 0.0
+        meas = at * (1 + 0.25 * math.sin(2 * math.pi * 0.3 * now)) + float(w.rng.normal(0, 0.3))
+        self.wind_est = max(0.0, self.wind_est + (meas - self.wind_est) * min(1.0, dt / 1.5))
+        want = self.wind_est < WD_EXIT_MPS if self.wind_descent else self.wind_est > WD_ENTER_MPS
+        if not want:
+            self._wd_since = None
+            return
+        self._wd_since = self._wd_since if self._wd_since is not None else now
+        if now - self._wd_since < (WD_EXIT_S if self.wind_descent else WD_ENTER_S):
+            return
+        self._wd_since = None
+        self.wind_descent = not self.wind_descent
+        if self.wind_descent:
+            w.trace(self.id, self.state, "wind_descent", ["ODOM", "IMU"],
+                    f"Wind {self.wind_est:.1f} m/s from 240° estimated from drift (cmd vs odometry)",
+                    "Wind shear grows with height; lower is calmer and keeps the footprint on target", 0.86,
+                    f"Descending to {WIND_AGL:.0f} m AGL", "warn")
+        else:
+            w.trace(self.id, self.state, "wind_clear", ["ODOM", "IMU"], f"Wind {self.wind_est:.1f} m/s for {WD_EXIT_S:.0f} s",
+                    f"Below {WD_EXIT_MPS:.0f} m/s: the cruise altitude is safe again", 0.9, f"Climbing back to {CRUISE_AGL:.0f} m AGL")
+
+    def _hold_agl(self, dt: float):
+        tgt = WIND_AGL if self.wind_descent else CRUISE_AGL
+        self.alt += max(-1.5 * dt, min(1.5 * dt, tgt - self.alt))
 
     def sensors_json(self, w: World, others: list) -> dict:
         return {"accel": self.accel, "accel_g": round(math.sqrt(sum(v * v for v in self.accel)) / G0, 3), "gyro": self.gyro,

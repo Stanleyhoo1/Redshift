@@ -109,7 +109,7 @@ class RosLink:
     # ------------------------------------------------------------------ fleet (re)configuration
     def reset(self):
         with self.lock:
-            self.env = {'dust_level': 0.0, 'seismic': False, 'remaining_s': None}
+            self.env = {'dust_level': 0.0, 'seismic': False, 'remaining_s': None, 'kind': None, 'wind_mps': 0.0}
             self.layers: np.ndarray | None = None
             self.layers_version = 0
             self.stats: dict = {}
@@ -177,9 +177,8 @@ class RosLink:
                  'accel': [round(a.x, 3), round(a.y, 3), round(a.z, 3)]}
 
     def _json(self, c: RobotCache, attr: str, m):
-        try:
-            d = json.loads(m.data)
-        except json.JSONDecodeError:
+        d = parse_json_object(m.data)          # a cached non-object would break every telemetry frame
+        if d is None:
             return
         with self.lock:
             setattr(c, attr, d)
@@ -234,9 +233,8 @@ class RosLink:
                 self.brain, self._brain_rx = d, time.time()
 
     def _on_env(self, m):
-        try:
-            d = json.loads(m.data)
-        except json.JSONDecodeError:
+        d = parse_json_object(m.data)
+        if d is None:
             return
         with self.lock:
             self.env = d

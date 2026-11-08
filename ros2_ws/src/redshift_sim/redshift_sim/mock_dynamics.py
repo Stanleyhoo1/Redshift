@@ -9,7 +9,9 @@
   as the Gazebo `cmd_vel` → `cmd_vel_hw` relay does, so a damaged rover crawls and veers and the autonomy only sees
   it in its sensors. The debris strike (start_strike) adds the rover_hw half-sine shock to the IMU specific force
   and a small roll kick to the roll mode, damages the drivetrain and reports the measured |a| peak in its event.
-* Scout: VelocityControl-like body-frame velocity commands with a first-order lag, resting on its skids.
+* Scout: VelocityControl-like body-frame velocity commands with a first-order lag, resting on its skids. In a dust
+  storm the world adds the wind at the scout's own AGL (rover_hw.wind_at shear, StormWind bearing and gusts) to that
+  lagged velocity, as Gazebo's cmd_vel → cmd_vel_hw relay does: the drone sees it only as drift in its odometry.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ import numpy as np
 from redshift_autonomy.physics_model import RoverPhysics
 
 from .mock_render import rpy_matrix
-from .rover_hw import STRIKE, Drivetrain, peak_g_above_gravity, strike_shape, strike_specific_force
+from .rover_hw import STRIKE, Drivetrain, StormWind, peak_g_above_gravity, strike_shape, strike_specific_force
 from .scene_events import JOLT
 
 G0 = 9.80665
@@ -36,6 +38,7 @@ ROLL_ZETA = 0.4
 JOLT_ACCEL = 40.0             # rad/s² of roll acceleration while the subsidence torque is applied
 SKID_Z = 0.05                 # scout base height above ground when landed
 SCOUT_TAU_S, SCOUT_YAW_TAU_S = 0.25, 0.2
+WIND_TAU_S = 0.5              # the airframe picks up a change of wind through drag over ≈ this long (env_state steps)
 
 
 class RoverSim:
@@ -196,48 +199,61 @@ class RoverSim:
 
 
 class ScoutSim:
-    def __init__(self, name: str, spec: dict, spawn, g_mult: float):
+    def __init__(self, name: str, spec: dict, spawn, g_mult: float, wind_field: StormWind | None = None):
         self.name, self.spec, self.g = name, spec, float(g_mult)
         x, y, z, yaw = spawn
         self.x, self.y, self.z, self.yaw, self.yaw0 = float(x), float(y), float(z), float(yaw), float(yaw)
         self.cmd = (0.0, 0.0, 0.0, 0.0)          # body vx, vy, vz, yaw rate
-        self.vel = np.zeros(3)
+        self.vel = np.zeros(3)                   # lagged commanded velocity (world frame, relative to the air)
         self.w = 0.0
         self.accel = np.array([0.0, 0.0, self.g * G0])
+        self.wind = 0.0                          # storm wind (m/s at WIND_REF_AGL_M), set from /world/env_state
+        self.wind_field = wind_field if wind_field is not None else StormWind()   # the storm's bearing and gusts
+        self.drift = np.zeros(3)                 # world-frame wind drift added to the lagged velocity
 
     def vel_world(self) -> np.ndarray:
-        return self.vel.copy()
+        """Ground velocity (world frame): lagged command + wind drift."""
+        return self.vel + self.drift
 
     def step(self, dt: float, scene, t: float) -> None:
-        vmax, vzmax = self.spec.get('v_max', 4.0), self.spec.get('vz_max', 2.0)
+        # commands are clamped at the air-relative limit (the planner keeps guidance within v_max itself and may
+        # add wind feed-forward on top in a storm)
+        vmax = self.spec.get('v_air_max', self.spec.get('v_max', 4.0))
+        vzmax = self.spec.get('vz_max', 2.0)
         vx, vy, vz, wz = self.cmd
         sp = math.hypot(vx, vy)
         if sp > vmax:
             vx, vy = vx * vmax / sp, vy * vmax / sp
         c, s = math.cos(self.yaw), math.sin(self.yaw)
         target = np.array([c * vx - s * vy, s * vx + c * vy, float(np.clip(vz, -vzmax, vzmax))])
-        prev = self.vel.copy()
+        prev = self.vel_world()
         self.vel += (target - self.vel) * min(1.0, dt / SCOUT_TAU_S)
         self.w += (wz - self.w) * min(1.0, dt / SCOUT_YAW_TAU_S)
-        ground = float(scene.height_at(self.x, self.y)) + SKID_Z
-        if self.z - ground < 0.1 and target[2] <= 0.0:          # on (or settling onto) its skids
+        terrain = float(scene.height_at(self.x, self.y))
+        ground = terrain + SKID_Z
+        on_skids = self.z - ground < 0.1 and target[2] <= 0.0
+        if on_skids:                                             # on (or settling onto) its skids
             self.vel[:] = 0.0 if abs(target[0]) + abs(target[1]) < 1e-3 else self.vel
             self.vel[2] = 0.0
             self.z = ground
-        self.x += self.vel[0] * dt
-        self.y += self.vel[1] * dt
+        # storm wind at its own AGL (the skids grip the ground); picked up through drag, never as a velocity step
+        want = (0.0, 0.0) if on_skids or self.wind <= 0.0 else self.wind_field.vector(t, self.z - terrain, self.wind)
+        self.drift[:2] += (np.asarray(want) - self.drift[:2]) * min(1.0, dt / WIND_TAU_S)
+        v = self.vel_world()
+        self.x += v[0] * dt
+        self.y += v[1] * dt
         self.z = max(ground, self.z + self.vel[2] * dt)
         if self.z <= ground:
             self.vel[2] = max(0.0, self.vel[2])
         edge = scene.half - 0.5
         self.x, self.y = float(np.clip(self.x, -edge, edge)), float(np.clip(self.y, -edge, edge))
         self.yaw = (self.yaw + self.w * dt + math.pi) % (2 * math.pi) - math.pi
-        a_w = (self.vel - prev) / dt + np.array([0.0, 0.0, self.g * G0])
+        a_w = (self.vel_world() - prev) / dt + np.array([0.0, 0.0, self.g * G0])
         self.accel = np.array([c * a_w[0] + s * a_w[1], -s * a_w[0] + c * a_w[1], a_w[2]])
 
     def snapshot(self) -> dict:
         c, s = math.cos(self.yaw), math.sin(self.yaw)
-        v = self.vel
+        v = self.vel_world()
         return {'x': self.x, 'y': self.y, 'z': self.z, 'yaw': self.yaw, 'roll': 0.0, 'pitch': 0.0,
                 'v_body': (c * v[0] + s * v[1], -s * v[0] + c * v[1], v[2]), 'gyro': (0.0, 0.0, self.w),
                 'accel': tuple(self.accel), 'imu_yaw': self.yaw - self.yaw0}

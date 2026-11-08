@@ -62,7 +62,9 @@ class World:
         self.rock_version = 0
         self.perm: list[list[float]] = []
         self.found_science: list[list[float]] = []
-        self.env = {"dust_level": 0.0, "seismic": False, "until_t": 0.0, "seismic_until": 0.0}
+        # kind / wind_mps (docs/protocol.md §10.1): "dust" for a plain anomaly, "dust_storm" with its 12 m-AGL wind
+        self.env = {"dust_level": 0.0, "seismic": False, "until_t": 0.0, "seismic_until": 0.0, "kind": None, "wind_mps": 0.0}
+        self.pillars: list[list] = []  # landed pillars, each a list of [x, y, r] chunks (also in self.rocks)
         self.truth = self._truth_classes()
         self.new_hazard = (0, 0.0)
         self.last_trace_t = 0.0
@@ -239,6 +241,18 @@ class World:
                 s = -0.5 * d - 4.0 * turn - sum(20.0 for ax, ay in avoid if math.hypot(gx - ax, gy - ay) < 8) + self.rng.uniform(0, 3)
                 if s > best_s:
                     best, best_s = (gx, gy), s
+        return best
+
+    def pillar_ahead(self, x: float, y: float, yaw: float, max_m: float = 16.0, half_fov: float = 0.7) -> float | None:
+        """Range to the nearest landed pillar chunk in view ahead of (x, y, yaw), or None."""
+        best = None
+        for chunks in self.pillars:
+            for cx, cy, _ in chunks:
+                fwd = (cx - x) * math.cos(yaw) + (cy - y) * math.sin(yaw)
+                lat = -(cx - x) * math.sin(yaw) + (cy - y) * math.cos(yaw)
+                if 1.0 <= fwd <= max_m and abs(math.atan2(lat, fwd)) <= half_fov:
+                    d = math.hypot(fwd, lat)
+                    best = d if best is None else min(best, d)
         return best
 
     # ---- traces & events -----------------------------------------------------------------

@@ -57,6 +57,11 @@ describe('sampleOf', () => {
     expect(s.slip).toBeNull()
     expect(s.altitude_agl).toBe(12)
   })
+  it("carries the drone's own wind estimate, never a rover's", () => {
+    expect(sampleOf({ ...base, type: 'scout', altitude_agl: 8, wind_mps: 13.2 }, 0).wind_mps).toBe(13.2)
+    expect(sampleOf({ ...base, type: 'scout', altitude_agl: 8, wind_mps: null }, 0).wind_mps).toBeNull()
+    expect(sampleOf({ ...base, wind_mps: 5 }, 0).wind_mps).toBeNull()
+  })
   it('measures gyro magnitude in °/s', () => expect(gyroDps([0, 0, Math.PI])).toBeCloseTo(180, 9))
 })
 

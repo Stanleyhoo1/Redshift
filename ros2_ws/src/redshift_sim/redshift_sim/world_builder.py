@@ -3,6 +3,9 @@
 Everything the mission needs lands in one runtime directory:
   world.sdf · heightmap.png (16-bit) · regolith_diffuse.png · regolith_normal.png · terrain.npz ·
   bridge.yaml · world_meta.json
+
+It also holds the pure Gazebo-side helpers of world_interface_node: the SDF of the toppling basalt pillar it spawns
+at run time (pillar_model_sdf) and the body-frame storm-wind drift its scout command relay adds (wind_drift_body).
 """
 from __future__ import annotations
 
@@ -105,9 +108,103 @@ def _e(ros, gz, ros_t, gz_t, direction='GZ_TO_ROS'):
 
 
 def cmd_topic_ros(name: str) -> str:
-    """ROS topic bridged to the robot's gz DiffDrive / VelocityControl `/<name>/cmd_vel`. Rovers drive through
-    world_interface_node's drivetrain relay (`cmd_vel` scaled by wheel health → `cmd_vel_hw`, protocol §8.2)."""
-    return f'/{name}/cmd_vel_hw' if name.startswith('rover') else f'/{name}/cmd_vel'
+    """ROS topic bridged to the robot's gz DiffDrive / VelocityControl `/<name>/cmd_vel`. Every robot drives through
+    world_interface_node's relay `cmd_vel` → `cmd_vel_hw`: a rover's is scaled by its wheel health (protocol §8.2),
+    the scout's carries the storm-wind drift (§10.1)."""
+    return f'/{name}/cmd_vel_hw'
+
+
+# --- scout command relay: storm wind drift (world_interface_node) -------------------------------------------------
+WIND_MIN_AGL_M = 0.3          # below this the scout sits on its skids: the wind does not slide a landed drone
+
+
+def world_to_body_xy(vx: float, vy: float, yaw: float) -> tuple[float, float]:
+    """A world-frame horizontal vector in the body frame of a level robot heading `yaw`: the rotation the scout
+    planner applies to its own commands, since VelocityControl's linear velocity is body-frame."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    return c * vx + s * vy, -s * vx + c * vy
+
+
+def wind_drift_body(wind_xy_world, yaw: float, h_agl: float) -> tuple[float, float]:
+    """Body-frame velocity (m/s) the relay adds to the scout's command: the world wind at its height
+    (rover_hw.StormWind.vector), rotated into the body frame; none while it is landed (h_agl < WIND_MIN_AGL_M)."""
+    wx, wy = float(wind_xy_world[0]), float(wind_xy_world[1])
+    if h_agl < WIND_MIN_AGL_M or (wx == 0.0 and wy == 0.0):
+        return 0.0, 0.0
+    return world_to_body_xy(wx, wy, yaw)
+
+
+# --- toppling basalt pillar (world_interface_node `pillar_collapse`, protocol §10.1) --------------------------------
+BASALT_RGB = (20, 19, 18)     # scene_events.PILLAR['albedo_rgb']: fresh basalt (albedo ≈ 0.08), diffuse = albedo / 255.
+                              # Gazebo's camera renders it at HSV V ≈ 70 (gamma-encoded), the boulders (0.38-0.46) far lighter
+PILLAR_MU = 1.2               # ground friction on every pillar collision (≥ 1.0): the base pivots instead of skating
+TOPPLE_MARGIN_DEG = 2.5       # spawn tilt past the flat base's balance angle, so gravity topples it, never rights it
+KEEL_PROTRUDE_M = 0.03        # anti-roll keel: a flat face this far beyond the trunk on the side that lands down ...
+KEEL_THICK_M = 0.06           # ... this thick,
+KEEL_HALF_WIDTH = 0.75        # ... half as wide as this × radius (a fallen trunk holds on slopes up to ≈ 35°),
+KEEL_END_FRAC = 0.05          # ... and clear of each end by this fraction of the height (off the ground while standing)
+
+
+def pillar_balance_deg(height: float, radius: float) -> float:
+    """Tilt (deg) at which a flat-based solid cylinder standing on its base rim balances, atan(2r / h): released at
+    less, its centre of mass is still over the base and it rights itself (6.65° for the 6 m × 0.35 m pillar)."""
+    return math.degrees(math.atan2(2.0 * radius, height))
+
+
+def pillar_spawn_tilt_deg(tilt0_deg: float, height: float, radius: float) -> float:
+    """Spawn tilt: the requested one, raised past the balance angle by TOPPLE_MARGIN_DEG when it would not topple.
+    (The mock's thin-rod model falls from any tilt; a real 0.7 m-wide base does not.)"""
+    return max(float(tilt0_deg), pillar_balance_deg(height, radius) + TOPPLE_MARGIN_DEG)
+
+
+def disc_ground_z(height_at, x: float, y: float, radius: float, n: int = 12) -> float:
+    """Highest ground under a disc of `radius` at (x, y) (centre + n rim points): a base spawned there never starts
+    inside a slope. `height_at` is vectorised (terrain_gen.Terrain.height_at)."""
+    a = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
+    xs = np.concatenate([[x], x + radius * np.cos(a)])
+    ys = np.concatenate([[y], y + radius * np.sin(a)])
+    return float(np.max(height_at(xs, ys)))
+
+
+def pillar_model_sdf(name: str, base_xyz, fall_dir, tilt0_deg: float, height: float, radius: float, mass: float,
+                     albedo_rgb=BASALT_RGB) -> str:
+    """A dynamic basalt pillar for EntityFactory: one link, a solid cylinder (radius × height, inertia of a solid
+    cylinder) whose model origin is the centre of its base, leaning pillar_spawn_tilt_deg toward `fall_dir` (unit
+    world xy) so gravity topples it across the route. `base_xyz` = the ground point under the base (terrain + a
+    clearance): the base centre is lifted by r·sin(tilt), so its low rim, the pivot, sits there.
+
+    Pose = (0, tilt, atan2(fall_dir)): the fall turns the trunk about its own y axis, so its +x side lands down. That
+    side carries a thin flat keel collision a few cm proud of the trunk, so the fallen cylinder rests on a face instead
+    of rolling down a slope and off the route. The keel is collision only; cameras and LiDAR see the cylinder."""
+    bx, by, bz = (float(v) for v in base_xyz)
+    h, r, m = float(height), float(radius), float(mass)
+    tilt = math.radians(pillar_spawn_tilt_deg(tilt0_deg, h, r))
+    yaw = math.atan2(float(fall_dir[1]), float(fall_dir[0]))
+    z0 = bz + r * math.sin(tilt)
+    i_side, i_axis = m * (3.0 * r * r + h * h) / 12.0, m * r * r / 2.0
+    keel_x = r + KEEL_PROTRUDE_M - KEEL_THICK_M / 2.0
+    keel_len = h * (1.0 - 2.0 * KEEL_END_FRAC)
+    dr, dg, db = (c / 255.0 for c in albedo_rgb)
+    mid = f'<pose>0 0 {h / 2:.4f} 0 0 0</pose>'
+    cylinder = f'<geometry><cylinder><radius>{r:.4f}</radius><length>{h:.4f}</length></cylinder></geometry>'
+    friction = f'<surface><friction><ode><mu>{PILLAR_MU}</mu><mu2>{PILLAR_MU}</mu2></ode></friction></surface>'
+    inertia = (f'<inertia><ixx>{i_side:.4f}</ixx><iyy>{i_side:.4f}</iyy><izz>{i_axis:.4f}</izz>'
+               f'<ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>')
+    return f'''<sdf version="1.10"><model name="{name}">
+  <pose>{bx:.3f} {by:.3f} {z0:.3f} 0 {tilt:.5f} {yaw:.5f}</pose>
+  <link name="link">
+    <inertial>{mid}<mass>{m:.3f}</mass>{inertia}</inertial>
+    <collision name="trunk">{mid}{cylinder}{friction}</collision>
+    <collision name="keel"><pose>{keel_x:.4f} 0 {h / 2:.4f} 0 0 0</pose>
+      <geometry><box><size>{KEEL_THICK_M:.4f} {2 * KEEL_HALF_WIDTH * r:.4f} {keel_len:.4f}</size></box></geometry>
+      {friction}
+    </collision>
+    <visual name="trunk_visual">{mid}{cylinder}
+      <material><ambient>{0.6 * dr:.3f} {0.6 * dg:.3f} {0.6 * db:.3f} 1</ambient>
+        <diffuse>{dr:.3f} {dg:.3f} {db:.3f} 1</diffuse><specular>0.05 0.05 0.05 1</specular></material>
+    </visual>
+  </link>
+</model></sdf>'''
 
 
 def _bridge_entries(name: str) -> list[dict]:

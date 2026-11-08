@@ -1,5 +1,6 @@
 import { fmtElapsed } from '../lib/format'
 import { useStore } from '../lib/store'
+import { envLine } from '../lib/storm'
 import { C } from '../lib/theme'
 
 /** Overlay on the globe stage: coverage first, then what the fleet has found. */
@@ -8,8 +9,8 @@ export function MissionProgress() {
   const stats = useStore((s) => s.map?.stats)
   const pct = m?.percent_mapped ?? stats?.percent ?? 0
   const perm = stats?.permanent_hazards.length ?? 0
-  const dust = m?.env.dust_level ?? 0
-  const seismic = !!m?.env.seismic
+  const env = envLine(m?.env)
+  const envColor = env?.storm ? C.storm : C.ochre
 
   return (
     <div className="pointer-events-auto w-[300px] rounded-[3px] border border-rule bg-void/75 px-4 py-3 backdrop-blur-md">
@@ -29,12 +30,10 @@ export function MissionProgress() {
         <Count label="Hazard cells" value={m?.hazard_cells ?? stats?.hazard_cells ?? 0} color={C.ha} />
         <Count label="No-go zones" value={perm} color="#d23a55" />
       </dl>
-      {(dust > 0 || seismic) && (
-        <p className="mt-3 flex items-center gap-2 rounded-[2px] bg-ochre/15 px-2 py-1.5 text-[12px] text-ochre">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-ochre" />
-          {dust > 0 ? `Dust storm, opacity ${dust.toFixed(2)}` : ''}
-          {dust > 0 && seismic ? ', ' : ''}
-          {seismic ? 'seismic tremor' : ''}
+      {env && (
+        <p className="mt-3 flex items-center gap-2 rounded-[2px] px-2 py-1.5 text-[12px]" style={{ color: envColor, backgroundColor: `${envColor}26` }}>
+          <span className="h-2 w-2 shrink-0 animate-pulse rounded-full" style={{ backgroundColor: envColor }} />
+          {env.text}
         </p>
       )}
     </div>

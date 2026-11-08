@@ -2,8 +2,8 @@ import math
 
 import pytest
 
-from redshift_autonomy.rover_health import (CRITICAL_PCT, G0, RECOVERED_PCT, DroneHealth, RoverHealth,
-                                            drone_hover_power_w)
+from redshift_autonomy.rover_health import (CRITICAL_PCT, G0, PS_SPEED_SCALE, RECOVERED_PCT, DroneHealth,
+                                            PowerSaver, RoverHealth, drone_hover_power_w)
 
 G = 2.2
 
@@ -217,3 +217,121 @@ def test_drone_battery_drains_with_hover_power_at_high_gravity():
     for k in range(100):
         ground.step(k * 0.1, 0.1, airborne=False, compute_w=8.0)
     assert ground.state().load_w < 40.0
+
+
+def test_drone_hover_load_grows_with_the_estimated_wind():
+    calm, windy = DroneHealth('scout_0', 2.2), DroneHealth('scout_0', 2.2)
+    for k in range(10):
+        calm.step(k * 0.1, 0.1, airborne=True, compute_w=8.0)
+        windy.step(k * 0.1, 0.1, airborne=True, compute_w=8.0, wind_mps=14.0)
+    assert windy.state().load_w - calm.state().load_w == pytest.approx(0.25 * 14.0 ** 2)
+    landed = DroneHealth('scout_0', 2.2)
+    landed.step(0.0, 0.1, airborne=False, compute_w=8.0, wind_mps=14.0)
+    assert landed.state().load_w == pytest.approx(15.0 + 8.0)            # parked: no wind load
+
+
+# ---------------------------------------------------------------------------------------------------- PowerSaver
+HW_DT = 0.2                                # hw_status arrives at 5 Hz
+
+
+def feed(ps, t0, seconds, solar_w, irradiance, battery_pct=78.0):
+    """hw_status samples for `seconds`; returns (end time, the events raised)."""
+    t, events = t0, []
+    for _ in range(int(round(seconds / HW_DT))):
+        ev = ps.update(t, solar_w, irradiance, battery_pct)
+        if ev:
+            events.append((round(t, 2), ev))
+        t += HW_DT
+    return t, events
+
+
+def test_power_saver_enters_after_two_seconds_of_dust_dimmed_irradiance():
+    ps = PowerSaver()
+    assert not ps.active and ps.speed_scale == 1.0
+    t, ev = feed(ps, 0.0, 10.0, 205.0, 0.93)                       # clear sky: the reference is 205 W
+    assert ev == [] and ps.ref_w == pytest.approx(205.0)
+    t, ev = feed(ps, t, 1.8, 31.0, 0.15)                           # storm: under 2 s is not yet a blackout
+    assert ev == [] and not ps.active
+    t, ev = feed(ps, t, 0.6, 31.0, 0.15)
+    assert [e for _, e in ev] == ['enter'] and ps.active
+    assert ps.speed_scale == pytest.approx(PS_SPEED_SCALE) == pytest.approx(0.6)
+    assert ps.reason == 'Solar 31 W (was 205 W, −85 %), irradiance 0.15, battery 78 %'
+    assert ps.trigger == 'irradiance'
+    tx = ps.texts('enter')
+    assert tx['input'] == ps.reason and tx['action'] == 'Battery conservation: speed ×0.6'
+    assert tx['severity'] == 'warn' and 'irradiance below 0.35' in tx['reasoning']
+
+
+def test_power_saver_ignores_a_short_dip_and_exits_with_hysteresis():
+    ps = PowerSaver()
+    t, _ = feed(ps, 0.0, 5.0, 200.0, 0.93)
+    t, ev = feed(ps, t, 1.6, 30.0, 0.2)
+    t, ev2 = feed(ps, t, 1.0, 200.0, 0.93)                         # a 1.6 s dip: no conservation mode
+    assert ev == ev2 == [] and not ps.active
+    t, ev = feed(ps, t, 3.0, 30.0, 0.2)
+    assert [e for _, e in ev] == ['enter']
+    t, ev = feed(ps, t, 20.0, 100.0, 0.5)                          # between the thresholds: stays in
+    assert ev == [] and ps.active
+    t, ev = feed(ps, t, 4.0, 150.0, 0.7)                           # clearing, but under 5 s
+    t, ev2 = feed(ps, t, 0.4, 100.0, 0.5)                          # ... interrupted: the exit timer restarts
+    t, ev3 = feed(ps, t, 4.8, 150.0, 0.7)
+    assert ev == ev2 == ev3 == [] and ps.active
+    t_clear = t
+    t, ev = feed(ps, t, 1.0, 150.0, 0.7)
+    assert [e for _, e in ev] == ['exit'] and not ps.active and ps.speed_scale == 1.0
+    assert ev[0][0] == pytest.approx(t_clear + 0.2)                # 5.0 s after the clearing run began
+    assert ps.reason.startswith('Solar 150 W') and 'irradiance 0.70' in ps.reason
+    tx = ps.texts('exit')
+    assert tx['input'] == ps.reason and tx['severity'] == 'info' and 'restored' in tx['action']
+
+
+def test_power_saver_enters_on_collapsed_solar_output_and_does_not_flap():
+    ps = PowerSaver()
+    t, _ = feed(ps, 0.0, 10.0, 180.0, 0.93)
+    t, ev = feed(ps, t, 2.6, 40.0, 0.9)                            # < 25 % of 180 W with the pyranometer bright
+    assert [e for _, e in ev] == ['enter'] and ps.trigger == 'solar'
+    t, ev = feed(ps, t, 20.0, 40.0, 0.9)                           # still producing nothing: no exit, no flapping
+    assert ev == [] and ps.active
+    t, ev = feed(ps, t, 6.0, 170.0, 0.9)
+    assert [e for _, e in ev] == ['exit']
+
+
+def test_power_saver_reference_is_clear_sky_only_and_ages_out():
+    ps = PowerSaver()
+    t, _ = feed(ps, 0.0, 5.0, 300.0, 0.7)                          # hazy: not a clear-sky sample
+    assert ps.ref_w is None
+    t, _ = feed(ps, t, 5.0, 200.0, 0.9)
+    assert ps.ref_w == pytest.approx(200.0)
+    t, _ = feed(ps, t, 61.0, 150.0, 0.7)                           # 61 s without a clear-sky sample
+    assert ps.ref_w is None
+    t, ev = feed(ps, t, 3.0, 20.0, 0.2)                            # no reference: the text says only what it saw
+    assert [e for _, e in ev] == ['enter'] and ps.reason == 'Solar 20 W, irradiance 0.20, battery 78 %'
+
+
+def test_power_saver_runs_on_the_injected_clock():
+    ps = PowerSaver()
+    feed(ps, 1000.0, 5.0, 200.0, 0.93)
+    assert ps.update(1005.0, 20.0, 0.1, 70.0) is None
+    assert ps.update(1006.99, 20.0, 0.1, 70.0) is None
+    assert ps.update(1007.0, 20.0, 0.1, 70.0) == 'enter'
+    assert ps.update(1007.2, 20.0, None, 70.0) is None and ps.active        # no pyranometer reading: no change
+
+
+def test_power_save_from_a_starved_panel_does_not_end_while_it_stays_starved():
+    """Bright sky, shaded panel (solar 30 W against a 200 W reference): conservation holds for longer than the
+    reference window, and ends only once the output is back."""
+    from redshift_autonomy.rover_health import PS_REF_S, PowerSaver
+    ps = PowerSaver()
+    t = 0.0
+    while t < 20.0:
+        ps.update(t, 200.0, 0.95)
+        t += 0.5
+    events = []
+    while t < 20.0 + 3 * PS_REF_S:
+        events.append(ps.update(t, 30.0, 0.95))
+        t += 0.5
+    assert events.count('enter') == 1 and 'exit' not in events and ps.active
+    while t < 40.0 + 3 * PS_REF_S and ps.active:
+        ps.update(t, 190.0, 0.95)
+        t += 0.5
+    assert not ps.active

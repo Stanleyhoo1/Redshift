@@ -5,10 +5,11 @@ import numpy as np
 import pytest
 
 from redshift_autonomy.physics_model import RoverPhysics
-from redshift_sim.rover_hw import (DAMAGE_FAULTS, DAMAGED_HEALTH, G0, STRIKE, SOLAR_PEAK_W, SUN_ELEVATION_DEG,
-                                   SUN_VEC, Drivetrain, hw_status_dict, peak_g_above_gravity, planar_distance,
+from redshift_sim.rover_hw import (DAMAGE_FAULTS, DAMAGED_HEALTH, G0, GUST_FRAC, GUST_HZ, STORM_WIND_TOWARD_DEG,
+                                   STRIKE, SOLAR_PEAK_W, SUN_ELEVATION_DEG, SUN_VEC, WIND_REF_AGL_M, WIND_SHEAR_EXP,
+                                   Drivetrain, StormWind, hw_status_dict, peak_g_above_gravity, planar_distance,
                                    solar_output, strike_peak_accel, strike_shape, strike_specific_force,
-                                   strike_wrenches_world)
+                                   strike_wrenches_world, wind_at)
 
 SUN_AZ = math.atan2(SUN_VEC[1], SUN_VEC[0])
 
@@ -150,3 +151,45 @@ def test_gazebo_strike_never_lifts_a_wheel_and_reads_the_same_peak():
 
 def test_planar_distance():
     assert planar_distance((0.0, 0.0, 5.0), (3.0, 4.0, -1.0)) == pytest.approx(5.0)
+
+
+# ---------------------------------------------------------------- storm wind on the drone (spec §1.2)
+
+def test_wind_shear_grows_with_height_and_is_clipped():
+    assert (WIND_SHEAR_EXP, WIND_REF_AGL_M) == (0.6, 12.0)
+    assert wind_at(12.0, 14.0) == pytest.approx(14.0)
+    assert wind_at(8.0, 14.0) == pytest.approx(14.0 * (8.0 / 12.0) ** 0.6)            # ≈ 11.0 m/s: calmer below
+    assert wind_at(8.0, 14.0) == pytest.approx(10.97, abs=0.01)
+    hs = np.linspace(0.0, 40.0, 81)
+    assert np.all(np.diff([wind_at(h, 14.0) for h in hs]) >= 0.0)                       # monotonic in height
+    assert wind_at(0.0, 14.0) == pytest.approx(14.0 * 0.05 ** 0.6) == wind_at(-3.0, 14.0)
+    assert wind_at(100.0, 14.0) == pytest.approx(14.0 * 2.0 ** 0.6) == wind_at(24.0, 14.0)
+    assert wind_at(10.0, 0.0) == 0.0
+
+
+def test_storm_wind_blows_along_a_fixed_bearing_with_seeded_gusts():
+    w = StormWind(seed=3)
+    ts = np.arange(0.0, 20.0, 0.01)
+    g = np.array([w.gust(t) for t in ts])
+    assert g.min() >= 1.0 - GUST_FRAC - 1e-9 and g.max() <= 1.0 + GUST_FRAC + 1e-9    # ±25 %
+    assert g.max() - g.min() > 1.8 * GUST_FRAC                                          # really gusting
+    spec = np.abs(np.fft.rfft(g - g.mean()))
+    assert np.fft.rfftfreq(len(g), 0.01)[spec.argmax()] == pytest.approx(GUST_HZ, abs=0.06)
+    assert [StormWind(seed=3).gust(t) for t in (0.0, 1.7)] == [w.gust(0.0), w.gust(1.7)]   # seeded
+    assert StormWind(seed=4).gust(0.0) != w.gust(0.0)
+    for t in (0.0, 2.5, 7.0):
+        vx, vy = w.vector(t, 12.0, 14.0)
+        assert math.hypot(vx, vy) == pytest.approx(14.0 * w.gust(t))
+        assert math.degrees(math.atan2(vy, vx)) == pytest.approx(STORM_WIND_TOWARD_DEG)
+    lo, hi = w.vector(1.0, 8.0, 14.0), w.vector(1.0, 12.0, 14.0)
+    assert math.hypot(*lo) / math.hypot(*hi) == pytest.approx((8.0 / 12.0) ** 0.6)
+    assert w.vector(1.0, 12.0, 0.0) == (0.0, 0.0)
+    calm = StormWind(seed=3, gust_frac=0.0)
+    assert calm.vector(5.0, 12.0, 14.0) == pytest.approx((14.0 * math.cos(math.radians(STORM_WIND_TOWARD_DEG)),
+                                                          14.0 * math.sin(math.radians(STORM_WIND_TOWARD_DEG))))
+
+
+def test_the_storm_wind_reads_from_240_degrees_on_the_compass():
+    """The ENU direction the storm blows toward is the compass "from 240°" the drone's wind_descent trace prints."""
+    from redshift_autonomy.wind import compass_from_deg
+    assert compass_from_deg(math.radians(STORM_WIND_TOWARD_DEG)) == pytest.approx(240.0)

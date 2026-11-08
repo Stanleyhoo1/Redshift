@@ -13,6 +13,9 @@ import numpy as np
 from . import _paths  # noqa: F401
 from redshift_autonomy.agent_fsm import display_name, role_of
 
+ENV_KINDS = ('dust_storm', 'dust')     # /world/env_state "kind" (docs/protocol.md §10.1); anything else is null
+MAX_DETECTIONS = 16                    # detections per robot per telemetry frame; perception rarely reports more
+
 
 def png_b64(rgb: np.ndarray) -> str:
     """RGB uint8 image → base64 PNG (row 0 stays row 0 = south edge of the sector)."""
@@ -130,12 +133,64 @@ def robot_telemetry(c: RobotCache) -> dict:
         # advisory-brain limits the planner is honouring right now (docs/protocol.md §9.6); null when none
         'brain_cap': _obj(a.get('brain_cap')),
         'brain_agl': _obj(a.get('brain_agl')),
+        # rover battery conservation and the drone's own wind estimate / automatic descent (docs/protocol.md §10.3)
+        'power_save': a.get('power_save') is True,
+        'wind_mps': _round(_num(a.get('wind_mps'))),
+        'wind_descent': a.get('wind_descent') is True,
+        'detections': detection_summary(c.detections),
         'sensors': sensor_readings(c, imu, unc),
     }
 
 
 def _obj(v) -> dict | None:
     return v if isinstance(v, dict) else None
+
+
+def _num(v) -> float | None:
+    """A finite JSON number as a float, else None (a bool is not a number here)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except OverflowError:          # a huge JSON integer
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _round(v: float | None, nd: int = 2) -> float | None:
+    return None if v is None else round(v, nd)
+
+
+def _xy(v) -> list | None:
+    if not isinstance(v, (list, tuple)) or len(v) != 2:
+        return None
+    p = [_num(x) for x in v]
+    return None if None in p else [round(x, 2) for x in p]
+
+
+def detection_summary(det: dict | None, cap: int = MAX_DETECTIONS) -> list:
+    """The latest /perception/detections, compact: [{cls, conf, range_m, world_xy}] (≤ cap; the boxes and labels
+    are drawn into the annotated camera feed). Malformed entries are dropped."""
+    items = det.get('detections') if isinstance(det, dict) else None
+    if not isinstance(items, list):
+        return []
+    out = []
+    for d in items:
+        if not isinstance(d, dict) or not isinstance(d.get('cls'), str):
+            continue
+        out.append({'cls': d['cls'], 'conf': _round(_num(d.get('conf'))), 'range_m': _round(_num(d.get('range_m'))),
+                    'world_xy': _xy(d.get('world_xy'))})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def env_telemetry(env: dict) -> dict:
+    """WS telemetry mission.env from the latest /world/env_state (docs/protocol.md §7, §10.1): dust level, tremor
+    flag, the anomaly kind (null when clear or unknown) and the ramped storm wind in m/s (0 when calm)."""
+    kind = env.get('kind')
+    return {'dust_level': _num(env.get('dust_level')) or 0.0, 'seismic': bool(env.get('seismic', False)),
+            'kind': kind if kind in ENV_KINDS else None, 'wind_mps': max(0.0, _num(env.get('wind_mps')) or 0.0)}
 
 
 def sensor_readings(c: RobotCache, imu: dict, unc: dict) -> dict:

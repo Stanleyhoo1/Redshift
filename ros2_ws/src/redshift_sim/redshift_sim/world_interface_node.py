@@ -1,5 +1,6 @@
-"""Gazebo implementation of /world/command (rockslide spawning, tip/slip jolts, simulation speed, debris strike /
-critical damage, repair) via gz-transport, plus the simulated rover hardware (rover_hw, docs/protocol.md §8).
+"""Gazebo implementation of /world/command (rockslide spawning, pillar collapse, tip/slip jolts, simulation speed,
+debris strike / critical damage, repair) via gz-transport, plus the simulated rover hardware (rover_hw, docs/protocol.md
+§8) and the dust storm's wind on the drone (§10.1).
 
 Dust/seismic anomalies are handled by sensor_effects_node in both backends; this node only touches
 the physical world. Every executed command is echoed on /world/events.
@@ -16,6 +17,15 @@ crawls and veers exactly as in the mock. `/<rover>/hw_status` is published at 5 
 callback. The debris strike is a short two-phase wrench on <rover>::base_link that never lifts a wheel (persistent
 wrench, delta wrench at half time, clear; timed in simulated time like the jolt; see rover_hw); its event reports the
 |a| peak measured on imu_raw.
+
+Pillar collapse: armed and deferred like the rockslide (rockslide_due), then one dynamic basalt cylinder
+(world_builder.pillar_model_sdf) is spawned beside the route at scene_events.pillar_layout's base, leaning across it;
+gravity topples it. Its event carries the planned footprint (base, tip, cross).
+
+Scout: the bridge feeds gz `/<scout>/cmd_vel` (VelocityControl, body frame) from ROS `/<scout>/cmd_vel_hw`, which this
+node relays from `/<scout>/cmd_vel` plus the storm's wind drift: rover_hw.StormWind (fixed bearing, seeded gusts) at
+the scout's AGL (odom z minus the terrain under it), with env_state `wind_mps` as the reference wind, rotated into the
+body frame (world_builder.wind_drift_body). The drone only learns the wind from its own odometry.
 """
 from __future__ import annotations
 
@@ -37,15 +47,19 @@ from std_msgs.msg import String
 from redshift_autonomy.physics_model import RoverPhysics
 
 from .robot_models import ROVER_SPEC, rover_com_z
-from .rover_hw import (REPAIR_RANGE_M, REPAIR_S, STRIKE, Drivetrain, hw_status_dict, peak_g_above_gravity,
+from .rover_hw import (REPAIR_RANGE_M, REPAIR_S, STRIKE, Drivetrain, StormWind, hw_status_dict, peak_g_above_gravity,
                        planar_distance, solar_output, strike_wrenches_world)
-from .scene_events import JOLT, jolt_cut_angle_deg, jolt_wrench_world, rockslide_due, rockslide_layout
+from .scene_events import (JOLT, PILLAR, jolt_cut_angle_deg, jolt_wrench_world, pillar_footprint, pillar_layout,
+                           rockslide_due, rockslide_layout)
 from .terrain_gen import Terrain
-from .world_builder import GZ_CLOCK_TOPIC, cmd_topic_ros
+from .world_builder import (GZ_CLOCK_TOPIC, WIND_MIN_AGL_M, cmd_topic_ros, disc_ground_z, pillar_model_sdf,
+                            wind_drift_body)
 
 
 CLOCK_PERIOD_S = 0.01
 HW_STATUS_PERIOD_S = 0.2
+PILLAR_CLEARANCE_M = 0.02     # the pillar's low base rim spawns this far above the highest ground under its base
+WIND_TAU_S = 0.5              # the drone picks up a change of drift through drag over ≈ this long (as the mock does)
 
 
 def yaw_of(q) -> float:
@@ -93,12 +107,16 @@ class WorldInterface(Node):
         self.create_subscription(Clock, GZ_CLOCK_TOPIC, self._on_gz_clock, QoSProfile(depth=50))
         self.paths: dict[str, np.ndarray] = {}
         self._sliding: set[str] = set()     # rovers with a rockslide armed (waiting for rockslide_due)
+        self._pillaring: set[str] = set()   # rovers with a pillar collapse armed (same deferral)
+        self._pillar = 0
         self.poses: dict[str, tuple] = {}
         self.roll: dict[str, float] = {}
         self.cut_deg = jolt_cut_angle_deg(RoverPhysics().limits(self.g).tip_alarm_deg)
         self._jolting: set[str] = set()
         self._striking: set[str] = set()
-        self.rovers = [r for r in self.get_parameter('robots').value if r.startswith('rover')]
+        robots = list(self.get_parameter('robots').value)
+        self.rovers = [r for r in robots if r.startswith('rover')]
+        self.scouts = [r for r in robots if not r.startswith('rover')]
         self.tilt: dict[str, tuple] = {}            # (roll, pitch) rad from imu_raw
         self.accel: dict[str, float] = {}           # |a| m/s² from imu_raw
         self._peak: dict[str, float] = {}           # running |a| max while a strike is being measured
@@ -107,6 +125,14 @@ class WorldInterface(Node):
         self.cmd_in: dict[str, Twist] = {}
         self.repairs: dict[str, dict] = {}          # repair event under way, echoed again when done
         self.dust_level = 0.0
+        self.env_kind: str | None = None             # 'dust_storm' | 'dust' | None (env_state)
+        self.wind_mps = 0.0                           # storm wind at WIND_REF_AGL_M (env_state, ramped)
+        self._storm = 0                               # storms so far: seeds each one's gusts (as the mock world)
+        self.wind_field = StormWind()
+        self.scout_odom: dict[str, tuple] = {}        # (x, y, z, yaw)
+        self.scout_ground0: dict[str, float] = {}     # odom z at rest on the pad: the AGL datum without a terrain
+        self.scout_cmd: dict[str, Twist] = {}
+        self.scout_drift: dict[str, tuple] = {}       # (t, wx, wy): lagged world-frame drift last relayed
         self._next_hw: float | None = None
         self.hw_pub, self.cmd_hw_pub = {}, {}
         for r in self.rovers:
@@ -116,6 +142,11 @@ class WorldInterface(Node):
             self.hw_pub[r] = self.create_publisher(String, f'/{r}/hw_status', QoSProfile(depth=10))
             self.cmd_hw_pub[r] = self.create_publisher(Twist, cmd_topic_ros(r), QoSProfile(depth=10))
             self.create_subscription(Twist, f'/{r}/cmd_vel', lambda m, r=r: self._on_cmd_vel(r, m),
+                                     qos_profile_sensor_data)
+        for s in self.scouts:
+            self.create_subscription(Odometry, f'/{s}/odom', lambda m, s=s: self._on_scout_odom(s, m), 10)
+            self.cmd_hw_pub[s] = self.create_publisher(Twist, cmd_topic_ros(s), QoSProfile(depth=10))
+            self.create_subscription(Twist, f'/{s}/cmd_vel', lambda m, s=s: self._on_scout_cmd(s, m),
                                      qos_profile_sensor_data)
         self.create_subscription(String, '/world/env_state', self._on_env, 10)
         self.events = self.create_publisher(String, '/world/events', 10)
@@ -141,13 +172,26 @@ class WorldInterface(Node):
                 self._publish_hw(r)
                 if self.hw[r].repairing:
                     self._relay(r)                    # health is ramping: apply it even between commands
+            for s in self.scouts:
+                if self.wind_mps > 0.0 or s in self.scout_drift:
+                    self._relay_scout(s)              # gusts and the wind ramp act between commands too
 
     # ------------------------------------------------------------------ simulated rover hardware
     def _on_env(self, msg: String):
         try:
-            self.dust_level = float(json.loads(msg.data).get('dust_level') or 0.0)
+            env = json.loads(msg.data)
+            dust = float(env.get('dust_level') or 0.0)
+            wind = max(0.0, float(env.get('wind_mps') or 0.0))
+            kind = env.get('kind')
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
-            pass
+            return
+        self.dust_level = dust
+        if wind > 0.0 and self.wind_mps <= 0.0:       # a new storm: its own gusts, the fixed bearing
+            self._storm += 1
+            self.wind_field = StormWind(seed=self._storm)
+            self.get_logger().info(f'storm #{self._storm} ({kind or "wind"}): wind rising toward the scouts '
+                                   f'(bearing {math.degrees(self.wind_field.toward):.0f}° ENU)')
+        self.wind_mps, self.env_kind = wind, kind
 
     def _on_cmd_vel(self, robot: str, msg: Twist):
         self.cmd_in[robot] = msg
@@ -167,6 +211,49 @@ class WorldInterface(Node):
         out.linear.x, out.linear.y, out.linear.z = float(v), m.linear.y, m.linear.z
         out.angular.x, out.angular.y, out.angular.z = m.angular.x, m.angular.y, float(w)
         self.cmd_hw_pub[robot].publish(out)
+
+    # ------------------------------------------------------------------ scout: storm wind drift (protocol §10.1)
+    def _on_scout_odom(self, scout: str, msg: Odometry):
+        p = msg.pose.pose
+        self.scout_odom[scout] = (p.position.x, p.position.y, p.position.z, yaw_of(p.orientation))
+        self.scout_ground0.setdefault(scout, p.position.z)
+
+    def _on_scout_cmd(self, scout: str, msg: Twist):
+        self.scout_cmd[scout] = msg
+        self._relay_scout(scout)
+
+    def _scout_agl(self, scout: str) -> float | None:
+        o = self.scout_odom.get(scout)
+        if o is None:
+            return None
+        ground = self.terrain.height_at(o[0], o[1]) if self.terrain else self.scout_ground0[scout]
+        return o[2] - ground
+
+    def _relay_scout(self, scout: str):
+        """cmd_vel → cmd_vel_hw plus the body-frame wind drift (zero-latency for every command, and 5 Hz in a storm)."""
+        m = self.scout_cmd.get(scout)
+        if m is None:
+            return
+        o, agl = self.scout_odom.get(scout), self._scout_agl(scout)
+        want = (0.0, 0.0)
+        if self.wind_mps > 0.0 and agl is not None and agl >= WIND_MIN_AGL_M:     # airborne: on its skids it grips
+            want = self.wind_field.vector(self.sim_t, agl, self.wind_mps)
+        t0, wx, wy = self.scout_drift.get(scout, (self.sim_t, 0.0, 0.0))
+        k = min(1.0, max(0.0, self.sim_t - t0) / WIND_TAU_S)
+        wx, wy = wx + (want[0] - wx) * k, wy + (want[1] - wy) * k
+        if want == (0.0, 0.0) and math.hypot(wx, wy) < 0.05:
+            self.scout_drift.pop(scout, None)         # calm again: relay unchanged
+            wx = wy = 0.0
+        else:
+            self.scout_drift[scout] = (self.sim_t, wx, wy)
+        bx, by = wind_drift_body((wx, wy), o[3], agl) if o is not None and agl is not None else (0.0, 0.0)
+        if bx == 0.0 and by == 0.0:
+            self.cmd_hw_pub[scout].publish(m)
+            return
+        out = Twist()
+        out.linear.x, out.linear.y, out.linear.z = m.linear.x + bx, m.linear.y + by, m.linear.z
+        out.angular.x, out.angular.y, out.angular.z = m.angular.x, m.angular.y, m.angular.z
+        self.cmd_hw_pub[scout].publish(out)
 
     def _publish_hw(self, robot: str):
         roll, pitch = self.tilt.get(robot, (0.0, 0.0))
@@ -213,6 +300,13 @@ class WorldInterface(Node):
             if robot not in self._sliding:                 # one armed slide per rover
                 self._sliding.add(robot)
                 threading.Thread(target=self._rockslide, args=(robot,), daemon=True).start()
+        elif op == 'pillar_collapse':
+            robot = cmd.get('robot', 'rover_0')
+            if robot not in self.hw:
+                self._emit({'op': 'pillar_collapse', 'ok': False, 'robot': robot, 'detail': 'unknown rover'})
+            elif robot not in self._pillaring:             # one armed pillar per rover
+                self._pillaring.add(robot)
+                threading.Thread(target=self._pillar_collapse, args=(robot,), daemon=True).start()
         elif op == 'jolt':
             self._jolt(cmd.get('robot', 'rover_0'))
         elif op == 'critical_damage':
@@ -267,6 +361,46 @@ class WorldInterface(Node):
                                + (f' (waited {waited:.1f} s for the next route)' if waited > 0 else ''))
         self._emit({'op': 'spawn_rockslide', 'ok': ok_all, 'robot': robot, 'impact': list(impact),
                     'rocks': [list(r) for r in rocks], 'waited_s': round(waited, 2)})
+
+    def _pillar_collapse(self, robot: str):
+        try:
+            if self.poses.get(robot) is None:
+                self._emit({'op': 'pillar_collapse', 'ok': False, 'robot': robot, 'detail': 'no odometry yet'})
+                return
+            # like the rockslide: near its goal, wait (simulated time) for the next route; the wall guard only covers
+            # a stopped clock
+            t0, w0 = self.sim_t, time.monotonic()
+            while not rockslide_due(self.paths.get(robot), self.poses[robot], self.sim_t - t0) \
+                    and time.monotonic() - w0 < 30.0:
+                time.sleep(0.05)
+            self._drop_pillar(robot, self.poses[robot], self.sim_t - t0)
+        except Exception as e:  # noqa: BLE001 - the inject must always answer
+            self.get_logger().error(f'pillar collapse for {robot} failed: {e}')
+            self._emit({'op': 'pillar_collapse', 'ok': False, 'robot': robot, 'detail': f'pillar failed: {e}'})
+        finally:
+            self._pillaring.discard(robot)
+
+    def _drop_pillar(self, robot: str, pose, waited: float):
+        from gz.msgs10.boolean_pb2 import Boolean
+        from gz.msgs10.entity_factory_pb2 import EntityFactory
+        lay = pillar_layout(self.paths.get(robot), pose, seed=self._pillar)
+        self._pillar += 1
+        (bx, by), tip = pillar_footprint(lay)
+        r, h = lay['radius_m'], lay['height_m']
+        ground = disc_ground_z(self.terrain.height_at, bx, by, r) if self.terrain else 0.0
+        sdf = pillar_model_sdf(f'pillar_{self._pillar}', (bx, by, ground + PILLAR_CLEARANCE_M), lay['fall_dir'],
+                               PILLAR['tilt0_deg'], h, r, PILLAR['mass_kg'], PILLAR['albedo_rgb'])
+        ok, rep = self.gz.request(f'/world/{self.world}/create', EntityFactory(sdf=sdf, allow_renaming=True),
+                                  EntityFactory, Boolean, 2000)
+        ok = bool(ok and rep.data)
+        self.get_logger().info(f'pillar #{self._pillar} beside {robot} route at ({bx:.1f}, {by:.1f}) toppling across '
+                               f'{lay["cross"]}: ok={ok}' + (f' (waited {waited:.1f} s for the next route)'
+                                                             if waited > 0 else ''))
+        ev = {'op': 'pillar_collapse', 'ok': ok, 'robot': robot, 'base': [bx, by], 'tip': list(tip),
+              'cross': list(lay['cross']), 'height_m': h, 'radius_m': r, 'waited_s': round(waited, 2)}
+        if not ok:
+            ev['detail'] = 'gz create request failed'
+        self._emit(ev)
 
     def _jolt(self, robot: str):
         if robot in self._jolting or robot in self._striking:

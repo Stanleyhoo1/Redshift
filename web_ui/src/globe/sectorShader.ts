@@ -223,9 +223,14 @@ void main() {
   gl_Position = projectionMatrix * modelViewMatrix * vec4(dir * (1.0 + uLift), 1.0);
 }
 `
+/**
+ * uStorm 0 = brown dust haze, 1 = the dust storm's orange-red (sensor_effects STORM_RGB 205, 88, 48), denser.
+ * uTime is the haze's own clock (DustShell runs it faster in a storm).
+ */
 export const DUST_FRAGMENT = /* glsl */ `
 uniform float uTime;
 uniform float uLevel;
+uniform float uStorm;
 varying vec2 vUv;
 varying vec3 vDir;
 ${NOISE_GLSL}
@@ -234,7 +239,9 @@ void main() {
   float n = fbm(p) * 0.75 + fbm(p * 2.7 - uTime * 0.3) * 0.25;
   vec2 edge = min(vUv, 1.0 - vUv);
   float fade = smoothstep(0.0, 0.12, min(edge.x, edge.y));
-  float a = clamp(uLevel * (0.2 + 0.8 * smoothstep(0.35, 0.8, n)) * fade, 0.0, 1.0) * 0.55;
-  gl_FragColor = vec4(mix(vec3(0.62, 0.42, 0.24), vec3(0.85, 0.62, 0.38), n), a);
+  float a = clamp(uLevel * (0.2 + 0.8 * smoothstep(0.35, 0.8, n)) * fade, 0.0, 1.0) * mix(0.55, 0.68, uStorm);
+  vec3 dust = mix(vec3(0.62, 0.42, 0.24), vec3(0.85, 0.62, 0.38), n);
+  vec3 storm = mix(vec3(0.62, 0.24, 0.12), vec3(0.95, 0.42, 0.22), n);
+  gl_FragColor = vec4(mix(dust, storm, uStorm), a);
 }
 `

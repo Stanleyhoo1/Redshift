@@ -51,7 +51,7 @@ Global:
 | `/fleet/scan_complete` | std_msgs/String | `{id, scout, xy, max_slope_deg, mean_slope_deg, verdict, t}` |
 | `/world/command` | std_msgs/String | §4 |
 | `/world/events` | std_msgs/String | §4 |
-| `/world/env_state` | std_msgs/String | `{dust_level, seismic, remaining_s}` (`remaining_s` = simulated s of dust left, null when clear) |
+| `/world/env_state` | std_msgs/String | `{dust_level, seismic, remaining_s, kind, wind_mps}` (`remaining_s` = simulated s of dust left, null when clear; `kind` / `wind_mps` §10.1). Read by the world backends and the backend bridge, never by the autonomy stack |
 | `/clock` | rosgraph_msgs/Clock | simulated time, ≤100 Hz (every 0.01 s of sim time): `world_interface_node` (republished from Gazebo via `/gz/clock`) or `mock_world_node` |
 | `/gz/clock` | rosgraph_msgs/Clock | Gazebo backend only: gz-sim's per-step clock (250 Hz at 1×) via ros_gz_bridge → `world_interface_node` |
 
@@ -78,7 +78,7 @@ the UI shows them as times of day.
 §8.6, and `GEMMA` / `LOCAL` on `brain_advice` traces §9.5: which brain decided, Gemma or the local rules).
 `kind` examples: `mission_start, frontier_selected, path_planned, path_blocked, replanned, slope_hazard,
 science_target, caution_enter, caution_exit, safe_hold, recovery_reverse, hazard_marked, scout_tasked,
-scan_complete, resume, edge_throttle, mission_complete`.
+scan_complete, resume, edge_throttle, core_escape, mission_complete` (Phase 3 kinds §10.4).
 
 ### 3.2 Detections
 ```json
@@ -89,7 +89,7 @@ scan_complete, resume, edge_throttle, mission_complete`.
  "uncertainty":{"score":0.14,"camera_conf":0.91,"lidar_conf":0.95,"imu_vib":0.05},
  "stage_ms":{"quality":1.2,"detect":9.8,"lidar":2.1,"annotate":1.5}}
 ```
-`cls` ∈ `ROCK | CRATER | SCIENCE | SLOPE`.
+`cls` ∈ `ROCK | CRATER | SCIENCE | SLOPE`, plus `ROVER` (§8.8) and `PILLAR` (§10.2).
 
 ### 3.3 Agent state
 ```json
@@ -120,6 +120,8 @@ Commands (published by the backend; executed by `world_interface_node` (Gazebo) 
 {"op":"spawn_rockslide","robot":"rover_0"}
 {"op":"jolt","robot":"rover_0"}
 {"op":"anomaly","dust_level":0.85,"duration_s":25,"seismic_s":4}
+{"op":"anomaly","kind":"dust_storm","dust_level":1.0,"duration_s":45,"seismic_s":0,"wind_mps":14.0}
+{"op":"pillar_collapse","robot":"rover_0"}
 {"op":"clear_anomaly"}
 {"op":"set_speed","speed":2.0}
 ```
@@ -130,13 +132,14 @@ Commands (published by the backend; executed by `world_interface_node` (Gazebo) 
 lands beyond the path's end. With under 4 m of route left (the rover is about to reach its goal) the slide is armed
 and waits, up to 8 simulated seconds, for the rover's next planned route and lands across that
 (`scene_events.rockslide_due`; the event then carries `waited_s`); after that, or with no path, along the heading.
-A second request while one is armed is ignored.
+A second request while one is armed is ignored. `pillar_collapse` and the `dust_storm` anomaly kind: §10.1.
 
 Events (one per executed command):
 ```json
 {"op":"spawn_rockslide","ok":true,"robot":"rover_0","impact":[x,y],"rocks":[[x,y,r]],"waited_s":0.0,"t":0.0}
 {"op":"jolt","ok":true,"robot":"rover_0","t":0.0}
 {"op":"anomaly","ok":true,"dust_level":0.85,"duration_s":25,"t":0.0}
+{"op":"anomaly","ok":true,"kind":"dust_storm","dust_level":1.0,"duration_s":45,"wind_mps":14.0,"t":0.0}
 {"op":"set_speed","ok":true,"speed":2.0,"t":0.0}
 ```
 
@@ -161,7 +164,8 @@ RGB8, height = width = grid cells, **pixel row i = grid row i (row 0 = southmost
 - `POST /api/mission/abort` → `{ok}`
 - `GET /api/mission/status` → `{status, backend, config, started_at, checklist:{name:bool}, detail}`
 - `POST /api/inject/rockslide` `{robot?}` · `POST /api/inject/anomaly` `{dust_level?, duration_s?}` ·
-  `POST /api/inject/tip` `{robot?}` → `{ok, detail}`
+  `POST /api/inject/tip` `{robot?}` · `POST /api/inject/pillar` `{robot?}` · `POST /api/inject/storm`
+  `{duration_s?, wind_mps?}` (§10.6) → `{ok, detail}`
 - `POST /api/sim/speed` `{speed}` (0.25–3) → `{ok, speed, detail}` — live speed change of the running mission (also
   recorded in the mission config that telemetry and status report); `{ok:false}` when no mission is running.
 - `POST /api/command` `{text, robot?}` → `{ok, id}` — operator command for the advisory brain (§9.8).
@@ -196,12 +200,13 @@ request (POST) or a `/ws` upgrade whose `Origin` is neither localhost nor this s
 Server → client (JSON text frames):
 - `{"type":"status", status, backend, detail, checklist:{gazebo,bridge,mapping,rover_0,scout_0,...}, config}` — on change and 1 Hz while launching.
 - `{"type":"boot_log","line":"…","t":…}`
-- `{"type":"telemetry","t":…,"mission":{status, backend, elapsed_s, sim_time_s, sim_speed, rtf, percent_mapped, science_found, hazard_cells, env:{dust_level, seismic}, brain, config},
+- `{"type":"telemetry","t":…,"mission":{status, backend, elapsed_s, sim_time_s, sim_speed, rtf, percent_mapped, science_found, hazard_cells, env:{dust_level, seismic, kind, wind_mps}, brain, config},
    "robots":{"rover_0":{type, pose:{x,y,z,roll,pitch,yaw}, speed, state, mode, goal, v_limit, slip, tip_alarm_deg, max_slope_deg,
    altitude_agl, imu:{roll_deg,pitch_deg,gyro:[x,y,z]}, uncertainty:{score,camera_conf,lidar_conf,imu_vib}, edge:{…§3.4},
    path:[[x,y],…≤150], trail:[[x,y],…≤300], last_safe:[x,y]|null}}}` — 15 Hz.
   `brain` = the latest `/brain/status` of this mission (§9.3) plus `stale` (§9.8), null until the brain node has
-  reported; robots also carry `brain_cap` / `brain_agl` (§9.6).
+  reported; robots also carry `brain_cap` / `brain_agl` (§9.6) and `power_save`, `wind_mps`, `wind_descent`,
+  `detections` (§10.6).
   `elapsed_s` = mission time since `running` in **simulated** seconds (wall seconds until `/clock` is seen);
   `sim_time_s` = simulator clock; `sim_speed` = target; `rtf` = achieved real-time factor over ~2 s (null until
   measured, 0 when the clock has stalled).
@@ -234,7 +239,7 @@ Both rovers use `ROVER_SPEC` (identical physics). `role` comes from the index: `
 | topic | type | publisher | rate (sim) | payload |
 |---|---|---|---|---|
 | `/<rover>/hw_status` | String JSON | world (mock_world_node / world_interface_node) | 5 Hz | §8.3 |
-| `/<rover>/cmd_vel_hw` | Twist | world_interface_node (Gazebo only) | as cmd_vel | `/<rover>/cmd_vel` scaled by drivetrain health, bridged to gz `/<rover>/cmd_vel` |
+| `/<robot>/cmd_vel_hw` | Twist | world_interface_node (Gazebo only) | as cmd_vel | rovers: `/<rover>/cmd_vel` scaled by drivetrain health; the scout: `/<scout>/cmd_vel` plus the wind drift (§10.1); bridged to gz `/<robot>/cmd_vel` |
 | `/<r>/perception/depth/compressed` | CompressedImage (jpeg) | perception_node | perception rate | colour-mapped depth (turbo, near = red), same size as the RGB frame |
 | `/fleet/sos` | String JSON | damaged rover agent | 1 Hz while active, once on resolve | §8.4 |
 | `/fleet/rescue` | String JSON | recovery rover agent | on phase change + 1 Hz | §8.4 |
@@ -300,8 +305,9 @@ New trace kinds: `critical_damage`, `sos`, `rescue_start`, `rescue_route`, `resc
 `repair_start`, `repair_complete`, `repaired`, `rescue_abort`, `rescue_noroute` (no reachable stand-off on
 the current map). New trace sensor tag `DIAG` (motor-controller diagnostics).
 
-Docking is entered when the A* stand-off is reached within 3.0 m (or anywhere within 2.4 m); during transit a LiDAR
-corridor return closer than 4 m to the target is the target itself and does not trigger a re-plan. Docked = centre
+Docking is entered when the A* stand-off is reached within 3.3 m of the teammate (the 2.45 m ring plus the 0.6 m
+pursuit tolerance and a margin), or anywhere within 2.4 m; during transit a LiDAR corridor return closer than 4 m to
+the target is the target itself and does not trigger a re-plan. Docked = centre
 distance ≤ 1.45 m with a perception lock (or after 5 s without one, traced as odometry-only). The rescuer actuates the
 repair with `/world/command {"op":"repair"}` (the simulated repair tool), retries every 8 s, and once the target
 reports its SOS resolved backs off 2 m and resumes exploring. The docking creep stops while a LiDAR corridor return is
@@ -536,3 +542,127 @@ critical).
   ground speed < 0.05 m/s within 5 s, then "resume at full speed" (any outcome; the INFO line reports whether
   `rover_0`'s operator cap was cleared). Timeouts are simulated seconds, stretched below 1×. They pass whether Gemma
   or the local fallback decided; each detail names the source, the model, the measured round-trip and the tokens.
+
+## 10. Pillar collapse and dust storm (v2, Phase 3)
+
+Two more unscripted changes. Both are perceived, never read: the autonomy stack sees the fallen pillar in its camera,
+depth and LiDAR, and infers the storm from its camera / LiDAR statistics, its odometry and the rover's own power
+readings in `hw_status`. It never reads `/world/env_state` or the world's storm flags.
+
+### 10.1 World commands / events (additions to §4)
+- `{"op":"pillar_collapse","robot":"rover_0"}` — a basalt pillar (`scene_events.PILLAR`: 6.0 m tall, radius 0.35 m,
+  1500 kg, fresh-basalt albedo (20, 19, 18) ≈ 0.08) stands 2.8 m to the left or right of the robot's planned route and topples across
+  it. The crossing point follows the rockslide rules (§4, `_point_along`): 8 m ahead along the route, or 60 % of the
+  remaining route when that is shorter (never under 3 m). Arming and deferral are `rockslide_due`'s (up to 8 s for
+  the next route). The trunk falls from the base through the crossing point, so it spans ≈ 2.8 m before the route
+  and 3.2 m past it.
+  - Gazebo: a dynamic `pillar_<k>` model (one cylinder link, solid-cylinder inertia, ground friction μ ≥ 1.0) spawned
+    tilted towards the route at `world_builder.pillar_spawn_tilt_deg` = max(4°, balance + 2.5°), where balance =
+    atan(2r / h) is the angle a flat base still stands at: 9.15° for the 6.0 m × 0.35 m pillar. Gravity topples it
+    (≈ 1.3 s at 2.2 g for an ideal rod; the flat base rim adds a little).
+  - Mock: released 4° off vertical (`PILLAR['tilt0_deg']`) and moved along `pillar_fall_angle` (a rigid rod pivoting
+    on its base): lands in 2.47 / 1.66 / 1.42 s at 1.0 / 2.2 / 3.0 g. It is 9 overlapping near-spherical chunks
+    (`pillar_segments`, r = 1.15 × radius) moved every physics step (by the physics thread, which owns the scene);
+    once landed they stay, and collide and render in LiDAR, depth and RGB like boulders.
+
+  Event (once spawned): `{"op":"pillar_collapse","ok":true,"robot":"rover_0","base":[x,y],"tip":[x,y],"cross":[x,y],
+  "height_m":6.0,"radius_m":0.35,"waited_s":0.0,"t":…}` (`tip` = the planned footprint tip, base + height × fall
+  direction; `cross` = the route point it falls across). On failure `ok:false` plus `detail`.
+- `{"op":"anomaly","kind":"dust_storm","dust_level":1.0,"duration_s":45,"seismic_s":0,"wind_mps":14.0}` — a dust
+  storm. An anomaly without `kind` behaves as before (§4). `sensor_effects_node`:
+  - hazes RGB towards orange-red `STORM_RGB` (205, 88, 48) at strength 0.75·L instead of the brown dust at 0.65·L, with
+    the same blur, noise and particles; camera confidence ends well below 0.5;
+  - applies the existing depth / LiDAR dust model at the storm's level;
+  - echoes `kind` and `wind_mps` in the anomaly event.
+
+  `/world/env_state` gains `"kind": "dust_storm" | "dust" | null` (`dust` for a plain anomaly, null when clear) and
+  `"wind_mps"`, ramped like the dust level.
+- **Solar.** Unchanged `rover_hw.solar_output`: transmittance 1 − 0.85·dust_level, so at level 1.0 the measured
+  `solar_w` and `irradiance` in `hw_status` (§8.3, the rover's pyranometer) drop 85 %.
+- **Wind on the drone** (shear grows with height): `rover_hw.wind_at(h_agl, wind_ref) = wind_ref ·
+  clip(h_agl / WIND_REF_AGL_M, 0.05, 2) ^ WIND_SHEAR_EXP` (12.0 m, 0.6), with `wind_ref` = the storm's `wind_mps`.
+  It blows toward the fixed world direction `STORM_WIND_TOWARD_DEG` = 30° (ENU, counter-clockwise from +x east),
+  i.e. from compass 240° (clockwise from north, the convention traces use), plus seeded gusts of ±25 % at 0.3 Hz.
+  - Gazebo: the scout's VelocityControl listens on `/<scout>/cmd_vel_hw` (bridged like the rovers', §8.2), and
+    `world_interface_node` relays `/<scout>/cmd_vel` → `/<scout>/cmd_vel_hw`. The relay adds the world wind at
+    the scout's current AGL (odom z minus the terrain height under it, or the spawn ground height when that is
+    unknown), rotated into the body frame because VelocityControl's linear velocity is body-frame.
+  - Mock: `mock_dynamics.ScoutSim.wind` (set by `mock_world_node` from env_state) adds the same world-frame drift to
+    the lagged velocity.
+
+### 10.2 Detection class `PILLAR` (§3.2)
+`{"cls":"PILLAR","conf":0.86,"bbox":[…],"range_m":7.4,"bearing_rad":-0.1,"world_xy":[x,y],"sources":["DEPTH","CAM"]}`,
+drawn as "FALLEN PILLAR" in colour (255, 120, 200). It is a depth-geometry obstacle bump, like `ROCK`, that is:
+- elongated in world units (from the bbox, the range and the camera intrinsics): horizontal extent ≥ 2.5 m and
+  extent / height ≥ 2.5;
+- dark: the median HSV V of its pixels is ≤ 0.35 × 255 (boulders are lighter grey);
+- one straight trunk: of its depth points (≥ 20), 80 % lie within a band ≤ 0.25 m wide across its long axis
+  (`trunk_thickness`; a trunk shows less than its radius, touching staggered boulders ≳ 0.3 m).
+
+Only the bump's rock-coloured pixels count: height above the ground plane > 0.12 m and HSV S ≤ 140 (`ROCK_MAX_S`;
+rust regolith is ≳ 175). Darkness is a camera measurement, so `PILLAR` is only reported while the camera is in use
+(`FUSED`); in `LIDAR_ONLY` the trunk is still an obstacle in the map. A line of separate boulders is not a pillar.
+`PILLAR` is in the default class list.
+
+### 10.3 Agent state additions (§3.3, and WS telemetry `robots.<r>`)
+- Rovers: `"power_save": true|false` — battery-conservation mode (§10.4).
+- Scout: `"wind_mps": 13.2 | null` — its own wind estimate (null until estimated); `"wind_descent": true|false` — the
+  automatic wind descent is active.
+
+**Battery conservation** (`rover_health.PowerSaver`, from `hw_status` alone, simulated time):
+- Enter after 2.0 s with `irradiance` < 0.35, or with `solar_w` < 25 % of the clear-sky reference. The reference is
+  the rolling 60 s maximum of `solar_w` while `irradiance` > 0.8. It does not age while the mode is active, so a
+  starved panel never becomes its own reference.
+- Exit after 5.0 s with `irradiance` > 0.6 and `solar_w` back above 25 % of the reference.
+- While active, the drive speed is × 0.6, applied like the FSM speed scale and never above it. Only the speed
+  changes: perception keeps the edge budget's rate.
+
+**Wind descent** (`redshift_autonomy/wind.py`, local and authoritative, simulated time):
+- `WindEstimator`: world-frame wind = EMA (τ 1.5 s) of odometry velocity minus the published command (body frame,
+  rotated by yaw). Samples are skipped while the guidance command (before the feed-forward) changed by more than
+  1 m/s in the last 0.5 s.
+- Feed-forward (`wind_feedforward`): once airborne (AGL > 0.5 m) with an estimate, the drone publishes its guidance
+  velocity minus the wind estimate, limited to the air-relative speed `v_air_max` (18 m/s, `SCOUT_SPEC`), so it holds
+  station and track in the wind it measured; a wind above that limit still drifts it.
+- `WindDescent`: an estimate > 8.0 m/s for 2.0 s → target AGL max(6, cruise − 4) (8 m from 12 m); < 5.0 m/s for
+  5.0 s → back to cruise.
+- In `BRAIN_AGL_STATES` the altitude set-point is min(cruise or the brain's AGL §9.6, the wind-descent AGL).
+  `SCANNING` keeps the AGL the scan started at.
+- `DroneHealth` hover load grows with the estimate: `load_w += 0.25 · wind_mps²`.
+
+### 10.4 Trace kinds
+| kind | robot | sensors | example |
+|---|---|---|---|
+| `power_save` | rover | `DIAG` | input "Solar 31 W (was 205 W, −85 %), irradiance 0.15, battery 78 %" → action "Battery conservation: speed ×0.6" |
+| `power_restored` | rover | `DIAG` | irradiance back above 0.6 (and solar above 25 % of the reference) for 5 s → normal speed |
+| `wind_descent` | scout | `ODOM`, `IMU` | input "Wind 13.2 m/s from 240° estimated from drift (cmd vs odometry)", reasoning "Wind shear grows with height; lower is calmer and keeps the footprint on target", action "Descending to 8 m AGL" |
+| `wind_clear` | scout | `ODOM`, `IMU` | estimate below 5 m/s for 5 s → back to cruise AGL |
+| `pillar_identified` | rover | `CAM`, `DEPTH` | the first `PILLAR` detection after 30 s without one: input "Fallen pillar 5.4 m ahead at (x, y), confidence 0.86", reasoning "Camera + depth: one long, low, straight, dark body lying across the ground: a toppled basalt pillar, not a line of boulders", action "Trunk kept lethal on the map; any route across it re-plans around the whole length" (severity warn). LiDAR usually blocks the route first, while the trunk is still falling; this records what the camera says it is |
+| `core_escape` | rover | `ODOM`, `MAP` | input "Standing inside a no-go cell at (x, y): slid, drifted or was pushed in" → the shortest escape across the lethal blob, crossing no other obstacle |
+
+`path_blocked` (§3.1): when camera detections near the blocking cell include `PILLAR`, the input says "camera confirms
+a fallen pillar" (instead of "camera confirms N boulders") and `sensors` include `CAM`.
+
+### 10.5 Brain events (additions to §9.7)
+| source | event | robot | context |
+|---|---|---|---|
+| trace `wind_descent` | `low_confidence` | the scout | `wind_mps` from its agent_state, `fleet.drone_affected = true`; Gemma may answer `ADJUST_DRONE_ALTITUDE` (the local descent has already happened; validation clamps 6–20 m) |
+| trace `path_blocked` with a pillar | `novel_hazard` (as before) | the rover | the trigger text carries "fallen pillar" |
+| trace `pillar_identified` | `novel_hazard` | the rover | trigger priority 3, above `path_blocked` / `hazard_marked` (2): when the camera names the pillar inside the 10 s interval after the LiDAR block's decision, it is the event re-offered once the interval ends |
+
+`power_save` raises no brain event; the context carries `battery` as before.
+
+### 10.6 Backend additions
+- `POST /api/inject/pillar` `{robot?}` (default the first rover; a robot that is not a running rover →
+  `{ok:false, detail:"Unknown rover '…'"}`) → `/world/command {"op":"pillar_collapse","robot":…}` →
+  `{"ok":true,"detail":"Basalt pillar toppling across rover_0 planned path"}`.
+- `POST /api/inject/storm` `{duration_s?: 3–120 (45), wind_mps?: 0–20 (14)}` → `/world/command {"op":"anomaly",
+  "kind":"dust_storm","dust_level":1.0,"duration_s":45.0,"seismic_s":0.0,"wind_mps":14.0}` →
+  `{"ok":true,"detail":"Dust storm for 45 s: solar blackout, 14 m/s wind"}`. The dust level is fixed at 1.0.
+- Both work like the other injects: 422 for an invalid body (§6); `{ok:false, detail}` with no running mission, or
+  when nothing listens on `/world/command`. The UI applies the button cooldowns.
+- WS telemetry: `mission.env` = `{dust_level, seismic, kind, wind_mps}` (`kind` null unless `dust_storm` / `dust`;
+  `wind_mps` 0 when calm). `robots.<r>` gain `power_save` (bool, false when absent), `wind_mps` (number | null),
+  `wind_descent` (bool) from agent_state, and `detections` = the latest `/perception/detections`, compact
+  `[{cls, conf, range_m, world_xy}]` (≤ 16; `[]` before the first). Boxes and labels ("FALLEN PILLAR") are drawn in the
+  annotated camera feed. The `pillar_collapse` event and the new traces are forwarded like any other.
