@@ -162,8 +162,8 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `OPERATOR_ASK_FIRST` | 1 | the first anomaly after start or reset always asks the operator (reliable demo trigger) |
 | `CAMERA_SHADOWS` | 1 | 0 = camera renders without the sun's shadows (about 3 times faster with software OpenGL) |
 | `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase until `POST /api/launch` (the setup screen); 1 = start at once. `AUTO_RESET_S` above 0 also starts at once |
-| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features (0 leaves one out). Off in a bare `Config()`, on in `Config.from_env()`; each is built in its own v7 step |
-| `WEAR` | normal | `off`, `normal` or `harsh` (parts wear out about 4 times sooner) |
+| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features (0 leaves one out). Off in a bare `Config()`, on in `Config.from_env()`. Code: `v7_landforms.py` (mesas, canyon, pits, boulder fields), `v7_surface.py` (dunes, ice sheets, wheel friction composer, low traction rule), `v7_geysers.py`, `v7_flora.py`; ground detail is drawn by the web only |
+| `WEAR` | normal | `off`, `normal` or `harsh` (parts wear out about 4 times sooner). Accepted and echoed in `config`; wear itself is not part of this build yet |
 
 More Gemma settings (timeouts, tokens, model loading) are in `GEMMA.md`.
 

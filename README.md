@@ -44,8 +44,8 @@ Stop with Ctrl+C, then `docker compose down`.
 | `MAP_SIZE` | 120 | map width in metres (60 to 200) |
 | `GRAVITY_G` | 2.0 | gravity in Earth g (0.5 to 3) |
 | `AUTO_LAUNCH` | 0 | 0: the fleet waits on the setup screen until you press Launch. 1: start at once with these values |
-| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | new world features, each on by default (0 leaves it out; each arrives in its own v7 step) |
-| `WEAR` | normal | how fast parts wear out: off, normal or harsh |
+| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 terrain features, each on by default (0 leaves it out). See "Terrain" below |
+| `WEAR` | normal | how fast parts wear out: off, normal or harsh (the setting exists, but wear itself is not part of this build yet) |
 | `AUTO_RESET_S` | 0 | off: the planet only changes when you press Reset sim. Set it (e.g. 60) to land on a new random planet that many seconds after exploration finishes |
 | `GEMMA_ENABLED` | 1 | 0 = rules only |
 | `GEMMA_MODEL` | gemma4:e2b | falls back to gemma4:e4b, then gemma3:4b if not installed |
@@ -70,6 +70,22 @@ The rules always keep control of safety: Gemma's picks are only taken from optio
 - **Samples tab:** every sample collected so far, sorted by science value, with the instrument used (drill, scoop, gas sniffer, swab), the lab result, and whether it is still on a rover or cached at the lander. Rover cards show their 3 tube slots and a progress bar while sampling.
 - **Comms tab:** type instructions ("rover 2, explore north", "everyone come home", "orange one, sample the vent"). Gemma turns them into commands, the rules check they are safe, and the rover replies or refuses with its reasons. Rover questions appear here and as a card at the top, with the rover's camera view and a countdown.
 - **Reality:** overlays the true terrain and every real target, so you can compare it with what the fleet knows.
+
+## Terrain (version 7)
+
+Each feature can be switched off on the setup screen or with its env var. With all of them off the planet is exactly the one from version 6.
+
+- **Mesas and buttes:** flat-topped hills with cliff walls no rover can climb. Rovers see the walls in their LiDAR map and drive around.
+- **Canyon:** a winding trench across part of the map with two ramps, the only ways across. The ramps are no steeper than the towing slope at the chosen gravity.
+- **Pits:** sinkholes and small, deep lava-tube skylights. Sheer drops that the planner treats as impassable.
+- **Boulder fields:** dense patches of boulders to steer around.
+- **Dunes:** fields of rippled loose sand where the wheels slip more, but rovers can still cross slowly.
+- **Ice sheets:** level frozen ground with almost no grip. A rover that sees high wheel slip at low motor load on level ground reports low traction, backs out and the fleet marks an ice zone to avoid.
+- **Geysers:** vents that erupt on a schedule. Steam scatters the LiDAR (those returns never reach the map), and rovers learn to keep clear of a vent once they have seen it erupt.
+- **Alien flora:** groves of fungal trees with violet and teal caps and glowing lime bulb bushes. A rover identifies a plant from its LiDAR and camera and keeps at least 4 m away (planetary protection, like the grazers).
+- **Ground detail:** pebbles, cracks and small craters for looks only. Drawn by the dashboard, nothing the rovers sense.
+
+The planet view (`G`, or View: Planet) shows the whole world from orbit with the landing sector marked.
 - **Reset sim and New mission:** Reset sim lands the fleet on a new random planet with the same settings. New mission opens the setup screen first, to change gravity, fleet size, sector size, features, wear or speed; the gravity readout and the slope figure show how steep the rovers can climb and tow at that gravity.
 
 ## Run natively with the MuJoCo viewer
