@@ -10,6 +10,7 @@ import { reducedMotion } from './sceneConstants.js'
 import { boxUV, grime, hardwareMaterials, merge, place, strut } from './hardware.js'
 import { padTexture } from './proceduralTextures.js'
 import { DrapedDisc, useDrape } from './drape.js'
+import { SpareIcons } from '../components/HealthBits.jsx'
 
 // The lander: a compact descent stage on splayed legs in the middle of its charging pad.
 // The rovers park on the pad round it (the sim spreads their docks evenly on a circle), so
@@ -18,6 +19,7 @@ import { DrapedDisc, useDrape } from './drape.js'
 // and a draped pad with charging markings. The cache count stays in its label.
 
 const V = (x, y, z) => new THREE.Vector3(x, y, z)
+const REPAIR = '#5fd4c8'
 
 // Directions (three.js x, z) between the sim's dock spots for n rovers.
 function legAngles(n) {
@@ -88,6 +90,11 @@ export function Lander() {
   const roverCount = useSim((s) => s.roverMeta.length)
   const labelsReady = useThree((s) => !!s.events.connected) // see Rovers.jsx
   const cached = useSim((s) => (Number.isFinite(s.fleet.samples_cached) ? s.fleet.samples_cached : null)) // v4b
+  // v9: spare parts, and the rovers being repaired on the pad.
+  const spares = useSim((s) => s.spares)
+  const repairing = useSim((s) => s.roverMeta.filter((m) => s.rovers[m.id]?.state === 'repairing').map((m) => m.name).join(', '))
+  const repairRef = useRef(false)
+  repairRef.current = !!repairing
   const group = useRef()
   const h = useRef(null)
   const R = lander?.radius ?? 2.5
@@ -128,6 +135,14 @@ export function Lander() {
     group.current.position.set(lander.x, h.current, -lander.y)
     const blink = reducedMotion ? 1 : Math.pow(0.5 + 0.5 * Math.sin(clock.elapsedTime * 2.4), 6)
     fx.bulbMat.opacity = 0.35 + 0.65 * blink
+    // v9: the pad's edge pulses while a rover is being repaired there.
+    if (repairRef.current) {
+      fx.edgeMat.color.set(REPAIR)
+      fx.edgeMat.opacity = reducedMotion ? 0.8 : 0.45 + 0.45 * (0.5 + 0.5 * Math.sin(clock.elapsedTime * 3.2))
+    } else if (fx.edgeMat.opacity !== 0.55) {
+      fx.edgeMat.color.set(SIGNAL)
+      fx.edgeMat.opacity = 0.55
+    }
     fx.beamMat.opacity = 0.15 + 0.75 * blink
     if (beam.current) beam.current.scale.setScalar(0.9 + 0.5 * blink)
   })
@@ -154,6 +169,15 @@ export function Lander() {
                 <span className="lander-cache" data-some={cached > 0 || undefined} title="Samples in the lander's cache">
                   <i aria-hidden="true" />
                   {cached} cached
+                </span>
+              )}
+              {spares && <SpareIcons spares={spares} />}
+              {repairing && (
+                <span className="lander-repair" title={`Being repaired at the lander: ${repairing}`}>
+                  <svg viewBox="0 0 12 12" aria-hidden="true">
+                    <path d="M7.6 1.4a2.6 2.6 0 0 0-2.3 3.5L1.6 8.6a1.1 1.1 0 0 0 1.6 1.6l3.7-3.7a2.6 2.6 0 0 0 3.5-2.3L8.9 5.7 7.2 4.6 6.3 3.1z" />
+                  </svg>
+                  Repairing {repairing}
                 </span>
               )}
             </div>

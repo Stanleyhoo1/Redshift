@@ -80,6 +80,33 @@ The rules still check every decision (a "proceed slowly" into soft ground become
 and go around`). Switching to autonomous decides the open questions at once; "you decide" with questions open
 decides just those. `OPERATOR_ASK_BELOW` and `OPERATOR_ASK_FIRST` below describe the behaviour before v8.
 
+### Rescue decisions (protocol v9)
+
+When a helper has diagnosed a rover that still can't drive after a field repair, the rules work out which options
+are safe (tow: an A* route home within the towing slope limit and the helper's battery at 2.2 times its usual cost
+per metre; salvage: a working part worth taking and the battery home; leave: always) and list only the safe ones as
+`rescue` candidates of a choice request, best first, each quoting its numbers:
+
+```
+tow (rescue): tow r2 home: route 17 m, slope max 4 deg (tow limit 26 deg), r1 battery after 85%, lander repair needs 1 spare (drive), in stock
+salvage (rescue): salvage r2: take LiDAR 100%, camera 100% (30 s here; spares now drive 0, lidar 1, camera 1, power 1), r3 battery 89%
+leave (rescue): leave r2 here and keep exploring, r1 battery 70%
+```
+
+Autonomous: Gemma's pick (0.5 confidence floor; the rules' order when it is offline or unsure: tow a repairable
+rover, salvage a wreck the spares can't fix, leave when nothing else is safe) is logged as an event with a `decision`
+object and said in the chat ("r1 decided (Gemma 0.80): tow it home. r2 immobile at (-1, -16), health 50 ...").
+Supervised: a request of kind `rescue` (`about` = the disabled rover) offers all three with the rules' verdict on
+each (`safe`, `note`); Gemma's pick is marked as the suggestion; an unsafe option can't be picked. The fake model
+picks the first candidate.
+
+The operator can order a rescue: "rover 1, go help rover 2", "send r3 to rescue r1", "tow rover 2 home", "salvage
+rover 3", "leave it" (command `rescue` with `plan` help / tow / salvage / leave and `target_rover`; the keyword parser
+reads who helps whom from the word order and its reading wins, and a model `rescue` for a message without a rescue
+word is the parser's reading). Health questions ("rover 2, are you damaged?", "how is rover 3?") are topic `health`:
+the facts are the rover's hp and status, its self diagnosis, who is helping it and its last hit (the fleet: every
+rover's health, the rescues, the spares and the wrecks).
+
 ### Questions to the operator
 
 Before v8 (now: supervised mode asks every decision). A rover asks you (protocol `requests` plus a chat message) when Gemma says `ask_operator`, when its
@@ -184,6 +211,7 @@ most relevant facts, so its answers are grounded too.
 | explore one of those holes, go to the biggest gap, explore the dark patch near rover 2 | protocol v8 place `gaps` (`gaps.py`): pockets of unknown ground inside the map that a rover can reach; the closest free rover explores the best one (size and distance), or a `choose_place` request in supervised mode |
 | prioritize the gaps, focus on the unexplored holes first, fill in the gaps, prioritize the north, prioritize water, prioritize sampling, back to normal | `prioritize` (priority `gaps`, `direction`, `water`, `sampling`, `none`): a fleet priority that every rover's frontier choice weighs strongly until nothing is left (chat "Done: ...") or "back to normal"; the ack names the plan per rover |
 | switch to supervised mode, ask me before you decide, you decide from now on | `set_mode` (`supervised` or `autonomous`) |
+| rover 1, go help rover 2; tow rover 2 home; salvage rover 3; leave it | protocol v9 `rescue` (`plan`, `target_rover`): the named rover helps (the rules check its battery and state), or the closest capable one; tow / salvage are carried out after the diagnosis if the rules find them safe, at once if the helper is already there; leave marks the rover as a wreck |
 | explore water terrain (the lake is already mapped), check the area east of the lake | an area focus; on mapped ground a re-survey: a loop through the circle for the whole time, then "Re-surveyed ...: no changes since it was mapped" or what changed |
 | hold | parks where it is: state `idle`, goal `null`, chat note "say resume to continue". Not allowed while it is returning on low battery. A held rover leaves the hold by itself if its battery would not get it home otherwise |
 | resume | back to full autonomy (cancels holds, trips, directions and operator returns) |

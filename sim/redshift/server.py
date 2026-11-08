@@ -433,9 +433,20 @@ async def hazard(request: Request):
                 or not (math.isfinite(x) and math.isfinite(y)):
             return JSONResponse({"ok": False, "error": "x and y must be numbers (world metres)"}, status_code=400)
 
+    severity, part, charge = data.get("severity"), data.get("part"), data.get("charge", False)
+    if kind == "damage":                       # protocol v9 demo control
+        if severity is not None and not isinstance(severity, str):
+            return JSONResponse({"ok": False, "error": "severity must be one of light, heavy, disable, wreck"},
+                                status_code=400)
+        if part is not None and not isinstance(part, str):
+            return JSONResponse({"ok": False, "error": "part must be one of drive_l, drive_r, lidar, camera, power, "
+                                                       "comms"}, status_code=400)
+    if not isinstance(charge, bool):
+        return JSONResponse({"ok": False, "error": "charge must be true or false"}, status_code=400)
+
     def trigger():
         with runner.locked() as sim:
-            return sim.hazards.trigger(kind, rover, x, y)
+            return sim.hazards.trigger(kind, rover, x, y, severity=severity, part=part, charge=charge)
 
     try:
         h = await asyncio.to_thread(trigger)
@@ -443,7 +454,11 @@ async def hazard(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     _log(f"hazard {h['id']}: {h['type']}" + (f" on {h['rover']}" if h.get("rover") else "")
          + (f" at ({x:g}, {y:g})" if x is not None else ""))
-    return {"ok": True, "hazard": h}
+    health = h.pop("health", None)
+    out = {"ok": True, "hazard": h}
+    if health is not None:
+        out["health"] = health                 # protocol v9: the damaged rover's health right after the hit
+    return out
 
 
 async def _json_body(request: Request):
@@ -504,6 +519,9 @@ async def answer(request: Request):
     if status == "closed":
         return JSONResponse({"ok": False, "error": f"request {data['id']} already expired or was answered"},
                             status_code=409)
+    if status == "unsafe":
+        return JSONResponse({"ok": False, "error": f"option {data['option']!r} is marked unsafe by the rules "
+                                                   f"(see its note); pick a safe one"}, status_code=400)
     return JSONResponse({"ok": False, "error": f"option {data['option']!r} is not one of this request's options"},
                         status_code=400)
 

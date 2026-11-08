@@ -5,8 +5,15 @@ Each creature is a MuJoCo mocap body (world.creature_body_xml) moved once per de
   - keeps loose herd cohesion (back toward the herd's middle if it strays, apart if too close),
   - avoids steep ground, liquid, rocks and spires (it knows the true terrain: it lives there),
   - shies away from any rover closer than about 3 m (and speeds up to 0.5 m/s).
-They are visible to LiDAR and the cameras but nothing collides with them. The rovers know nothing of
-this module; they only see LiDAR points that move (tracker.py) and camera pictures.
+They are visible to LiDAR and the cameras. The rovers know nothing of this module; they only see LiDAR points
+that move (tracker.py) and camera pictures.
+
+Protocol v9: the biggest grazer of each herd is territorial. A rover that stays within TERRITORY_M of it for
+TERRITORY_S makes it warn (it stops, faces the rover and steps toward it) and then charge at CHARGE_V, homing on
+the rover a little, for only as far as it takes to reach where the rover was (a rover that backs away in time is
+missed). A creature that reaches a rover rams it: a force on the rover's chassis in MuJoCo for a few substeps
+(health.DamageMonitor.push), which the rover's IMU feels like any other shock. A creature that walks into a rover
+without charging bumps it gently (usually below any damage). Then it trots back to its herd.
 """
 from __future__ import annotations
 
@@ -20,6 +27,16 @@ MAX_V = 0.5
 TURN_RATE = 1.2       # rad/s
 COHESION_M = 3.5      # beyond this from the herd's middle, steer back
 SEPARATION_M = 1.4
+TERRITORY_M = 3.5     # protocol v9: a rover this close to the territorial grazer ...
+TERRITORY_S = 12.0    # ... for this long provokes a charge (observers keep 4 m or more)
+WARN_S = 1.2          # it warns first (stops, faces the rover, steps toward it)
+WARN_V = 0.3
+CHARGE_V = 2.0        # m/s
+CHARGE_TURN = 1.0     # rad/s while charging (homing a little)
+CHARGE_COOLDOWN_S = 90.0
+CREATURE_MASS = 120.0  # kg (a grazer about 1.3 m long, built for 2 g)
+RAM_S = 0.02          # a ram lasts this long (s): the impulse of a partly elastic collision, spread over it
+CONTACT_M = 0.55      # body contact: centre distance below this plus half the creature's length
 PROBE_M = 1.0         # look this far ahead for bad ground
 MAX_SLOPE = 15.0
 
@@ -43,6 +60,15 @@ class Creature:
         self.pause_until = 0.0
         self.next_goal = 0.0
         self.phase = float(rng.uniform(0, 2 * math.pi))
+        self.territorial = False             # protocol v9: the herd's biggest charges rovers that stay close
+        self.annoy = 0.0
+        self.mode = None                     # None, "warn", "charge", "retreat"
+        self.mode_t = 0.0
+        self.target = None                   # the rover it charges
+        self.travel = 0.0                    # charge distance left (m)
+        self.cooldown = 0.0
+        self.provoked_at = None              # demo: charge this rover at this time
+        self.bumped = -1e9
 
     def to_msg(self) -> dict:
         return {"id": self.id, "kind": "grazer", "x": round(self.x, 2), "y": round(self.y, 2), "z": round(self.z, 2),
@@ -80,6 +106,8 @@ class LifeformManager:
                 h.members.append(c)
                 self.creatures.append(c)
                 k += 1
+            if h.members:
+                max(h.members, key=lambda c_: c_.size).territorial = True
             self.herds.append(h)
         self._half = (self.cfg.nx - 1) * self.cfg.res / 2.0
         self._rocky = None
@@ -118,6 +146,10 @@ class LifeformManager:
                 continue
             hx, hy = h.centre()
             for c in h.members:
+                if c.territorial and self._territory(c, t, dt):
+                    self._place(c, t)
+                    continue
+                self._bump(c, t)
                 flee = None
                 for rx, ry in rovers:
                     dd = math.hypot(c.x - rx, c.y - ry)
@@ -172,6 +204,117 @@ class LifeformManager:
                 else:
                     c.speed = 0.0
                 self._place(c, t)
+
+    # ------------------------------------------------------------------ protocol v9: territory and charges
+    def provoke(self, herd: Herd, rover, at_t: float) -> None:
+        """Demo: the herd's territorial member charges this rover at sim time at_t."""
+        c = next((c_ for c_ in herd.members if c_.territorial), None)
+        if c is not None:
+            c.provoked_at = (rover.id, at_t)
+            c.cooldown = 0.0
+
+    def _territory(self, c: Creature, t: float, dt: float) -> bool:
+        """Territorial behaviour. True while it is warning, charging or trotting back (normal moves skipped)."""
+        rovers = self.sim.rovers
+        if c.mode is None:
+            near = min(rovers, key=lambda r: math.hypot(r.x - c.x, r.y - c.y), default=None)
+            if near is None:
+                return False
+            dd = math.hypot(near.x - c.x, near.y - c.y)
+            if dd < TERRITORY_M and near.state != "towed":
+                c.annoy += dt
+            else:
+                c.annoy = max(0.0, c.annoy - 2.0 * dt)
+            target = None
+            if c.provoked_at is not None and t >= c.provoked_at[1]:
+                target = next((r for r in rovers if r.id == c.provoked_at[0]), None)
+                c.provoked_at = None
+            elif c.annoy >= TERRITORY_S and t >= c.cooldown:
+                target = near
+            if target is None:
+                return False
+            c.mode, c.mode_t, c.target, c.annoy = "warn", t, target.id, 0.0
+            return True
+        tgt = next((r for r in rovers if r.id == c.target), None)
+        if tgt is None:
+            c.mode = None
+            return False
+        dx, dy = tgt.x - c.x, tgt.y - c.y
+        dist = math.hypot(dx, dy)
+        want = math.atan2(dy, dx)
+        if c.mode == "warn":
+            c.yaw = _wrap(c.yaw + max(-2.0 * dt, min(2.0 * dt, _wrap(want - c.yaw))))
+            c.speed = WARN_V if dist > 2.5 else 0.0
+            self._move(c, dt)
+            if t - c.mode_t >= WARN_S:
+                c.mode, c.mode_t = "charge", t
+                c.yaw = want
+                c.travel = max(0.5, dist - (CONTACT_M + 0.5 * c.size) + 0.1)      # just enough to reach it
+            return True
+        if c.mode == "charge":
+            c.yaw = _wrap(c.yaw + max(-CHARGE_TURN * dt, min(CHARGE_TURN * dt, _wrap(want - c.yaw))))
+            c.speed = CHARGE_V
+            step = min(CHARGE_V * dt, max(c.travel, 0.0))
+            reach = CONTACT_M + 0.5 * c.size
+            c.speed = step / dt
+            moved = self._move(c, dt)
+            c.travel -= step
+            if math.hypot(tgt.x - c.x, tgt.y - c.y) <= reach:
+                self._ram(c, tgt, t, CHARGE_V, "charge")
+                c.mode, c.mode_t = "retreat", t
+                c.cooldown = t + CHARGE_COOLDOWN_S
+                return True
+            if c.travel <= 0.0 or not moved:
+                c.mode, c.mode_t = "retreat", t             # it fell short: a bluff
+                c.cooldown = t + CHARGE_COOLDOWN_S
+                self.sim.fleet.log(t, "hazard", f"A grazer charged {tgt.name} and stopped short.", None, at=(c.x, c.y))
+            return True
+        # retreat: trot back toward the herd's middle for a few seconds
+        hx, hy = c.herd.centre()
+        c.yaw = _wrap(c.yaw + max(-TURN_RATE * dt, min(TURN_RATE * dt, _wrap(math.atan2(hy - c.y, hx - c.x) - c.yaw))))
+        c.speed = 0.8
+        self._move(c, dt)
+        if t - c.mode_t > 4.0:
+            c.mode, c.target = None, None
+            c.speed = 0.3
+        return True
+
+    def _move(self, c: Creature, dt: float) -> bool:
+        nx_, ny_ = c.x + c.speed * dt * math.cos(c.yaw), c.y + c.speed * dt * math.sin(c.yaw)
+        if self._bad(nx_, ny_):
+            c.speed = 0.0
+            return False
+        c.x, c.y = nx_, ny_
+        return True
+
+    def _ram(self, c: Creature, rover, t: float, v: float, why: str) -> None:
+        """The creature hits the rover: a horizontal force on its chassis (MuJoCo xfrc_applied) for RAM_S."""
+        mon = getattr(self.sim, "damage", None)
+        ux, uy = math.cos(c.yaw), math.sin(c.yaw)
+        mu = CREATURE_MASS * rover.mass / (CREATURE_MASS + rover.mass)      # reduced mass of the two
+        f = 1.5 * mu * v / RAM_S                                             # impulse (restitution 0.5) / duration
+        steps = max(1, int(round(RAM_S / self.sim.model.opt.timestep)))
+        # where the blow came from, in the rover's frame (+x forward, +y left)
+        cy_, sy_ = math.cos(rover.yaw), math.sin(rover.yaw)
+        bx, by = -ux, -uy
+        local = (bx * cy_ + by * sy_, -bx * sy_ + by * cy_)
+        if mon is not None:
+            mon.push(rover.idx, (f * ux, f * uy, 0.1 * f), steps, "lifeform", local)
+        if why == "charge":
+            self.sim.fleet.log(t, "hazard", f"A grazer rammed {rover.name} at {v:.1f} m/s.", None, at=(rover.x, rover.y))
+        c.bumped = t
+
+    def _bump(self, c: Creature, t: float) -> None:
+        """A creature that walks into a rover without charging bumps it gently."""
+        if c.speed < 0.15 or t - c.bumped < 3.0:
+            return
+        reach = CONTACT_M + 0.5 * c.size
+        for r in self.sim.rovers:
+            if math.hypot(r.x - c.x, r.y - c.y) < reach:
+                ang = math.atan2(r.y - c.y, r.x - c.x)
+                if abs(_wrap(ang - c.yaw)) < 1.2:
+                    self._ram(c, r, t, c.speed, "bump")
+                    return
 
     # ------------------------------------------------------------------ demo: bring a herd into view
     def move_herd(self, herd: Herd, x: float, y: float, face: float | None = None) -> None:

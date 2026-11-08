@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { appStore, useApp, useSim } from '../state/store.js'
 import { postHazard } from '../net/connection.js'
 import { fixed, shortName } from '../lib/format.js'
-import { HAZARD_TYPES } from '../lib/theme.js'
+import { HAZARD_TYPES, PARTS, SEVERITIES, partLabel } from '../lib/theme.js'
 import { PLACE_TEXT, placement, startPlacing, stopPlacing } from '../lib/placement.js'
 import { useHudRect } from '../lib/useHudRect.js'
+import { PartIcon } from './HealthBits.jsx'
 
 const COOLDOWN_OK = 4000
 const COOLDOWN_ERR = 1200
@@ -43,6 +44,11 @@ const ICONS = {
       <path d="M9.2 1.5 4 9h4l-1.2 5.5L12 7H8z" />
     </svg>
   ),
+  damage: (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 1.6 9.3 5.4l3.6-1.6-1.6 3.6 3.6 1.3-3.6 1.3 1.6 3.6-3.6-1.6L8 15.6l-1.3-3.6-3.6 1.6 1.6-3.6-3.6-1.3 3.6-1.3-1.6-3.6 3.6 1.6z" />
+    </svg>
+  ),
   lifeform: (
     <svg viewBox="0 0 16 16" aria-hidden="true">
       <ellipse cx="6.6" cy="8.4" rx="3.6" ry="2.2" />
@@ -62,6 +68,10 @@ function describe(h, type, byId) {
   if (type === 'rover_fault') return h?.rover ? `Motor fault on ${name(h.rover)}. Watch the fleet route around it.` : 'Motor fault triggered.'
   if (type === 'spire_fall') return `Spire ${h?.spire ?? ''} topples${h?.rover ? ` across ${name(h.rover)}'s route` : ''}. Watch the LiDAR pick it up.`.replace('  ', ' ')
   if (type === 'lifeform') return `A small herd wanders in${h?.rover ? ` near ${name(h.rover)}` : ''}. The rovers still have to notice it.`
+  if (type === 'damage') {
+    const sev = h?.severity ? `${h.severity[0].toUpperCase()}${h.severity.slice(1)} damage` : 'Damage'
+    return `${sev} on ${h?.rover ? name(h.rover) : 'a rover'}${h?.part ? ` (${partLabel(h.part).toLowerCase()})` : ''}. Watch its health and diagnosis${h?.severity === 'disable' || h?.severity === 'wreck' ? ', and the rescue' : ''}.`
+  }
   return 'Hazard triggered.'
 }
 
@@ -86,6 +96,7 @@ export function HazardPanel() {
   const hazards = useSim((s) => s.hazards)
   const ready = useSim((s) => s.ready)
   const v4 = useSim((s) => s.v4)
+  const v9 = useSim((s) => s.v9)
   const gen = useSim((s) => s.gen)
   const placing = useApp((a) => a.placing)
   const [target, setTarget] = useState(null) // null = let the sim pick
@@ -94,7 +105,21 @@ export function HazardPanel() {
   const [cool, startCool] = useCooldowns()
   const ref = useHudRect('hazards')
   const byId = useMemo(() => Object.fromEntries(meta.map((m) => [m.id, m])), [meta])
-  const types = HAZARD_TYPES.filter((h) => !h.v4 || v4)
+  const types = HAZARD_TYPES.filter((h) => (!h.v4 || v4) && (!h.v9 || v9))
+  // v9: the Damage popover, open for one rover: { rover }; the part picked (null = any);
+  // the sim's refusal, shown inside it.
+  const [dmg, setDmg] = useState(null)
+  const [dmgPart, setDmgPart] = useState(null)
+  const [dmgErr, setDmgErr] = useState(null)
+  const openDamage = (rover) => {
+    stopPlacing()
+    setDmgErr(null)
+    setDmg({ rover })
+  }
+  const closeDamage = () => {
+    setDmg(null)
+    setDmgErr(null)
+  }
 
   useEffect(() => {
     if (target && !byId[target]) setTarget(null)
@@ -107,21 +132,52 @@ export function HazardPanel() {
   // A reset (or an older sim) ends placement.
   useEffect(() => stopPlacing, [gen])
   useEffect(() => {
+    setDmg(null)
+    setDmgErr(null)
+  }, [gen])
+  if (dmg && meta.length && !byId[dmg.rover]) setDmg(null)
+  // Esc closes the Damage popover before anything else (capture: ahead of the app's keys).
+  useEffect(() => {
+    if (!dmg) return
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return
+      e.stopImmediatePropagation()
+      setDmg(null)
+      setDmgErr(null)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [dmg])
+  useEffect(() => {
     if (!v4 || !ready) stopPlacing()
   }, [v4, ready])
 
   // One request. `where`: { x, y } | { rover } | { auto: true } | null. Resolves { ok, error }.
-  const fire = async (type, where = null) => {
+  // `extra`: more body fields (v9 damage: severity, part).
+  const fire = async (type, where = null, extra = null) => {
     if (pending) return { ok: false }
+    // v9: picking a rover for Damage opens the severity popover instead of firing.
+    if (type === 'damage' && !extra) {
+      const rover = where?.rover ?? target
+      if (rover) openDamage(rover)
+      else if (where?.auto) setStatus({ kind: 'error', text: 'Pick a rover for the damage: click it, or choose it under Target.', key: Date.now() })
+      return { ok: !!rover }
+    }
     setPending(type)
     try {
       const rover = where?.rover ?? target
-      const h = await postHazard(type, rover, Number.isFinite(where?.x) ? [where.x, where.y] : null)
-      setStatus({ kind: 'ok', text: describe(h, type, byId), key: Date.now() })
-      startCool(type, COOLDOWN_OK)
+      const h = await postHazard(type, rover, Number.isFinite(where?.x) ? [where.x, where.y] : null, extra)
+      setStatus({ kind: 'ok', text: describe(h || { rover, ...extra }, type, byId), key: Date.now() })
+      startCool(type, type === 'damage' ? 1500 : COOLDOWN_OK)
       stopPlacing()
+      if (type === 'damage') closeDamage()
       return { ok: true }
     } catch (err) {
+      if (type === 'damage') {
+        // Shown in the popover, which stays open so another choice is one click away.
+        setDmgErr(err?.message || 'Damage refused')
+        return { ok: false, error: err?.message }
+      }
       setStatus({ kind: 'error', text: err?.message || 'Hazard refused', key: Date.now() })
       // In placement mode the user can simply click somewhere else.
       if (!appStore.get().placing) startCool(type, COOLDOWN_ERR)
@@ -146,6 +202,8 @@ export function HazardPanel() {
 
   const press = (h) => {
     if (placing?.type === h.type) return stopPlacing() // second click cancels
+    if (h.type === 'damage' && dmg) return closeDamage()
+    if (h.type === 'damage' && target) return openDamage(target)
     if (!v4 || !h.place) {
       stopPlacing()
       return fire(h.type)
@@ -162,6 +220,7 @@ export function HazardPanel() {
   const pickTarget = (id) => {
     setTarget(id)
     if (id && placing?.mode === 'rover') fire(placing.type, { rover: id })
+    else if (id && dmg) openDamage(id)
   }
 
   // Live badges: storm time left, rovers with a fault.
@@ -174,7 +233,7 @@ export function HazardPanel() {
 
   const button = (h) => {
     const c = cool[h.type]
-    const on = placing?.type === h.type
+    const on = placing?.type === h.type || (h.type === 'damage' && !!dmg)
     return (
       <button
         key={h.type}
@@ -202,7 +261,7 @@ export function HazardPanel() {
   const hazardTypes = types.filter((h) => !h.discovery)
   const finds = types.filter((h) => h.discovery)
   return (
-    <div className="hud hud-hazards" ref={ref} aria-label="Hazards" data-v4={v4 || undefined}>
+    <div className="hud hud-hazards" ref={ref} aria-label="Hazards" data-v4={v4 || undefined} data-v9={v9 || undefined}>
       <div className="hz-row">
         <div className="hz-title">
           <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -238,6 +297,80 @@ export function HazardPanel() {
           {status ? status.text : HINT}
         </p>
       </div>
+      {dmg && byId[dmg.rover] && (
+        <DamagePopover
+          meta={byId[dmg.rover]}
+          part={dmgPart}
+          setPart={setDmgPart}
+          error={dmgErr}
+          busy={pending === 'damage'}
+          onPick={(severity) => {
+            setDmgErr(null)
+            fire('damage', { rover: dmg.rover }, { severity, part: dmgPart })
+          }}
+          onClose={closeDamage}
+        />
+      )}
+    </div>
+  )
+}
+
+// v9: after picking a rover for Damage: which part (optional) and how bad. One click on a
+// severity sends it; the sim's refusal shows here.
+function DamagePopover({ meta, part, setPart, error, busy, onPick, onClose }) {
+  const health = useSim((s) => s.rovers[meta.id]?.health || null)
+  const state = useSim((s) => s.rovers[meta.id]?.state || null)
+  return (
+    <div className="hz-dmg" role="group" aria-label={`Damage ${meta.name}`} style={{ '--rover': meta.color }}>
+      <div className="hz-dmg-head">
+        <span className="dot" style={{ background: meta.color }} aria-hidden="true" />
+        <b>Damage {meta.name}</b>
+        {health && (
+          <span className="hz-dmg-hp">
+            health {Number.isFinite(health.hp) ? `${health.hp}%` : '--'}
+            {state && state !== 'exploring' ? `, ${state}` : ''}
+          </span>
+        )}
+        <button type="button" className="hz-dmg-x" onClick={onClose} title="Close (Esc)" aria-label="Close">
+          <svg viewBox="0 0 12 12" aria-hidden="true">
+            <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+          </svg>
+        </button>
+      </div>
+      <div className="hz-dmg-row">
+        <span className="hz-label" id="hz-dmg-part">
+          Part
+        </span>
+        <div className="seg seg-sm hz-dmg-parts" role="group" aria-labelledby="hz-dmg-part">
+          <button type="button" aria-pressed={!part} onClick={() => setPart(null)} title="Let the sim pick the part">
+            Any
+          </button>
+          {PARTS.map((p) => {
+            const v = health?.parts?.[p.key]
+            return (
+              <button key={p.key} type="button" aria-pressed={part === p.key} onClick={() => setPart(p.key)} title={`${p.label}${Number.isFinite(v) ? ` (now ${v}%)` : ''}`}>
+                <PartIcon part={p.key} className="hz-dmg-pi" />
+                {p.short}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+      <div className="hz-dmg-row">
+        <span className="hz-label">How bad</span>
+        <div className="hz-dmg-sev">
+          {SEVERITIES.map((s) => (
+            <button key={s.key} type="button" className="hz-sev" data-sev={s.key} disabled={busy} aria-busy={busy || undefined} onClick={() => onPick(s.key)} title={s.hint}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {error && (
+        <p className="hz-dmg-err" role="alert">
+          {error}
+        </p>
+      )}
     </div>
   )
 }
@@ -251,7 +384,11 @@ export function PlacementHint() {
   return (
     <div className="banner banner-place" role="status" data-discovery={discovery || undefined}>
       <span className="banner-place-icon">{ICONS[placing.type]}</span>
-      {placing.mode === 'rover' ? (
+      {placing.type === 'damage' ? (
+        <span>
+          Click a rover to damage it, then pick how bad. <kbd>Esc</kbd> to cancel.
+        </span>
+      ) : placing.mode === 'rover' ? (
         <span>
           Click a rover to give it {t.what}. <kbd>Esc</kbd> to cancel. <kbd>Right-click</kbd> to let the sim pick.
         </span>

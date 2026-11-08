@@ -90,8 +90,9 @@ from .rover import SURVEY_S
 from .terrain import KIND_LABEL
 
 EM_DASH = chr(0x2014)
-PARKED = ("idle", "charging", "fault")
+PARKED = ("idle", "charging", "fault", "disabled", "towed", "wrecked", "repairing")
 DRIVING = ("exploring", "investigating", "returning")
+HURT = ("disabled", "towed", "wrecked")       # protocol v9: out of action
 
 INTERP_OPTIONS = ["reroute", "back_out", "proceed_slowly", "wait"]
 RULE_REACTION = {"new_obstacle": "reroute", "slip": "back_out", "low_visibility": "proceed_slowly",
@@ -131,11 +132,12 @@ CHOICE_STALE_S = 20.0     # an answer about a choice older than this (sim s) is 
 GO_PLAN_S = 10.0          # an operator go_to whose plan takes longer than this (sim s) is refused
 MAX_CHAT = 400
 FREE_CHARGE = 0.5         # a rover charging below this battery is not free for a place command
-REQUEST_KIND = {"lifeform": "lifeform", "choose_place": "choose_place"}     # anything else: "anomaly"
+REQUEST_KIND = {"lifeform": "lifeform", "choose_place": "choose_place", "rescue": "rescue"}   # else: "anomaly"
 # protocol v8: decisions a rover makes on its own (autonomous mode), or Gemma's suggestion (supervised)
 CONF_FLOOR = 0.5          # below this Gemma confidence the safest option is taken
 SAFEST = {k: v[0][0] for k, v in QUESTION_OPTIONS.items()}
-DECISION_LABEL = {"reroute": "go around", "proceed_slowly": "approach slowly", "wait": "wait",
+DECISION_LABEL = {"tow": "tow it home", "salvage": "salvage parts", "leave": "leave it",
+                  "reroute": "go around", "proceed_slowly": "approach slowly", "wait": "wait",
                   "back_out": "back out and go around", "follow": "keep following", "observe_here": "observe from here",
                   "keep_exploring": "keep exploring"}
 OPTION_FIX = {("new_obstacle", "back_out"): "reroute", ("slip", "reroute"): "back_out",
@@ -366,11 +368,17 @@ class Advisor:
                     e["x"], e["y"] = round(float(o[2]), 1), round(float(o[3]), 1)
                 if q.get("suggest") == o[0]:
                     e["suggested"] = True            # protocol v8: Gemma's pick
+                mt = (q.get("meta") or {}).get(o[0])
+                if mt is not None:                   # protocol v9: the rules' verdict on a rescue option
+                    e["safe"], e["note"] = bool(mt["safe"]), mt["note"]
                 opts.append(e)
             dl = q.get("deadline")
-            out.append({"id": q["id"], "rover": q["rover"], "kind": REQUEST_KIND.get(q["kind"], "anomaly"), "t": q["t"],
-                        "question": q["question"], "options": opts, "default": q["default"],
-                        "expires_in": None if dl is None else round(max(0.0, dl - now), 1), "image": q["image"]})
+            e = {"id": q["id"], "rover": q["rover"], "kind": REQUEST_KIND.get(q["kind"], "anomaly"), "t": q["t"],
+                 "question": q["question"], "options": opts, "default": q["default"],
+                 "expires_in": None if dl is None else round(max(0.0, dl - now), 1), "image": q["image"]}
+            if q.get("about"):
+                e["about"] = q["about"]              # protocol v9: the rover a rescue request is about
+            out.append(e)
         return out
 
     def _deadline(self):
@@ -994,12 +1002,52 @@ class Advisor:
                 tail = "I'll ask again if it still matters."
                 if q["kind"] == "lifeform":       # that herd may be asked about again on a later sighting
                     self.asked_herds = [h for h in self.asked_herds if h.get("qid") != q["id"]]
+            if q["kind"] == "rescue":
+                tail = "Another rover will take over the rescue."
             self.say(rover.id, t, f"Battery {b:.0f}%, I can't wait any longer: heading back to the lander. {tail}",
                      "info", request_id=q["id"], reply_to=q["job"].get("cid") if q["kind"] == "choose_place" else None)
             self._log(t, "info", f"{rover.id} closed its question {q['id']}: battery {b:.0f}%, returning to the "
                                  f"lander.", rover.id, at=(rover.x, rover.y))
         if rover.id in self.go_jobs:
             self._cancel_go(rover.id, t, f"battery {b:.0f}%, returning to the lander")
+
+    def on_out_of_action(self, rover, t: float) -> None:
+        """Protocol v9: the rover can no longer drive. Its open questions close (it can't act on them) with a chat line,
+        and a trip still being planned drops."""
+        for q in [q for q in self.requests.values() if q["rover"] == rover.id]:
+            self._close(q["id"], "superseded", t)
+            if q["kind"] == "lifeform":
+                self.asked_herds = [h for h in self.asked_herds if h.get("qid") != q["id"]]
+            self.say(rover.id, t, f"I can't drive any more ({rover.health.short()}), so I can't act on this question.",
+                     "info", request_id=q["id"], reply_to=q["job"].get("cid") if q["kind"] == "choose_place" else None)
+        self._cancel_go(rover.id, t, "I can't drive any more")
+        self.choices.pop(rover.id, None)
+
+    def open_rescue_request(self, helper, rec: dict, opts: list, default: str, text: str, suggest, conf,
+                            t: float, meta: dict | None = None) -> str:
+        """Protocol v9 (supervised): ask the operator what to do with a rover that can't drive (tow, salvage, leave).
+        Every option carries the rules' verdict (safe, note); an unsafe one cannot be picked. The helper waits by
+        the rover."""
+        self.req_seq += 1
+        qid = f"q{self.req_seq}"
+        at = (rec["at"][0], rec["at"][1])
+        q = {"id": qid, "rover": helper.id, "t": round(t, 1), "question": text, "options": opts, "default": default,
+             "deadline": self._deadline(), "image": f"/api/camera/{helper.id}.jpg?view=fpv", "kind": "rescue",
+             "job": {"at": at, "rescue": rec["rover"], "cid": rec.get("cid")}, "suggest": suggest,
+             "suggest_conf": conf, "meta": meta or {}, "about": rec["rover"]}
+        self.requests[qid] = q
+        self.last_question[helper.id] = t
+        self.say(helper.id, t, text, "question", source="gemma" if suggest is not None else "rules", request_id=qid)
+        return qid
+
+    def _apply_rescue(self, q: dict, option: str, t: float, by: str = "operator") -> str:
+        resc = getattr(self.sim, "rescue", None)
+        rec = resc.active(q["job"]["rescue"]) if resc is not None else None
+        if rec is None:
+            return "that rescue is over"
+        rec["qid"] = None
+        why = resc.apply_plan(rec, option, t, by=by)
+        return f"can't: {why}" if why else DECISION_LABEL.get(option, option)
 
     def answer(self, qid: str, option: str) -> str:
         """POST /api/answer. Returns "ok", "unknown", "closed" or "bad_option"."""
@@ -1014,6 +1062,8 @@ class Advisor:
         labels = self._labels(q)
         if option not in labels:
             return "bad_option"
+        if q["kind"] == "rescue" and not (q.get("meta") or {}).get(option, {}).get("safe", True):
+            return "unsafe"                          # protocol v9: the rules marked it unsafe (the request stays open)
         t = self.sim.t
         q, rover = self._close(qid, "answered", t)
         rid = q["rover"]
@@ -1023,6 +1073,11 @@ class Advisor:
             at = next(((o[2], o[3]) for o in q["options"] if o[0] == option and len(o) >= 4), q["job"]["at"])
             self._log(t, "info", f"{rid} operator chose '{labels[option]}'.", rid, at=at, source="operator")
             self._apply_place_choice(rover, q, option, t)
+            return "ok"
+        if q["kind"] == "rescue":
+            phrase = self._apply_rescue(q, option, t)
+            self._log(t, "info", f"{rid} operator chose '{labels[option]}' for {q['job']['rescue']}: {phrase}.", rid,
+                      at=q["job"]["at"], source="operator")
             return "ok"
         if rover is None:
             return "ok"
@@ -1043,6 +1098,8 @@ class Advisor:
         rid, label = q["rover"], self._labels(q)[q["default"]]
         if q["kind"] == "choose_place":
             self._apply_place_choice(rover, q, q["default"], t, quiet=True)
+        elif q["kind"] == "rescue":
+            self._apply_rescue(q, q["default"], t, by="rules")
         elif rover is not None:
             if q["kind"] == "lifeform":
                 self._apply_life(rover, q["default"], t, q)
@@ -1369,6 +1426,32 @@ class Advisor:
             self._cmd_prioritize(cmd, t, src, c)
         elif typ == "set_mode":
             self._cmd_mode(cmd, t, src, c)
+        elif typ == "rescue":
+            self._cmd_rescue(cmd, t, src, c)
+
+    def _cmd_rescue(self, cmd: dict, t: float, src: str, c: dict) -> None:
+        """Protocol v9: "rover 1, go help rover 2", "tow rover 2 home", "salvage rover 3", "leave it"."""
+        plan = cmd.get("plan") or "help"
+        target = cmd.get("target")
+        helper = cmd.get("rover") if cmd.get("rover") not in (None, "all") else None
+        ids = [r.id for r in self.sim.rovers]
+        if target not in ids:
+            target = None
+        if helper not in ids:
+            helper = None
+        hr = self._rover(helper)
+        if hr is not None and target is None and hr.state in HURT:
+            helper, target = None, helper     # "rover 2, leave it" said to the rover in trouble: it is the target
+        if helper is not None and helper == target:
+            self._reply(helper, t, f"{helper}: I can't help myself. Which rover should help?", "question", src)
+            return
+        ok, text = self.sim.rescue.order(plan, target, helper, t, reply_to=self._reply_to)
+        frm = helper or (self.sim.rescue.active(target)["helper"] if target and self.sim.rescue.active(target)
+                         and self.sim.rescue.active(target).get("helper") else None) or "fleet"
+        if not ok:
+            self._reply(frm, t, (text or "I can't do that."), "refuse", "rules")
+        elif text:
+            self._reply(frm, t, text, "ack", src)
 
     def _who(self, named, hint, text) -> str | None:
         """Who a message is for. The text itself decides when it names a rover or everyone; otherwise
@@ -1475,10 +1558,32 @@ class Advisor:
 
     def _busy_reason(self, r) -> str | None:
         """Why this rover cannot take a new job right now (safety rules), or None."""
+        why = self._v9_busy(r)
+        if why is not None:
+            return why
         if r.state == "fault":
             return "my motors are offline (rebooting)"
         if r.state == "returning" and r.return_reason in ("battery", "range"):
             return f"battery {r.battery * 100:.0f}%, I am returning to charge"
+        return None
+
+    def _v9_busy(self, r, allow_rescuing: bool = False) -> str | None:
+        """Protocol v9: why a rover out of action, being repaired, towing or helping can't take a job, or None."""
+        st = r.state
+        if st == "disabled":
+            return f"I can't drive ({r.health.short()}); I'm waiting for help"
+        if st == "towed":
+            return "I'm being towed to the lander"
+        if st == "wrecked":
+            return f"I'm a wreck at ({r.x:.0f}, {r.y:.0f}), out of action"
+        if st == "repairing":
+            return f"I'm being repaired at the lander (health {r.health.hp()})"
+        resc = getattr(self.sim, "rescue", None)
+        rec = resc.by_helper(r.id) if resc is not None else None
+        if st == "towing" and rec is not None:
+            return f"I'm towing {rec['rover']} home; say 'leave it' to stop"
+        if st == "rescuing" and rec is not None and not allow_rescuing:
+            return f"I'm helping {rec['rover']}; send another rover to help it, or say 'leave it'"
         return None
 
     def _cancel_go(self, rid: str, t: float, why: str) -> None:
@@ -1739,6 +1844,10 @@ class Advisor:
         lines = []
         for r in self._targets_for(rid):
             dd = math.hypot(r.x - r.dock[0], r.y - r.dock[1])
+            why = self._v9_busy(r, allow_rescuing=True)
+            if why is not None:
+                lines.append((r.id, f"can't, {why}", "refuse"))
+                continue
             if r.state == "fault":
                 lines.append((r.id, "can't, my motors are offline (rebooting)", "refuse"))
             elif r.state == "charging" or (r.state == "idle" and dd < 1.6):
@@ -1771,6 +1880,10 @@ class Advisor:
     def _cmd_hold(self, rid, t: float, src: str) -> None:
         lines = []
         for r in self._targets_for(rid):
+            why = self._v9_busy(r)
+            if why is not None:
+                lines.append((r.id, f"can't hold, {why}", "refuse"))
+                continue
             if r.state == "fault":
                 lines.append((r.id, "already stopped (motors offline)", "ack"))
                 continue
@@ -1804,6 +1917,10 @@ class Advisor:
             r.dir_bias = None
             r.pause_until = min(r.pause_until, t)
             self._cancel_go(r.id, t, "resuming exploration")
+            why = self._v9_busy(r)
+            if why is not None:
+                lines.append((r.id, f"not now, {why}", "ack"))
+                continue
             if r.state == "fault":
                 lines.append((r.id, "my motors are offline, I will carry on after the reboot", "ack"))
                 continue
@@ -2566,6 +2683,20 @@ class Advisor:
                               by, conf, why, (p.x, p.y), t, label=P.option_label(p, (rover.x, rover.y)), force=True,
                               request_id=q["id"], reply_to=job.get("cid"))
                 self._apply_place_choice(rover, q, choice, t)
+            elif q["kind"] == "rescue":
+                resc = self.sim.rescue
+                rec = resc.active(job["rescue"])
+                if rec is None or rec.get("opts") is None:
+                    continue
+                order = resc.rules_order(rec, self._rover(job["rescue"]))
+                sug = q.get("suggest")
+                choice = sug if sug in order else order[0]
+                by = "gemma" if sug in order else "rules"
+                conf = q.get("suggest_conf") if by == "gemma" else None
+                why = "Gemma's suggestion" if by == "gemma" else resc._rules_why(rec, order)
+                rec["qid"] = None
+                resc._decided(rec, self._rover(job["rescue"]), rover, order, choice, by, conf, why, t)
+                resc.apply_plan(rec, choice, t, by=by)
             elif q["kind"] == "lifeform":
                 choice, by, conf, why = self._life_choice(job.get("res"))
                 self._decided(rover, "lifeform", self._life_question(job["ask"]).split(")")[0] + ")", [o for o, _ in

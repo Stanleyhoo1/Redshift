@@ -18,9 +18,17 @@ own sensors:
   lifeform     a demo convenience: moves a herd of grazers into view of a rover (or to a point). The
                rovers still have to notice them (moving LiDAR clusters, tracker.py).
 
+  damage       protocol v9 demo control: damages a rover's parts at once ("light", "heavy", "disable", "wreck",
+               plus "jam": immobile but fixable in the field), optionally one part. The rover reacts through its
+               own health (distress when it can no longer drive).
+
 Point and click: rockfall, sand, spire_fall and lifeform accept a point (x, y). It is refused (400) if
 it is off the map, on the lander, within 2 m of a rover, or unsuitable (water, steep ground for
-sand, nowhere safe to put it). dust_storm and rover_fault ignore the point.
+sand, nowhere safe to put it). dust_storm and rover_fault ignore the point. Protocol v9: a rockfall or a
+falling spire clicked on (or within 2 m of) a rover is aimed at it and hits it: the boulder lands on the rover,
+presses on it and rolls off beside it; the spire falls onto it and slides off. MuJoCo contacts do the rest
+(health.py turns the shock and the contact force into damage). The lifeform hazard takes "charge": true to
+make the herd's territorial member charge the rover a moment after it appears (lifeforms.py).
 
 Sand physics, per rover: each wheel inside a patch gets low friction and extra joint damping
 (rolling resistance), and the body gets a horizontal drag that grows with the square of the share of
@@ -36,7 +44,9 @@ from dataclasses import dataclass, field
 import mujoco
 import numpy as np
 
-TYPES = ("rockfall", "sand", "dust_storm", "rover_fault", "spire_fall", "lifeform")
+TYPES = ("rockfall", "sand", "dust_storm", "rover_fault", "spire_fall", "lifeform", "damage")
+SEVERITIES = ("light", "heavy", "disable", "wreck", "jam")     # jam: a sim extra, see PROTOCOL.md v9 notes
+HIT_RADIUS = 2.0       # protocol v9: a rockfall or spire fall clicked this close to a rover is aimed at it
 POINT_TYPES = ("rockfall", "sand", "spire_fall", "lifeform")
 DROP_HEIGHT = 5.0      # boulders start this far above the ground
 DROP_TIME = 0.9        # and land after this long (s)
@@ -65,6 +75,8 @@ class Hazard:
     active: bool = True
     spire: str | None = None
     seg: tuple | None = None                        # spire_fall: (x0, y0, x1, y1) base and tip
+    severity: str | None = None                     # damage (protocol v9)
+    part: str | None = None
 
     def to_msg(self, t: float) -> dict:
         m = {"id": self.id, "type": self.type, "t": round(self.t, 1), "rover": self.rover}
@@ -79,6 +91,9 @@ class Hazard:
             m["rocks"] = [[round(v, 2) for v in r] for r in self.rocks]
         if self.type == "sand":
             m["known"] = bool(self.known)
+        if self.type == "damage":
+            m["severity"] = self.severity
+            m["part"] = self.part
         if self.until is not None:
             m["remaining"] = round(max(0.0, self.until - t), 1) if self.active else 0.0
         m["active"] = bool(self.active)
@@ -144,6 +159,7 @@ class HazardManager:
         self.spare_mocap = [m_ for m_, _g in wsp[len(self.spires):]]
         self.spire_standing = {sp.id: True for sp in self.spires}
         self.falls: list = []          # toppling spires: [mocap id, x0, y0, z0, ax, ay, angle, lift, t0]
+        self.keyed: list = []          # protocol v9: hits on rovers, keyframed {"mid", "t0", "keys": [(t, pos, quat)]}
         self.fallen: list = []         # (spire, x0, y0, z0, x1, y1, z1, from terrain)
         self.features_version = 0      # bumps when a spire falls (tick carries an updated `features`)
         self._conn_cache: dict = {}    # (passable grid, rover) -> connected before a placement (one request)
@@ -180,12 +196,15 @@ class HazardManager:
             return base
         ter = self.sim.terrain
         H = base.copy()
-        for (sp, x0, y0, z0, x1, y1, z1, native) in self.fallen:
+        for rec in self.fallen:
+            sp, x0, y0, z0, x1, y1, z1, native = rec[:8]
             ext = sp.radius + 0.1
             if native:                  # the column where it stood is open ground now
                 i0, j0 = ter.ij(x0 - ext, y0 - ext)
                 i1, j1 = ter.ij(x0 + ext, y0 + ext)
                 H[j0:j1 + 1, i0:i1 + 1] = ter.truth_nospire[j0:j1 + 1, i0:i1 + 1]
+            if len(rec) > 8:            # protocol v9: it slid off a rover, its base moved
+                x0, y0 = x0 + rec[8][0], y0 + rec[8][1]
             i0, j0 = ter.ij(min(x0, x1) - ext, min(y0, y1) - ext)
             i1, j1 = ter.ij(max(x0, x1) + ext, max(y0, y1) + ext)
             X = ter.X[j0:j1 + 1, i0:i1 + 1]
@@ -208,9 +227,11 @@ class HazardManager:
         return H
 
     # ================================================================== triggering
-    def trigger(self, kind, rover_id=None, x=None, y=None) -> dict:
+    def trigger(self, kind, rover_id=None, x=None, y=None, severity=None, part=None, charge=False) -> dict:
         """Start a hazard now, optionally at a point (x, y) for rockfall, sand, spire_fall and
-        lifeform. Returns its message dict, or raises HazardError."""
+        lifeform. Returns its message dict, or raises HazardError. Protocol v9: "damage" takes severity
+        and part (the returned dict then also carries the rover's resulting "health"); a rockfall or spire
+        fall at a point within HIT_RADIUS of a rover hits that rover; a lifeform with charge=True charges."""
         sim = self.sim
         t = sim.t
         if kind not in TYPES:
@@ -221,28 +242,37 @@ class HazardManager:
         self._conn_cache = {}
         if (x is None) != (y is None):
             raise HazardError("give both x and y, or neither")
+        if kind == "damage":
+            return self._damage(t, rovers.get(rover_id), severity, part)
         point = None
+        aimed = None
         if x is not None and kind in POINT_TYPES:
             point = (float(x), float(y))
             if not (math.isfinite(point[0]) and math.isfinite(point[1])):
                 raise HazardError("x and y must be finite numbers")
-            self._check_point(point)
-        working = [r for r in sim.rovers if not r.motor_fault]
-        if not working:
+            aimed = self._check_point(point, hit=kind in ("rockfall", "spire_fall"))
+        working = [r for r in sim.rovers if not r.motor_fault and r.state not in ("disabled", "towed", "wrecked")]
+        if not working and kind not in ("rockfall", "spire_fall", "dust_storm", "sand", "lifeform"):
             raise HazardError("every rover is already faulted")
+        if aimed is not None:
+            h = (self._rockfall_hit if kind == "rockfall" else self._spire_hit)(t, aimed, point)
+            return h.to_msg(t)
+        if not working:
+            raise HazardError("every rover is out of action")
         if kind == "dust_storm":
             h = self._dust_storm(t)
         elif kind == "rover_fault":
             h = self._fault(t, rovers.get(rover_id), working)
         elif kind == "lifeform":
-            h = self._lifeform(t, rovers.get(rover_id), working, point)
+            h = self._lifeform(t, rovers.get(rover_id), working, point, charge=bool(charge))
         elif point is not None:
             h = {"rockfall": self._rockfall_at, "sand": self._sand_at, "spire_fall": self._spire_fall_at}[kind](t, point)
         else:
             if rover_id is not None:
                 r = rovers[rover_id]
-                if r.motor_fault:
-                    raise HazardError(f"{rover_id} is faulted and parked; pick a moving rover")
+                if r.motor_fault or r not in working:
+                    raise HazardError(f"{rover_id} is {'faulted' if r.motor_fault else r.state} and parked; pick a "
+                                      f"moving rover")
                 cands = [r]
             else:
                 cands = self._route_candidates(working)
@@ -267,7 +297,9 @@ class HazardManager:
         return h.to_msg(t)
 
     # ------------------------------------------------------------------ point checks
-    def _check_point(self, p) -> None:
+    def _check_point(self, p, hit: bool = False):
+        """Refuse a bad point (HazardError). hit (rockfall, spire fall): a point on or within HIT_RADIUS of a rover
+        aims at that rover; it is returned (protocol v9). Returns None otherwise."""
         cfg, sim = self.cfg, self.sim
         half = (cfg.nx - 1) * cfg.res / 2.0
         x, y = p
@@ -275,12 +307,20 @@ class HazardManager:
             raise HazardError(f"point ({x:g}, {y:g}) is off the map (x and y from {-half + 1:g} to {half - 1:g} m)")
         if math.hypot(x, y) < cfg.lander_radius + 1.0:
             raise HazardError(f"point ({x:g}, {y:g}) is on the lander pad")
-        for r in sim.rovers:
-            d = math.hypot(x - r.x, y - r.y)
+        near = sorted(((math.hypot(x - r.x, y - r.y), r) for r in sim.rovers), key=lambda e: e[0])
+        if hit and near and near[0][0] <= HIT_RADIUS:
+            r = near[0][1]
+            if math.hypot(r.x, r.y) < cfg.lander_radius + 1.5:
+                raise HazardError(f"{r.id} is on the lander pad; nothing falls on the lander")
+            if r.state == "towed":
+                raise HazardError(f"{r.id} is being towed; pick another spot")
+            return r
+        for d, r in near:
             if d < 2.0:
                 raise HazardError(f"point ({x:g}, {y:g}) is within 2 m of {r.id} ({d:.1f} m away)")
         if sim.terrain.wet_near(x, y, 0.3):
             raise HazardError(f"point ({x:g}, {y:g}) is in the water")
+        return None
 
     def _rover_crossing(self, blocks: list):
         """The driving rover whose remaining route runs through any of these circles (x, y, r)."""
@@ -497,6 +537,229 @@ class HazardManager:
             if f < 1.0:
                 keep.append(rec)
         self.falls = keep
+        if self.keyed:
+            keep = []
+            for rec in self.keyed:
+                keys = rec["keys"]
+                tr = t - rec["t0"]
+                k = 0
+                while k < len(keys) - 2 and tr > keys[k + 1][0]:
+                    k += 1
+                (ta, pa, qa), (tb, pb, qb) = keys[k], keys[k + 1]
+                f = min(1.0, max(0.0, (tr - ta) / max(tb - ta, 1e-6)))
+                pos = [pa[i] + f * (pb[i] - pa[i]) for i in range(3)]
+                q = [qa[i] + f * (qb[i] - qa[i]) for i in range(4)]
+                n = math.sqrt(sum(v * v for v in q)) or 1.0
+                d.mocap_pos[rec["mid"]] = pos
+                d.mocap_quat[rec["mid"]] = [v / n for v in q]
+                if tr < keys[-1][0]:
+                    keep.append(rec)
+            self.keyed = keep
+
+    # ------------------------------------------------------------------ protocol v9: hits on a rover
+    def _predict(self, rover, dt: float):
+        """Where the rover will be in dt (it may be driving): its position plus its velocity times dt."""
+        v = self.sim.data.qvel
+        b = rover.vadr
+        return rover.x + float(v[b]) * dt, rover.y + float(v[b + 1]) * dt
+
+    def _rockfall_hit(self, t: float, rover, p) -> Hazard:
+        """A boulder lands on the rover (aimed where it will be when the boulder arrives), presses on it and rolls
+        off beside it; a couple more come down around it. The damage is whatever the contact does (health.py)."""
+        if len(self.free_boulders) < 2:
+            raise HazardError("no boulders left for another rockfall (reset to clear the map)")
+        ter, d = self.sim.terrain, self.sim.data
+        big = max(self.free_boulders, key=lambda k: self.sim.world.boulders[k][2][0])
+        mid, _g, (sx, sy, sz) = self.sim.world.boulders[big]
+        px, py = self._predict(rover, DROP_TIME)
+        ux, uy = p[0] - rover.x, p[1] - rover.y
+        n = math.hypot(ux, uy)
+        if n < 0.3:                                   # clicked right on it: roll off to its right
+            ux, uy = math.sin(rover.yaw), -math.cos(rover.yaw)
+        else:
+            ux, uy = ux / n, uy / n
+        from .world import rover_spawn_height
+        gz = ter.height_at(px, py)
+        top = gz + rover_spawn_height(self.cfg) + self.cfg.chassis_half[2]
+        hx, hy = px + 0.12 * ux, py + 0.12 * uy
+        z_imp = top + sz - 0.03
+        off = 0.55 + sx + 0.35                        # rest beside it: the rover's half diagonal plus the boulder
+        rx, ry = px + off * ux, py + off * uy
+        ground = min(ter.height_at(rx + dx, ry + dy) for dx, dy in ((0, 0), (sx * 0.6, 0), (-sx * 0.6, 0),
+                                                                     (0, sy * 0.6), (0, -sy * 0.6)))
+        z_rest = ground + 0.45 * sz
+        yaw = float(self.rng.uniform(0, math.pi))
+        q = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+        keys = [(DROP_TIME * k / 8.0, (hx, hy, z_imp + DROP_HEIGHT * (1.0 - (k / 8.0) ** 2)), q) for k in range(9)]
+        keys += [(DROP_TIME + 0.3, (hx, hy, z_imp - 0.03), q), (DROP_TIME + 0.9, (rx, ry, z_rest), q)]
+        d.mocap_quat[mid] = q
+        d.mocap_pos[mid] = keys[0][1]
+        self.keyed.append({"mid": mid, "t0": t, "keys": keys})
+        self.placed.append((rx, ry, z_rest, sx, sy, sz, yaw))
+        self.free_boulders.remove(big)
+        rocks = [[rx, ry, z_rest, sx]]
+        # one or two more around it (never on another rover)
+        for _ in range(int(self.rng.integers(1, 3))):
+            if not self.free_boulders:
+                break
+            k = self.free_boulders[int(self.rng.integers(len(self.free_boulders)))]
+            m2, _g2, (bx, by, bz) = self.sim.world.boulders[k]
+            for _try in range(20):
+                a = float(self.rng.uniform(0, 2 * math.pi))
+                rr = float(self.rng.uniform(1.6, 2.6))
+                x, y = px + rr * math.cos(a), py + rr * math.sin(a)
+                if self._spot_ok(x, y, bx, ROVER_HALF_DIAG + 0.6) and ter.max_slope_near(x, y, bx) <= 24.0 \
+                        and all(math.hypot(x - b[0], y - b[1]) > bx + b[3] + 0.1 for b in self.placed):
+                    z = ter.height_at(x, y) + 0.45 * bz
+                    yw = float(self.rng.uniform(0, math.pi))
+                    d.mocap_quat[m2] = (math.cos(yw / 2), 0.0, 0.0, math.sin(yw / 2))
+                    d.mocap_pos[m2] = (x, y, z + DROP_HEIGHT)
+                    self.drops.append([m2, x, y, z, t])
+                    self.placed.append((x, y, z, bx, by, bz, yw))
+                    self.free_boulders.remove(k)
+                    rocks.append([x, y, z, bx])
+                    break
+        self.version += 1
+        h = self._new("rockfall", t, rover=rover.id, x=px, y=py, radius=2.6, rocks=rocks)
+        self.sim.fleet.log(t, "hazard", f"Rockfall right on {rover.name}.", None, at=(px, py))
+        return h
+
+    def _spire_hit(self, t: float, rover, p) -> Hazard:
+        """A spire falls onto the rover (the nearest standing one that reaches it, or a spare one that comes up
+        next to it), presses on it and slides off beside it."""
+        ter, d, cfg = self.sim.terrain, self.sim.data, self.cfg
+        px, py = self._predict(rover, FALL_TIME)
+        from .world import rover_spawn_height
+        top = ter.height_at(px, py) + rover_spawn_height(cfg) + cfg.chassis_half[2]
+        sp, base = None, None
+        for c in sorted((s_ for s_ in self.spires if self.spire_standing.get(s_.id)),
+                        key=lambda s_: math.hypot(s_.x - px, s_.y - py)):
+            D = math.hypot(c.x - px, c.y - py)
+            if D > 6.0:
+                break
+            if 1.2 <= D <= c.height - 0.8 and not ter.wet_near(c.x, c.y, 0.3):
+                sp, base = c, (c.x, c.y)
+                break
+        if sp is None:
+            if not self.spare_mocap:
+                raise HazardError("no spare spires left to drop (reset to restore them)")
+            ux, uy = p[0] - rover.x, p[1] - rover.y
+            n = math.hypot(ux, uy)
+            a0 = math.atan2(uy, ux) if n >= 0.3 else rover.yaw + math.pi / 2
+            for off in (0.0, 0.6, -0.6, 1.2, -1.2, 1.8, -1.8, math.pi):
+                bx, by = px + 1.9 * math.cos(a0 + off), py + 1.9 * math.sin(a0 + off)
+                if self._spot_ok(bx, by, 0.4, 1.2) and ter.max_slope_near(bx, by, 0.6) <= 18.0:
+                    base = (bx, by)
+                    break
+            if base is None:
+                raise HazardError(f"no room next to {rover.id} for a spire to fall on it")
+            sp = self._spare_spire(*base)
+        mid = self.spire_mocap[sp.id]
+        x0, y0, z0 = sp.x, sp.y, sp.z
+        D = math.hypot(px - x0, py - y0)
+        ux, uy = (px - x0) / D, (py - y0) / D
+        ax, ay = -uy, ux                              # horizontal rotation axis (z cross u)
+        a_hit = math.atan2(D, max(0.2, top - z0 + sp.radius - 0.04))
+        lie = math.pi / 2 - math.asin(max(-0.9, min(0.9, (ter.height_at(x0 + ux * sp.height * 0.8, y0 + uy * sp.height * 0.8)
+                                                         - z0) / (sp.height * 0.8))))
+        lie = max(lie, a_hit + 0.15)
+        side = 1.0 if (p[0] - rover.x) * ax + (p[1] - rover.y) * ay >= 0 else -1.0
+        shift = 0.5 + sp.radius + 0.25
+        sx_, sy_ = side * ax * shift, side * ay * shift
+
+        def quat(a):
+            s_ = math.sin(a / 2)
+            return (math.cos(a / 2), ax * s_, ay * s_, 0.0)
+        keys = [(FALL_TIME * k / 8.0, (x0, y0, z0), quat(a_hit * (k / 8.0) ** 2)) for k in range(9)]
+        keys += [(FALL_TIME + 0.3, (x0, y0, z0), quat(a_hit + 0.03)),
+                 (FALL_TIME + 1.0, (x0 + sx_, y0 + sy_, z0 + sp.radius * (1.0 - math.cos(lie))), quat(lie))]
+        self.keyed.append({"mid": mid, "t0": t, "keys": keys})
+        reach = sp.height - sp.radius
+        x1, y1 = x0 + sx_ + ux * reach * math.sin(lie), y0 + sy_ + uy * reach * math.sin(lie)
+        native = sp in getattr(ter, "spires", [])
+        self.fallen.append((sp, x0, y0, z0, x1, y1, ter.height_at(x1, y1), native, (sx_, sy_)))
+        self.spire_standing[sp.id] = False
+        self.features_version += 1
+        self.version += 1
+        hz = self._new("spire_fall", t, rover=rover.id, spire=sp.id, seg=(x0 + sx_, y0 + sy_, x1, y1))
+        self.sim.fleet.log(t, "hazard", f"A spire falls onto {rover.name}.", None, at=(px, py))
+        return hz
+
+    # ------------------------------------------------------------------ protocol v9: demo damage
+    def _damage(self, t: float, rover, severity, part) -> dict:
+        """Damage a rover at once (demo control). severity: light, heavy, disable (always immobile), wreck (always
+        beyond field repair), jam (immobile but fixable in the field). part: one of health.PARTS, optional.
+        disable with a sensor part (lidar, camera, comms) damages that part and burns out the right drive motor
+        too, so the rover is always immobile. Returns the hazard message plus "health" (the result)."""
+        from .health import PARTS
+        sim = self.sim
+        if severity is None:
+            severity = "heavy"
+        if severity not in SEVERITIES:
+            raise HazardError(f"unknown severity {severity!r} (use {', '.join(SEVERITIES[:4])}, or jam)")
+        if part is not None and part not in PARTS:
+            raise HazardError(f"unknown part {part!r} (use {', '.join(PARTS)})")
+        if rover is None:
+            pool = [r for r in sim.rovers if r.state not in ("disabled", "towed", "wrecked", "repairing")
+                    and r.health.mobile()]
+            if not pool:
+                raise HazardError("every rover is already out of action")
+            pool.sort(key=lambda r: (r.state != "exploring", -math.hypot(r.x, r.y)))
+            rover = pool[0]
+        hp = rover.health
+        if rover.state == "wrecked" or hp.status() == "wrecked":
+            raise HazardError(f"{rover.id} is already wrecked (beyond field repair)")
+        if rover.state == "towed":
+            raise HazardError(f"{rover.id} is being towed home; damage another rover")
+        if severity in ("disable", "jam") and not hp.mobile():
+            raise HazardError(f"{rover.id} is already immobile (health {hp.hp()}, waiting for help)")
+        cur = hp.values()
+        rng = self.rng
+        sets, kinds = {}, {}
+        if severity == "light":
+            p = part or PARTS[int(rng.integers(len(PARTS)))]
+            sets[p] = max(cur[p] - float(rng.uniform(15.0, 25.0)), 30.0 if p in ("drive_l", "drive_r", "power") else 5.0)
+        elif severity == "heavy":
+            p = part or ("drive_l", "drive_r")[int(rng.integers(2))]
+            floor = 25.0 if p in ("drive_l", "drive_r", "power") else 0.0      # heavy never immobilises
+            sets[p] = max(min(cur[p], float(rng.uniform(35.0, 45.0))), floor)
+        elif severity == "disable":
+            if part in ("drive_l", "drive_r"):
+                sets[part] = 0.0
+            elif part == "power":
+                sets["power"] = 5.0
+            else:
+                sets["drive_r"] = 0.0                  # the right motor burns out ...
+                if part is None:
+                    sets["drive_l"] = 20.0             # ... and the left wheel jams (fixable, not enough on its own)
+                    kinds["drive_l"] = "jam"
+                else:
+                    sets[part] = min(cur[part], 10.0)
+        elif severity == "jam":
+            sets["drive_l"], kinds["drive_l"] = 10.0, "jam"
+            sets["drive_r"], kinds["drive_r"] = 0.0, "trip"
+            if part is not None and part not in sets:
+                sets[part], kinds[part] = min(cur[part], 40.0), "dirt"
+        else:   # wreck: both drives and the power system gone, the sensors mostly fine (worth salvaging)
+            sets.update({"drive_l": 0.0, "drive_r": 5.0, "power": 8.0})
+            if part is not None:
+                sets[part] = 0.0
+        for p, v in sets.items():
+            kind = kinds.get(p, "broken")
+            loss = cur[p] - v
+            if loss > 0.5:
+                hp.apply(t, p, loss, "demo", kind)
+        if severity == "wreck" and hp.status() != "wrecked":
+            for p in ("lidar", "camera", "comms"):     # make sure: beyond field repair
+                hp.apply(t, p, max(0.0, hp.value(p) - 35.0), "demo")
+        h = self._new("damage", t, rover=rover.id, x=rover.x, y=rover.y, severity=severity, part=part)
+        h.active = False
+        sim.fleet.log(t, "hazard", f"Demo damage to {rover.name} ({severity}{', ' + part if part else ''}).", None,
+                      at=(rover.x, rover.y))
+        sim.rescue.check_now(rover, t)
+        msg = h.to_msg(t)
+        msg["health"] = hp.msg()
+        return msg
 
     # ------------------------------------------------------------------ sand
     def _gentle(self, cx: float, cy: float, R: float) -> bool:
@@ -795,7 +1058,7 @@ class HazardManager:
         return hz
 
     # ------------------------------------------------------------------ lifeform (demo)
-    def _lifeform(self, t: float, rover, working: list, p) -> Hazard:
+    def _lifeform(self, t: float, rover, working: list, p, charge: bool = False) -> Hazard:
         sim = self.sim
         lf = sim.lifeforms
         if not lf.herds:
@@ -858,6 +1121,8 @@ class HazardManager:
                 tr.ignored = False
         h = self._new("lifeform", t, rover=rover.id, x=spot[0], y=spot[1])
         sim.fleet.log(t, "hazard", f"A herd of creatures wanders into view of {rover.name}.", None, at=spot)
+        if charge:                                    # protocol v9 demo: its territorial member charges the rover
+            lf.provoke(herd, rover, t + 3.0)
         return h
 
     def on_soft_zone(self, x: float, y: float, radius: float) -> None:
@@ -916,6 +1181,8 @@ class HazardManager:
     def _fault(self, t: float, rover, working: list) -> Hazard:
         if rover is not None and rover.motor_fault:
             raise HazardError(f"{rover.id} is already faulted")
+        if rover is not None and rover not in working:
+            raise HazardError(f"{rover.id} is {rover.state}; pick a working rover")
         if len(working) <= 1:
             raise HazardError("that would leave no working rover")
         if rover is None:

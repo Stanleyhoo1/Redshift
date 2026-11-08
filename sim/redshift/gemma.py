@@ -113,16 +113,17 @@ LOCAL_URL = "http://localhost:11434"                 # Ollama when the sim runs 
 DEFAULT_MODEL = "gemma4:e2b"
 FALLBACK_MODELS = ("gemma4:e2b", "gemma4:e4b", "gemma3:4b")
 
-CANDIDATE_KINDS = ("frontier", "target", "return", "wait", "place")    # place: which of several places (v8)
+CANDIDATE_KINDS = ("frontier", "target", "return", "wait", "place", "rescue")    # place (v8), rescue (v9)
 ACTIONS = ("reroute", "back_out", "proceed_slowly", "wait", "ask_operator")
 CLASSES = ("rock", "steep_slope", "soft_ground", "dust", "liquid", "other_rover", "crater_edge", "clear", "unknown")
 DESCRIBE_CLASSES = ("lifeform", "rock", "other_rover", "dust", "unknown")
 DESCRIBE_ACTIONS = ("approach", "observe", "ignore", "ask_operator")
 MAX_LABEL_WORDS = 10
 COMMANDS = ("go_to", "go_to_place", "explore_direction", "sample_target", "return_home", "hold", "resume",
-            "avoid_area", "repeat", "prioritize", "set_mode", "question", "unclear")
+            "avoid_area", "repeat", "prioritize", "set_mode", "rescue", "question", "unclear")
 TOPICS = ("status", "history", "exploration", "finds", "samples", "battery", "hazards", "lifeforms", "water",
-          "location", "why", "unknown")
+          "location", "why", "health", "unknown")
+PLANS = ("help", "tow", "salvage", "leave")      # v9: what to do for a rover that can't drive
 DIRECTIONS = ("north", "south", "east", "west", "north-east", "north-west", "south-east", "south-west")
 # protocol v6: commands that name a place the fleet knows ("go to the water source"); v7: "there" is the place
 # the chat talked about last (resolved by the advisor's chat memory), "mentioned" picks the one the chat named
@@ -177,14 +178,14 @@ SYSTEM_INTERPRET = SYSTEM_BASE + (
     'Example reason: "slip 52% while ground speed 0.05 m/s: the wheels spin in soft ground."'
 )
 SYSTEM_COMMAND = (
-    "Turn the operator's message into ONE command for a rover fleet. JSON only. "
+    "Turn the operator's message into ONE fleet command. JSON only. "
     "Commands: go_to (x, y); go_to_place (place, target_id, qualifier, ordinal, near_rover, investigate, explore); "
-    "explore_direction (direction); sample_target (target_id); prioritize (priority, direction): the whole fleet "
-    "favours it until done, none = back to normal; set_mode (mode): supervised = ask the operator first, autonomous "
-    "= rovers decide; return_home; hold; resume; avoid_area (x, y, radius); repeat: do that again; question (topic): "
-    "asks for information; unclear: ask one short question. "
-    "place: a known place (the water, a vent, crystals are spire, the herd, t7); gaps: holes or unexplored patches "
-    "in the map; there: the place talked about last (there, it, the second one); qualifier mentioned: that lake. "
+    "explore_direction (direction); sample_target (target_id); prioritize (priority, direction), none = back to "
+    "normal; set_mode (mode): supervised asks the operator first, autonomous = rovers decide; "
+    "return_home; hold; resume; avoid_area (x, y, radius); repeat: do that again; rescue (plan, target_rover): help, "
+    "tow, salvage or leave a broken rover; question (topic): wants information; unclear: ask one short question. "
+    "place: a known place (the water, a vent, crystals are spire, the herd, t7); gaps: unexplored holes; "
+    "there: the place talked about last (there, it, the second one); qualifier mentioned: that lake. "
     "explore: stay and map around it. investigate: survey, look for life. Polite requests to act are commands. "
     "rover: an id, all, or none if not named. Use only numbers and ids from the message or lists; 0 or none if "
     "unused. ack: one short sentence."
@@ -900,6 +901,9 @@ def build_schema(req: Request) -> dict:
                  "direction": {"type": "string", "enum": list(DIRECTIONS) + ["none"]},
                  "priority": {"type": "string", "enum": list(PRIORITIES)},
                  "mode": {"type": "string", "enum": list(MODES) + ["none"]},
+                 "plan": {"type": "string", "enum": list(PLANS) + ["none"]},
+                 "target_rover": ({"type": "string", "enum": list(req.ids) + ["none"]} if req.ids
+                                  else {"type": "string"}),
                  "x": {"type": "number"}, "y": {"type": "number"}, "radius": {"type": "number"},
                  "target_id": target,
                  "topic": {"type": "string", "enum": list(TOPICS) + ["none"]},
@@ -973,6 +977,10 @@ _IMPERATIVE_RE = re.compile(rf"^(?:please\s+)?(?:{_CMD_VERBS}|map)\b")
 _LEAD_RE = re.compile(r"^(?:[\s,.:;!\-]|hey\b|hi\b|ok\b|okay\b|so\b|and\b|also\b|quick question\b|question\b)+")
 _EACH_RE = re.compile(r"\b(?:each|every rover|everyone|everybody|all of you|all rovers|each of you|every one of you)\b")
 _TOPIC_RES = (   # first match wins
+    ("health", re.compile(r"^how(?:'?s| is| are| r)?\s*(?:it|they|he|she|doing)?\s*(?:doing)?\s*[?.!]*$|damag|\bhealth|"
+                          r"\bhurt|injur|broken|\bbroke\b|\bhp\b|repair|\bwreck|immobile|disabled|in one piece|"
+                          r"\bfix(?:ed|able)?\b|rescu|\btow|salvag|distress|\bspare|who(?:'s| is) helping|"
+                          r"working (?:ok|properly|fine|right)|still (?:work|driv|move)|\bstuck\b")),   # v9
     ("battery", re.compile(r"batter|charg|\bpower|energy|juice|\bfuel")),
     ("lifeforms", re.compile(r"\blife|alive|creature|animal|organism|grazer|\bherd|alien(?!\s+spire)|living|biolog|"
                              r"moving thing|something mov|anything mov")),
@@ -1334,6 +1342,53 @@ def parse_place(low: str, rest: str, rover, target, rovers: list, polite: bool =
     return out
 
 
+# ---- protocol v9: rescue orders ("rover 1, go help rover 2", "tow rover 2 home", "salvage rover 3", "leave it")
+_TREF = (r"(?:rover\s*(?:#|no\.?|number)?\s*(?:\d+|" + "|".join(_WORD_NUMS) + r")|r\d+|it|him|her|them|that one|"
+         r"the wreck|the (?:broken|damaged|stuck|disabled|immobile|dead) (?:one|rover)|the (?:\w+) one)")
+_RESCUE_RES = (
+    ("tow", re.compile(r"\btow(?:s|ing|ed)?\b|\b(?:drag|haul)\s+" + _TREF + r"\s+(?:back|home)")),
+    ("salvage", re.compile(r"\b(?:salvag\w*|scaveng\w*|cannibali[sz]\w*|strip)\b")),
+    ("leave", re.compile(r"\b(?:leave|abandon|ditch)\s+" + _TREF + r"(?!\s+alone)\b|\bleave\s+the\s+wreck\b")),
+    ("help", re.compile(r"\b(?:help|rescue|assist|aid)\s+(?:out\s+)?" + _TREF + r"|\b(?:go|come|please)\s+(?:and\s+)?"
+                        r"(?:help|rescue)\b|\b(?:help|rescue)\s*[.!]*$|\bto\s+(?:help|rescue)\b")),
+)
+
+
+def _rovers_in(text: str, rovers: list) -> list:
+    """Rover ids mentioned in text, in order."""
+    out = []
+    for m in _ROVERN_RE.finditer(text):
+        tok = m.group(1) or m.group(2)
+        out.append((m.start(), f"r{int(tok) if tok.isdigit() else _WORD_NUMS[tok]}"))
+    for m in _RID_RE.finditer(text):
+        out.append((m.start(), f"r{m.group(1)}"))
+    for r in rovers:
+        name = str(r.get("name") or "").lower().strip()
+        if name and not re.fullmatch(r"(rover|robot)\s*\d+", name):
+            for m in re.finditer(r"\b" + re.escape(name) + r"\b", text):
+                out.append((m.start(), r["id"]))
+        col = r.get("colour")
+        if col:
+            for m in re.finditer(r"\b(?:the\s+)?" + col + r"\s+(?:one|rover)\b", text):
+                out.append((m.start(), r["id"]))
+    return [rid for _p, rid in sorted(out)]
+
+
+def parse_rescue(low: str, rovers: list) -> dict | None:
+    """{"type": "rescue", "rover": helper or None, "target": the rover in trouble or None, "plan"} or None. The rover
+    named before the verb helps ("rover 1, go help rover 2", "send r3 to rescue r1"); the one after it is the one in
+    trouble ("tow rover 2 home"). "it", "the wreck" or nothing: the rover currently in trouble (the advisor knows)."""
+    for plan, rx in _RESCUE_RES:
+        m = rx.search(low)
+        if m is None:
+            continue
+        before, after = _rovers_in(low[:m.start()], rovers), _rovers_in(low[m.start():], rovers)
+        helper = before[-1] if before else None
+        target = after[0] if after else None
+        return {"type": "rescue", "rover": helper, "target": target, "plan": plan}
+    return None
+
+
 def _ask(rover, topic: str, conf: float) -> dict:
     cmd = {"type": "question", "rover": rover, "topic": topic if topic in TOPICS else "unknown"}
     return {"command": cmd, "ack": "", "question": None, "confidence": conf}
@@ -1450,6 +1505,12 @@ def command_ack(cmd: dict) -> str:
         return f"Prioritizing {what}."
     if typ == "set_mode":
         return f"Switching to {cmd.get('mode')} mode."
+    if typ == "rescue":
+        what = cmd.get("target") or "the rover in trouble"
+        verb = {"help": "going to help", "tow": "towing", "salvage": "salvaging", "leave": "leaving"}.get(
+            cmd.get("plan"), "helping")
+        tail = " home" if cmd.get("plan") == "tow" else ""
+        return f"{who} {verb} {what}{tail}." if who else f"{verb[:1].upper() + verb[1:]} {what}{tail}."
     return cmd.get("question") or _HELP
 
 
@@ -1487,6 +1548,11 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
     low = " ".join(str(text or "").lower().split())
     if not low:
         return _unclear(_HELP)
+    q_pre, _t_pre = question_intent(low, rovers)
+    if q_pre != "strong":
+        rc = parse_rescue(low, rovers)                # v9: before the one-rover-at-a-time check
+        if rc is not None:
+            return _done(rc)
     rover, rest, question = _resolve_rover(low, rovers)
     if question:
         return _unclear(question)
@@ -1854,6 +1920,17 @@ def _fix_task(req: Request, cmd: dict) -> dict:
     return cmd
 
 
+def _fix_rescue(req: Request, cmd: dict) -> dict:
+    """v9: the keyword parser's reading of a rescue order wins (who helps whom is in the word order); a model
+    "rescue" for a message without any rescue word is the parser's reading instead."""
+    p = (req.parsed or {}).get("command") or {}
+    if p.get("type") == "rescue":
+        return dict(p)
+    if cmd.get("type") == "rescue":
+        return dict(p) if p else {"type": "unclear", "question": _HELP}
+    return cmd
+
+
 def _fix_intent(req: Request, cmd: dict) -> dict:
     """Post-check command vs question with the keyword rules (small models mix them up): a message
     that starts with a question word ("did you sample t4?") is a question, not an order; one that
@@ -1995,6 +2072,15 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             cmd = _priority_command(req, data)
         elif typ == "set_mode":
             cmd = _mode_command(req, data)
+        elif typ == "rescue":
+            plan = str(data.get("plan") or "").strip().lower()
+            if plan not in PLANS:
+                raise ValueError(f"plan {plan!r} not in {list(PLANS)}")
+            tg = data.get("target_rover")
+            tg = None if tg is None or str(tg).strip().lower() in ("", "none", "null") else str(tg).strip()
+            if tg is not None and req.ids and tg not in req.ids:
+                raise ValueError(f"target_rover {tg!r} not in {list(req.ids)}")
+            cmd = {"type": "rescue", "rover": rv if rv != "all" else None, "target": tg, "plan": plan}
         elif typ == "question":
             topic = str(data.get("topic") or "").strip().lower()
             cmd = {"type": "question", "rover": rv, "topic": topic if topic in TOPICS else "unknown"}
@@ -2003,6 +2089,7 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             cmd = {"type": "unclear", "question": q}
     except ValueError as e:
         return bad(str(e))
+    cmd = _fix_rescue(req, cmd)
     cmd = _fix_go_to(req, cmd, data)
     cmd = _fix_place(req, cmd)
     cmd = _fix_refs(req, cmd)
@@ -2334,7 +2421,9 @@ class FakeBackend(Backend):
             m = re.search(r"(\d+)\s*cells", c["summary"])
             return int(m.group(1)) if m else 0
 
-        if frac is not None and frac < 0.3 and "return" in by_kind:
+        if "rescue" in by_kind:                   # v9: the rules list the safe options best first
+            pick, why = by_kind["rescue"][0], "safest useful option"
+        elif frac is not None and frac < 0.3 and "return" in by_kind:
             pick, why = by_kind["return"][0], "battery low"
         elif "target" in by_kind:
             pick, why = by_kind["target"][0], "science target in reach"
@@ -2422,6 +2511,7 @@ class FakeBackend(Backend):
                 "x": c.get("x", 0), "y": c.get("y", 0), "radius": c.get("radius", 0),
                 "target_id": c.get("target_id") or "none", "topic": c.get("topic", "none"),
                 "priority": c.get("priority") or "none", "mode": c.get("mode") or "none",
+                "plan": c.get("plan") or "none", "target_rover": c.get("target") or "none",
                 "question": c.get("question", ""), "ack": p["ack"], "confidence": 0.85}
 
     _LEADS = {"status": "Status: ", "history": "My log: ", "exploration": "Mapping so far: ", "finds": "Finds: ", "samples": "Samples: ",

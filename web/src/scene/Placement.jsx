@@ -22,7 +22,7 @@ import { pickGround } from './pick.js'
 
 const SEGS = 64
 const BAD = '#ff5a4f'
-const COLORS = { rockfall: '#e8dcc8', sand: SAND, spire_fall: SPIRE.line, lifeform: LIFE, rover_fault: HAZARD }
+const COLORS = { rockfall: '#e8dcc8', sand: SAND, spire_fall: SPIRE.line, lifeform: LIFE, rover_fault: HAZARD, damage: HAZARD }
 const ROVER_PICK_PX = 44
 const SPIRE_REACH = 6 // m: PROTOCOL.md, a spire fall topples the nearest standing spire within about 6 m
 
@@ -32,7 +32,7 @@ const EAST = [1, 0]
 
 // What a click right here would do, from what this client can see. Writes into one
 // shared object (this runs every frame while placing).
-const _cur = { x: 0, y: 0, h: 0, valid: true, reason: '', spire: null, dir: null, rover: null }
+const _cur = { x: 0, y: 0, h: 0, valid: true, reason: '', spire: null, dir: null, rover: null, hits: null }
 const _dir = [1, 0]
 const bad = (reason) => ((_cur.valid = false), (_cur.reason = reason), _cur)
 
@@ -46,15 +46,21 @@ function assess(type, hit, s, reality) {
   out.spire = null
   out.dir = null
   out.rover = null
+  out.hits = null
   const map = s.map
   const outside = (v, o, w) => v < o || v > o + w
   if (!hit.onMap || outside(hit.x, map.ox, map.width) || outside(hit.y, map.oy, map.depth)) return bad('Off the map')
   const L = s.lander
   if (L && Math.hypot(hit.x - L.x, hit.y - L.y) < L.radius + 0.5) return bad('On the lander')
+  // v9: a rockfall or a falling spire may land on a rover (it hits it); the rest keep 2 m away.
+  const onRover = s.v9 && META[type]?.onRover
   for (const m of s.roverMeta) {
     const p = roverPoses.get(m.id)
     if (!p) continue
-    if (Math.hypot(p.x - hit.x, -p.z - hit.y) < 2) return bad(`Too close to ${m.name}`)
+    if (Math.hypot(p.x - hit.x, -p.z - hit.y) < 2) {
+      if (!onRover) return bad(`Too close to ${m.name}`)
+      if (!out.hits) out.hits = m
+    }
   }
   let wet = false
   const zones = s.fleet.water_zones
@@ -318,19 +324,24 @@ export function Placement({ reality }) {
       const rr = roverRing.current
       const m = cur.rover
       const p = m && roverPoses.get(m.id)
-      const faulted = m && sim.rovers[m.id]?.state === 'fault'
+      const st = m ? sim.rovers[m.id]?.state : null
+      // Motor fault: a faulted rover cannot get another. v9 damage: the sim refuses a wreck
+      // (or a rover being towed or repaired), so those read as unavailable.
+      const dmg = type === 'damage'
+      const blocked = dmg ? st === 'wrecked' || st === 'towed' || st === 'repairing' : st === 'fault'
       if (rr) {
         rr.visible = !!p
         if (p) {
           rr.position.set(p.x, p.y + 0.15, p.z)
           rr.scale.setScalar(2.3 + 0.12 * Math.sin(now * 6))
-          mats.rover.color.set(faulted ? '#8d99aa' : HAZARD)
+          mats.rover.color.set(blocked ? '#8d99aa' : HAZARD)
         }
       }
-      const key = m ? `${m.id}|${faulted}` : ''
+      const key = m ? `${m.id}|${blocked}|${st}` : ''
       if (key !== s.info) {
         s.info = key
-        setInfo(m ? { title: faulted ? `${m.name} already has a fault` : `Motor fault on ${m.name}`, sub: faulted ? '' : 'Click to trigger', valid: !faulted, color: HAZARD } : null)
+        const why = st === 'wrecked' ? 'is already a wreck' : st === 'towed' ? 'is being towed' : st === 'repairing' ? 'is under repair' : 'already has a fault'
+        setInfo(m ? { title: blocked ? `${m.name} ${why}` : dmg ? `Damage ${m.name}` : `Motor fault on ${m.name}`, sub: blocked ? '' : dmg ? 'Click, then pick how bad' : 'Click to trigger', valid: !blocked, color: HAZARD } : null)
       }
       return
     }
@@ -396,6 +407,7 @@ export function Placement({ reality }) {
       fallLine.object.visible = false
       if (ghostSpire.current) ghostSpire.current.visible = false
     }
+    if (cur.hits && cur.valid) sub = `Lands on ${cur.hits.name}: it takes a hit`
     if (!cur.valid) {
       title = cur.reason
       sub = 'The sim will refuse this spot'

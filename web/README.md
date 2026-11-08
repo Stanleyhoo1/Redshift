@@ -11,8 +11,8 @@ Vite + React + three.js (@react-three/fiber, drei). Node 22.
 ```sh
 npm install
 npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
-                  #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, AUTONOMY_MODE, MOCK_GEMMA=offline, MOCK_PROTOCOL=2..7,
-                  #   MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE, MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off)
+                  #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, AUTONOMY_MODE, MOCK_GEMMA=offline, MOCK_PROTOCOL=2..8,
+                  #   MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE, MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off, MOCK_KNOCK_S)
 npm run dev       # in a second terminal, then open http://localhost:5173
 ```
 
@@ -161,6 +161,27 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   remembered across reloads. A small readout gives fps and frame age; polling stops while
   the tab is hidden or the viewer covers the panel. The sensor panel adds "Sees: creature
   0.83 at 6 m, rock 0.64 at 4 m" from the rover's `vision` and the detector's time.
+- Rover health (version 9): each rover card has an hp bar coloured by status (green, amber,
+  red when immobile, grey for a wreck) and six part indicators (left and right drive, LiDAR,
+  camera, power, comms; hover for the percentage, hover the row for the rover's own
+  diagnosis). The sensor panel adds a Health section: every part with its percentage, the
+  diagnosis line and the last hit (cause, shock in g, how long ago). New states have their
+  own pills and card lines: Disabled (solid red, blinking), Rescuing, Towing, In tow,
+  Repairing, Wrecked (greyed). Each hit (`damage` event) shows in the log with the part,
+  before and after on a small bar, cause and shock; the Damage filter lists only hits (each
+  rover's filter shows its own). On the map a hit flashes with sparks; a disabled rover gets a
+  pulsing red and amber distress beacon with a light pillar and "Rover 2 needs help" (calmer
+  once help arrives), its helper a dashed line to it while on the way, then a tag with
+  progress while it diagnoses, fixes or salvages; towing draws a tow line; a wreck stays as a
+  darkened rover with a ground marker and a "Wreck" chip; the lander tag shows the fleet's
+  spares (icon and count each) and "Repairing Rover 2" while its pad pulses. Rescue requests
+  (`kind: "rescue"`) list tow, salvage and leave with the rules' verdict and note under each
+  (unsafe options are locked) and Gemma's suggestion; the UI reads option `safe` and `note`
+  (or `why`, `reason`) and request `about` when a sim sends them. Hazard bar: Damage, then
+  click a rover (or pick it under Target), then choose the part (Any by default) and how bad
+  (light, heavy, disable, wreck) in the small panel under the bar; the sim's refusal shows
+  there. Rockfall and Falling spire may be dropped on a rover ("Lands on Rover 2"); the lander
+  stays refused.
 - Every version 2, 3 and 4 field is optional: with an older sim the panel shows dashes, the
   camera says it is unavailable, the hazard buttons say the sim does not support them, the
   Gemma pill and bar stay hidden, Comms says the sim has no operator chat, and the version 4
@@ -233,6 +254,20 @@ with `MOCK_FIRST_QUESTION_S=99999`, preview running) checks the log filter, both
 suggested option, the camera boxes and the priority chip, and saves screenshots (low
 graphics by default, `GRAPHICS=high` to override). `node scripts/cam-rate.mjs [url] [w] [h]`
 measures the camera stream on its own (new frames a second, repeats skipped).
+
+Version 9 in the mock (the default; `MOCK_PROTOCOL=8` for the previous behaviour): rover
+`health` that changes behaviour (a weak drive side pulls and slows, a damaged LiDAR loses range,
+damaged power drains faster), damage from the demo control (`{"type": "damage", "rover",
+"severity", "part"}`, with 400s for an unknown severity or part, a wreck, a rover in tow or
+under repair), a rockfall or spire dropped on a rover, strain in soft sand and a knock now and
+then (`MOCK_KNOCK_S`). An immobile rover sends a distress signal (silent with dead comms: the
+fleet notices after 15 s), the closest rover with the battery drives over, diagnoses for 20 s,
+then fixes it in the field (sometimes) or the fleet tows it home (it follows behind the
+helper) for a repair with spares, salvages it (spares go up, the wreck stays) or leaves it:
+Gemma decides in autonomous mode (logged), supervised mode asks with a `rescue` request.
+Fleet `spares`, `rescues` (mock extra: `progress`) and `wrecks`. Chat: "rover 1, go help rover
+2", "tow it", "salvage rover 3", "leave it", "how is rover 2?". Test hook: `POST
+/api/_mock/heal {"rover"?}`.
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

@@ -134,10 +134,14 @@ class Fleet:
         self.gaps: list = []               # protocol v8: unexplored gaps (gaps.find_gaps), cached ...
         self.gap_grid = None               # ... their label grid (frontier lookups) ...
         self.gaps_t = -1e9                 # ... and when they were found
+        self.spares: dict = {}             # protocol v9: spare parts at the lander (rescue.py fills it)
+        self.wrecks: list = []             # protocol v9: rovers left behind {"rover", "x", "y"}
+        self.rescue = None                 # protocol v9: the sim's RescueManager
+        self.rescues_msg = lambda: []
 
     # ------------------------------------------------------------------ events
     def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None,
-            decision: dict | None = None) -> None:
+            decision: dict | None = None, damage: dict | None = None) -> None:
         """source: "gemma" or "operator" when the decision came from tier 2 or a typed command
         (protocol v3); None means the rules (the field is then left out). decision (protocol v8): what a
         rover decided on its own instead of asking the operator."""
@@ -149,6 +153,8 @@ class Fleet:
             e["source"] = source
         if decision is not None:
             e["decision"] = decision
+        if damage is not None:
+            e["damage"] = damage           # protocol v9: what a hit did to one part
         self.events.append(e)
         if len(self.events) > 400:
             del self.events[:100]
@@ -167,6 +173,8 @@ class Fleet:
             out["source"] = e["source"]
         if "decision" in e:
             out["decision"] = e["decision"]
+        if "damage" in e:
+            out["damage"] = e["damage"]
         return out
 
     # ------------------------------------------------------------------ periodic
@@ -309,8 +317,8 @@ class Fleet:
                 self.log(t, "info", "New frontier spotted. Resuming exploration.")
             return
         usable = self.usable_frontiers(t)
-        busy = any((r.state in ("exploring", "investigating") and r.goal is not None) or r.state in ("fault", "observing")
-                   for r in self.rovers)
+        busy = any((r.state in ("exploring", "investigating") and r.goal is not None) or r.state in (
+            "fault", "observing", "rescuing", "towing") for r in self.rovers)
         if usable or busy or t < 30.0:
             self.no_frontier_since = None
             return
@@ -347,12 +355,15 @@ class Fleet:
         self._cost = None
         self._costs.clear()
 
-    def plan(self, t: float, rover, goal: tuple, relax: float = 0.0, max_exp: int = 14000):
+    def plan(self, t: float, rover, goal: tuple, relax: float = 0.0, max_exp: int = 14000, limit: float | None = None):
         """Plan from the rover to goal (x, y). Returns a list of (x, y) waypoints, None if there is
         no path, or PENDING if the rover's compute budget for this cycle ran out first (the search
-        resumes on the next call with the same goal)."""
+        resumes on the next call with the same goal). The slope limit is the rover's own (protocol v9: the
+        fleet's, lower for a damaged drive or while towing), or `limit` when given."""
         g = self.map.ij(goal[0], goal[1])
-        key = (g, round(relax, 1))
+        if limit is None:
+            limit = rover.limit_now() if hasattr(rover, "limit_now") else self.slope_limit
+        key = (g, round(relax, 1), round(limit, 1))
         fail = rover.plan_fails.get(key)
         if fail is not None and t - fail[0] < 2.0 and math.hypot(rover.x - fail[1], rover.y - fail[2]) < 1.0:
             return None                     # same question, same answer a moment ago
@@ -361,11 +372,12 @@ class Fleet:
                                  or math.hypot(rover.x - srch.sx, rover.y - srch.sy) > 1.0):
             srch = None
         if srch is None:
-            lim = self.slope_limit + relax
+            lim = limit + relax
             unk = self.cfg.degraded_unknown_cost if rover.degraded else (0.6 if relax > 0 else 1.0)
             base = self.cost(t, lim, unk)
-            others = [(o.x, o.y, 1.3 if (o.speed < 0.05 or o.state in ("idle", "charging", "fault")) else 0.9)
-                      for o in self.rovers if o is not rover]
+            others = [(o.x, o.y, 1.3 if (o.speed < 0.05 or o.state in (
+                "idle", "charging", "fault", "disabled", "wrecked", "towed", "repairing")) else 0.9)
+                for o in self.rovers if o is not rover and o is not getattr(rover, "helper", None)]
             others += [(*tr.predict(t), 3.0) for tr in self.tracker.near(rover.x, rover.y, 25.0, t)]
             mult = add_avoid(base, self.map, others)
             srch = AStar(mult, self.map.ij(rover.x, rover.y), g, max_expansions=max_exp)
@@ -732,6 +744,8 @@ class Fleet:
                 why = "LiDAR degraded, staying on mapped ground"
             elif rover.state == "fault":
                 why = "motors offline"
+            elif rover.state in ("disabled", "towed", "wrecked", "repairing", "rescuing", "towing"):
+                why = "out of action" if rover.state in ("disabled", "towed", "wrecked") else rover.state   # v9
             else:
                 why = "busy"
             self.log(t, "discovery", f"{rover.id} spectrometer flags a possible {label} ({ts.spec.id}) {dist:.0f} m "
@@ -863,6 +877,9 @@ class Fleet:
             "science_score": int(self.science_score),
             "mode": self.mode,                              # protocol v8
             **({"priority": self.priority_msg()} if self.priority is not None else {}),
+            "spares": dict(self.spares),                    # protocol v9
+            "rescues": self.rescues_msg(),
+            "wrecks": [dict(w) for w in self.wrecks],
         }
 
     def discovered_targets(self) -> list:

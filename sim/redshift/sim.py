@@ -27,6 +27,7 @@ from .advisor import Advisor
 from .config import ROVER_COLORS, Config
 from .fleet import Fleet
 from .hazards import HazardError, HazardManager
+from .health import DamageMonitor
 from .lifeforms import LifeformManager
 from .mapping import FleetMap
 from .rover import Rover
@@ -71,6 +72,10 @@ class Simulation:
         self.hazards = HazardManager(self)
         self.fleet.hazards = self.hazards
         self.lifeforms = LifeformManager(self)
+        self.damage = DamageMonitor(self)   # protocol v9: shocks and hard contacts on the rovers
+        from .rescue import RescueManager
+        self.rescue = RescueManager(self)   # protocol v9: distress, helpers, towing, salvage, repair
+        self.fleet.rescue = self.rescue
         self.camera_ok = None           # rules' camera checks: None = not tried yet, False = no OpenGL here
         self._features_sent = -1
         self.advisor = Advisor(self, planner, frame_source, wait_for_gemma=wait_for_gemma)
@@ -116,18 +121,24 @@ class Simulation:
         c0 = time.perf_counter()
         hz.update_physics(t_start)
         self.lifeforms.step(t_start, self.agent_dt)
+        mon = self.damage
+        tow = self.rescue.kinematic
         for _ in range(self.steps_per_tick):
-            if hz.drops or hz.falls:
+            if hz.drops or hz.falls or hz.keyed:
                 hz.animate(float(d.time))
+            if tow:
+                self.rescue.follow_step(d)
             mujoco.mj_step(m, d)
             f = d.actuator_force[act]
             energy += (np.abs(f * d.qvel[dof]) + k_heat * f * f).sum(axis=1) * dt
+            mon.step(d)
         # MuJoCo resets the whole state if it ever goes unstable: undo that and carry on
         if d.time < t_start + 0.5 * self.agent_dt or not np.isfinite(d.qpos).all() or not np.isfinite(d.qvel).all():
             self._recover_physics(t_start)
         self._check_rovers_in_world()
         t = float(d.time)
         hz.step(t)
+        mon.after_physics(t)
         c1 = time.perf_counter()
         n = len(self.rovers)
         s0 = self.ticks % n
@@ -135,6 +146,7 @@ class Simulation:
             r = self.rovers[(s0 + k) % n]
             r.tick(t, self.agent_dt, float(energy[r.idx]), duty=(k == 0))
             energy[r.idx] = 0.0
+        self.rescue.update(t)
         self.advisor.update(t)
         self.ticks += 1
         c2 = time.perf_counter()

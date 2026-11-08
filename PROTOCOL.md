@@ -440,6 +440,59 @@ Clarifications (sim implementation notes):
 - Rover `vision` is absent until the rover's first detection. It comes from the newest of: the rover's own small detector render (about 1 per second, 256 x 192, no shadows), the streamed fpv view the UI is polling, or the frame Gemma looked at; `vision.frame` equals `X-Frame` when it came from that frame. Weak detections (confidence below 0.3) are dropped; decisions use about 0.5 and up.
 - `GET /api/vision/stats` answers `{"ok": true, "frames", "conf_min", "match", "classes": {label: {"tp", "fp", "fn", "precision", "recall"}}, "overall", "ms": {"avg", "p95"}, "confusion", "camera": {...}}`, measured on one detector frame in five since the sim started (`precision` / `recall` are `null` until there is data).
 
+## Version 9 additions (rover health and damage, distress, rescue, towing, salvage, repair)
+
+All optional for clients.
+
+### Rover addition: `health` (every tick)
+
+```json
+"health": {"hp": 64, "status": "damaged",
+           "parts": {"drive_l": 100, "drive_r": 35, "lidar": 90, "camera": 70, "power": 100, "comms": 100},
+           "diagnosis": "Right drive motor at 35%: pulls left, top speed 0.4 m/s.",
+           "last_hit": {"t": 812.4, "cause": "boulder", "shock_g": 7.4}}
+```
+
+- `parts` are 0 to 100 (100 = like new). `hp` is the overall figure the UI shows (worst parts weigh most).
+- `status`: `"ok" | "damaged" | "immobile" | "wrecked"`. Immobile: cannot drive (both drive sides too weak, or power gone) but can be repaired or towed. Wrecked: beyond field repair; it can only be towed home for a lander repair or salvaged for parts.
+- `diagnosis`: the rover's own plain-language reading of its state, from its sensors (motor current against wheel speed, IMU shocks, LiDAR return counts, camera noise, battery behaviour), never from ground truth.
+- Damage changes behaviour through the sensors and the physics: a weak drive side makes the rover pull to one side and lowers its top speed and climbing ability (its own slope limit drops); a damaged LiDAR loses range and rays; a damaged camera gets noisy and the detector's confidence drops; damaged power drains the battery faster; damaged comms shortens how far its messages reach.
+
+### Damage sources
+
+Damage comes from what happens in the physics: hard contacts and shocks from rocks and boulders (including a rockfall landing on or next to a rover), a spire falling onto a rover, tipping over, driving into water, long stalls and hard pulling in soft sand (motor strain), dust on the camera and panels, and lifeforms: a herd wandering into a rover, or a territorial creature charging a rover that stays too close too long. Rovers see a charge coming (a fast LiDAR track heading at them, confirmed by the camera) and back away when they can. Each hit is an event with a `damage` object:
+
+```json
+"damage": {"rover": "r2", "part": "drive_r", "before": 100, "after": 35, "cause": "boulder", "shock_g": 7.4}
+```
+
+Demo control: `POST /api/hazard` with `{"type": "damage", "rover": "r2", "severity": "light" | "heavy" | "disable" | "wreck"}` (optional `"part"`). Damage is also reachable by clicking: a rockfall or falling spire placed on a rover hits it.
+
+### Distress, rescue, towing, salvage, repair
+
+- A rover that becomes immobile stops, logs its diagnosis, and sends a **distress signal** (event plus chat, kind `"info"`): "r2: immobile. Right drive at 0%, left at 20%. Requesting help at (14.2, -30.5)." If its comms are too damaged to reach the others, they notice it went silent (no heartbeat for about 15 s) and go to its last known position.
+- The best placed healthy rover becomes the **helper** (closest, enough battery for the trip and back, plus towing if needed) and says so. It drives to the disabled rover, then **diagnoses** it for about 20 s (camera and close inspection), and reports what it found. Some damage can be fixed in the field (a jammed wheel, a tripped motor controller, a dirty camera): the helper fixes it and both carry on.
+- Otherwise there are three options, decided by Gemma in autonomous mode or asked as a request of `kind: "rescue"` in supervised mode, with the rules marking which are safe:
+  - **tow**: the helper hitches up and tows the rover back to the lander slowly (stricter slope limit, extra battery) for repair. Only offered when a safe route exists and the helper's battery covers it.
+  - **salvage**: the helper takes the most useful working parts (adds them to the fleet's spares) and leaves the wreck.
+  - **leave**: the wreck stays where it is, marked on the map, and the fleet carries on without it.
+- Rescue request options carry the rules' verdict: `{"id": "tow", "label": "Tow it home (180 m)", "safe": true, "note": "Route at most 12 deg, helper battery after tow about 41%"}`; unsafe options have `"safe": false` and the reason in `note` (the UI locks them). The request may carry `about` (the disabled rover's id).
+- **Repair at the lander**: a rover at the lander gets repaired over time, using spare parts for broken components. A drive, LiDAR, camera or power part below 30% needs a spare; better parts are serviced without one.
+- Fleet additions: `spares` `{"drive": 2, "lidar": 1, "camera": 1, "power": 1}`; `rescues` `[{"rover": "r2", "helper": "r1", "phase": "en_route" | "diagnosing" | "repairing" | "towing" | "salvaging" | "done", "plan": "tow" | "salvage" | "leave" | null}]`; `wrecks` `[{"rover": "r2", "x": 14.2, "y": -30.5}]`.
+- New rover states: `"disabled"` (immobile, waiting for help), `"rescuing"` (helper on its way or working), `"towing"`, `"towed"`, `"repairing"` (at the lander), `"wrecked"` (left behind).
+- Rovers answer questions about their health ("rover 2, are you damaged?", "how is rover 3?") from `health`, and the operator can order a rescue ("rover 1, go help rover 2", "tow rover 2 home", "salvage rover 3", "leave it").
+
+Sim notes (clarifications):
+- `status` "immobile" can still need a tow (a burnt-out motor needs a spare at the lander); "wrecked" means immobile even after a field repair and badly hurt overall (hp under 30, or three or more parts under 10%). A rover pulls toward its weak drive side ("Right drive motor at 35%: pulls right, top speed 0.4 m/s."). A skid steer needs both sides: either drive side under 15%, or power under 10%, is immobile.
+- `damage` hazard: `light` takes 15 to 25 points off one part (the named one, or a random one); `heavy` takes a part (default a drive side) to 35 to 45% and never immobilises; `disable` without a part burns out the right drive (0%) and jams the left wheel (20%, fixable in the field, not enough on its own); with `drive_l` / `drive_r` / `power` that part is knocked out; with `lidar`, `camera` or `comms` that part drops to 10% and the right drive burns out too, so the rover is always immobile; `wreck` takes both drives and the power system out (beyond field repair, the sensors stay worth salvaging; with a part, that part is lost too). Extra severity `"jam"`: a jammed left wheel and a tripped right motor controller (immobile, fully fixable in the field, for demoing a field repair). The rover reacts at once (distress in the same call). The response adds `"health"` (the rover's health after the hit). 400 for an unknown severity or part, an unknown rover, a rover already wrecked or being towed, and `disable` / `jam` on a rover that is already immobile. The hazard entry is `{"id", "type": "damage", "t", "rover", "x", "y", "severity", "part", "active": false}`.
+- A rockfall or spire fall placed on or within 2 m of a rover is aimed at it (instead of the old 400); the lander is still refused. `lifeform` accepts `"charge": true` (demo): the herd's territorial member charges the rover a few seconds after it appears.
+- Rescue phases: hitching up is reported as `"towing"`, waiting for a free helper as `"en_route"` with `helper` null, waiting for the decision (or the operator) as `"diagnosing"`. Finished rescues stay in `rescues` with phase `"done"` for 60 s.
+- A `rescue` request's `rover` is the helper (it waits by the disabled rover); `about` is the disabled rover. Option ids are `tow`, `salvage`, `leave`, the safe ones first; `default` is the rules' first safe option. Answering an option with `safe: false` gets HTTP 400 and the request stays open.
+- Towing is physical (a MuJoCo `connect` constraint between the helper's rear hitch and the towed rover's front hitch, the towed rover's drives passive). If it gets stuck the towed rover follows the hitch kinematically instead; the event log says which ("on the tow bar" or "on the rigid bar").
+- Repair at the lander: a spare is fitted and tested in about 20 s; a rover whose broken part has no spare waits at the lander (state `"repairing"`, charging) until one is delivered. Salvaged parts count once the helper docks, or at once when it fits one to itself.
+- Radio range is about 220 m times `comms` (the whole 120 m map at 100%); a rover heard by neither the lander nor another rover for 15 s goes silent.
+- Chat: question topic `"health"`; the command parser adds `{"type": "rescue", "rover": helper or null, "target": rover or null, "plan": "help" | "tow" | "salvage" | "leave"}` (null target: the rover currently in trouble).
+
 ### `GET /api/camera/{rover_id}.jpg`
 
 Live image rendered by MuJoCo from the rover's point of view, at the current sim state.

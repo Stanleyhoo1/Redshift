@@ -33,8 +33,17 @@ export function StatePill({ rover, hazards }) {
       </span>
     )
   }
+  // v9: a rover that cannot drive stands out (solid, blinking); a wreck is greyed out.
+  if (rover && st.alert) {
+    return (
+      <span className="pill pill-alert" role="status" style={{ '--pill': st.color }} title="Immobile: it cannot drive and has asked for help">
+        <i className="pill-blink" aria-hidden="true" />
+        {st.label}
+      </span>
+    )
+  }
   return (
-    <span className="pill" style={{ '--pill': st.color }}>
+    <span className="pill" data-wreck={(rover && st.wreck) || undefined} style={{ '--pill': st.color }}>
       {rover ? st.label : 'No data'}
     </span>
   )

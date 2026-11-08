@@ -3,6 +3,8 @@ import { useSim } from '../state/store.js'
 import { cleanMsg, mmss, shortName } from '../lib/format.js'
 import { GemmaStar, SourceTag } from './Planner.jsx'
 import { LifeIcon } from './FleetStats.jsx'
+import { PartIcon } from './HealthBits.jsx'
+import { causeText, partLabel, partLevel } from '../lib/theme.js'
 
 // A herd brought in from the hazard bar arrives as a "hazard" event (an environment
 // change), but it is a find, not a danger: shown as such.
@@ -82,10 +84,36 @@ function Decision({ d }) {
   )
 }
 
+// v9: a hit (event `damage`): the part, before and after on a small bar, cause and shock.
+function DamageLine({ d }) {
+  const level = partLevel(d.after)
+  const b = Number.isFinite(d.before) ? d.before : null
+  const a = Number.isFinite(d.after) ? d.after : null
+  return (
+    <span className="dmg" data-level={level} title={`${partLabel(d.part)} ${b ?? '--'}% to ${a ?? '--'}%${d.cause ? `, ${causeText(d.cause)}` : ''}${Number.isFinite(d.shock_g) && d.shock_g > 0 ? `, ${d.shock_g.toFixed(1)} g` : ''}`}>
+      <PartIcon part={d.part} className="dmg-icon" />
+      <span className="dmg-part">{partLabel(d.part)}</span>
+      <span className="dmg-bar" aria-hidden="true">
+        {b !== null && <u style={{ width: `${b}%` }} />}
+        {a !== null && <i style={{ width: `${a}%` }} />}
+      </span>
+      <span className="dmg-nums">
+        {b ?? '--'}
+        <svg viewBox="0 0 10 8" aria-hidden="true">
+          <path d="M1 4h7M5.5 1.5 8 4 5.5 6.5" />
+        </svg>
+        <b>{a ?? '--'}</b>
+      </span>
+      {d.cause && <span className="dmg-cause">{causeText(d.cause)}</span>}
+      {Number.isFinite(d.shock_g) && d.shock_g > 0 && <span className="dmg-g">{d.shock_g.toFixed(1)} g</span>}
+    </span>
+  )
+}
+
 const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
   const life = e.level === 'hazard' && LIFE_RE.test(e.msg)
   const hazard = e.level === 'hazard' && !life
-  const level = life ? 'life' : e.level
+  const level = life ? 'life' : e.damage ? 'damage' : e.level
   const content = (
     <>
       <span className="ev-time">{mmss(e.t)}</span>
@@ -105,6 +133,7 @@ const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
         <span className="ev-who">{life ? 'Lifeform' : hazard ? 'Hazard' : rover ? rover.name : e.rover || 'Fleet'}</span>{' '}
         {e.source !== 'rules' && !e.decision && <SourceTag source={e.source} />}
         <span className="ev-msg">{cleanMsg(e.msg, e.rover, byId)}</span>
+        {e.damage && <DamageLine d={e.damage} />}
         {e.at && (
           <span className="ev-goto" aria-hidden="true">
             <svg viewBox="0 0 12 12">
@@ -139,7 +168,7 @@ const EventRow = memo(function EventRow({ e, rover, live, byId, onFocus }) {
 
 // The filter chips: All, one per rover (in its colour), Fleet (events without a rover) and
 // Decisions (v8 events with a `decision`), each with its count.
-function Filters({ filter, setFilter, counts, meta, hasDecisions }) {
+function Filters({ filter, setFilter, counts, meta, hasDecisions, hasDamage }) {
   const chip = (id, label, n, extra = {}) => (
     <button key={id} type="button" className="evf" aria-pressed={filter === id} onClick={() => setFilter(id)} {...extra}>
       {label}
@@ -161,6 +190,18 @@ function Filters({ filter, setFilter, counts, meta, hasDecisions }) {
         ),
       )}
       {chip('fleet', 'Fleet', counts.fleet, { title: 'Fleet-wide events and hazards (no single rover)' })}
+      {(hasDamage || filter === 'damage') &&
+        chip(
+          'damage',
+          <>
+            <svg className="evf-dmg" viewBox="0 0 12 12" aria-hidden="true">
+              <path d="M6.6 1 3.4 6.6h2.4L5 11l3.6-6H6.2z" />
+            </svg>
+            Damage
+          </>,
+          counts.damage,
+          { title: 'Hits and the parts they damaged (each rover filter shows its own too)', 'data-dmg': true },
+        )}
       {(hasDecisions || filter === 'decisions') &&
         chip(
           'decisions',
@@ -179,6 +220,7 @@ const EMPTY = {
   all: 'Rover decisions and discoveries will appear here.',
   fleet: 'No fleet-wide events yet.',
   decisions: 'No decisions logged yet. In autonomous mode every choice a rover makes on its own (and why) appears here.',
+  damage: 'No damage so far. Every hit a rover takes (part, before and after, cause, shock) appears here.',
 }
 
 // Newest first. Rendered under the sidebar's "Events" tab (the tab bar is the heading).
@@ -195,11 +237,12 @@ export function EventLog({ onFocusEvent, hidden }) {
   const byId = useMemo(() => Object.fromEntries(meta.map((m) => [m.id, m])), [meta])
 
   const counts = useMemo(() => {
-    const c = { all: events.length, fleet: 0, decisions: 0 }
+    const c = { all: events.length, fleet: 0, decisions: 0, damage: 0 }
     for (const e of events) {
       if (e.rover) c[e.rover] = (c[e.rover] || 0) + 1
       else c.fleet++
       if (e.decision) c.decisions++
+      if (e.damage) c.damage++
     }
     return c
   }, [events])
@@ -208,11 +251,12 @@ export function EventLog({ onFocusEvent, hidden }) {
     if (filter === 'all') return events
     if (filter === 'fleet') return events.filter((e) => !e.rover)
     if (filter === 'decisions') return events.filter((e) => e.decision)
+    if (filter === 'damage') return events.filter((e) => e.damage)
     return events.filter((e) => e.rover === filter)
   }, [events, filter])
 
   // A rover that left (sim reset) cannot stay the filter.
-  if (filter !== 'all' && filter !== 'fleet' && filter !== 'decisions' && meta.length && !byId[filter]) setFilter('all')
+  if (filter !== 'all' && filter !== 'fleet' && filter !== 'decisions' && filter !== 'damage' && meta.length && !byId[filter]) setFilter('all')
 
   const pick = (id) => {
     setFilter(id)
@@ -237,7 +281,7 @@ export function EventLog({ onFocusEvent, hidden }) {
   const rows = shown.length > limit ? shown.slice(0, limit) : shown
   return (
     <div className="log" id="panel-events" role="tabpanel" aria-labelledby="tab-events" hidden={hidden}>
-      {events.length > 0 && <Filters filter={filter} setFilter={pick} counts={counts} meta={meta} hasDecisions={v8 || counts.decisions > 0} />}
+      {events.length > 0 && <Filters filter={filter} setFilter={pick} counts={counts} meta={meta} hasDecisions={v8 || counts.decisions > 0} hasDamage={counts.damage > 0} />}
       <ol
         className="log-list"
         ref={list}

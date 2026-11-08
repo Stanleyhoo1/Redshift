@@ -117,12 +117,14 @@ export async function loadTruth(gen) {
 // POST /api/hazard (PROTOCOL.md, version 2; `at` = [x, y] for version 4 point and click).
 // Resolves with the server's hazard, or throws an Error carrying the server's own error
 // text (HTTP 400) when it refuses.
-export async function postHazard(type, rover, at = null) {
+// `extra`: more body fields, e.g. version 9 damage { severity, part } (null values dropped).
+export async function postHazard(type, rover, at = null, extra = null) {
   const body = rover ? { type, rover } : { type }
   if (at) {
     body.x = at[0]
     body.y = at[1]
   }
+  if (extra) for (const [k, v] of Object.entries(extra)) if (v != null) body[k] = v
   let res
   try {
     res = await fetch('/api/hazard', {

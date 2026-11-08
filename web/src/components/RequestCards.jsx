@@ -42,6 +42,12 @@ const ShieldIcon = () => (
     <path d="M6 1 10.2 2.6v3c0 2.6-1.8 4.4-4.2 5.4C3.6 10 1.8 8.2 1.8 5.6v-3z" />
   </svg>
 )
+const WarnIcon = () => (
+  <svg viewBox="0 0 12 12" aria-hidden="true">
+    <path d="M6 1.4 11 10.2H1z" />
+    <path d="M6 4.8v2.4M6 8.6v.1" />
+  </svg>
+)
 const CheckIcon = () => (
   <svg viewBox="0 0 12 12" aria-hidden="true">
     <path d="M2.2 6.4 4.8 9 9.8 3.2" />
@@ -316,8 +322,12 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
   const color = meta?.color || '#8d99aa'
   // v7: a rover that sights a herd follows it at a safe distance while it asks.
   const following = useSim((s) => q.kind === 'lifeform' && s.rovers[q.rover]?.state === 'observing')
+  // v9: a rescue decision (tow, salvage, leave) with the rules' safety notes.
+  const rescue = q.kind === 'rescue'
+  const about = rescue && q.about ? byId[q.about]?.name || q.about : null
   let hint
-  if (following) hint = `Following at a safe distance while waiting for you${auto ? `. With no answer it takes the safe default: ${def.toLowerCase()}.` : '.'}`
+  if (rescue) hint = `${name} waits${about ? ` by ${about}` : ''} until you decide. Options the rules mark unsafe are locked.`
+  else if (following) hint = `Following at a safe distance while waiting for you${auto ? `. With no answer it takes the safe default: ${def.toLowerCase()}.` : '.'}`
   else if (waiting && places) hint = `${name} holds position until you choose. Click a numbered marker on the map, a choice here, or reply in Comms ("the second one").`
   else if (waiting) hint = `${name} holds position until you answer.`
   else if (auto) hint = `Moving cautiously until you answer. With no answer it takes the safe default: ${def.toLowerCase()}.`
@@ -331,7 +341,7 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
           <button type="button" className="rq-name" onClick={() => q.rover && onSelect?.(q.rover)} title={`Show ${name}'s sensors`}>
             {name}
           </button>
-          <span className="rq-asks">{kind ? 'asked' : 'asks you'}</span>
+          <span className="rq-asks">{kind ? 'asked' : rescue ? 'needs a decision' : 'asks you'}</span>
           {source && <SourceTag source={source} />}
           {!kind && left !== null && (
             <span className="rq-left" data-low={left <= 5 || undefined} aria-label={`${Math.ceil(left)} seconds left`}>
@@ -351,10 +361,11 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
           <Outcome kind={kind} q={q} name={name} answer={answer} ghost={ghost} />
         ) : (
           <>
-            <div className="rq-opts" role="group" aria-label="Answer">
+            <div className="rq-opts" role="group" aria-label="Answer" data-rescue={rescue || undefined}>
               {q.options.map((o) => {
                 const isDefault = o.id === auto
                 const n = nums?.[o.id]
+                const unsafe = o.safe === false
                 return (
                   <button
                     key={o.id}
@@ -363,10 +374,12 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
                     data-default={isDefault || undefined}
                     data-suggested={o.suggested || undefined}
                     data-place={n ? true : undefined}
+                    data-safe={o.safe === true || undefined}
+                    data-unsafe={unsafe || undefined}
                     aria-busy={(pending && answer.option === o.id) || undefined}
-                    disabled={pending}
+                    disabled={pending || unsafe}
                     onClick={() => sendAnswer(q.id, o.id)}
-                    title={n ? `${o.label} (marker ${n} on the map)${o.suggested ? ", Gemma's suggestion" : ''}` : o.suggested ? "Gemma's suggestion" : undefined}
+                    title={unsafe ? `Not safe by the rules${o.note ? `: ${o.note}` : ''}` : n ? `${o.label} (marker ${n} on the map)${o.suggested ? ", Gemma's suggestion" : ''}` : o.suggested ? "Gemma's suggestion" : o.note || undefined}
                     {...placeChipProps(q, o, hover)}
                   >
                     {n ? (
@@ -391,6 +404,13 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
                         safe default
                       </span>
                     )}
+                    {rescue && (o.safe === true || unsafe) && (
+                      <span className="rq-rule" data-unsafe={unsafe || undefined}>
+                        {unsafe ? <WarnIcon /> : <ShieldIcon />}
+                        {unsafe ? 'Not safe' : 'Safe'}
+                      </span>
+                    )}
+                    {o.note && <span className="rq-note">{o.note}</span>}
                   </button>
                 )
               })}

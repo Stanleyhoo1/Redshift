@@ -25,7 +25,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `redshift/world.py` | Builds the MuJoCo physics model: the ground as height-map tiles, rocks, the lander pad, target markers, liquid surfaces, spires, creatures, hidden rockfall boulders and spare spires, and the rovers (4 wheels, skid steering, front axle that rocks so all wheels touch, an IMU). |
 | `redshift/mapping.py` | The shared fleet map. Turns LiDAR hits into heights and slopes for each grid cell, notices when mapped ground changes, keeps layers for soft ground, identified water and "no echo here" evidence, and finds frontiers (edges of the known area). |
 | `redshift/planner.py` | A* path planning on the map. Steep cells, obstacles, soft ground and water are off limits. The search can stop when its time is up and carry on in the next cycle. |
-| `redshift/rover.py` | One rover's brain: sensors, driving, battery, samples, and its state (exploring, investigating, returning, charging, recovering, idle, fault, observing). |
+| `redshift/rover.py` | One rover's brain: sensors, driving, battery, samples, and its state (exploring, investigating, returning, charging, recovering, idle, fault, observing; v9: disabled, rescuing, towing, towed, repairing, wrecked). Applies its health to the motors and sensors, and backs away from a charging creature. |
 | `redshift/fleet.py` | Team decisions: who goes to which frontier, the shared slope limit, the target list and the sample cache, soft ground and water reports, who observes a lifeform, who takes over from a broken rover, and the event log. |
 | `redshift/tracker.py` | Motion tracker: LiDAR point clusters that move between sweeps become tracks (position, speed, size). |
 | `redshift/lifeforms.py` | The grazers: they wander, graze, keep together, avoid bad ground and shy away from rovers. The rovers never read this. |
@@ -40,6 +40,8 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `redshift/gemma.py` | Talks to the local Gemma model (Ollama), or a fake model for demos and tests: prompts, answer checks, timeouts, a keyword parser for typed commands. |
 | `redshift/advisor.py` | Tier 2: asks Gemma at the right moments, applies its advice when it is safe, runs the operator chat (commands and questions) and the questions to the operator. |
 | `redshift/chatmem.py` | Chat memory (protocol v7): the last messages and what they talked about (places, targets, candidate lists, the rover, the last command, survey and focus reports), so "go back there", "the second one", "that lake" and "do that again" resolve. |
+| `redshift/health.py` | Protocol v9: each rover's parts (drive_l, drive_r, lidar, camera, power, comms), hp, status and self diagnosis, how damage changes the rover (torque and top speed per drive side, LiDAR range and rays, camera noise, battery drain, radio range), and the physics monitor that turns shocks and contact forces into damage. |
+| `redshift/rescue.py` | Protocol v9: distress and the silent-rover heartbeat, picking the helper, diagnosis, field repair, the tow / salvage / leave decision (Gemma or a `rescue` request), physical towing with a kinematic fallback, salvage, wrecks, repair at the lander with spares. |
 | `redshift/gaps.py` | Unexplored gaps (protocol v8): connected pockets of unknown ground inside the map with known ground around most of their edge (narrow channels sealed first), with the frontiers on their edge. A few ms on the 120 m map, cached by the fleet and refreshed every 3 s only while needed. |
 | `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
 | `scripts/climb_test.py` | Drives a rover up ramps of known angle to check how steep it can climb. |
@@ -56,6 +58,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `tests/test_v5.py` | Questions: intent (questions vs commands), Gemma's answer checks (a bad number or id falls back to the rules), grounded rule answers for every topic, fleet vs per-rover replies, `reply_to`, `stats`, camera sizes up to 1280 x 720. |
 | `tests/test_v6.py` | Place commands: polite orders vs questions, place parsing (keyword parser and checked Gemma answers), the resolver and its qualifiers, "nothing known", the closest free rover, `choose_place` answered by `POST /api/answer` and by chat, the survey and its report, requests that never expire by default (and the countdown when `OPERATOR_TIMEOUT_S` is above 0). |
 | `tests/test_v7.py` | Area focus (frontier choice inside the circle, claims, the stay and its report, "explore north of the lander", survey then focus), curiosity (triggers, cooldown, limits), chat references (keyword parser and fake Gemma), following a new herd while asking, and leaving for the lander when waiting would drain the battery. |
+| `tests/test_v9.py` | Protocol v9: boulder and spire hits damage, normal driving does not; drive pull, LiDAR range, power and camera effects; the `damage` hazard (every severity and every 400); distress, helper choice and field repair; the silent rover; tow home and a lander repair with a spare; waiting for a missing spare; Gemma salvaging a wreck; a supervised `rescue` request (safe / note / about); health questions and rescue orders (keyword parser, fake Gemma, in the sim); a creature charge. |
 | `tests/test_v8.py` | Autonomy mode (env, `POST /api/mode`, chat; decisions by Gemma, the rules and the 0.5 floor, logged with a `decision` object; supervised asks with Gemma's suggestion; switching decides open questions), gap detection and gaps as places and as a priority, the other priorities, the re-survey and its report, area questions, and a table of operator messages through the keyword parser and the fake Gemma. |
 
 `test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
@@ -110,6 +113,11 @@ curl -X POST localhost:8000/api/hazard -d '{"type": "rover_fault", "rover": "r3"
 curl -X POST localhost:8000/api/hazard -d '{"type": "spire_fall"}'                 # across a rover's route
 curl -X POST localhost:8000/api/hazard -d '{"type": "lifeform", "rover": "r2"}'    # a herd walks into view
 curl -X POST localhost:8000/api/hazard -d '{"type": "rockfall", "x": 12.5, "y": -30}'   # at a clicked point
+curl -X POST localhost:8000/api/hazard -d '{"type": "damage", "rover": "r2", "severity": "disable"}'   # v9 demo
+curl -X POST localhost:8000/api/hazard -d '{"type": "damage", "rover": "r3", "severity": "wreck"}'     # salvage demo
+curl -X POST localhost:8000/api/hazard -d '{"type": "damage", "rover": "r1", "severity": "jam"}'       # field repair
+curl -X POST localhost:8000/api/hazard -d '{"type": "lifeform", "rover": "r2", "charge": true}'       # a charge
+curl -X POST localhost:8000/api/chat -d '{"text": "rover 1, go help rover 2"}'      # also: tow rover 2 home, leave it
 ```
 
 The answer is `{"ok": true, "hazard": {...}}`, or HTTP 400 with a reason (unknown type, nowhere
@@ -218,8 +226,81 @@ The hazard list (`hazards` in every message) is for the UI only. The rovers neve
 | Spire fall | An alien spire topples across a rover's route 4 to 9 m ahead (about 1.5 s, rotating about its base), then lies there: a long, low obstacle. If no spire stands near the route, a spare one comes up beside it and falls. Never onto a rover or the lander, and nobody gets trapped. | LiDAR change detection, as for a rockfall. The changed cells form one narrow continuous strip, so it is called a long, low obstacle (a boulder row has gaps). | "r2 sees a new long, low obstacle across its path 7 m ahead (LiDAR: about 2.0 m long, 0.8 m tall, 3 map cells changed)", slows, replans ("rerouting around the fallen obstacle"). The UI gets `standing: false` for that spire in an updated `features` object in the next tick (and in every later `init`). |
 | Lifeform (demo) | Moves a herd of grazers 6 to 7 m in front of a rover (or to the clicked point), walking across its view. | The rovers must notice them themselves: moving LiDAR clusters (tracker). | See "Lifeforms". |
 
+| Damage (v9 demo) | Takes a rover's parts down at once: `light`, `heavy`, `disable` (always immobile), `wreck` (beyond field repair), `jam` (immobile, fixable in the field); optional `part`. | Its own self tests (health). | See "Health, damage and rescue". |
+| Rockfall or spire fall on a rover (v9) | Clicked on or within 2 m of a rover: a boulder lands on it (aimed where it will be), presses on it and rolls off beside it; or a spire topples onto it and slides off. | IMU shock and the chassis skin (contact force), then its self tests. | Damage from the contact, then the usual LiDAR reaction to the new obstacle; distress if it can't drive. |
+
 Hazards stay until `/api/reset`. Exploration-complete and the auto reset keep working (a faulted
 rover is not parked, so there is no reset while one is down).
+
+## Health, damage and rescue (protocol v9)
+
+Every rover has six parts, 0 to 100: `drive_l`, `drive_r`, `lidar`, `camera`, `power`, `comms` (`health` in every
+tick, with `hp`, `status`, the rover's own `diagnosis` and its `last_hit`). Damage only comes from the physics and
+what the rover senses (`health.py`):
+
+| Source | What measures it | Parts |
+|---|---|---|
+| Hard contacts: a boulder or spire landing on it, a rock, another rover | IMU accelerometer (the chassis' MuJoCo acceleration over 20 ms, a shock sensor) and a MuJoCo touch sensor over the chassis (the skin). The contact list is only read when something strong happened, to find what hit and where | where it touched: a side = that side's drive, mast top = LiDAR and camera, rear deck = power and antenna, a wheel = its drive (partly a jammed wheel, fixable in the field) |
+| Tipping over | IMU tilt | LiDAR, camera, antenna, power |
+| Driving into water | belly water probe (chassis 5 cm or more under, once a minute) | power, both drives |
+| Motor strain | each side's torque at its limit for 75 s net of cooling (pushing into sand, a long stall) | that side's motor controller trips (fixable in the field) |
+| Dust storm | exposure | dirt on the camera window (fixable) |
+| Creatures | a grazer that runs into a rover pushes it (a force on the chassis for 20 ms, the impulse of the collision); the IMU feels it like any other shock | where the blow came from |
+
+Thresholds come from a 900 s run of seed 42 without hazards: chassis shocks peak at 4.5 g and skin forces at
+2.2 kN (driving over rocks with the belly), so damage starts above 6 g (9 points per g) and 3.5 kN (25 points per
+doubling); the longest saturated climb heated a motor for 36 s (the trip is at 75 s). A boulder landing on a rover
+gives about 33 kN and takes 60 to 100 points off the parts under it; a charging grazer gives about 8 to 9 g.
+
+**Effects, through the existing mechanics.** A weak drive side gets less torque, a lower top wheel speed and a
+softer servo, so the rover physically pulls toward it; the controller compensates by lowering its own top speed
+(0.4 m/s with a side at 35%) and its own slope limit (from the torque left), which the planner uses; it never lowers
+the fleet's limit when it stalls. A damaged LiDAR loses range and rays (visibility checks use its own range, so this
+is not mistaken for dust); a damaged camera adds noise to its frames, so the detector's confidence drops by itself;
+damaged power drains the battery up to 3.5 times faster; damaged comms shorten the radio range (about 220 m at
+100%). Below 55 hp, or with a drive, the LiDAR or power under 35% (comms under 40%), a rover that can still drive goes
+home for a repair.
+
+**A charge.** The biggest grazer of each herd is territorial: a rover within 3.5 m of it for 12 s makes it warn,
+then charge at 2 m/s for only as far as it takes to reach where the rover was. A rover sees a LiDAR track closing
+at 0.65 m/s or more, straight at it, within 4 s (the camera confirms it when it sees a creature there), logs it and
+backs away from it for 2.5 s if the ground there is safe (even when parked); a rover that gets far enough back is
+missed. A disabled rover can't move and gets rammed.
+
+**Rescue** (`rescue.py`). A rover that can't drive (either drive side under 15%, or power under 10%) stops, drops
+every claim (frontier, target, focus, questions), logs its diagnosis and sends a distress signal (event and chat) if
+its radio reaches the lander or a rover; otherwise the others notice after 15 s without a heartbeat and go to where
+it was last heard. The closest rover with the battery for the trip, a tow home (2.2 times its usual cost per metre)
+and its margin becomes the helper, drives over, diagnoses for 20 s and fixes field faults (a jammed wheel, a tripped
+motor controller, dirt) for 15 s. Still immobile: tow, salvage or leave, with the rules marking which are safe
+(tow: an A* route home within the fleet's slope limit minus 4 deg, and the battery; salvage: a part of 60% or more
+left and the battery home; leave: always). Autonomous: Gemma picks among the safe ones (the rules' order otherwise:
+tow a repairable rover, salvage a wreck the spares can't fix) and the decision is logged with a `decision` object;
+supervised: a `rescue` request with `safe` and `note` on every option and Gemma's pick marked.
+
+Towing is physical: a MuJoCo `connect` constraint (declared at build time for every pair, switched on with
+`data.eq_active`) joins the helper's rear hitch to the towed rover's front hitch, 0.35 m beyond each bumper. The
+helper drives to a point ahead of the rover, turns to face away and backs up until the hitch points meet; the bar is
+soft for 1.5 s, then stiff. The towed rover's drives go passive (free rolling, and its tyres skid sideways more
+easily); the helper tows at 0.3 m/s, turns at most 0.3 rad/s in arcs (no pivots, which jackknifed the first
+version), with the stricter slope limit. If the tow makes no progress for 12 s, the bar pulls apart or the towed
+rover tips, the fallback takes over: the towed rover's collisions go off and it follows the hitch like a trailer,
+set every physics substep ("on the rigid bar" in the log). In the tests the 12 m tow arrives on the physical bar.
+At the lander the rover is unhitched and repaired (state `repairing`, charging meanwhile): field faults clear at
+once, a part under 30% gets a spare (fitted and tested in about 20 s; `spares` starts at drive 2, LiDAR, camera and
+power 1), the rest is serviced at 2 points per second; with no spare it waits there. Salvage takes up to two parts
+(the kinds the fleet has fewest of first) and the wreck's sample tubes; a part the helper needs is fitted at once,
+the others count when it docks. Left and salvaged rovers stay where they are (`wrecks`).
+
+The operator: "rover 2, are you damaged?", "how is rover 3?" (topic `health`), "rover 1, go help rover 2", "tow rover
+2 home", "salvage rover 3", "leave it" (the keyword parser reads who helps whom from the word order; Gemma's schema
+has `rescue` with `plan` and `target_rover`, and the parser's reading wins). Commands to a rover that is out of
+action, being repaired, towing or helping get a refusal that says so.
+
+The decision cycle's share is small: the health bookkeeping is a few dictionary reads per cycle, the shock and
+contact monitor a few vector reads per physics substep (the contact list only after a strong hit), and the tow route
+is an anytime A* inside the helper's budget. In a 900 s run the sim still runs at about 9.5x and brain p95 stays
+around 4 ms.
 
 ## Water
 

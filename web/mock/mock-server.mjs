@@ -65,17 +65,32 @@
 // (headers X-Frame, X-Frame-Age-Ms, X-Detections on FPV frames). Faster camera: the newest
 // frame per view and size is kept and served at once while fresh (re-rendered at most
 // every 66 ms, or twice its render time); large frames render at half resolution.
+// Version 9 additions: rover `health` (parts 0 to 100, hp, status, the rover's own diagnosis,
+// last hit) that changes behaviour (a weak drive side pulls and slows the rover, a damaged
+// LiDAR loses range, damaged power drains the battery faster); damage events with a `damage`
+// object from the demo control (POST /api/hazard {"type": "damage", "rover", "severity":
+// light | heavy | disable | wreck, "part"?}), a rockfall or falling spire placed on a rover,
+// motor strain in soft sand, and occasional knocks (MOCK_KNOCK_S); an immobile rover sends a
+// distress signal (or goes silent with dead comms), the best placed rover drives over,
+// diagnoses it for 20 s and either fixes it in the field or it is towed to the lander (the
+// rover follows behind the helper) and repaired with spares, salvaged (spares go up, the
+// wreck stays) or left. Supervised mode asks with a `rescue` request (options carry the
+// rules' `safe` flag and a `note`; mock extra: `about` names the rover in trouble),
+// autonomous mode logs a decision. Fleet `spares`, `rescues` (mock extra: `progress` 0 to 1)
+// and `wrecks`. Chat: "rover 1, go help rover 2", "tow rover 2 home", "salvage it", "leave
+// it", "how is rover 3?".
 //
 // Run: node mock/mock-server.mjs
 // Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
 //      GEMMA_ENABLED, GEMMA_MODEL, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S,
 //      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
-//      MOCK_PROTOCOL (2 to 7 = an older sim without the later fields), MOCK_CAMERA (off), AUTONOMY_MODE,
-//      MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions)
+//      MOCK_PROTOCOL (2 to 8 = an older sim without the later fields), MOCK_CAMERA (off), AUTONOMY_MODE,
+//      MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions), MOCK_KNOCK_S (v9: sim s between knocks)
 // Mock-only test hooks (not part of the protocol): POST /api/_mock/planner {"state"},
 // POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"},
 // POST /api/_mock/teleport {"rover", "x", "y", "hold"?}, POST /api/_mock/rearm {"armed"?} (first-sighting question; v7: every herd's),
-// POST /api/_mock/reveal {"water"?, "targets"?, "spires"?} (the fleet learns all of them at once, for testing place commands).
+// POST /api/_mock/reveal {"water"?, "targets"?, "spires"?} (the fleet learns all of them at once, for testing place commands),
+// POST /api/_mock/heal {"rover"?} (v9: like new again, every rover when none is named).
 
 import http from 'node:http'
 import zlib from 'node:zlib'
@@ -115,7 +130,7 @@ const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma4:e2b'
 const GEMMA_BUDGET_MS = Number(process.env.GEMMA_BUDGET_MS || 3000)
 const GEMMA_WARMUP_S = Number(process.env.MOCK_GEMMA_WARMUP_S || 10)
 const FIRST_QUESTION_S = Number(process.env.MOCK_FIRST_QUESTION_S || 40)
-const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 8) // 2 to 7 = behave like an older sim (no later fields or endpoints)
+const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 9) // 2 to 8 = behave like an older sim (no later fields or endpoints)
 // v8: who decides. Kept across resets (the operator's choice), like the fake Gemma.
 let autonomy = PROTOCOL >= 8 ? (process.env.AUTONOMY_MODE === 'supervised' ? 'supervised' : 'autonomous') : null
 const autonomous = () => autonomy === 'autonomous'
@@ -125,7 +140,7 @@ const OPERATOR_TIMEOUT_S = Math.max(0, Number(process.env.OPERATOR_TIMEOUT_S ?? 
 const requestDeadline = () => (OPERATOR_TIMEOUT_S > 0 ? wallNow() + OPERATOR_TIMEOUT_S : null)
 const CAMERA_ON = PROTOCOL >= 5 && process.env.MOCK_CAMERA !== 'off'
 const ANSWER_EXTRA_MS = Math.max(0, Number(process.env.MOCK_ANSWER_DELAY_MS || 0)) // mock only: slower answers, for screenshots
-const HAZARD_TYPES = ['rockfall', 'sand', 'dust_storm', 'rover_fault', ...(PROTOCOL >= 4 ? ['spire_fall', 'lifeform'] : [])]
+const HAZARD_TYPES = ['rockfall', 'sand', 'dust_storm', 'rover_fault', ...(PROTOCOL >= 4 ? ['spire_fall', 'lifeform'] : []), ...(PROTOCOL >= 9 ? ['damage'] : [])]
 
 // Version 4: water, spires, lifeforms and tracks.
 const IDENTIFY_RANGE = 4.5 // m from the water's edge at which a rover works out it is liquid
@@ -748,6 +763,12 @@ function newSim(seed) {
     gaps: null, // cached unexplored gaps (computeGaps)
     gapsT: -1e9,
     camSeen: new Map(), // target id -> sim t the camera last reported it (event rate limit)
+    // v9
+    spares: { drive: 2, lidar: 1, camera: 1, power: 1 },
+    rescues: [], // { rover, helper, phase, plan, t, ... }
+    wrecks: [], // { rover, x, y }
+    pendingHits: [], // { t, rover, changes, cause, shock }: hits that land a moment later (rockfall, spire)
+    nextKnockT: KNOCK_S * (0.6 + rand() * 0.4),
   }
   for (const h of world.herds) spawnHerd(h.cx, h.cy, h.count)
   for (let r = 0; r < NUM_ROVERS; r++) {
@@ -805,6 +826,17 @@ function newSim(seed) {
       frameNo: 0, // camera frames and detector passes, numbered
       vision: null, // the detector's latest result
       visionAt: 0,
+      // v9
+      parts: freshParts(), // 0..100 each (floats while being repaired)
+      lastHit: null, // { t, cause, shock_g }
+      wrecked: false,
+      fixable: null, // what a helper could fix in the field ("a tripped motor controller"), unknown to the rover itself
+      fixParts: null,
+      rescue: null, // the rescue this rover is helping with
+      towedBy: null,
+      disabledAt: 0,
+      nextHelpT: 0,
+      silent: false,
     })
   }
   addEvent(null, 'info', `Survey started. ${NUM_ROVERS} rover${NUM_ROVERS === 1 ? '' : 's'} deployed from the lander.`)
@@ -813,11 +845,12 @@ function newSim(seed) {
   computeFrontiers()
 }
 
-function addEvent(roverId, level, msg, at = null, source = null, decision = null) {
+function addEvent(roverId, level, msg, at = null, source = null, decision = null, damage = null) {
   const e = { t: r1(sim.t), rover: roverId, level, msg }
   if (at) e.at = [r1(at[0]), r1(at[1])]
   if (source) e.source = source
   if (decision && PROTOCOL >= 8) e.decision = decision
+  if (damage && PROTOCOL >= 9) e.damage = damage
   sim.pendingEvents.push(e)
   sim.events.push(e)
   if (sim.events.length > 50) sim.events.splice(0, sim.events.length - 50)
@@ -1080,7 +1113,7 @@ function knownObstacles(self) {
   const out = []
   for (const rk of sim.rocks) if (rk.seen) out.push([rk.x, rk.y, rk.r + 0.8])
   for (const z of sim.softZones) out.push([z[0], z[1], z[2] + 0.6])
-  for (const r of sim.rovers) if (r !== self && r.state === 'fault') out.push([r.x, r.y, 1.7])
+  for (const r of sim.rovers) if (r !== self && (r.state === 'fault' || (PROTOCOL >= 9 && (r.state === 'disabled' || r.state === 'wrecked')))) out.push([r.x, r.y, 1.7])
   // v4: identified water, and spires the LiDAR has seen (fallen ones as a row of discs).
   for (const z of sim.waterZones) out.push([z[0], z[1], z[2] + 0.3])
   for (const sp of world.spires) {
@@ -1403,6 +1436,7 @@ function trueSandAt(x, y) {
 
 function drive(rover, dt, maxSpeed) {
   if (dustActive()) maxSpeed *= 0.5 // unsure what is ahead: slow down
+  if (PROTOCOL >= 9) maxSpeed *= speedFactor(rover) // v9: a weak drive side lowers the top speed
   if (trueSandAt(rover.x, rover.y)) maxSpeed = Math.min(maxSpeed, 0.12) // bogged down
   // v3: asked the operator (crawl or hold until answered), answered "approach slowly",
   // or told to hold.
@@ -1432,6 +1466,8 @@ function drive(rover, dt, maxSpeed) {
   const want = Math.atan2(wy - rover.y, wx - rover.x)
   const diff = wrapAngle(want - rover.yaw)
   rover.yaw = wrapAngle(rover.yaw + clamp(diff, -1.1 * dt, 1.1 * dt))
+  // v9: the weaker side drags, so the rover pulls towards it (the steering corrects).
+  if (PROTOCOL >= 9) rover.yaw = wrapAngle(rover.yaw - ((rover.parts.drive_l - rover.parts.drive_r) / 100) * 0.35 * dt * clamp(rover.speed / 0.4, 0, 1))
   const slope = slopeAt(rover.x, rover.y)
   const target = maxSpeed * (1 - 0.45 * clamp(slope / sim.slopeLimit, 0, 1)) * (Math.abs(diff) > 0.9 ? 0.25 : 1)
   rover.speed += clamp(target - rover.speed, -dt * 1.2, dt * 0.6)
@@ -1479,6 +1515,7 @@ function bumpReplan(rover) {
     return
   }
   if (rover.goal && setGoal(rover, rover.goal[0], rover.goal[1], rover.state)) return
+  if (busy9(rover)) return // v9: a helper keeps its rescue and tries again
   releaseTarget(rover)
   Object.assign(rover, { goal: null, path: [], state: 'idle', timer: 0.5 })
 }
@@ -1609,8 +1646,10 @@ function deliverSamples(rover) {
 }
 
 function stepRover(rover, dt) {
-  const moving = rover.speed > 0.05
-  rover.battery = clamp(rover.battery - dt * (moving ? 0.0032 : 0.0008), 0, 1)
+  const moving = rover.speed > 0.05 && rover.state !== 'towed'
+  // v9: damaged power drains faster, towing takes about twice the energy.
+  const drain = PROTOCOL >= 9 ? drainFactor(rover) * (rover.state === 'towing' ? 2.2 : 1) : 1
+  if (rover.state !== 'wrecked') rover.battery = clamp(rover.battery - dt * (moving ? 0.0032 : 0.0008) * drain, 0, 1)
 
   // Wheel slip is the only way to feel soft sand: the LiDAR sees flat ground. The
   // wheels dig in over a couple of seconds (slip climbs), then the rover reacts.
@@ -1634,7 +1673,7 @@ function stepRover(rover, dt) {
   // v6: a rover waiting for an answer still moves when staying is the danger: a low
   // battery withdraws the question and sends it home.
   const q = rover.request
-  if (q && !q.pending && q.deadline === null && rover.state !== 'charging' && rover.state !== 'fault' && lowBattery(rover, 0.2)) {
+  if (q && !q.pending && q.deadline === null && rover.state !== 'charging' && rover.state !== 'fault' && !busy9(rover) && lowBattery(rover, 0.2)) {
     resolveRequest(q, 'cancelled')
     addChat(rover.id, 'operator', q.follow ? `Battery at ${Math.round(rover.battery * 100)}%, so I stopped following and I'm heading back to charge. Ask me again later.` : `Battery at ${Math.round(rover.battery * 100)}%, so I can't wait for your answer any longer. Heading back to charge; ask me again later.`, 'info', 'rules', q.id)
     if (rover.state === 'observing') endObserve(rover, null) // v7: it was following the herd while it asked
@@ -1648,7 +1687,7 @@ function stepRover(rover, dt) {
     addChat(rover.id, 'operator', 'Waited 60 s. Carrying on exploring.', 'info', 'rules')
   }
   // Safety beats orders: a held rover with a nearly flat battery goes to charge.
-  if (rover.hold && rover.battery < 0.12 && rover.state !== 'charging' && rover.state !== 'fault') {
+  if (rover.hold && rover.battery < 0.12 && rover.state !== 'charging' && rover.state !== 'fault' && !busy9(rover)) {
     rover.hold = false
     rover.holdUntil = null
     addChat(rover.id, 'operator', `Battery at ${Math.round(rover.battery * 100)}%, so I can't hold any longer. Heading back to charge.`, 'info', 'rules')
@@ -1656,6 +1695,30 @@ function stepRover(rover, dt) {
   }
 
   switch (rover.state) {
+    // v9: health, rescue, towing and repair
+    case 'disabled':
+    case 'wrecked': {
+      rover.speed = 0
+      rover.path = []
+      rover.goal = null
+      break
+    }
+    case 'rescuing': {
+      stepRescuer(rover, dt)
+      break
+    }
+    case 'towing': {
+      stepTowing(rover, dt)
+      break
+    }
+    case 'towed': {
+      stepTowed(rover)
+      break
+    }
+    case 'repairing': {
+      stepRepair(rover, dt)
+      break
+    }
     case 'fault': {
       rover.speed = 0
       rover.path = []
@@ -2044,6 +2107,7 @@ function replanAround(x, y, r, except = null) {
     if (rover.state === 'fault' || rover.state === 'charging' || rover.state === 'recovering') continue
     if (!pathNear(rover, x, y, r)) continue
     if (setGoal(rover, rover.goal[0], rover.goal[1], rover.state)) changed.push(rover)
+    else if (busy9(rover)) continue // v9: a helper keeps its rescue
     else {
       releaseTarget(rover)
       rover.goal = null
@@ -2131,6 +2195,11 @@ function detectSoftGround(rover) {
   const truth = trueSandAt(rover.x, rover.y)
   if (truth) truth.known = true
   noteHazard(rover, `sand:${truth?.id ?? `${Math.round(ex / 4)},${Math.round(ey / 4)}`}`, 'soft sand', ex, ey)
+  // v9: pulling hard in the soft ground strains the weaker drive motor a little.
+  if (PROTOCOL >= 9) {
+    const side = rover.parts.drive_l <= rover.parts.drive_r ? 'drive_l' : 'drive_r'
+    hit(rover, [[side, Math.max(40, rover.parts[side] - rint(4, 9))]], 'strain', 0)
+  }
   rover.sandT = -999 // one detection per visit
   rover.reactedAt = sim.t
   const changed = replanAround(ex, ey, 3.2, rover)
@@ -2296,7 +2365,7 @@ function readSensors(rover, range, hits) {
   const slope = slopeAt(rover.x, rover.y)
   let slip = 0.03 + 0.12 * clamp(slope / sim.slopeLimit, 0, 1) + Math.abs(gaussian(sim.rand)) * 0.015
   const inSand = trueSandAt(rover.x, rover.y)
-  const powered = rover.state !== 'fault' && rover.state !== 'charging' && rover.state !== 'idle'
+  const powered = rover.state !== 'fault' && rover.state !== 'charging' && rover.state !== 'idle' && !(PROTOCOL >= 9 && ['disabled', 'wrecked', 'towed', 'repairing'].includes(rover.state))
   if (inSand && powered) slip = 0.3 + 0.46 * clamp((rover.sinkT || 0) / 1.8, 0, 1) + sim.rand() * 0.05
   if (rover.slipBoost && sim.t < rover.slipBoost.until) slip = Math.max(slip, rover.slipBoost.value + gaussian(sim.rand) * 0.03)
   slip = clamp(slip, 0, 0.95)
@@ -2356,9 +2425,11 @@ function brainSummary(rover) {
 }
 
 function updateSensors(dtTotal) {
-  const range = lidarRange()
+  const fleetRange = lidarRange()
   for (const rover of sim.rovers) {
-    const { hits, scan, seen } = lidarScan(rover, range)
+    // v9: a damaged LiDAR loses range and rays; a dead one sees nothing.
+    const range = PROTOCOL >= 9 ? r1(fleetRange * lidarFactor(rover)) : fleetRange
+    const { hits, scan, seen } = PROTOCOL >= 9 && rover.parts.lidar < 3 ? { hits: 0, scan: [], seen: [] } : lidarScan(rover, range)
     rover.hits = hits
     rover.scan = scan
     if (seen.some((rk) => !rk.seen)) markRocksSeen(rover, seen)
@@ -2381,6 +2452,7 @@ function publicHazard(h) {
   }
   if (h.type === 'spire_fall') Object.assign(out, { spire: h.spire, x0: h.x0, y0: h.y0, x1: h.x1, y1: h.y1 })
   if (h.type === 'lifeform') Object.assign(out, { x: h.x, y: h.y })
+  if (h.type === 'damage') Object.assign(out, { severity: h.severity, part: h.part, x: r1(h.x), y: r1(h.y) })
   return out
 }
 
@@ -2430,7 +2502,7 @@ function pickRover(requested) {
 
 // Rovers to try for a hazard on a route, best first: long routes ahead, then the rest.
 function routeCandidates(needRoute) {
-  const ok = sim.rovers.filter((r) => r.state !== 'fault' && r.state !== 'charging')
+  const ok = sim.rovers.filter((r) => r.state !== 'fault' && r.state !== 'charging' && !busy9(r))
   const drivers = ok.filter((r) => r.path.length && remainingPath(r) > (needRoute ? 4.4 : 6)).sort((a, b) => remainingPath(b) - remainingPath(a))
   if (drivers.length > 1 && sim.rand() < 0.4) [drivers[0], drivers[1]] = [drivers[1], drivers[0]]
   if (needRoute) return drivers
@@ -2443,9 +2515,11 @@ function checkPoint(type, [x, y]) {
   const at = `(${r1(x)}, ${r1(y)})`
   if (Math.abs(x) > half || Math.abs(y) > half) throw new HazardError(`${at} is off the map: it spans ${-half} to ${half} m on both axes.`)
   if (Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + 0.5) throw new HazardError(`${at} is on the lander. Pick a spot at least ${LANDER.radius + 0.5} m from its centre.`)
+  // v9: a rockfall or a falling spire may be dropped on a rover (it hits it).
+  const onRover = PROTOCOL >= 9 && (type === 'rockfall' || type === 'spire_fall')
   for (const r of sim.rovers) {
     const d = Math.hypot(r.x - x, r.y - y)
-    if (d < 2) throw new HazardError(`${at} is ${r1(d)} m from ${r.name}. Pick a spot at least 2 m from any rover.`)
+    if (d < 2 && !onRover) throw new HazardError(`${at} is ${r1(d)} m from ${r.name}. Pick a spot at least 2 m from any rover.`)
   }
   const wi = waterAt(x, y)
   if (wi >= 0 && type !== 'spire_fall') throw new HazardError(`${at} is in the ${world.water[wi].kind === 'river' ? 'stream' : 'lake'}. Pick dry ground.`)
@@ -2507,6 +2581,11 @@ function makeRocks(h, spot, radius) {
 
 // Rockfall or soft sand where the user clicked (snapped onto a rover route nearby).
 function placeAt(base, type, [x, y], requested) {
+  // v9: a rockfall dropped on (or right next to) a rover hits it.
+  if (type === 'rockfall' && PROTOCOL >= 9) {
+    const victim = sim.rovers.filter((r) => r.state !== 'wrecked' && Math.hypot(r.x - x, r.y - y) < 2.6).sort((a, b) => Math.hypot(a.x - x, a.y - y) - Math.hypot(b.x - x, b.y - y))[0]
+    if (victim) return rockfallOnRover(base, victim, [x, y])
+  }
   const radius = type === 'rockfall' ? 2.6 : r1(2.0 + sim.rand() * 0.4)
   const prefer = requested != null ? pickRover(requested) : null
   let spot = [x, y]
@@ -2534,13 +2613,15 @@ function placeAt(base, type, [x, y], requested) {
 // v4: a spire topples (toward the clicked point, or across a rover's route).
 function createSpireFall(base, requested, at) {
   const prefer = requested != null ? pickRover(requested) : null
-  if (prefer && prefer.state === 'fault' && !at) throw new HazardError(`${prefer.name} is parked with a motor fault. Pick another rover.`)
+  if (prefer && (prefer.state === 'fault' || busy9(prefer)) && !at) throw new HazardError(`${prefer.name} is ${prefer.state === 'fault' ? 'parked with a motor fault' : prefer.state}. Pick another rover.`)
+  // v9: clicked on (or next to) a rover: the spire falls onto it.
+  const onRover = PROTOCOL >= 9 && at ? sim.rovers.filter((q) => q.state !== 'wrecked' && Math.hypot(q.x - at[0], q.y - at[1]) < 2.5).sort((a, b) => Math.hypot(a.x - at[0], a.y - at[1]) - Math.hypot(b.x - at[0], b.y - at[1]))[0] || null : null
   const okFall = (x0, y0, x1, y1, r) => {
     const lim = MAP_SIZE / 2 - 0.5
     if (Math.abs(x1) > lim || Math.abs(y1) > lim) return 'The spire would fall off the map.'
     if (segDist(LANDER.x, LANDER.y, x0, y0, x1, y1) < LANDER.radius + 0.4) return 'The spire would fall onto the lander.'
     const hit = sim.rovers.find((q) => segDist(q.x, q.y, x0, y0, x1, y1) < r + 1.1)
-    if (hit) return `The spire would fall onto ${hit.name}. Pick another spot.`
+    if (hit && !onRover) return `The spire would fall onto ${hit.name}. Pick another spot.`
     return null
   }
   let sp = null
@@ -2549,7 +2630,20 @@ function createSpireFall(base, requested, at) {
   if (at) {
     const [x, y] = at
     sp = world.spires.filter((q) => q.standing && Math.hypot(q.x - x, q.y - y) <= 6).sort((a, b) => Math.hypot(a.x - x, a.y - y) - Math.hypot(b.x - x, b.y - y))[0] || null
-    if (sp) {
+    if (onRover && (!sp || Math.hypot(sp.x - onRover.x, sp.y - onRover.y) > sp.height - 0.3)) {
+      // No spire tall enough in reach: a new one rises 1.3 m away and falls across the rover.
+      const d = Math.hypot(x - onRover.x, y - onRover.y)
+      const a = d > 0.3 ? Math.atan2(y - onRover.y, x - onRover.x) : sim.rand() * Math.PI * 2
+      const bx = onRover.x + Math.cos(a) * 1.3
+      const by = onRover.y + Math.sin(a) * 1.3
+      sp = { id: `s${sim.nextSpire}`, x: r1(bx), y: r1(by), height: r1(2.8 + sim.rand() * 1.0), radius: r2(0.3 + sim.rand() * 0.1), standing: true, fresh: true }
+      dir = [-Math.cos(a), -Math.sin(a)]
+      rover = onRover
+    } else if (sp && onRover) {
+      const d = Math.max(0.3, Math.hypot(onRover.x - sp.x, onRover.y - sp.y))
+      dir = [(onRover.x - sp.x) / d, (onRover.y - sp.y) / d]
+      rover = onRover
+    } else if (sp) {
       const d = Math.hypot(x - sp.x, y - sp.y)
       const a = d > 0.3 ? Math.atan2(y - sp.y, x - sp.x) : sim.rand() * Math.PI * 2
       dir = [Math.cos(a), Math.sin(a)]
@@ -2621,7 +2715,19 @@ function createSpireFall(base, requested, at) {
   const h = { ...base, type: 'spire_fall', rover: rover?.id ?? null, spire: sp.id, x0: sp.x, y0: sp.y, x1, y1 }
   sim.hazards.push(h)
   sim.nextHazard++
-  addEvent(null, 'hazard', rover ? `Spire ${sp.id} toppled across ${rover.id}'s route.` : `Spire ${sp.id} toppled.`, [(sp.x + x1) / 2, (sp.y + y1) / 2])
+  // v9: every rover under the falling spire takes a hit on the mast (LiDAR, camera) as it lands.
+  const victims = PROTOCOL >= 9 ? sim.rovers.filter((q) => q.state !== 'wrecked' && segDist(q.x, q.y, sp.x, sp.y, x1, y1) < sp.radius + 0.9) : []
+  for (const v of victims) {
+    const P = v.parts
+    const changes = [['lidar', Math.min(P.lidar - 30, rint(15, 40))], ['camera', Math.min(P.camera - 25, rint(25, 50))]]
+    if (sim.rand() < 0.4) {
+      const side = choose9(['drive_l', 'drive_r'])
+      changes.push([side, Math.max(30, P[side] - rint(20, 30))])
+    }
+    sim.pendingHits.push({ t: sp.fallT + 0.2, rover: v.id, changes, cause: 'spire', shock: 9 + sim.rand() * 4 })
+  }
+  const onto = victims.length ? victims.map((q) => q.id).join(' and ') : null
+  addEvent(null, 'hazard', onto ? `Spire ${sp.id} toppled onto ${onto}.` : rover ? `Spire ${sp.id} toppled across ${rover.id}'s route.` : `Spire ${sp.id} toppled.`, [(sp.x + x1) / 2, (sp.y + y1) / 2])
   return h
 }
 
@@ -2668,9 +2774,10 @@ function createLifeformHazard(base, requested, at) {
   return h
 }
 
-function createHazard(type, requested, point = null) {
+function createHazard(type, requested, point = null, opts = {}) {
   if (!HAZARD_TYPES.includes(type)) throw new HazardError(`Unknown hazard type "${type}". Use ${HAZARD_TYPES.slice(0, -1).join(', ')} or ${HAZARD_TYPES[HAZARD_TYPES.length - 1]}.`)
   const base = { id: `h${sim.nextHazard}`, type, t: sim.t, rover: null, active: true }
+  if (type === 'damage') return createDamage(base, requested, opts)
 
   if (type === 'dust_storm') {
     const live = sim.hazards.find((h) => h.type === 'dust_storm' && h.active)
@@ -2701,7 +2808,8 @@ function createHazard(type, requested, point = null) {
   if (type === 'rover_fault') {
     const rover = requested != null ? pickRover(requested) : null
     if (rover && rover.state === 'fault') throw new HazardError(`${rover.name} already has a motor fault (${Math.ceil(rover.faultHazard?.remaining ?? 0)} s left).`)
-    const pool = sim.rovers.filter((r) => r.state !== 'fault')
+    if (rover && busy9(rover)) throw new HazardError(`${rover.name} is ${rover.state} right now. Pick another rover.`)
+    const pool = sim.rovers.filter((r) => r.state !== 'fault' && !busy9(r))
     if (!pool.length) throw new HazardError('Every rover already has a motor fault.')
     const moving = pool.filter((r) => r.speed > 0.1 && r.state !== 'charging')
     const victim = rover || (moving.length ? moving : pool)[Math.floor(sim.rand() * (moving.length || pool.length))]
@@ -2721,7 +2829,7 @@ function createHazard(type, requested, point = null) {
     if (changed.length) addEvent(null, 'info', `${changed.map((r) => r.id).join(' and ')} replanned around the parked ${victim.id}.`, [victim.x, victim.y])
     if (hadTarget && hadTarget.status !== 'sampled') {
       const helper = sim.rovers
-        .filter((r) => r !== victim && r.state !== 'fault' && r.state !== 'charging' && r.battery > 0.4 && !r.targetId)
+        .filter((r) => r !== victim && r.state !== 'fault' && r.state !== 'charging' && !busy9(r) && r.battery > 0.4 && !r.targetId)
         .sort((a, b) => Math.hypot(a.x - hadTarget.x, a.y - hadTarget.y) - Math.hypot(b.x - hadTarget.x, b.y - hadTarget.y))[0]
       if (helper && setGoal(helper, hadTarget.x, hadTarget.y, 'investigating')) {
         hadTarget.assigned = helper.id
@@ -2744,6 +2852,7 @@ function createHazard(type, requested, point = null) {
   if (requested != null) {
     const r = pickRover(requested)
     if (r.state === 'fault') throw new HazardError(`${r.name} is parked with a motor fault. Pick another rover.`)
+    if (busy9(r)) throw new HazardError(`${r.name} is ${r.state} right now, not driving a route. Click the map to drop it on the rover instead.`)
     if (type === 'sand' && (!r.path.length || remainingPath(r) < 4)) throw new HazardError(`${r.name} is not driving a route right now, so soft sand would never be found. Try another rover.`)
     candidates = [r]
   } else {
@@ -2804,6 +2913,788 @@ function stepHazards(dt) {
 }
 
 // ---------------------------------------------------------------------------
+// Version 9: rover health and damage, distress, rescue, towing, salvage, repair
+
+const PARTS = ['drive_l', 'drive_r', 'lidar', 'camera', 'power', 'comms']
+const PART_NAME = { drive_l: 'left drive', drive_r: 'right drive', lidar: 'LiDAR', camera: 'camera', power: 'power', comms: 'comms' }
+const SPARE_OF = { drive_l: 'drive', drive_r: 'drive', lidar: 'lidar', camera: 'camera', power: 'power' }
+const SPARE_NAME = { drive: 'drive', lidar: 'LiDAR', camera: 'camera', power: 'power' }
+const SEVERITIES = ['light', 'heavy', 'disable', 'wreck']
+const V9_BUSY = new Set(['disabled', 'rescuing', 'towing', 'towed', 'repairing', 'wrecked'])
+const DIAG_S = 20 // sim s a helper spends diagnosing
+const FIELD_FIX_S = 14
+const SALVAGE_S = 16
+const TOW_SPEED = 0.3 // m/s
+const TOW_GAP = 1.9 // m between the helper and the rover it tows
+const TOW_SLOPE = 15 // deg, the stricter slope limit while towing
+const REPAIR_RATE = 3 // % per sim s at the lander
+const SILENT_S = 15
+const NEED_SPARE_BELOW = 30
+const KNOCK_S = Math.max(20, Number(process.env.MOCK_KNOCK_S || 140)) // mock only: sim s between occasional knocks
+const CAUSE_TEXT = {
+  boulder: 'Hit a boulder',
+  rockfall: 'A falling boulder hit me',
+  spire: 'A falling spire hit me',
+  rock: 'Clipped a rock',
+  dust: 'Dust settled on the camera',
+  strain: 'Motor strain pulling through soft sand',
+  tip_over: 'Tipped over',
+  stall: 'Power bus tripped under load',
+}
+const PHASE_WORD = { en_route: 'on the way to', diagnosing: 'diagnosing', repairing: 'repairing', salvaging: 'salvaging', towing: 'towing' }
+
+const busy9 = (r) => PROTOCOL >= 9 && V9_BUSY.has(r.state)
+const freshParts = () => Object.fromEntries(PARTS.map((p) => [p, 100]))
+const choose9 = (list) => list[Math.floor(sim.rand() * list.length)]
+const rint = (a, b) => Math.round(a + sim.rand() * (b - a))
+const rover9 = (id) => sim.rovers.find((r) => r.id === id) || null
+const activeRescue = (id) => sim.rescues.find((rs) => rs.rover === id && rs.phase !== 'done') || null
+const sparesText = () => Object.entries(sim.spares).map(([k, n]) => `${SPARE_NAME[k]} ${n}`).join(', ')
+
+function immobile(r) {
+  const p = r.parts
+  return Math.max(p.drive_l, p.drive_r) < 25 || Math.min(p.drive_l, p.drive_r) < 3 || p.power < 10
+}
+function hpOf(r) {
+  const v = PARTS.map((p) => r.parts[p])
+  return Math.round(0.55 * Math.min(...v) + (0.45 * v.reduce((a, b) => a + b, 0)) / v.length)
+}
+function healthStatus(r) {
+  if (r.wrecked) return 'wrecked'
+  if (immobile(r)) return 'immobile'
+  return PARTS.some((p) => r.parts[p] < 90) ? 'damaged' : 'ok'
+}
+const speedFactor = (r) => 0.35 + 0.65 * clamp(Math.min(r.parts.drive_l, r.parts.drive_r) / 100, 0, 1)
+const drainFactor = (r) => 1 + (100 - r.parts.power) / 60
+const lidarFactor = (r) => 0.35 + 0.65 * clamp(r.parts.lidar / 100, 0, 1)
+const commsRange = (r) => Math.round(15 + r.parts.comms * 1.05)
+
+// The rover's own reading of its state, from what its sensors tell it (motor current
+// against wheel speed, IMU shocks, LiDAR returns, camera noise, battery behaviour).
+function diagnosis(r) {
+  const p = Object.fromEntries(PARTS.map((k) => [k, Math.round(r.parts[k])]))
+  if (r.wrecked) return `Chassis twisted, both drives dead (left ${p.drive_l}%, right ${p.drive_r}%), power ${p.power}%. Beyond field repair.`
+  const out = []
+  const weak = Math.min(p.drive_l, p.drive_r)
+  const side = p.drive_l < p.drive_r ? 'Left' : 'Right'
+  if (Math.max(p.drive_l, p.drive_r) < 25) out.push([0, `Both drive motors weak (left ${p.drive_l}%, right ${p.drive_r}%): current spikes but the wheels barely turn. I can't drive.`])
+  else if (weak < 3) out.push([1, `${side} drive dead: no current, the wheels on that side are locked, so I can't drive.`])
+  else if (weak < 90) out.push([weak, `${side} drive motor at ${weak}%: pulls ${side.toLowerCase()}, top speed ${r1(0.55 * speedFactor(r))} m/s.`])
+  if (p.power < 10) out.push([2, `Power at ${p.power}%: the bus browns out under load, so I can't drive.`])
+  else if (p.power < 90) out.push([p.power, `Power at ${p.power}%: the battery drains about ${drainFactor(r).toFixed(1)}x faster.`])
+  if (p.lidar < 90) out.push([p.lidar, `LiDAR at ${p.lidar}%: range ${r1(LIDAR_RANGE * lidarFactor(r))} m, about ${Math.round((1 - lidarFactor(r)) * 100)}% fewer returns.`])
+  if (p.camera < 90) out.push([p.camera, `Camera at ${p.camera}%: noisy frames, detector confidence down.`])
+  if (p.comms < 90) out.push([p.comms, `Comms at ${p.comms}%: messages reach about ${commsRange(r)} m.`])
+  if (!out.length) return 'All systems nominal: motor currents, IMU, LiDAR returns and battery look normal.'
+  return out
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, 2)
+    .map((q) => q[1])
+    .join(' ')
+}
+
+function healthJson(r) {
+  return {
+    hp: hpOf(r),
+    status: healthStatus(r),
+    parts: Object.fromEntries(PARTS.map((p) => [p, Math.round(r.parts[p])])),
+    diagnosis: diagnosis(r),
+    last_hit: r.lastHit,
+  }
+}
+
+// The worst parts in a few words: "right drive 0%, left drive 20%".
+function worstParts(r, below = 50) {
+  const list = PARTS.filter((p) => r.parts[p] < below).sort((a, b) => r.parts[a] - r.parts[b])
+  return list.length ? list.slice(0, 3).map((p) => `${PART_NAME[p]} ${Math.round(r.parts[p])}%`).join(', ') : `nothing below ${below}%`
+}
+const listParts = (parts, r) => {
+  const w = parts.map((p) => `${PART_NAME[p]} (${Math.round(r.parts[p])}%)`)
+  return w.length > 1 ? `${w.slice(0, -1).join(', ')} and ${w[w.length - 1]}` : w[0]
+}
+const salvageable = (r) => PARTS.filter((p) => SPARE_OF[p] && r.parts[p] >= 40)
+
+// One hit: lowers parts ([[part, after], ...]) and logs one event with a `damage` object per
+// part changed; then the rover reacts (an immobile one stops and sends a distress signal).
+function hit(rover, changes, cause, shock) {
+  if (PROTOCOL < 9 || rover.state === 'wrecked') return []
+  const done = []
+  for (const [part, after] of changes) {
+    const before = Math.round(rover.parts[part])
+    const a = Math.round(clamp(after, 0, 100))
+    if (a >= before) continue
+    rover.parts[part] = a
+    done.push({ rover: rover.id, part, before, after: a, cause, shock_g: r1(shock) })
+  }
+  if (!done.length) return done
+  rover.lastHit = { t: r1(sim.t), cause, shock_g: r1(shock) }
+  rover.reactedAt = sim.t
+  noteHazard(rover, `hit:${Math.round(sim.t)}`, `a hit (${cause.replace('_', ' ')}${shock >= 0.5 ? `, ${r1(shock)} g` : ''})`, rover.x, rover.y)
+  done.forEach((d, k) => {
+    const what = `${PART_NAME[d.part]} ${d.before}% to ${d.after}%`
+    const msg = k === 0 ? `${CAUSE_TEXT[cause] || capital(cause)}${shock >= 0.5 ? ` (${r1(shock)} g)` : ''}: ${what}.` : `Same hit: ${what}.`
+    addEvent(rover.id, d.after < 30 ? 'warn' : 'info', msg, [rover.x, rover.y], null, null, d)
+  })
+  if (busy9(rover) && rover.state !== 'rescuing' && rover.state !== 'towing') return done
+  if (rover.wrecked || immobile(rover)) goDisabled(rover)
+  return done
+}
+
+// Immobile: stop, log the diagnosis and send a distress signal (unless comms are dead).
+function goDisabled(rover) {
+  if (rover.state === 'observing') endObserve(rover, null)
+  const q = rover.request
+  if (q) {
+    if (q.pending) rover.request = null
+    else resolveRequest(q, 'cancelled')
+  }
+  if (rover.focus) endFocus(rover, 'replaced')
+  releaseTarget(rover)
+  Object.assign(rover, { survey: null, placeTask: null, hold: false, holdUntil: null })
+  for (const rs of sim.rescues) if (rs.helper === rover.id && rs.phase !== 'done') releaseRescue(rs, rover)
+  rover.rescue = null
+  Object.assign(rover, { state: 'disabled', speed: 0, path: [], goal: null, towedBy: null, disabledAt: sim.t, silent: rover.parts.comms < 15, helpNoted: false, silentNoted: false, nextHelpT: sim.t + 2.5 })
+  const p = rover.parts
+  const what = rover.wrecked ? `Chassis badly damaged, power at ${Math.round(p.power)}%` : p.power < 10 ? `Power at ${Math.round(p.power)}%` : p.drive_r <= p.drive_l ? `Right drive at ${Math.round(p.drive_r)}%, left at ${Math.round(p.drive_l)}%` : `Left drive at ${Math.round(p.drive_l)}%, right at ${Math.round(p.drive_r)}%`
+  const status = rover.wrecked ? 'Wrecked' : 'Immobile'
+  const where = `(${r1(rover.x)}, ${r1(rover.y)})`
+  if (!rover.silent) {
+    addEvent(rover.id, 'warn', `${status}. ${what}. Requesting help at ${where}.`, [rover.x, rover.y])
+    addChat(rover.id, 'operator', `${rover.id}: ${status.toLowerCase()}. ${what}. Requesting help at ${where}.`, 'info', 'rules')
+  }
+  const changed = replanAround(rover.x, rover.y, 2.2, rover)
+  if (changed.length) addEvent(null, 'info', `${changed.map((r) => r.id).join(' and ')} replanned around the immobile ${rover.id}.`, [rover.x, rover.y])
+}
+
+// A helper that can no longer help hands the rescue back; another one is picked.
+function releaseRescue(rs, helper) {
+  if (rs.phase === 'repairing' && rs.plan === 'tow') return // already at the lander
+  const tgt = rover9(rs.rover)
+  if (tgt && tgt.state === 'towed') Object.assign(tgt, { state: 'disabled', towedBy: null, disabledAt: sim.t, nextHelpT: sim.t + 3, speed: 0 })
+  if (tgt && tgt.state === 'disabled') tgt.nextHelpT = sim.t + 3
+  Object.assign(rs, { helper: null, phase: 'en_route', plan: null, asked: false, deciding: false })
+  addEvent(null, 'warn', `${helper.id} can no longer help ${rs.rover}. Looking for another helper.`, tgt ? [tgt.x, tgt.y] : null)
+}
+
+// Rovers able to help, best first: mobile, free, and with the battery for the trip there
+// and back home.
+function helperCandidates(target) {
+  const home = Math.hypot(target.x - LANDER.x, target.y - LANDER.y)
+  return sim.rovers
+    .filter((r) => r !== target && !V9_BUSY.has(r.state) && r.state !== 'fault' && r.state !== 'recovering' && !r.wrecked && !immobile(r))
+    .map((r) => {
+      const d = Math.hypot(r.x - target.x, r.y - target.y)
+      return { r, d, need: (d * 1.2 + home * 1.3) * ENERGY_PER_M * drainFactor(r) + 0.08 }
+    })
+    .filter((c) => c.r.battery - c.need > 0.12)
+    .sort((a, b) => a.d - b.d)
+}
+
+// Where the helper parks: 2.1 m from the rover, on the lander side if possible (so a tow
+// heads away from it).
+function approachPoint(helper, target) {
+  const toLander = Math.atan2(LANDER.y - target.y, LANDER.x - target.x)
+  const toHelper = Math.atan2(helper.y - target.y, helper.x - target.x)
+  const tries = Math.hypot(target.x - LANDER.x, target.y - LANDER.y) > 6 ? [toLander, toLander + 0.6, toLander - 0.6, toHelper] : [toHelper]
+  for (const a of [...tries, toHelper + 1.2, toHelper - 1.2, toHelper + Math.PI]) {
+    const x = target.x + Math.cos(a) * 2.1
+    const y = target.y + Math.sin(a) * 2.1
+    if (placeOk(x, y)) return [x, y]
+  }
+  return [target.x + Math.cos(toHelper) * 2.1, target.y + Math.sin(toHelper) * 2.1]
+}
+
+function startHelping(helper, target, rs, replyTo = null, preset = null) {
+  if (helper.state === 'observing') endObserve(helper, null)
+  if (helper.request) {
+    const q = helper.request
+    if (q.pending) helper.request = null
+    else resolveRequest(q, 'cancelled')
+  }
+  if (helper.focus) endFocus(helper, 'replaced')
+  releaseTarget(helper)
+  Object.assign(helper, { hold: false, holdUntil: null, survey: null, placeTask: null })
+  if (!rs) {
+    rs = { rover: target.id, helper: null, phase: 'en_route', plan: null }
+    sim.rescues.push(rs)
+  }
+  Object.assign(rs, { helper: helper.id, phase: 'en_route', plan: null, t: sim.t, asked: false, deciding: false, preset: preset ?? rs.preset ?? null })
+  helper.rescue = rs
+  const [gx, gy] = approachPoint(helper, target)
+  if (!setGoal(helper, gx, gy, 'rescuing')) Object.assign(helper, { state: 'rescuing', goal: [r1(gx), r1(gy)], path: [[gx, gy]] })
+  const d = Math.round(Math.max(remainingPath(helper), Math.hypot(gx - helper.x, gy - helper.y)))
+  const home = Math.hypot(target.x - LANDER.x, target.y - LANDER.y) * 1.3
+  const towOk = helper.battery - (d * 1.2 + home * 2.2) * ENERGY_PER_M > BATTERY_RESERVE
+  const text = `Going to help ${target.id}: ${d} m, battery ${pctOf(helper.battery)} covers the trip${towOk ? ' and a tow home' : ', not a tow home'}.`
+  addEvent(helper.id, 'info', text, [target.x, target.y], replyTo ? 'operator' : null)
+  addChat(helper.id, 'operator', text, replyTo ? 'ack' : 'info', 'rules', null, replyTo)
+  return rs
+}
+
+function endHelping(helper) {
+  helper.rescue = null
+  if (V9_BUSY.has(helper.state)) Object.assign(helper, { state: 'idle', timer: 1.5, path: [], goal: null })
+  helper.lastGoalEventT = sim.t
+}
+
+function leaveWreck(tgt) {
+  Object.assign(tgt, { state: 'wrecked', wrecked: true, speed: 0, path: [], goal: null, towedBy: null })
+  if (!sim.wrecks.some((w) => w.rover === tgt.id)) sim.wrecks.push({ rover: tgt.id, x: r1(tgt.x), y: r1(tgt.y) })
+}
+
+function stepRescuer(rover, dt) {
+  const rs = rover.rescue
+  const tgt = rs && rover9(rs.rover)
+  if (!rs || !tgt || rs.helper !== rover.id || rs.phase === 'done') return endHelping(rover)
+  if (rs.phase === 'en_route') {
+    if (Math.hypot(tgt.x - rover.x, tgt.y - rover.y) < 2.7) {
+      Object.assign(rs, { phase: 'diagnosing', t: sim.t })
+      Object.assign(rover, { path: [], goal: null })
+      addEvent(rover.id, 'info', `Reached ${tgt.id}. Diagnosing it with the camera and a close look, about ${DIAG_S} s.`, [tgt.x, tgt.y])
+      return
+    }
+    const arrived = drive(rover, dt, 0.6)
+    if (arrived || sim.t > rover.replanT) {
+      rover.replanT = sim.t + 4
+      const [gx, gy] = approachPoint(rover, tgt)
+      if (!setGoal(rover, gx, gy, 'rescuing') && arrived) Object.assign(rover, { goal: [r1(gx), r1(gy)], path: [[gx, gy]] })
+    }
+    return
+  }
+  rover.speed = Math.max(0, rover.speed - dt * 1.5)
+  faceToward(rover, tgt.x, tgt.y, dt)
+  const el = sim.t - rs.t
+  if (rs.phase === 'diagnosing' && rs.plan === null && !rs.asked && !rs.deciding && el >= DIAG_S) finishDiagnosis(rover, tgt, rs)
+  else if (rs.phase === 'repairing' && el >= FIELD_FIX_S) finishFieldFix(rover, tgt, rs)
+  else if (rs.phase === 'salvaging' && el >= SALVAGE_S) finishSalvage(rover, tgt, rs)
+}
+
+function finishDiagnosis(helper, tgt, rs) {
+  rs.deciding = true
+  const g = gemmaCall('vision')
+  later(g.ok ? g.ms : 150, () => {
+    rs.deciding = false
+    if (rs.helper !== helper.id || rs.phase !== 'diagnosing') return
+    const src = g.ok ? 'gemma' : 'rules'
+    if (tgt.fixable && !tgt.wrecked) {
+      const text = `Diagnosis of ${tgt.id}: ${tgt.fixable}. I can fix that here, about ${FIELD_FIX_S} s.`
+      addEvent(helper.id, 'info', text, [tgt.x, tgt.y], g.ok ? 'gemma' : null)
+      addChat(helper.id, 'operator', text, 'info', src)
+      Object.assign(rs, { phase: 'repairing', t: sim.t, plan: null })
+      return
+    }
+    const text = `Diagnosis of ${tgt.id}: ${tgt.wrecked ? 'chassis twisted, ' : ''}${worstParts(tgt)}. ${tgt.wrecked ? 'A wreck: only a lander repair or salvage.' : 'Not fixable in the field.'}`
+    addEvent(helper.id, 'warn', text, [tgt.x, tgt.y], g.ok ? 'gemma' : null)
+    addChat(helper.id, 'operator', text, 'info', src)
+    decideRescue(helper, tgt, rs)
+  })
+}
+
+// Tow, salvage or leave, with the rules' verdict on each.
+function rescueOptions(helper, tgt) {
+  const [dx, dy] = dockPoint(helper)
+  const saved = sim.slopeLimit
+  sim.slopeLimit = Math.min(saved, TOW_SLOPE)
+  const route = planPath(tgt.x, tgt.y, dx, dy, tgt)
+  sim.slopeLimit = saved
+  let len = 0
+  if (route) {
+    let px = tgt.x
+    let py = tgt.y
+    for (const [x, y] of route) {
+      len += Math.hypot(x - px, y - py)
+      px = x
+      py = y
+    }
+  }
+  const need = len * ENERGY_PER_M * 2.2 * drainFactor(helper)
+  const towSafe = !!route && helper.battery - need >= BATTERY_RESERVE
+  const salv = salvageable(tgt)
+  const left = sim.rovers.filter((r) => r !== tgt && r.state !== 'wrecked').length
+  return [
+    {
+      id: 'tow',
+      label: 'Tow to the lander',
+      safe: towSafe,
+      note: !route
+        ? `No route to the lander under the ${TOW_SLOPE} deg tow slope limit.`
+        : towSafe
+          ? `${Math.round(len)} m at ${TOW_SPEED} m/s under the ${TOW_SLOPE} deg tow limit. Uses about ${pctOf(need)} of ${helper.id}'s ${pctOf(helper.battery)}; repaired at the lander.`
+          : `${helper.id} has ${pctOf(helper.battery)}: towing ${Math.round(len)} m needs about ${pctOf(need)} plus the ${pctOf(BATTERY_RESERVE)} reserve.`,
+    },
+    { id: 'salvage', label: 'Salvage parts', safe: true, note: salv.length ? `Takes the ${listParts(salv, tgt)} as spares; the wreck stays.` : 'Nothing above 40% worth taking; the wreck stays.' },
+    { id: 'leave', label: 'Leave it', safe: true, note: `Marks the wreck on the map; the fleet carries on with ${plural(left, 'rover')}.` },
+  ]
+}
+
+function decideRescue(helper, tgt, rs) {
+  const opts = rescueOptions(helper, tgt)
+  const safe = (id) => opts.some((o) => o.id === id && o.safe !== false)
+  const question = `${tgt.name} can't be fixed here (${worstParts(tgt)}). Tow it home, salvage parts, or leave it?`
+  if (rs.preset && safe(rs.preset)) {
+    // The operator already said what to do.
+    const label = opts.find((o) => o.id === rs.preset).label
+    const did = applyRescue(helper, { kind: 'rescue', rescue: rs }, rs.preset)
+    addChat(helper.id, 'operator', `As you asked: ${label.toLowerCase()}. ${did}`, 'info', 'rules')
+    addEvent(helper.id, 'info', `Operator's order: ${label.toLowerCase()}. ${did}`, [tgt.x, tgt.y], 'operator')
+    return
+  }
+  const salv = salvageable(tgt)
+  const choice = safe('tow') ? 'tow' : salv.length ? 'salvage' : 'leave'
+  const g = gemmaCall('choice')
+  const conf = r2(0.62 + Math.random() * 0.32)
+  const towNote = opts[0].note.replace(/\.$/, '')
+  const why = choice === 'tow' ? `towing is safe: ${towNote}` : choice === 'salvage' ? `towing is not safe (${towNote}); the ${salv.map((p) => PART_NAME[p]).join(', ')} are worth keeping as spares` : 'towing is not safe and nothing is worth salvaging'
+  if (supervised()) {
+    const options = opts.map((o) => (g.ok && o.id === choice ? { ...o, suggested: true } : o))
+    const label = options.find((o) => o.id === choice).label
+    const q = {
+      id: `q${sim.nextRequest++}`,
+      rover: helper.id,
+      about: tgt.id,
+      t: sim.t,
+      question: question + (g.ok ? ` Gemma suggests: ${label.toLowerCase()} (${conf.toFixed(2)}).` : ''),
+      options,
+      pick: g.ok ? { choice, conf, why } : null,
+      info: { about: tgt.id },
+      default: 'leave',
+      deadline: requestDeadline(),
+      kind: 'rescue',
+      hold: true,
+      follow: false,
+      at: [tgt.x, tgt.y],
+      rescue: rs,
+    }
+    rs.asked = true
+    helper.request = q
+    sim.requests.push(q)
+    planner.asked++
+    addChat(helper.id, 'operator', q.question, 'question', g.ok ? 'gemma' : 'rules', q.id)
+    addEvent(helper.id, 'warn', `${tgt.id} can't be fixed in the field. Asking the operator: tow, salvage or leave.`, q.at, g.ok ? 'gemma' : null)
+    return
+  }
+  rs.deciding = true
+  later(g.ok ? g.ms : 120, () => {
+    rs.deciding = false
+    if (rs.helper !== helper.id || rs.phase !== 'diagnosing') return
+    const q = { kind: 'rescue', options: opts, at: [tgt.x, tgt.y], rescue: rs }
+    logDecision(helper, q, question, choice, g.ok ? 'gemma' : 'rules', g.ok ? conf : null, g.ok ? why : `Gemma is offline, so the rules decide: ${why}`)
+  })
+}
+
+// Carries out tow, salvage or leave. Returns what the helper says it does.
+function applyRescue(helper, q, option) {
+  const rs = q.rescue || helper.rescue
+  const tgt = rs && rover9(rs.rover)
+  if (!rs || !tgt || rs.helper !== helper.id) return 'That rescue is already over.'
+  rs.asked = false
+  if (option === 'tow') {
+    const [dx, dy] = dockPoint(helper)
+    Object.assign(rs, { plan: 'tow', phase: 'towing', t: sim.t })
+    const saved = sim.slopeLimit
+    sim.slopeLimit = Math.min(saved, TOW_SLOPE)
+    const ok = setGoal(helper, dx, dy, 'towing')
+    sim.slopeLimit = saved
+    if (!ok) Object.assign(helper, { state: 'towing', goal: [r1(dx), r1(dy)], path: [[dx, dy]] })
+    rs.towLen = Math.max(1, remainingPath(helper))
+    Object.assign(tgt, { state: 'towed', towedBy: helper.id })
+    sim.wrecks = sim.wrecks.filter((w) => w.rover !== tgt.id)
+    return `Hitched up to ${tgt.id}. Towing it ${Math.round(rs.towLen)} m to the lander at ${TOW_SPEED} m/s, tow slope limit ${TOW_SLOPE} deg.`
+  }
+  if (option === 'salvage') {
+    Object.assign(rs, { plan: 'salvage', phase: 'salvaging', t: sim.t })
+    const salv = salvageable(tgt)
+    return salv.length ? `Salvaging the ${listParts(salv, tgt)} from ${tgt.id}, about ${SALVAGE_S} s.` : `Nothing worth taking from ${tgt.id}; marking the wreck.`
+  }
+  Object.assign(rs, { plan: 'leave', phase: 'done', doneT: sim.t })
+  leaveWreck(tgt)
+  endHelping(helper)
+  return `Leaving ${tgt.id} at (${r1(tgt.x)}, ${r1(tgt.y)}), marked on the map. The fleet carries on without it.`
+}
+
+function finishFieldFix(helper, tgt, rs) {
+  for (const p of tgt.fixParts || []) tgt.parts[p] = Math.max(tgt.parts[p], rint(72, 86))
+  if (immobile(tgt)) for (const p of ['drive_l', 'drive_r', 'power']) if (tgt.parts[p] < 40) tgt.parts[p] = rint(55, 70)
+  const what = tgt.fixable || 'the fault'
+  Object.assign(tgt, { fixable: null, fixParts: null, state: 'idle', timer: 1.5 })
+  Object.assign(rs, { phase: 'done', doneT: sim.t, plan: null })
+  endHelping(helper)
+  const text = `Fixed ${tgt.id} in the field (${what}). It is moving again: left drive ${Math.round(tgt.parts.drive_l)}%, right drive ${Math.round(tgt.parts.drive_r)}%.`
+  addEvent(helper.id, 'info', text, [tgt.x, tgt.y])
+  addChat(helper.id, 'operator', text, 'info', 'rules')
+  addChat(tgt.id, 'operator', `Back on my wheels, thanks to ${helper.id}. ${diagnosis(tgt)}`, 'info', 'rules')
+}
+
+function finishSalvage(helper, tgt, rs) {
+  const salv = salvageable(tgt)
+  const names = salv.map((p) => PART_NAME[p])
+  for (const p of salv) {
+    sim.spares[SPARE_OF[p]]++
+    tgt.parts[p] = 0
+  }
+  leaveWreck(tgt)
+  Object.assign(rs, { phase: 'done', doneT: sim.t })
+  endHelping(helper)
+  const where = `(${r1(tgt.x)}, ${r1(tgt.y)})`
+  const text = salv.length ? `Salvaged the ${names.join(', ')} from ${tgt.id}. Spares at the lander: ${sparesText()}. The wreck stays at ${where}.` : `Nothing worth taking from ${tgt.id}. The wreck stays at ${where}, marked on the map.`
+  addEvent(helper.id, salv.length ? 'discovery' : 'info', text, [tgt.x, tgt.y])
+  addChat(helper.id, 'operator', text, 'info', 'rules')
+}
+
+function stepTowing(helper, dt) {
+  const rs = helper.rescue
+  const tgt = rs && rover9(rs.rover)
+  if (!rs || !tgt || tgt.towedBy !== helper.id) return endHelping(helper)
+  const [dx, dy] = dockPoint(helper)
+  if (Math.hypot(dx - helper.x, dy - helper.y) < 1.3) {
+    Object.assign(helper, { path: [], goal: null, speed: 0 })
+    Object.assign(rs, { phase: 'repairing', t: sim.t })
+    tgt.towedBy = null
+    endHelping(helper)
+    if (helper.battery < 0.6) helper.state = 'charging'
+    addEvent(helper.id, 'info', `Unhitched ${tgt.id} at the lander.${helper.state === 'charging' ? ' Charging.' : ' Back to exploring.'}`, [LANDER.x, LANDER.y])
+    startRepair(tgt)
+    return
+  }
+  const arrived = drive(helper, dt, TOW_SPEED)
+  if (arrived || sim.t > helper.replanT) {
+    helper.replanT = sim.t + 5
+    const saved = sim.slopeLimit
+    sim.slopeLimit = Math.min(saved, TOW_SLOPE)
+    setGoal(helper, dx, dy, 'towing')
+    sim.slopeLimit = saved
+  }
+}
+
+// The towed rover follows on the tow bar, TOW_GAP behind the helper.
+function stepTowed(rover) {
+  const h = rover9(rover.towedBy)
+  if (!h || h.state !== 'towing') {
+    Object.assign(rover, { state: 'disabled', towedBy: null, disabledAt: sim.t, nextHelpT: sim.t + 3, speed: 0 })
+    return
+  }
+  const dx = rover.x - h.x
+  const dy = rover.y - h.y
+  const d = Math.hypot(dx, dy) || 1
+  if (d > TOW_GAP) {
+    rover.x = h.x + (dx / d) * TOW_GAP
+    rover.y = h.y + (dy / d) * TOW_GAP
+  }
+  if (d > 0.5) rover.yaw = Math.atan2(h.y - rover.y, h.x - rover.x)
+  rover.speed = h.speed
+}
+
+// Repair at the lander: spares for drive, LiDAR, camera or power parts below 30%,
+// everything else serviced without one.
+function startRepair(tgt) {
+  const used = []
+  const missing = []
+  const serviced = []
+  tgt.repairTo = {}
+  for (const p of PARTS) {
+    const v = tgt.parts[p]
+    if (v >= 98) continue
+    const sp = SPARE_OF[p]
+    if (sp && v < NEED_SPARE_BELOW) {
+      if (sim.spares[sp] > 0) {
+        sim.spares[sp]--
+        used.push(p)
+        tgt.repairTo[p] = 100
+      } else missing.push(p)
+    } else {
+      serviced.push(p)
+      tgt.repairTo[p] = 100
+    }
+  }
+  tgt.repairMissing = missing
+  tgt.repairTotal = Object.entries(tgt.repairTo).reduce((s, [p, to]) => s + Math.max(0, to - tgt.parts[p]), 0) || 1
+  Object.assign(tgt, { state: 'repairing', speed: 0, path: [], goal: null, waitSpareNoted: false })
+  const spareText = used.length ? `Using ${plural(used.length, 'spare')}: ${used.map((p) => PART_NAME[p]).join(', ')}` : 'No spares needed'
+  const svc = serviced.length ? `; servicing the ${serviced.map((p) => PART_NAME[p]).join(', ')}` : ''
+  const miss = missing.length ? ` No spare ${missing.map((p) => SPARE_NAME[SPARE_OF[p]]).join(' or ')} left: ${missing.map((p) => `${PART_NAME[p]} stays at ${Math.round(tgt.parts[p])}%`).join(', ')} until one turns up.` : ''
+  addEvent(tgt.id, 'info', `At the lander for repairs. ${spareText}${svc}.${miss}`, [LANDER.x, LANDER.y])
+}
+
+function stepRepair(rover, dt) {
+  rover.speed = 0
+  rover.battery = clamp(rover.battery + dt * 0.03, 0, 1)
+  // Settle onto its own dock spot while the work goes on.
+  const [kx, ky] = dockPoint(rover)
+  if (Math.hypot(kx - rover.x, ky - rover.y) > 0.2) {
+    rover.x += (kx - rover.x) * Math.min(1, dt * 0.6)
+    rover.y += (ky - rover.y) * Math.min(1, dt * 0.6)
+  }
+  for (const p of [...(rover.repairMissing || [])]) {
+    if (sim.spares[SPARE_OF[p]] > 0) {
+      sim.spares[SPARE_OF[p]]--
+      rover.repairTo[p] = 100
+      rover.repairTotal += 100 - rover.parts[p]
+      rover.repairMissing.splice(rover.repairMissing.indexOf(p), 1)
+      addEvent(rover.id, 'info', `A spare ${SPARE_NAME[SPARE_OF[p]]} is in: fitting it.`, [LANDER.x, LANDER.y])
+    }
+  }
+  let left = 0
+  for (const [p, to] of Object.entries(rover.repairTo || {})) {
+    if (rover.parts[p] < to) rover.parts[p] = Math.min(to, rover.parts[p] + REPAIR_RATE * dt)
+    left += to - rover.parts[p]
+  }
+  if (left > 0.01) return
+  if (immobile(rover)) {
+    if (!rover.waitSpareNoted) {
+      rover.waitSpareNoted = true
+      addEvent(rover.id, 'warn', `Repairs done, but I still can't drive without a spare ${(rover.repairMissing || []).map((p) => SPARE_NAME[SPARE_OF[p]]).join(' or ')}. Waiting at the lander.`, [LANDER.x, LANDER.y])
+    }
+    return
+  }
+  rover.wrecked = false
+  rover.repairTo = null
+  const rs = activeRescue(rover.id)
+  if (rs) Object.assign(rs, { phase: 'done', doneT: sim.t })
+  Object.assign(rover, { state: rover.battery < 0.8 ? 'charging' : 'idle', timer: 1 })
+  const text = `Repaired at the lander: health ${hpOf(rover)}%. ${rover.state === 'charging' ? 'Charging, then back to exploring.' : 'Back to exploring.'}`
+  addEvent(rover.id, 'discovery', text, [LANDER.x, LANDER.y])
+  addChat(rover.id, 'operator', text, 'info', 'rules')
+}
+
+// Mock extra `progress` (0 to 1) on rescues that have a known length.
+function publicRescue(rs) {
+  const out = { rover: rs.rover, helper: rs.helper, phase: rs.phase, plan: rs.plan }
+  const el = sim.t - (rs.t ?? sim.t)
+  let p = null
+  if (rs.phase === 'diagnosing' && !rs.asked) p = el / DIAG_S
+  else if (rs.phase === 'repairing' && rs.plan === null) p = el / FIELD_FIX_S
+  else if (rs.phase === 'salvaging') p = el / SALVAGE_S
+  else if (rs.phase === 'towing') {
+    const h = rover9(rs.helper)
+    if (h && rs.towLen) p = 1 - remainingPath(h) / rs.towLen
+  } else if (rs.phase === 'repairing') {
+    const r = rover9(rs.rover)
+    if (r?.repairTo) p = 1 - Object.entries(r.repairTo).reduce((s, [k, to]) => s + Math.max(0, to - r.parts[k]), 0) / (r.repairTotal || 1)
+  }
+  if (p !== null) out.progress = r2(clamp(p, 0, 1))
+  return out
+}
+
+// Once per tick: hits that land now, helpers for rovers in trouble, occasional knocks.
+function stepRescueFleet() {
+  for (const ph of [...sim.pendingHits]) {
+    if (sim.t < ph.t) continue
+    sim.pendingHits.splice(sim.pendingHits.indexOf(ph), 1)
+    const r = rover9(ph.rover)
+    if (r) hit(r, ph.changes, ph.cause, ph.shock)
+  }
+  for (const r of sim.rovers) {
+    if (r.state !== 'disabled') continue
+    const rs = activeRescue(r.id)
+    if (rs?.helper) continue
+    if (r.silent && sim.t - r.disabledAt < SILENT_S) continue
+    if (sim.t < r.nextHelpT) continue
+    if (r.silent && !r.silentNoted) {
+      r.silentNoted = true
+      addEvent(null, 'warn', `${r.id} went silent: no heartbeat for ${SILENT_S} s. The fleet heads to its last known position (${r1(r.x)}, ${r1(r.y)}).`, [r.x, r.y])
+    }
+    const c = helperCandidates(r)[0]
+    if (!c) {
+      if (!r.helpNoted) {
+        r.helpNoted = true
+        addEvent(null, 'warn', `No rover has the battery to reach ${r.id} and get back right now. It waits; trying again every 10 s.`, [r.x, r.y])
+      }
+      r.nextHelpT = sim.t + 10
+      continue
+    }
+    startHelping(c.r, r, rs)
+  }
+  sim.rescues = sim.rescues.filter((rs) => rs.phase !== 'done' || sim.t - rs.doneT < 8)
+  if (sim.t >= sim.nextKnockT) {
+    const movers = sim.rovers.filter((r) => (r.state === 'exploring' || r.state === 'investigating') && r.speed > 0.15 && hpOf(r) > 55)
+    if (movers.length) {
+      const r = choose9(movers)
+      const roll = sim.rand()
+      if (roll < 0.6) {
+        const p = choose9(['drive_l', 'drive_r'])
+        hit(r, [[p, Math.max(45, r.parts[p] - rint(6, 14))]], 'rock', 2.5 + sim.rand() * 2.5)
+      } else if (roll < 0.85) hit(r, [['camera', Math.max(50, r.parts.camera - rint(5, 10))]], 'dust', 0)
+      else hit(r, [['lidar', Math.max(50, r.parts.lidar - rint(8, 15))]], 'rock', 3 + sim.rand() * 2)
+      sim.nextKnockT = sim.t + KNOCK_S * (0.75 + sim.rand() * 0.5)
+    } else sim.nextKnockT = sim.t + 5
+  }
+}
+
+// The demo control: POST /api/hazard {"type": "damage", "rover", "severity", "part"?}.
+function createDamage(base, requested, opts) {
+  const sev = opts?.severity == null || opts.severity === '' ? 'heavy' : String(opts.severity)
+  if (!SEVERITIES.includes(sev)) throw new HazardError(`Unknown severity "${sev}". Use light, heavy, disable or wreck.`)
+  const raw = opts?.part
+  const part = raw == null || raw === '' || raw === 'any' ? null : String(raw)
+  if (part && !PARTS.includes(part)) throw new HazardError(`Unknown part "${part}". Use drive_l, drive_r, lidar, camera, power or comms.`)
+  let rover
+  if (requested != null) rover = pickRover(requested)
+  else {
+    const pool = sim.rovers.filter((r) => !V9_BUSY.has(r.state) && r.state !== 'fault')
+    if (!pool.length) throw new HazardError('Every rover is already disabled, under rescue or wrecked.')
+    const moving = pool.filter((r) => r.speed > 0.1)
+    rover = choose9(moving.length ? moving : pool)
+  }
+  const where = `(${r1(rover.x)}, ${r1(rover.y)})`
+  if (rover.state === 'wrecked') throw new HazardError(`${rover.name} is already a wreck at ${where}. Pick another rover.`)
+  if (rover.state === 'towed') throw new HazardError(`${rover.name} is being towed to the lander right now. Try again once it is repaired.`)
+  if (rover.state === 'repairing') throw new HazardError(`${rover.name} is under repair at the lander. Try again once it is back out.`)
+  if (rover.state === 'disabled' && (sev === 'disable' || (sev === 'wreck' && rover.wrecked))) throw new HazardError(`${rover.name} is already ${rover.wrecked ? 'a wreck' : 'immobile'} and waiting for help.`)
+  const P = Object.fromEntries(PARTS.map((p) => [p, Math.round(rover.parts[p])]))
+  const drop = (p, a, b, floor = 0) => [p, Math.max(floor, P[p] - rint(a, b))]
+  let changes
+  let cause
+  let shock
+  let fixable = null
+  let fixParts = null
+  if (sev === 'light') {
+    const p = part || choose9(['drive_l', 'drive_r', 'lidar', 'camera'])
+    changes = [drop(p, 12, 24, 40)]
+    cause = p === 'camera' ? 'dust' : 'rock'
+    shock = cause === 'dust' ? 0 : 2.5 + sim.rand() * 2
+  } else if (sev === 'heavy') {
+    const p = part || choose9(['drive_l', 'drive_r', 'lidar', 'camera', 'power'])
+    const floor = p === 'drive_l' || p === 'drive_r' ? 30 : 22
+    changes = [[p, Math.max(floor, Math.min(P[p] - 30, rint(28, 45)))]]
+    if (sim.rand() < 0.5) changes.push(drop(choose9(PARTS.filter((x) => x !== p && x !== 'comms')), 8, 18, 50))
+    cause = 'boulder'
+    shock = 6 + sim.rand() * 3
+  } else if (sev === 'disable') {
+    const p = part || choose9(['drive_l', 'drive_r'])
+    if (p === 'drive_l' || p === 'drive_r') {
+      const other = p === 'drive_l' ? 'drive_r' : 'drive_l'
+      changes = [[p, rint(0, 2)], drop(other, 15, 35, 12)]
+      if (sim.rand() < 0.5) {
+        fixable = sim.rand() < 0.5 ? `a rock jammed in the ${PART_NAME[p]} wheels` : `a tripped ${PART_NAME[p]} motor controller`
+        fixParts = [p]
+      }
+    } else if (p === 'power') {
+      changes = [['power', rint(2, 6)]]
+      if (sim.rand() < 0.4) {
+        fixable = 'a tripped main power breaker'
+        fixParts = ['power']
+      }
+    } else changes = [[p, rint(0, 8)], ['drive_l', Math.min(P.drive_l, rint(8, 18))], ['drive_r', Math.min(P.drive_r, rint(10, 20))]]
+    cause = p === 'power' ? 'stall' : 'boulder'
+    shock = 8 + sim.rand() * 4
+  } else {
+    changes = [['drive_l', rint(0, 4)], ['drive_r', rint(0, 8)], ['power', rint(5, 12)], ['lidar', rint(20, 70)], ['camera', rint(15, 65)], ['comms', rint(25, 45)]]
+    if (part) changes = changes.map(([p, v]) => [p, p === part ? 0 : v])
+    cause = 'tip_over'
+    shock = 14 + sim.rand() * 6
+  }
+  if (sev !== 'wreck' && !changes.some(([p, v]) => Math.round(v) < P[p])) throw new HazardError(`${rover.name}'s ${PART_NAME[changes[0][0]]} is already at ${P[changes[0][0]]}%: ${sev} damage would not change it. Try a heavier one.`)
+  if (sev === 'wreck') rover.wrecked = true
+  if (sev === 'disable' || sev === 'wreck') Object.assign(rover, { fixable, fixParts })
+  const h = { ...base, type: 'damage', rover: rover.id, severity: sev, part, x: rover.x, y: rover.y, active: false, endedAt: sim.t }
+  sim.hazards.push(h)
+  sim.nextHazard++
+  const lead = { light: cause === 'dust' ? `A gust of dust coats ${rover.id}'s camera.` : `A rock kicks up into ${rover.id}.`, heavy: `A boulder slams into ${rover.id}.`, disable: `${rover.id} hits a hidden boulder hard.`, wreck: `${rover.id} tips over on loose ground.` }[sev]
+  addEvent(null, 'hazard', lead, [rover.x, rover.y])
+  hit(rover, changes, cause, shock)
+  return h
+}
+
+// A rockfall dropped on a rover: the boulders land round it and one hits it.
+function rockfallOnRover(base, rover, spot) {
+  const radius = 2.6
+  const h = { ...base, rover: rover.id, x: spot[0], y: spot[1], radius }
+  makeRocks(h, spot, radius)
+  if (!h.rocks.length) throw new HazardError(`No room for boulders at (${r1(spot[0])}, ${r1(spot[1])}). Pick a more open spot.`)
+  sim.hazards.push(h)
+  sim.nextHazard++
+  addEvent(null, 'hazard', `Rockfall right on top of ${rover.id}.`, spot)
+  const d = Math.hypot(rover.x - spot[0], rover.y - spot[1])
+  const P = rover.parts
+  let changes
+  if (d < 1.3) {
+    const side = choose9(['drive_l', 'drive_r'])
+    const other = side === 'drive_l' ? 'drive_r' : 'drive_l'
+    changes = [[side, rint(0, 3)], [other, Math.min(P[other], rint(10, 22))], ['camera', Math.min(P.camera, rint(40, 60))]]
+  } else {
+    const p = choose9(['drive_l', 'drive_r', 'lidar', 'camera'])
+    changes = [[p, Math.max(28, Math.min(P[p] - 25, rint(30, 50)))]]
+  }
+  sim.pendingHits.push({ t: sim.t + 0.8, rover: rover.id, changes, cause: 'rockfall', shock: d < 1.3 ? 10 + sim.rand() * 4 : 6 + sim.rand() * 3 })
+  return h
+}
+
+// --- chat: health answers and rescue orders
+
+function rescueWhy(r) {
+  const rs = activeRescue(r.id)
+  if (r.state === 'disabled') return `I can't drive. ${diagnosis(r)} ${rs?.helper ? `${rs.helper} is ${PHASE_WORD[rs.phase] || rs.phase} me.` : "I've asked for help."}`
+  if (r.state === 'towed') return `${r.towedBy} is towing me to the lander for repairs.`
+  if (r.state === 'repairing') return `I'm being repaired at the lander, health ${hpOf(r)}%.`
+  if (r.state === 'wrecked') return `I'm a wreck at ${at(r.x, r.y)}. The fleet carries on without me.`
+  const own = r.rescue
+  if (!own) return "I'm helping another rover."
+  if (r.state === 'towing') return `I'm towing ${own.rover} to the lander for repairs, at ${TOW_SPEED} m/s under a ${TOW_SLOPE} deg slope limit.`
+  return `I'm ${PHASE_WORD[own.phase] || own.phase} ${own.rover}, which can't drive.`
+}
+
+function healthAnswer(r) {
+  const st = healthStatus(r)
+  const head = st === 'ok' ? `No damage: health ${hpOf(r)}%, every part above 90%.` : `Health ${hpOf(r)}% (${st}). ${diagnosis(r)}`
+  const last = r.lastHit ? ` Last hit: ${r.lastHit.cause.replace('_', ' ')}${r.lastHit.shock_g ? `, ${r.lastHit.shock_g} g` : ''}, ${agoText(r.lastHit.t)}.` : ''
+  const rs = activeRescue(r.id)
+  const help = rs?.helper ? ` ${nameOf(rs.helper)} is ${PHASE_WORD[rs.phase] || rs.phase} me.` : r.state === 'disabled' ? ' Waiting for a helper.' : ''
+  return `${head}${last}${help}`
+}
+
+function parseRescue(t) {
+  const ref = String.raw`(?:rover\s*|r)(\d+)`
+  const it = String.raw`(?:${ref}|it|her|him|them|(?:the\s+)?(?:wreck|broken one|parts))`
+  let m
+  if ((m = new RegExp(String.raw`\b(?:help|rescue|assist|recover)\s+${ref}`).exec(t))) return { cmd: 'help', subject: `r${m[1]}` }
+  if ((m = new RegExp(String.raw`\btow\s+${it}`).exec(t))) return { cmd: 'tow', subject: m[1] ? `r${m[1]}` : null }
+  if ((m = new RegExp(String.raw`\bsalvage\s+${it}`).exec(t))) return { cmd: 'salvage', subject: m[1] ? `r${m[1]}` : null }
+  if ((m = new RegExp(String.raw`\b(?:leave|abandon)\s+${it}`).exec(t))) return { cmd: 'leave', subject: m[1] ? `r${m[1]}` : null }
+  return null
+}
+
+function respondRescue(rc, targets, source, replyTo) {
+  const say = (from, kind, text) => addChat(from, 'operator', text, kind, source, null, replyTo)
+  let subj = rc.subject ? rover9(rc.subject) : null
+  if (rc.subject && !subj) return say('fleet', 'refuse', `There is no rover called ${rc.subject}.`)
+  if (!subj) {
+    // "tow it": the rover a rescue question is about, else the one in trouble.
+    const open = sim.requests.find((q) => q.kind === 'rescue')
+    subj = (open && rover9(open.about)) || sim.rovers.find((r) => r.state === 'disabled') || (rc.cmd !== 'help' && rover9(sim.wrecks[sim.wrecks.length - 1]?.rover)) || null
+  }
+  if (!subj) return say('fleet', 'refuse', 'No rover needs help right now.')
+  if (subj.state === 'wrecked' && rc.cmd === 'leave') return say('fleet', 'ack', `${subj.id} is already left as a wreck at (${r1(subj.x)}, ${r1(subj.y)}).`)
+  if (subj.state === 'towed' || subj.state === 'repairing') return say('fleet', 'refuse', `${subj.id} is ${subj.state === 'towed' ? 'already being towed home' : 'already under repair at the lander'}.`)
+  if (subj.state !== 'disabled' && subj.state !== 'wrecked') return say('fleet', 'refuse', `${subj.id} doesn't need help: it is ${subj.state}, health ${hpOf(subj)}%.`)
+  const open = sim.requests.find((q) => q.kind === 'rescue' && q.about === subj.id)
+  if (open && rc.cmd !== 'help') {
+    const opt = open.options.find((o) => o.id === rc.cmd)
+    if (opt?.safe === false) return say(open.rover, 'refuse', `I can't ${rc.cmd} ${subj.id}: ${opt.note}`)
+    return resolveRequest(open, 'answered', rc.cmd, { id: replyTo, source })
+  }
+  const rs = activeRescue(subj.id)
+  if (rs?.helper) {
+    if (rc.cmd === 'help') return say(rs.helper, 'ack', `I'm already ${PHASE_WORD[rs.phase] || rs.phase} ${subj.id}.`)
+    if (rs.phase === 'en_route' || (rs.phase === 'diagnosing' && !rs.asked)) {
+      rs.preset = rc.cmd
+      return say(rs.helper, 'ack', `Understood: once I've diagnosed ${subj.id}, I'll ${rc.cmd === 'leave' ? 'leave it' : `${rc.cmd} it`} if the rules allow.`)
+    }
+    return say(rs.helper, 'refuse', `${subj.id}'s rescue is already under way (${rs.phase}).`)
+  }
+  if (rc.cmd === 'leave') {
+    leaveWreck(subj)
+    if (rs) Object.assign(rs, { phase: 'done', doneT: sim.t })
+    return say('fleet', 'ack', `Leaving ${subj.id} at (${r1(subj.x)}, ${r1(subj.y)}), marked on the map. The fleet carries on without it.`)
+  }
+  const named = targets.length < sim.rovers.length ? targets.find((r) => r !== subj) : null
+  if (named && (V9_BUSY.has(named.state) || named.state === 'fault' || immobile(named))) return say(named.id, 'refuse', unavailable(named) || "I can't help right now.")
+  const helper = named || helperCandidates(subj)[0]?.r
+  if (!helper) return say('fleet', 'refuse', `No rover has the battery to reach ${subj.id} and get back right now.`)
+  if (subj.state === 'wrecked') Object.assign(subj, { state: 'disabled', disabledAt: sim.t, nextHelpT: sim.t, silent: false })
+  startHelping(helper, subj, rs, replyTo, rc.cmd === 'help' ? null : rc.cmd)
+}
+
+// ---------------------------------------------------------------------------
 // Operator chat and clarification requests (v3)
 
 function addChat(from, to, text, kind, source = null, requestId = null, replyTo = null) {
@@ -2842,7 +3733,7 @@ const SAFE_DEFAULT = { rockfall: 'reroute', unknown: 'reroute', sand: 'back_out'
 // The rover (or Gemma looking at its camera) cannot interpret what it senses: it slows
 // (or holds, on soft ground) and asks. Returns false when it already has a question open.
 function askAbout(rover, kind, info) {
-  if (PROTOCOL < 3 || rover.request || rover.state === 'fault') return false
+  if (PROTOCOL < 3 || rover.request || rover.state === 'fault' || busy9(rover)) return false
   if (PROTOCOL >= 8 && autonomous()) return decideNow(rover, kind, info) // v8: Gemma decides, no question
   // v6: with no timeout the rover holds position until the operator answers.
   // v7: a herd sighting is asked about while the rover keeps following it.
@@ -2852,7 +3743,7 @@ function askAbout(rover, kind, info) {
   const g = gemmaCall('vision')
   later(g.ok ? g.ms : 120, () => {
     if (!rover.request?.pending) return
-    if (rover.state === 'fault') {
+    if (rover.state === 'fault' || busy9(rover)) {
       rover.request = null
       return
     }
@@ -2910,7 +3801,7 @@ function askAbout(rover, kind, info) {
   return true
 }
 
-const REQUEST_KIND = { rockfall: 'anomaly', unknown: 'anomaly', sand: 'anomaly', life: 'lifeform', place: 'choose_place' }
+const REQUEST_KIND = { rockfall: 'anomaly', unknown: 'anomaly', sand: 'anomaly', life: 'lifeform', place: 'choose_place', rescue: 'rescue' }
 
 function publicRequest(q) {
   return {
@@ -2923,12 +3814,14 @@ function publicRequest(q) {
     default: q.default,
     expires_in: q.deadline === null ? null : r1(Math.max(0, q.deadline - wallNow())),
     image: q.kind === 'place' ? null : `/api/camera/${q.rover}.jpg?view=fpv`,
+    ...(q.about && { about: q.about }), // v9 mock extra: the rover the rescue is about
   }
 }
 
 // Carry out an answer (or the safe default). Returns what the rover says it does.
 function applyOption(rover, q, option) {
   if (!rover) return ''
+  if (q.kind === 'rescue') return applyRescue(rover, q, option) // v9
   if (rover.state === 'fault') return 'Motors are down, so I will decide once they are back.'
   if (q.kind === 'place') return applyPlace(rover, q, option)
   if (q.kind === 'life') {
@@ -3070,7 +3963,7 @@ function decideNow(rover, kind, info) {
   later(g.ok ? g.ms : 120, () => {
     if (!rover.request?.pending) return
     rover.request = null
-    if (rover.state === 'fault') return
+    if (rover.state === 'fault' || busy9(rover)) return
     const q = { kind, options: OPTION_SETS[kind], follow, at: info.at || [rover.x, rover.y] }
     let by = 'rules'
     let conf = null
@@ -3096,6 +3989,13 @@ function decideOpen(q) {
   const rover = sim.rovers.find((r) => r.id === q.rover)
   if (!rover) return
   if (rover.request === q) rover.request = null
+  if (q.kind === 'rescue') {
+    // v9: the pick if the rules allow it, else the safest useful option.
+    const ok = (id) => q.options.some((o) => o.id === id && o.safe !== false)
+    const choice = q.pick && ok(q.pick.choice) ? q.pick.choice : ok('tow') ? 'tow' : 'salvage'
+    logDecision(rover, q, q.question.replace(/ Gemma suggests.*$/, ''), choice, q.pick ? 'gemma' : 'rules', q.pick?.conf ?? null, q.pick?.why || 'the rules pick the safest useful option')
+    return
+  }
   if (q.kind === 'place') {
     const choice = q.pick?.choice || 'p1'
     const words = q.options.map((o) => o.label)
@@ -3136,6 +4036,8 @@ function answerRequest(id, option) {
     throw new HttpError(404, `No open question with id "${key}".`)
   }
   if (!q.options.some((o) => o.id === option)) throw new HttpError(400, `Unknown option "${option}". Use ${q.options.map((o) => o.id).join(', ')}.`)
+  const opt = q.options.find((o) => o.id === option)
+  if (opt.safe === false) throw new HttpError(400, `${opt.label} is blocked by the rules: ${opt.note}`) // v9
   resolveRequest(q, 'answered', option)
 }
 
@@ -3175,6 +4077,13 @@ function lowBatteryRefusal(rover, gx, gy, what) {
 }
 
 function unavailable(rover) {
+  if (PROTOCOL >= 9 && V9_BUSY.has(rover.state)) {
+    if (rover.state === 'disabled') return `I can't move. ${diagnosis(rover)} Waiting for help.`
+    if (rover.state === 'towed') return `I'm being towed to the lander by ${rover.towedBy}.`
+    if (rover.state === 'wrecked') return `I'm a wreck at (${r1(rover.x)}, ${r1(rover.y)}). I can't do anything any more.`
+    if (rover.state === 'repairing') return `I'm under repair at the lander (health ${hpOf(rover)}%). I'll be back out soon.`
+    return `I'm helping ${rover.rescue?.rover ?? 'another rover'} right now. Ask another rover.`
+  }
   if (rover.state === 'fault') return `Motors are rebooting (${Math.ceil(rover.faultHazard?.remaining ?? 0)} s left). I can't move until they are back.`
   if (rover.state === 'charging' && rover.battery < 0.6) return `Charging at the lander, ${Math.round(rover.battery * 100)}%. I'll go once I'm above 60%.`
   return null
@@ -3243,6 +4152,7 @@ function cmdExplore(rover, dir) {
 }
 
 function cmdReturn(rover) {
+  if (PROTOCOL >= 9 && V9_BUSY.has(rover.state)) return ['refuse', unavailable(rover)]
   if (rover.state === 'fault') return ['refuse', `Motors are rebooting (${Math.ceil(rover.faultHazard?.remaining ?? 0)} s left). I'll head back once they are up.`]
   if (rover.state === 'charging') return ['ack', `Already docked and charging, ${Math.round(rover.battery * 100)}%.`]
   rover.hold = false
@@ -3278,6 +4188,12 @@ function handleChat(text, roverParam) {
   const g = gemmaCall('command')
   const source = g.ok ? 'gemma' : 'rules'
   const lower = raw.toLowerCase()
+  // v9: rescue orders ("rover 1, go help rover 2", "tow rover 2 home", "salvage it", "leave it").
+  const rc = PROTOCOL >= 9 && !/^(?:did|has|have|was|were|is|are|what|why|when|how|who)\b/.test(lower) ? parseRescue(lower) : null
+  if (rc) {
+    later(g.ok ? g.ms : 120, () => respondRescue(rc, targets, source, msg.id))
+    return msg.id
+  }
   if (PROTOCOL >= 8 && !isQuestion(lower)) {
     // v8: autonomy mode and fleet priorities by chat.
     const mode = /\b(mode|from now on|decide|ask me|controlled|autonomous|supervised)\b/.test(lower) ? parseMode(lower) : null
@@ -3405,6 +4321,7 @@ function isQuestion(t) {
 function questionTopic(t) {
   if (/\b(life|lifeforms?|creatures?|aliens?|animals?|grazers?|herds?|living|organisms?)\b/.test(t)) return 'life'
   if (/\b(battery|batteries|charge|charging|power|energy)\b/.test(t)) return 'battery'
+  if (PROTOCOL >= 9 && (/\b(health|damaged?|hurt|broken|injur\w*|condition|repairs?|repaired|wreck\w*|spares?)\b/.test(t) || /\bhow(?:'s| is)\s+(?:rover\s*\d+|r\d+)\b/.test(t))) return 'health'
   if (/\b(problems?|issues?|trouble|wrong|hazards?|danger|stuck|faults?|damage|obstacles?)\b/.test(t)) return 'problems'
   if (/\b(water|lakes?|rivers?|liquid|streams?)\b/.test(t)) return 'water'
   if (/\b(samples?|tubes?|cache|cached|science)\b/.test(t)) return 'samples'
@@ -3444,6 +4361,8 @@ function rangeLeft(r) {
 function currentIssues(r) {
   const out = []
   if (r.state === 'fault') out.push(`motors rebooting after a fault (${Math.ceil(r.faultHazard?.remaining ?? 0)} s left)`)
+  if (PROTOCOL >= 9 && r.state === 'disabled') out.push('immobile, waiting for help')
+  if (PROTOCOL >= 9 && healthStatus(r) !== 'ok') out.push(`health ${hpOf(r)}% (${worstParts(r, 90)})`)
   if (r.battery < 0.25) out.push(`battery low at ${pctOf(r.battery)}`)
   if ((r.sensors?.slip ?? 0) > 0.25) out.push(`wheel slip ${pctOf(r.sensors.slip)}`)
   if (dustActive()) out.push(`a dust storm cutting my LiDAR to ${DUST_LIDAR_RANGE} m`)
@@ -3454,6 +4373,7 @@ function currentIssues(r) {
 
 function whyText(r) {
   const d = r.goal ? Math.round(Math.hypot(r.goal[0] - r.x, r.goal[1] - r.y)) : 0
+  if (PROTOCOL >= 9 && V9_BUSY.has(r.state)) return rescueWhy(r)
   if (r.state === 'fault') return `My motors are rebooting after a fault (${Math.ceil(r.faultHazard?.remaining ?? 0)} s left), so I'm not going anywhere until they're back.`
   if (r.state === 'charging') return `I'm docked at the lander, charging (${pctOf(r.battery)}). I'll head out again once the battery is high enough for a useful trip.`
   if (r.hold) return `I'm holding at ${at(r.x, r.y)} because you asked me to. Say "resume" and I'll carry on.`
@@ -3552,6 +4472,8 @@ function roverAnswer(r, topic) {
       }
       return `The fleet has identified ${plural(n, 'body', 'bodies')} of water. The nearest edge is about ${Math.max(0, Math.round(best.d))} m ${compass(best.z[0] - r.x, best.z[1] - r.y)} of me. Every route stays out of it.`
     }
+    case 'health':
+      return healthAnswer(r)
     case 'location':
       return `I'm at ${at(r.x, r.y)}, ${fromLander(r.x, r.y)}, facing ${compass(Math.cos(r.yaw), Math.sin(r.yaw))}${r.goal ? `, heading for ${at(r.goal[0], r.goal[1])}` : ''}.`
     case 'status':
@@ -3607,6 +4529,8 @@ function fleetAnswer(topic) {
       const limit = sim.slopeLimit < INITIAL_SLOPE_LIMIT ? ` The slope limit is down to ${sim.slopeLimit} deg from ${INITIAL_SLOPE_LIMIT} after stalls.` : ''
       return `${head} ${met ? `${plural(met, 'hazard')} met so far` : 'No hazards met so far'}${sim.softZones.length ? `, ${plural(sim.softZones.length, 'soft zone')} marked` : ''}.${limit}`
     }
+    case 'health':
+      return `Health: ${rs.map((r) => `${r.name} ${hpOf(r)}% (${healthStatus(r)}${V9_BUSY.has(r.state) ? `, ${r.state}` : ''})`).join(', ')}. Spares at the lander: ${sparesText()}.${sim.wrecks.length ? ` ${plural(sim.wrecks.length, 'wreck')} left on the map.` : ''}`
     case 'water':
       return sim.identified.size ? `${plural(sim.identified.size, 'body', 'bodies')} of water identified, covered by ${sim.waterZones.length} no-go zones on the shared map.` : 'No water identified yet.'
     case 'location':
@@ -5231,6 +6155,7 @@ function fleetSummary() {
     soft_zones: sim.softZones.map((z) => [r1(z[0]), r1(z[1]), r1(z[2])]),
     ...(PROTOCOL >= 8 && { mode: autonomy }),
     ...(PROTOCOL >= 8 && sim.priority && { priority: priorityJson() }),
+    ...(PROTOCOL >= 9 && { spares: { ...sim.spares }, rescues: sim.rescues.filter((rs) => rs.helper).map(publicRescue), wrecks: sim.wrecks.map((w) => ({ ...w })) }),
     ...(PROTOCOL >= 4 && {
       explored_pct: r1(((sim.knownCount + sim.waterSeenCount) / sim.known.length) * 100),
       water_zones: sim.waterZones,
@@ -5278,6 +6203,7 @@ function targetList() {
 
 function roverStates() {
   return sim.rovers.map((r) => ({
+    ...(PROTOCOL >= 9 && { health: healthJson(r) }),
     id: r.id,
     x: r2(r.x),
     y: r2(r.y),
@@ -5379,6 +6305,7 @@ function tick() {
   if (PROTOCOL >= 4) stepTracks()
   computeFrontiers()
   fleetEvents()
+  if (PROTOCOL >= 9) stepRescueFleet()
   stepRequests()
   if (PROTOCOL >= 8) {
     updateVision()
@@ -5480,7 +6407,7 @@ const server = http.createServer((req, res) => {
         const hasY = parsed?.y != null
         if ((hasX || hasY) && !(Number.isFinite(parsed.x) && Number.isFinite(parsed.y))) throw new HazardError('Give both x and y as numbers (world metres), or neither.')
         const point = hasX && hasY ? [parsed.x, parsed.y] : null
-        const h = createHazard(String(parsed?.type ?? ''), parsed?.rover == null || parsed.rover === '' ? null : parsed.rover, point)
+        const h = createHazard(String(parsed?.type ?? ''), parsed?.rover == null || parsed.rover === '' ? null : parsed.rover, point, { severity: parsed?.severity, part: parsed?.part })
         console.log(`[mock] hazard ${h.id} ${h.type}${h.rover ? ` on ${h.rover}` : ''}`)
         sendJson(res, 200, { ok: true, hazard: publicHazard(h) })
       } catch (err) {
@@ -5529,6 +6456,18 @@ const server = http.createServer((req, res) => {
       return { ok: true, armed: !sim.firstLifeAsked }
     },
     '/api/_mock/reveal': (b) => revealAll(b),
+    '/api/_mock/heal': (b) => {
+      // v9: like new again (one rover, or every rover), back to exploring.
+      const list = b?.rover ? sim.rovers.filter((r) => r.id === b.rover) : sim.rovers
+      if (!list.length) throw new HttpError(400, 'Body: {"rover": "r2"} (or {} for every rover)')
+      for (const r of list) {
+        for (const rs of sim.rescues) if (rs.rover === r.id || rs.helper === r.id) Object.assign(rs, { phase: 'done', doneT: sim.t })
+        Object.assign(r, { parts: freshParts(), wrecked: false, fixable: null, fixParts: null, rescue: null, towedBy: null, lastHit: null, repairTo: null })
+        if (V9_BUSY.has(r.state)) Object.assign(r, { state: 'idle', timer: 1, path: [], goal: null })
+        sim.wrecks = sim.wrecks.filter((w) => w.rover !== r.id)
+      }
+      return { ok: true }
+    },
     '/api/_mock/gaps': () => ({ ok: true, gaps: PROTOCOL >= 8 ? computeGaps() : [] }),
     '/api/_mock/battery': (b) => {
       const rover = sim.rovers.find((r) => r.id === b?.rover)
@@ -5584,7 +6523,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'GET' && url.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' })
-    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, /api/hazard, /api/chat, /api/answer, /api/mode, /api/camera/{id}.jpg.\n')
+    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, /api/hazard (incl. damage), /api/chat, /api/answer, /api/mode, /api/camera/{id}.jpg.\n')
   }
   sendJson(res, 404, { ok: false, error: 'Not found' })
 })

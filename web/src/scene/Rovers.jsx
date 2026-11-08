@@ -9,7 +9,7 @@ import { FatPolyline } from './fatLine.js'
 import { glowTexture, warningTexture } from './textures.js'
 import { reducedMotion } from './sceneConstants.js'
 import { HAZARD } from '../lib/theme.js'
-import { hardwareMaterials } from './hardware.js'
+import { hardwareMaterials, wreckMaterials } from './hardware.js'
 import { MAST_TOP, WHEELS, WHEEL_R, roverParts } from './roverModel.js'
 import { RoverDust, dustSources } from './RoverDust.jsx'
 
@@ -31,16 +31,18 @@ const faultMats = {
 }
 
 // Wheels, LiDAR head and beacon move; everything else is merged per material (roverModel.js).
-function RoverModel({ color, wheels, lidar, beacon }) {
+// v9: a wreck is drawn with darkened, dull materials and no lights.
+function RoverModel({ color, wheels, lidar, beacon, wrecked }) {
   const P = roverParts()
-  const M = hardwareMaterials()
+  const M = wrecked ? wreckMaterials() : hardwareMaterials()
   // The identity colour as an accent (stripes, mast band, nose), a little self-lit so it
   // reads on a washed-out projector.
   const accent = useMemo(() => {
-    const m = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55, roughness: 0.4, metalness: 0.1 })
+    const dim = new THREE.Color(color).multiplyScalar(0.3)
+    const m = wrecked ? new THREE.MeshStandardMaterial({ color: dim, roughness: 0.9, metalness: 0.1 }) : new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55, roughness: 0.4, metalness: 0.1 })
     m.userData.realistic = true
     return m
-  }, [color])
+  }, [color, wrecked])
   const laserMat = useMemo(() => new THREE.MeshBasicMaterial({ color }), [color])
   const beaconMat = useMemo(() => new THREE.SpriteMaterial({ map: glowTexture(), color, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: false }), [color])
   useEffect(() => () => (accent.dispose(), laserMat.dispose(), beaconMat.dispose()), [accent, laserMat, beaconMat])
@@ -63,7 +65,7 @@ function RoverModel({ color, wheels, lidar, beacon }) {
           <mesh geometry={P.hub} material={M.metal} />
         </group>
       ))}
-      <sprite ref={beacon} material={beaconMat} position={[0.205, MAST_TOP, 0]} scale={0.011} renderOrder={5} />
+      <sprite ref={beacon} material={beaconMat} position={[0.205, MAST_TOP, 0]} scale={0.011} renderOrder={5} visible={!wrecked} />
     </group>
   )
 }
@@ -91,6 +93,17 @@ function groundNormal(T, x, y, out) {
 
 const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a))
 
+// v9: rovers whose LiDAR head stops (no power to the mast, or parked for good).
+const STILL = new Set(['fault', 'disabled', 'wrecked', 'towed', 'repairing'])
+// v9: a chip on the name tag for the new states (the distress tag covers "disabled").
+const TAG_CHIP = {
+  rescuing: { label: 'Helping', kind: 'help' },
+  towing: { label: 'Towing', kind: 'tow' },
+  towed: { label: 'In tow', kind: 'tow' },
+  repairing: { label: 'Repair', kind: 'repair' },
+  wrecked: { label: 'Wreck', kind: 'wreck' },
+}
+
 function Rover({ meta, selected, onSelect }) {
   const outer = useRef()
   const inner = useRef()
@@ -103,6 +116,9 @@ function Rover({ meta, selected, onSelect }) {
   const beacon = useRef()
   const state = useSim((s) => s.rovers[meta.id]?.state)
   const faulted = state === 'fault'
+  // v9: a wreck is darkened; the name tag says what is going on.
+  const wrecked = useSim((s) => s.rovers[meta.id]?.state === 'wrecked' || s.rovers[meta.id]?.health?.status === 'wrecked')
+  const tagChip = TAG_CHIP[state] || null
   const asking = useSim((s) => s.requests.some((q) => q.rover === meta.id)) // v3: waiting for the operator
   // drei <Html> picks its DOM container once R3F has connected its events; mounting it
   // earlier makes it unmount and remount its own React root (a React error in dev).
@@ -186,7 +202,7 @@ function Rover({ meta, selected, onSelect }) {
     const moved = Math.hypot(p.x - ox, p.y - oy)
     const along = (p.x - ox) * Math.cos(p.yaw) + (p.y - oy) * Math.sin(p.yaw)
     const gs = moved / Math.max(step, 1e-3)
-    const ws = sn && Number.isFinite(sn.wheel_speed) && r.state !== 'fault' ? sn.wheel_speed : gs
+    const ws = sn && Number.isFinite(sn.wheel_speed) && r.state !== 'fault' && r.state !== 'towed' ? sn.wheel_speed : gs
     const dir = along < -1e-4 ? -1 : 1
     p.v += (ws * dir - p.v) * Math.min(1, step * 6)
     const turn = wrap(p.yaw - oyaw) / Math.max(step, 1e-3)
@@ -200,7 +216,7 @@ function Rover({ meta, selected, onSelect }) {
         const v = p.v + (right ? 1 : -1) * turn * half
         w.rotation.z -= (v / R) * step
       }
-      if (lidar.current && r.state !== 'fault') lidar.current.rotation.y += step * 9
+      if (lidar.current && !STILL.has(r.state) && !(r.health?.parts?.lidar < 3)) lidar.current.rotation.y += step * 9
     }
     // Dust from the rear wheels (RoverDust reads this).
     let src = dustSources.get(meta.id)
@@ -215,7 +231,7 @@ function Rover({ meta, selected, onSelect }) {
     const isFault = r.state === 'fault'
     const t = clock.elapsedTime
     const blink = reducedMotion ? 1 : 0.5 + 0.5 * Math.sign(Math.sin(t * 6.5))
-    if (beacon.current) beacon.current.material.opacity = isFault ? 0.25 + 0.5 * blink : 0.85
+    if (beacon.current) beacon.current.material.opacity = isFault || r.state === 'disabled' ? 0.25 + 0.5 * blink : 0.85
     if (fault.current) {
       fault.current.visible = isFault
       if (isFault) {
@@ -254,7 +270,7 @@ function Rover({ meta, selected, onSelect }) {
       onPointerOut={() => (document.body.style.cursor = '')}
     >
       <group ref={inner}>
-        <RoverModel color={meta.color} wheels={wheels} lidar={lidar} beacon={beacon} />
+        <RoverModel color={meta.color} wheels={wheels} lidar={lidar} beacon={beacon} wrecked={wrecked} />
         <mesh geometry={geo.halo} material={markMats.halo} scale={3.4} position={[0, 0.05, 0]} renderOrder={3} />
         <mesh geometry={geo.idRing} material={markMats.ring} position={[0, 0.07, 0]} renderOrder={3} />
       </group>
@@ -266,10 +282,25 @@ function Rover({ meta, selected, onSelect }) {
       <sprite ref={sign} material={faultMats.sign} position={[0, 3.55, 0]} scale={1.15} visible={false} renderOrder={10} />
       {labelsReady && (
         <Html position={[0, 2.5, 0]} center zIndexRange={[12, 0]} style={{ pointerEvents: 'none' }}>
-          <button type="button" className="rover-tag" data-selected={selected || undefined} data-fault={faulted || undefined} data-ask={(asking && !faulted) || undefined} onClick={tagClick} title={`Show ${meta.name}'s sensors`}>
+          <button
+            type="button"
+            className="rover-tag"
+            data-selected={selected || undefined}
+            data-fault={faulted || undefined}
+            data-alert={state === 'disabled' || undefined}
+            data-wreck={state === 'wrecked' || undefined}
+            data-ask={(asking && !faulted) || undefined}
+            onClick={tagClick}
+            title={`Show ${meta.name}'s sensors`}
+          >
             <span className="dot" style={{ background: meta.color }} />
             {meta.name}
             {faulted && <span className="rover-tag-fault">Fault</span>}
+            {tagChip && (
+              <span className="rover-tag-chip" data-kind={tagChip.kind}>
+                {tagChip.label}
+              </span>
+            )}
             {asking && !faulted && (
               <span className="rover-tag-ask" title="Waiting for your answer">
                 ?

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { appStore, setShowBoxes, simStore, useApp, useSim } from '../state/store.js'
 import { sampleGround } from '../state/simState.js'
-import { fixed } from '../lib/format.js'
-import { HAZARD, SIGNAL, instrumentStyle, kindStyle } from '../lib/theme.js'
+import { fixed, mmss } from '../lib/format.js'
+import { HAZARD, PARTS, SIGNAL, causeText, healthColor, instrumentStyle, kindStyle, partLevel } from '../lib/theme.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { Battery, StatePill, brainLevel, fmtMs } from './RoverBits.jsx'
 import { InstrumentIcon, Tubes } from './SampleBits.jsx'
@@ -11,6 +11,8 @@ import { PlannerRow } from './Planner.jsx'
 import { reducedMotion } from '../scene/sceneConstants.js'
 import { RETRY_DOWN, cameraProblem, closeImage, fmtRate, useCamRate, useCameraStream } from './useCameraStream.js'
 import { detColor, detPhrase, drawDetections } from '../lib/detections.js'
+import { HealthBar, PartIcon, statusWord } from './HealthBits.jsx'
+import { V9_STATES, rescueLine } from '../lib/rescue.js'
 import '../styles/interaction.css'
 
 export { cameraProblem }
@@ -204,6 +206,63 @@ function SeesLine({ vision }) {
         {more > 0 && <span className="sp-dim"> +{more} more</span>}
       </span>
       {Number.isFinite(vision.ms) && <span className="sp-sees-ms">detector {fmtMs(vision.ms)} ms</span>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------- v9: health
+
+// Parts with their percentage, the rover's own diagnosis and the last hit (cause, shock,
+// when). Hidden with an older sim (no `health`).
+function HealthSection({ rover }) {
+  const h = rover.health
+  const t = useSim((s) => s.t)
+  const rescues = useSim((s) => s.rescues)
+  const meta = useSim((s) => s.roverMeta)
+  const rovers = useSim((s) => s.rovers)
+  const asking = useSim((s) => s.requests.some((q) => q.kind === 'rescue' && (q.rover === rover.id || q.about === rover.id)))
+  if (!h) return null
+  const color = healthColor(h.status, h.hp)
+  const lh = h.last_hit
+  const ago = lh && Number.isFinite(lh.t) ? Math.max(0, t - lh.t) : null
+  const agoText = ago === null ? '' : ago < 90 ? `${Math.round(ago)} s ago` : `${Math.round(ago / 60)} min ago`
+  const name = (id) => meta.find((m) => m.id === id)?.name || id
+  const dist = (id) => (rovers[id] ? Math.hypot(rovers[id].x - rover.x, rovers[id].y - rover.y) : null)
+  const line = V9_STATES.has(rover.state) ? rescueLine(rover, rescues, name, dist, asking) : null
+  return (
+    <div className="sp-health" data-status={h.status || undefined} style={{ '--hc': color }}>
+      <div className="sp-health-top">
+        <span className="sp-k">Health</span>
+        <HealthBar health={h} className="hb-sp" />
+        <span className="sp-health-hp">
+          <b>{Number.isFinite(h.hp) ? `${h.hp}%` : '--'}</b> {statusWord(h.status)}
+        </span>
+        <ul className="sp-parts" aria-label="Parts">
+          {PARTS.map((p) => {
+            const v = h.parts[p.key]
+            return (
+              <li key={p.key} data-level={partLevel(v)} title={`${p.label}: ${Number.isFinite(v) ? `${v}%` : 'no reading'}`}>
+                <PartIcon part={p.key} />
+                <span className="sp-part-name">{p.short}</span>
+                <b>{Number.isFinite(v) ? v : '--'}</b>
+              </li>
+            )
+          })}
+        </ul>
+      </div>
+      <div className="sp-health-diag">
+        <span className="sp-health-quote" title={h.diagnosis || undefined}>
+          {line && <b className="sp-health-line">{line}. </b>}
+          {h.diagnosis || <span className="sp-dim">No diagnosis from the rover</span>}
+        </span>
+        {lh && (
+          <span className="sp-health-hit" title={Number.isFinite(lh.t) ? `At ${mmss(lh.t)} sim time` : undefined}>
+            Last hit: {causeText(lh.cause)}
+            {Number.isFinite(lh.shock_g) && lh.shock_g > 0 ? `, ${fixed(lh.shock_g, 1)} g` : ''}
+            {agoText ? `, ${agoText}` : ''}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
@@ -704,14 +763,14 @@ export function SensorPanel({ roverId, onClose }) {
   const radarSize = useRadarSize()
   if (!meta) return null
   return (
-    <section className="hud hud-sensors" ref={ref} style={{ '--rover': meta.color }} aria-label={`${meta.name} live sensors`} data-fault={rover?.state === 'fault' || undefined}>
+    <section className="hud hud-sensors" ref={ref} style={{ '--rover': meta.color }} aria-label={`${meta.name} live sensors`} data-fault={rover?.state === 'fault' || rover?.state === 'disabled' || undefined} data-wreck={rover?.state === 'wrecked' || undefined}>
       <header className="sp-head">
         <span className="rover-dot" aria-hidden="true" />
         <h2 className="sp-name">{meta.name}</h2>
         <StatePill rover={rover} hazards={hazards} />
         <Battery value={rover?.battery} charging={rover?.state === 'charging'} />
         {rover?.capacity && <Tubes samples={rover.samples} capacity={rover.capacity} targets={targets} />}
-        {rover?.focus ? (
+        {rover?.focus && !V9_STATES.has(rover.state) ? (
           <span className="sp-title sp-focus" data-reason={rover.focus.reason} title={focusTitle(rover.focus)}>
             <i aria-hidden="true" />
             <span>{focusStatus(rover.focus)}</span>
@@ -733,6 +792,7 @@ export function SensorPanel({ roverId, onClose }) {
             <Readouts rover={rover} limit={limit} />
           </div>
           <SeesLine vision={rover.vision} />
+          <HealthSection rover={rover} />
           <div className="sp-brains ix-brains">
             <BrainRow brain={rover.brain} budget={budget} cycle={cycle} />
             {planner && <PlannerRow planner={planner} />}

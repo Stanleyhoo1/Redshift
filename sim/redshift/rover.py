@@ -15,7 +15,13 @@ Sensors (all the rover knows about the world):
                  its onboard object detector (vision.py, protocol v8): self.vision holds the latest
                  detections; the decision cycle only reads them (water, creatures, new obstacles, targets)
 
-States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault, observing.
+States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault, observing, and
+protocol v9: disabled (immobile, waiting for help), rescuing (a helper on its way or working), towing, towed,
+repairing (at the lander) and wrecked (left behind). Health (health.py) changes how the rover drives through the
+physics (a weak drive side has less torque and top speed), its sensors (LiDAR range and rays, camera noise), its
+battery drain and its radio range; the rover adapts (lower top speed, its own lower slope limit, home for a repair
+when its health is low) and backs away from a creature that charges at it (a fast LiDAR track coming straight at
+it, confirmed by the camera when it sees one).
 
 LiDAR returns are split three ways: liquid gives no return at all (water shows up as a hole in the
 map); hits on creatures go to the fleet's motion tracker (tracker.py; a stated simplification, a real
@@ -59,6 +65,7 @@ import mujoco
 import numpy as np
 
 from .config import Config
+from .health import Health
 from .memory import RoverMemory
 from .planner import PENDING, downsample, path_length
 from .terrain import KIND_LABEL
@@ -68,8 +75,13 @@ from .world import GROUP_ROCK
 LIDAR_GROUPS = np.array([1, 1, 1, 0, 0, 1], np.uint8)   # terrain, rocks, targets and creatures, liquid; never
                                                          # rovers (3) or the walls (4)
 BUMPER_GROUPS = np.array([0, 1, 0, 0, 0, 0], np.uint8)  # rocks only
-DRIVING = ("exploring", "investigating", "returning", "observing")
-PARKED = ("idle", "charging", "fault")
+DRIVING = ("exploring", "investigating", "returning", "observing", "rescuing", "towing")
+PARKED = ("idle", "charging", "fault", "disabled", "towed", "wrecked", "repairing")
+HURT = ("disabled", "towed", "wrecked")    # protocol v9: out of action (rescue.py decides what happens to them)
+CHARGE_SPEED = 0.65    # protocol v9: a LiDAR track closing this fast (m/s; grazers walk at 0.5 at most) ...
+CHARGE_RANGE = 9.0     # ... from this close, heading straight at the rover, is a creature charging
+EVADE_S = 2.5          # back away for this long
+REPAIR_NOTE_S = 120.0  # a rover that needs a repair says so at most this often
 ANOMALY_KINDS = ("new_obstacle", "slip", "low_visibility", "no_returns")
 ANOMALY_TYPE = {"new_obstacle": "new_obstacle", "slip": "wheel_slip", "low_visibility": "low_visibility",
                 "no_returns": "no_returns"}
@@ -308,6 +320,17 @@ class Rover:
 
         # mission memory: what it mapped, found, sampled and met (answers questions, protocol v5 stats)
         self.mem = RoverMemory(self)
+        self.health = Health(self)         # protocol v9: parts, status, self diagnosis
+        self._health_v = 0                 # health version last acted on (replan on a change)
+        self._drive_sig = (1.0, 1.0, None)  # drive factors and own slope limit last planned with
+        self.carried_spares: list = []     # salvaged parts on board: (spare kind, condition, from rover)
+        self.evade_until = -1e9            # backing away from a charging creature until then
+        self.evade_from = None
+        self.charge_note_t = -1e9
+        self.repair_go_t = -1e9
+        self.repair_t0 = 0.0
+        self.repair_note = None
+        self._drive_mode = None            # last actuator setup written by _apply (only rewritten on a change)
         self._count_replan = False
         self.vis_lost_t = None
         self.vision = VisionBrain(self)    # protocol v8: onboard object detection (results from the camera thread)
@@ -386,6 +409,10 @@ class Rover:
             self.slip_load += np.where(spin, self._hw_call(self.wheel_loads), 0.0)
         else:
             self.slip_since = None
+        if self.state in DRIVING:                       # protocol v9: motor strain (heat) per side
+            T = cfg.motor_torque
+            self.health.strain(t, 1.0 / cfg.agent_hz, (float(tau[:2].mean()) / T, float(tau[2:].mean()) / T),
+                               self.cmd_v > 0.1 or abs(self.cmd_w) > 0.3)
 
     def _slip_on_ground(self) -> bool:
         """Were the wheels that kept spinning actually on the ground? Sunk in sand they carry their share
@@ -425,6 +452,9 @@ class Rover:
         m, d = self.sim.model, self.sim.data
         hz = self.sim.hazards
         rng_max = hz.lidar_range() if hz is not None else cfg.lidar_range
+        he = self.health.effects()
+        if he["lidar_range"] < 1.0:                     # protocol v9: a damaged LiDAR sees less far
+            rng_max = min(rng_max, cfg.lidar_range * he["lidar_range"])
         pnt = d.site_xpos[self.site].copy()
         az = self.yaw + (np.arange(self.n_az) + self.rng.uniform()) * (2 * math.pi / self.n_az)
         el = self.el + self.rng.uniform(-0.6, 0.6, len(self.el)) * (math.pi / 180.0)
@@ -447,6 +477,8 @@ class Rover:
             hit &= self.rng.uniform(size=self.nray) >= drop
             dist = dist + self.rng.normal(0.0, sigma, self.nray)
             hit &= (dist > 0.05) & (dist <= rng_max)
+        if he["lidar_drop"] > 0.0:         # protocol v9: a damaged LiDAR loses rays
+            hit &= self.rng.uniform(size=self.nray) >= he["lidar_drop"]
         self.lidar_hits = int(hit.sum())
         returned = hit.copy()              # anything that echoed back (ground, rocks, markers, creatures)
         tmap = self.sim.world.target_geom_ids
@@ -668,6 +700,13 @@ class Rover:
         ax, ay = self.x + 1.5 * math.cos(self.yaw), self.y + 1.5 * math.sin(self.yaw)
         f.add_water_zone(t, self, ax, ay, 2.5)
         self.mem.on_hazard("wet", t, (self.x, self.y))
+        # protocol v9: water in the chassis shorts the power system and gets into the wheel motors (once a minute:
+        # backing out it may dip in again)
+        if depth >= 0.05 and t - getattr(self, "_wet_hit_t", -1e9) > 60.0:   # a dunk, not a wet belly at the shore
+            self._wet_hit_t = t
+            sev = min(20.0, 6.0 + 30.0 * depth)
+            self.health.hit(t, [("power", 1.0), ("drive_l", 0.35), ("drive_r", 0.35)], sev, "water",
+                            kinds={"drive_l": "broken", "drive_r": "broken"})
         f.log(t, "warn", f"{self.id} water sensor wet: chassis {depth:.2f} m under a liquid surface. Stopping, "
                          f"marking it for the fleet and backing out.", self.id, at=(self.x, self.y))
         if self.state != "recovering":
@@ -730,10 +769,10 @@ class Rover:
         """Infer LiDAR visibility from the rover's own returns: in dust, nothing comes back from
         beyond a few metres. Degraded = unsure: slow down, stay on mapped ground, stay close."""
         cfg = self.cfg
-        if len(self.far_hist) < self.far_hist.maxlen:
+        if len(self.far_hist) < self.far_hist.maxlen or self.state in HURT:
             return
         far_max, far_min = max(self.far_hist), min(self.far_hist)
-        nominal = cfg.lidar_range
+        nominal = cfg.lidar_range * self.health.effects()["lidar_range"]   # its own range (damage, protocol v9)
         if not self.degraded and far_max < 0.55 * nominal:
             self.degraded = True
             self.lidar_eff = round(far_max, 1)
@@ -872,18 +911,26 @@ class Rover:
         """Battery fraction to drive dist metres: learned motor cost per metre plus 25%, and the
         electronics drain at a cautious average speed (turns and slopes slow us down)."""
         cfg = self.cfg
-        return dist * (1.25 * self.e_per_m + cfg.battery_base_drain / cfg.battery_capacity / (0.55 * cfg.v_max))
+        e = self.health.effects()
+        v = 0.55 * cfg.v_max * min(1.0, e["v_cap"] + 0.1)
+        return dist * (1.25 * self.e_per_m + e["drain"] * cfg.battery_base_drain / cfg.battery_capacity / v)
 
     def _battery(self, t: float, dt: float, energy_j: float) -> None:
         cfg = self.cfg
         parked = self.state == "idle" and math.hypot(self.x - self.dock[0], self.y - self.dock[1]) < 1.6
+        if self.state == "repairing":
+            return                                      # rescue.repair_step charges it
         if self.state == "charging" or parked:
             power = self.sim.hazards.charge_factor() if self.sim.hazards is not None else 1.0
             self.battery = min(1.0, self.battery + power * dt / cfg.charge_time_s)
             return
         cap = cfg.battery_capacity
-        motor = cfg.battery_motor_k * energy_j / cap
-        self.battery = max(0.0, self.battery - cfg.battery_base_drain / cap * dt - motor)
+        drain = self.health.effects()["drain"]          # protocol v9: a damaged power system drains faster
+        motor = cfg.battery_motor_k * energy_j / cap * (1.0 + 0.4 * (drain - 1.0))
+        base = cfg.battery_base_drain / cap * dt * drain
+        if self.state in HURT:
+            base *= 0.3                                 # out of action: hibernating, only the heaters and radio
+        self.battery = max(0.0, self.battery - base - motor)
         moved = math.hypot(self.x - self.last_xy[0], self.y - self.last_xy[1])
         self.e_acc_drain += motor
         self.e_acc_dist += moved
@@ -990,6 +1037,9 @@ class Rover:
         self.vision.tick(t)                # decisions from the latest camera detections (protocol v8)
         self.hold_for_plan = False
         self.block_info = None
+        if self._health_tick(t, dt):       # protocol v9: out of action, or being repaired at the lander
+            self._apply()
+            return
 
         # motor controller status (motor feedback)
         if self.motor_fault:
@@ -1019,6 +1069,9 @@ class Rover:
 
         if self.state == "idle":
             self._set_cmd(0.0, 0.0)
+            if math.hypot(self.x - self.dock[0], self.y - self.dock[1]) > 1.6 and self._evade(t):
+                self._apply()                  # protocol v9: even a parked rover gets out of a charging creature's way
+                return
             if self.held:
                 away = math.hypot(self.x - self.dock[0], self.y - self.dock[1]) > 1.6
                 if away and self.battery > 0.0 and self._need_return(t):
@@ -1061,7 +1114,17 @@ class Rover:
             elif self._need_return(t):
                 self._go_home(t, "battery")
 
+        if self.state == "rescuing" and self._need_return(t):
+            self._say(t, f"{self.id}: battery {self.battery * 100:.0f}%, I have to leave the rescue and charge.")
+            self._go_home(t, "battery")
+        if self._evade(t):                 # protocol v9: a creature charging at us
+            self._apply()
+            return
         self._track(t)
+        if self.state == "towing":         # the rescue watches a tow's progress (no reversing with a load)
+            self.sim.rescue.drive(self, t) or self._drive(t)
+            self._apply()
+            return
         if self.slip_since is not None and t - self.slip_since >= self.cfg.slip_time_s:
             if self._slip_on_ground() and self.bumper() is None:
                 self._on_soft_ground(t)
@@ -1091,8 +1154,137 @@ class Rover:
             if self._observe(t):
                 self._apply()
                 return
+        elif self.state in ("rescuing", "towing"):
+            if self.sim.rescue.drive(self, t):       # protocol v9: the rescue sets the motors itself
+                self._apply()
+                return
         self._drive(t)
         self._apply()
+
+    # ================================================================== protocol v9: health
+    def _health_tick(self, t: float, dt: float) -> bool:
+        """Health bookkeeping once per cycle (cheap). Returns True when the rover is out of action or being
+        repaired, i.e. the rest of the decision cycle is skipped."""
+        h = self.health
+        hz = self.sim.hazards
+        h.dust(t, dt, hz is not None and hz.storm_active() and self.state not in ("charging", "repairing"))
+        if h.version != self._health_v:
+            self._health_v = h.version
+            e = h.effects()
+            sig = (e["drive_l"], e["drive_r"], e["slope_cap"])
+            if sig != self._drive_sig:
+                self._drive_sig = sig
+                self._replan_now(t)        # a weaker drive means another slope limit and speed
+                self.plan_t = -1e9
+            if not self.degraded:
+                self.lidar_eff = round(self.cfg.lidar_range * h.effects()["lidar_range"], 1)
+            if not h.mobile() and self.state not in HURT + ("repairing",):
+                self.sim.rescue.on_immobile(self, t)
+        st = self.state
+        if st in HURT:
+            self._set_cmd(0.0, 0.0)
+            self.goal, self.path = None, []
+            return True
+        if st == "repairing":
+            self.sim.rescue.repair_step(self, t, dt)
+            return self.state == "repairing"
+        if (st in ("exploring", "investigating", "observing") and h.needs_repair() and t - self.repair_go_t > 30.0
+                and not self.held):
+            self.repair_go_t = t
+            if self.obs is not None:
+                self.end_observing(t, "interrupted", quiet=True)
+            self.state = "exploring" if st == "observing" else st
+            self._go_home(t, "repair")
+        return False
+
+    def release_all(self, t: float, why: str, quiet: bool = False) -> None:
+        """Protocol v9: drop every task and claim (frontier, target, focus, survey, observation, operator trip, open
+        questions) so the fleet can take them over. why: "immobile" (out of action) or "rescue" (off to help)."""
+        if self.survey is not None:
+            self.end_survey(t, why)
+        if self.focus is not None:
+            self.end_focus(t, "battery" if why == "immobile" else "new command", quiet=True)
+        if self.obs is not None:
+            self.end_observing(t, "interrupted", quiet=True)
+        if why == "immobile":
+            self.fleet.rover_faulted(t, self)  # its frontier goes to the others (takeover note)
+        self._drop_target(t, None, retry_s=0.0)
+        self.op_goal = None
+        self.op_task = None
+        self.sticky_goal = None
+        self.dir_bias = None
+        self.pending_interest = None
+        self.goal, self.path = None, []
+        self.searches.clear()
+        self.pending_goal_key = None
+        self.rec_phase = None
+        self.dwell_until = None
+        self.pause_until = min(self.pause_until, t)
+        self.crawl_until = min(self.crawl_until, t)
+        self.vision.cam_goal = None
+        if why == "immobile":
+            self.held = False
+            if self.advisor is not None:
+                self.advisor.on_out_of_action(self, t)
+
+    def limit_now(self) -> float:
+        """The slope limit this rover plans with: the fleet's, its own (a damaged drive climbs less) and a
+        stricter one while towing (protocol v9)."""
+        lim = self.fleet.slope_limit
+        cap = self.health.effects()["slope_cap"]
+        if cap is not None:
+            lim = min(lim, cap)
+        if self.state == "towing":
+            from .rescue import TOW_SLOPE_MARGIN
+            lim = min(lim, self.fleet.slope_limit - TOW_SLOPE_MARGIN)
+        return lim
+
+    def _evade(self, t: float) -> bool:
+        """A creature charging: a LiDAR track closing fast and heading straight at us (the camera confirms it when
+        it sees one). Back away from it for a moment if the ground behind is safe. True while doing that."""
+        if self.state == "recovering" or (self.state not in DRIVING and self.state != "idle"):
+            return False
+        tr_ = self.fleet.tracker
+        if tr_.tracks and t >= self.evade_until - EVADE_S + 0.6:
+            for tr in tr_.near(self.x, self.y, CHARGE_RANGE, t):
+                sp = tr.speed
+                if sp < CHARGE_SPEED:
+                    continue
+                px, py = tr.predict(t)
+                dx, dy = self.x - px, self.y - py
+                d = math.hypot(dx, dy)
+                if d < 0.3:
+                    continue
+                closing = (tr.vx * dx + tr.vy * dy) / d
+                if closing < CHARGE_SPEED or closing < 0.85 * sp or d / closing > 4.0 or d > 6.5:
+                    continue                # not at us, or not soon (time to contact over 4 s)
+                self.evade_until = t + EVADE_S
+                self.evade_from = (px, py)
+                if t - self.charge_note_t > 8.0:
+                    self.charge_note_t = t
+                    cam = ""
+                    res = self.vision.fresh(t)
+                    if res is not None:
+                        seen = [o for o in res.objects if o["label"] == "creature"
+                                and math.hypot(o["x"] - px, o["y"] - py) < 2.5 + sp * 1.0]
+                        if seen:
+                            cam = f" Camera confirms a creature ({max(o['conf'] for o in seen):.2f})."
+                    self.fleet.log(t, "warn", f"{self.id} LiDAR track {tr.id} is coming straight at me ({closing:.1f} m/s, "
+                                              f"{d:.1f} m away).{cam} Backing away.", self.id, at=(px, py))
+                    self.mem.on_hazard("charge", t, (px, py), f"a creature charging at me ({closing:.1f} m/s)",
+                                       handled="backed away")
+                break
+        if t >= self.evade_until or self.evade_from is None:
+            return False
+        px, py = self.evade_from
+        bearing = wrap(math.atan2(py - self.y, px - self.x) - self.yaw)
+        v = -0.45 if abs(bearing) < math.pi / 2 else 0.5
+        sx = self.x + (1.2 if v > 0 else -1.2) * math.cos(self.yaw)
+        sy = self.y + (1.2 if v > 0 else -1.2) * math.sin(self.yaw)
+        if not self._safe_cell(sx, sy) or self.fleet.water_zone_at(sx, sy, margin=0.5) is not None:
+            v = 0.0                         # nowhere safe to go: brace
+        self._set_cmd(v, 0.0)
+        return True
 
     # ================================================================== state logic
     def _need_return(self, t: float) -> bool:
@@ -1113,16 +1305,16 @@ class Rover:
             self._say(t, f"{self.id}: {why}, giving up on ({gx:g}, {gy:g}) and returning to the lander.")
         self.op_goal = None
         self.sticky_goal = None
-        if reason in ("battery", "range"):
+        if reason in ("battery", "range", "repair"):
             self.pause_until = min(self.pause_until, t)     # no waiting around when the battery says go home
             self.crawl_until = min(self.crawl_until, t)
             self.pending_interest = None
         self._drop_target(t, "battery low" if reason in ("battery", "range") else None)
         self.state = "returning"
         self.return_reason = reason
-        if reason in ("battery", "range"):
+        if reason in ("battery", "range", "repair"):
             # protocol v7: waiting for the operator never outlasts the battery; a survey, a focus and any open
-            # question end here, with a chat line saying why
+            # question end here, with a chat line saying why (protocol v9: nor a repair)
             if self.survey is not None:
                 self.end_survey(t, "returning")
             if self.focus is not None:
@@ -1149,6 +1341,10 @@ class Rover:
                                       f"Heading toward the lander to find a way round.", self.id, at=here)
         elif reason == "cache":
             self.next_goal_try = t + 1.0
+        elif reason == "repair":
+            self.fleet.log(t, "warn", f"{self.id} health {self.health.hp()} ({self.health.short()}). Heading home for "
+                                      f"a repair at the lander.", self.id, at=here)
+            self._say(t, f"{self.id}: health {self.health.hp()} ({self.health.short()}), heading home for a repair.")
 
     def _drop_target(self, t: float, reason: str | None = None, retry_s: float = 20.0) -> None:
         if self.target_idx is not None:
@@ -1212,6 +1408,14 @@ class Rover:
             self.path = []
             self.goal = None
             self.fleet.cache_samples(t, self)
+            self.sim.rescue.deliver(self, t)             # protocol v9: salvaged parts become fleet spares
+            if self.return_reason == "repair" or self.health.status() != "ok":
+                self.state = "repairing"                 # protocol v9: repaired at the lander (charges too)
+                self.repair_t0 = t
+                self.repair_note = None
+                self.fleet.log(t, "info", f"{self.id} docked for a repair (health {self.health.hp()}: "
+                                          f"{self.health.short()}).", self.id, at=self.dock)
+                return True
             if self.return_reason == "cache" and self.battery >= 0.6 and not self.fleet.complete:
                 self.state = "exploring"
                 self.next_goal_try = t
@@ -2337,7 +2541,16 @@ class Rover:
         ax = self.x + 0.7 * math.cos(self.yaw)
         ay = self.y + 0.7 * math.sin(self.yaw)
         # only blame the slope if gravity alone would eat most of the motors' torque at this pitch
-        gravity_share = self.grav_torque * math.sin(math.radians(max(p_med, 0.0))) / (4.0 * self.cfg.motor_torque)
+        he = self.health.effects()
+        avail = 2.0 * self.cfg.motor_torque * (he["drive_l"] + he["drive_r"])     # protocol v9: a weak side
+        gravity_share = self.grav_torque * math.sin(math.radians(max(p_med, 0.0))) / avail
+        if he["slope_cap"] is not None and p_med >= 0.8 * p_max and not turning and gravity_share >= 0.8:
+            # a damaged drive: its own limit, not evidence about the fleet's (it does not lower the fleet limit)
+            f.map.mark_blocked(ax, ay, 0.5)
+            f.log(t, "info", f"{self.id} stalled on a {p_med:.0f} deg slope with its damaged drive (own slope limit "
+                             f"{he['slope_cap']:.0f} deg). Backing off and replanning.", self.id, at=here)
+            self._start_recovery(t, None)
+            return
         if p_med >= 12.0 and p_med >= 0.8 * p_max and not turning and gravity_share >= 0.8:
             # nose up on a steady slope with full power and no progress: the slope beat the motors.
             # The tilt (pitch and roll together) is the slope the planner's map measures.
@@ -2413,6 +2626,9 @@ class Rover:
             elif t - self.flip_since > self.cfg.flip_time_s:
                 self.flip_since = None
                 tilt = self.tilt
+                # protocol v9: tipping over knocks the mast (LiDAR, camera) and the antenna and deck
+                self.health.hit(t, [("lidar", 1.0), ("camera", 0.8), ("comms", 0.6), ("power", 0.4)], 30.0,
+                                "rollover")
                 self._hw_call(self.sim.reset_rover_upright, self)
                 self.read_pose()
                 self.mem.on_hazard("tipped", t, (self.x, self.y), f"tipping over (IMU tilt {tilt:.0f} deg)")
@@ -2440,7 +2656,7 @@ class Rover:
             return True
         if f._cost is None or t - f._cost_t > 0.6:
             f.cost(t)                       # keep the shared cost grid fresh for everyone's checks
-        b = f.blocked_ahead(t, self, f.slope_limit + self.plan_relax)
+        b = f.blocked_ahead(t, self, self.limit_now() + self.plan_relax)
         if b is not None:
             self.block_info = b
             x, y, dist, why = b
@@ -2557,12 +2773,16 @@ class Rover:
         e = wrap(math.atan2(c[1] - self.y, c[0] - self.x) - self.yaw)
         v_max = cfg.degraded_v_max if self.degraded else cfg.v_max
         w_max = 0.5 * cfg.w_max if self.degraded else cfg.w_max      # turn gently too when it cannot see far
+        v_max = min(v_max, cfg.v_max * self.health.effects()["v_cap"])  # protocol v9: a damaged rover drives slower
+        if self.state == "towing":
+            from .rescue import TOW_V, TOW_W
+            v_max, w_max = min(v_max, TOW_V), min(w_max, TOW_W)
         # Skid steer on a slope: a tight arc leaves the inner wheels with almost no speed target, so
         # only the outer pair pushes and the rover bogs down. On sloped ground make big corrections in
         # place and keep arcs wide enough that all four wheels drive forward.
         sloped = self.tilt > 7.0
         if abs(e) > (0.6 if sloped else 0.85):
-            v = 0.0
+            v = 0.12 if self.state == "towing" else 0.0      # protocol v9: towing turns in wide arcs, never pivots
             w = math.copysign(w_max, e)
         else:
             v = v_max * max(0.0, math.cos(e)) ** 2
@@ -2644,7 +2864,8 @@ class Rover:
         r = cfg.wheel_radius
         T = cfg.motor_torque
         Tb = 3.0 * T
-        if self.motor_fault:                 # controller offline: the parking brakes lock the wheels
+        if self.motor_fault or self.state in ("disabled", "wrecked"):
+            # controller offline, or out of action (protocol v9): the parking brakes lock the wheels
             for a in self.acts:
                 d.ctrl[a] = 0.0
                 m.actuator_forcerange[a] = (-Tb, Tb)
@@ -2652,23 +2873,43 @@ class Rover:
                 m.actuator_biasprm[a][2] = -BRAKE_KV
             self._brakes_locked = True
             return
-        if self._brakes_locked:
+        if self.state == "towed":            # protocol v9: drive clutches open, the wheels roll freely
             for a in self.acts:
-                m.actuator_gainprm[a][0] = cfg.motor_kv
-                m.actuator_biasprm[a][2] = -cfg.motor_kv
+                d.ctrl[a] = 0.0
+                m.actuator_forcerange[a] = (0.0, 0.0)
+                m.actuator_gainprm[a][0] = 0.0
+                m.actuator_biasprm[a][2] = 0.0
+            self._brakes_locked = True       # the gains are written again when it drives
+            return
+        e = self.health.effects()
+        fl, fr = e["drive_l"], e["drive_r"]
+        if self._brakes_locked or self._drive_mode != (fl, fr):
+            # protocol v9: a damaged drive side has a weaker servo (it lags, so the rover pulls that way)
+            for k, a in enumerate(self.acts):
+                f = fl if k < 2 else fr
+                kv = cfg.motor_kv if f >= 1.0 else cfg.motor_kv * (0.4 + 0.6 * f)
+                m.actuator_gainprm[a][0] = kv
+                m.actuator_biasprm[a][2] = -kv
             self._brakes_locked = False
+            self._drive_mode = (fl, fr)
         wl = (self.cmd_v - self.cmd_w * cfg.track_eff) / r
         wr = (self.cmd_v + self.cmd_w * cfg.track_eff) / r
         for k, a in enumerate(self.acts):
             wt = wl if k < 2 else wr
+            f = fl if k < 2 else fr
+            Tk, Tbk = T, Tb
+            if f < 1.0:                      # ... less torque and a lower top wheel speed
+                wm = cfg.max_wheel_speed * f
+                wt = max(-wm, min(wm, wt))
+                Tk, Tbk = T * f, Tb * max(f, 0.25)
             d.ctrl[a] = wt
             # motors drive with up to T, brakes and back driving resist with up to 3T
             if wt > 0.05:
-                m.actuator_forcerange[a] = (-Tb, T)
+                m.actuator_forcerange[a] = (-Tbk, Tk)
             elif wt < -0.05:
-                m.actuator_forcerange[a] = (-T, Tb)
+                m.actuator_forcerange[a] = (-Tk, Tbk)
             else:
-                m.actuator_forcerange[a] = (-Tb, Tb)
+                m.actuator_forcerange[a] = (-Tbk, Tbk)
 
     # ================================================================== protocol
     def sensors_msg(self) -> dict:
@@ -2695,7 +2936,7 @@ class Rover:
 
     def to_msg(self) -> dict:
         pts = []
-        if self.path and self.state not in ("charging", "idle", "fault"):
+        if self.path and self.state not in PARKED:
             rest = self.path[max(self.wp, 0):]
             pts = downsample([(self.x, self.y)] + rest, 30)
         msg = {
@@ -2715,6 +2956,7 @@ class Rover:
             "samples": [self.fleet.targets[k].spec.id for k in self.samples],
             "capacity": self.capacity,
             "stats": self.mem.stats(self),
+            "health": self.health.msg(),   # protocol v9
         }
         if self.focus is not None:
             msg["focus"] = self.focus_msg()

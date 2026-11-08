@@ -382,6 +382,17 @@ def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float, dust: float = 0.0) -> n
     return out
 
 
+def _sensor_noise(rgb: np.ndarray, sigma: float, seed: int) -> np.ndarray:
+    """Protocol v9: a damaged camera's picture: pixel noise (sigma in 0..255 units) and, when badly damaged, dead
+    rows. The onboard detector sees exactly this frame, so its confidence drops on its own."""
+    rng = np.random.default_rng(seed)
+    out = rgb.astype(np.int16) + rng.normal(0.0, sigma, rgb.shape).astype(np.int16)
+    if sigma > 25.0:
+        rows = rng.integers(0, rgb.shape[0], size=int(rgb.shape[0] * (sigma - 25.0) / 200.0) + 1)
+        out[rows] = out[rows] // 4
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def _linear_depth(raw: np.ndarray, near: float, far: float) -> np.ndarray:
     """Depth buffer (reverse Z, as mujoco.Renderer reads it) to metres along the view axis (float32 is
     plenty here: within 1e-5 relative of a float64 decode out to the far plane)."""
@@ -590,6 +601,8 @@ class GLRenderer:
                 g.snapshot(s.data)
                 t = float(s.data.time)
                 dust = _dust_level(s) if look else 0.0
+                hl = getattr(rover, "health", None)       # protocol v9: a damaged camera is noisy
+                noise = hl.effects()["camera_noise"] if (hl is not None and view == "fpv") else 0.0
             break
         else:
             raise RuntimeError("the model kept changing while rendering")
@@ -630,6 +643,8 @@ class GLRenderer:
         dep = _linear_depth(raw[::-1], spec.near, spec.far) if raw is not None else None
         if look:
             rgb = _haze(rgb, dep, spec.fovy, dust)
+        if noise > 0.5:
+            rgb = _sensor_noise(rgb, noise, num)
         return Frame(np.ascontiguousarray(rgb), dep if depth else None, spec, t, pos, yaw,
                      frame=num, view=view, rover=rover_id, dust=dust)
 

@@ -24,7 +24,7 @@ import re
 from .gemma import TOPICS
 from .memory import BANDS, compass
 from .terrain import KIND_LABEL
-PER_ROVER_TOPICS = ("battery", "location", "why", "status", "history")   # "everyone, report battery": each rover replies
+PER_ROVER_TOPICS = ("battery", "location", "why", "status", "history", "health")   # "everyone, report battery": each rover replies
 MAX_ANSWER_CHARS = 360
 KIND_SHORT = {"mineral": "mineral", "ice": "ice", "vent": "vent", "trace": "organic trace"}
 INSTRUMENT = {"drill": "drill", "scoop": "scoop", "sniffer": "gas sniffer", "swab": "swab"}
@@ -119,10 +119,38 @@ def _target_bits(rover, tidx):
     return ts, d, compass(ts.spec.x - rover.x, ts.spec.y - rover.y)
 
 
+def _rescue_rec(rover):
+    resc = getattr(rover.sim, "rescue", None)
+    if resc is None:
+        return None, None
+    return resc.active(rover.id), resc.by_helper(rover.id)
+
+
 def doing_text(rover) -> str:
     """What the rover is doing right now, first person, without a leading 'I'm'."""
     st, t = rover.state, rover.sim.t
     dd = math.hypot(rover.x - rover.dock[0], rover.y - rover.dock[1])
+    mine, helping = _rescue_rec(rover)
+    if st == "disabled":                  # protocol v9
+        who = (f"; {mine['helper']} is {'on its way' if mine['phase'] == 'en_route' else 'with me'}"
+               if mine is not None and mine.get("helper") else "")
+        return f"stuck at {_xy(rover.x, rover.y)}: I can't drive ({rover.health.short()}), waiting for help{who}"
+    if st == "towed":
+        return f"being towed to the lander by {mine['helper'] if mine and mine.get('helper') else 'another rover'}"
+    if st == "wrecked":
+        return f"out of action, left as a wreck at {_xy(rover.x, rover.y)}"
+    if st == "repairing":
+        return f"being repaired at the lander (health {rover.health.hp()})"
+    if st in ("rescuing", "towing") and helping is not None:
+        other = next((r for r in rover.sim.rovers if r.id == helping["rover"]), None)
+        d = math.hypot(other.x - rover.x, other.y - rover.y) if other is not None else 0.0
+        if st == "towing":
+            return f"towing {helping['rover']} to the lander, {math.hypot(rover.x, rover.y):.0f} m to go"
+        what = {"en_route": f"driving to help {helping['rover']}, {d:.0f} m away",
+                "diagnosing": f"looking {helping['rover']} over to see what is wrong",
+                "repairing": f"fixing {helping['rover']} in the field",
+                "salvaging": f"taking the working parts off {helping['rover']}"}
+        return what.get(helping["phase"], f"helping {helping['rover']}")
     if st == "fault":
         return "standing still: my motor controller is rebooting"
     if st == "charging":
@@ -155,7 +183,8 @@ def doing_text(rover) -> str:
     if st == "returning":
         why = {"battery": "to recharge", "range": "to recharge", "cache": "to cache my samples",
                "complete": "because exploration is complete", "operator": "as the operator asked",
-               "gemma": "to recharge early", "regroup": "to find a way around steep ground"}.get(
+               "gemma": "to recharge early", "regroup": "to find a way around steep ground",
+               "repair": "for a repair", "dock": "to my parking spot"}.get(
             rover.return_reason, "")
         return f"returning to the lander {why}, {dd:.0f} m to go".replace("  ", " ")
     # exploring
@@ -181,6 +210,18 @@ def doing_text(rover) -> str:
 def why_text(rover) -> str:
     """The reason for what it is doing (first person clause)."""
     st, t, cfg = rover.state, rover.sim.t, rover.cfg
+    if st in ("disabled", "towed", "wrecked", "repairing"):      # protocol v9
+        return {"disabled": f"my self test says: {rover.health.diagnosis()}",
+                "towed": "I can't drive, so another rover is taking me home for a repair",
+                "wrecked": "I was damaged beyond field repair and the fleet carries on without me",
+                "repairing": "the lander replaces broken parts with spares and services the rest"}[st]
+    if st in ("rescuing", "towing"):
+        _m, helping = _rescue_rec(rover)
+        if helping is not None:
+            return (f"{helping['rover']} can't drive and I was the best placed rover with enough battery to help"
+                    if st == "rescuing" else f"{helping['rover']} can't drive and the lander can repair it")
+    if rover.state in ("exploring", "returning") and rover.return_reason == "repair" and st == "returning":
+        return f"my health is {rover.health.hp()} ({rover.health.short()}), so I'm going home for a repair"
     need = rover.need_home * 100.0
     margin = rover.battery_margin * 100.0
     if st == "fault":
@@ -244,6 +285,11 @@ def why_text(rover) -> str:
 
 def _problem_now(rover):
     st, t = rover.state, rover.sim.t
+    hs = rover.health.status()
+    if st in ("disabled", "towed", "wrecked"):                   # protocol v9
+        return f"I can't drive: {rover.health.short()}"
+    if hs != "ok":
+        return f"my health is {rover.health.hp()} ({hs}: {rover.health.short()})"
     if st == "fault":
         return "my motor controller is offline (rebooting)"
     if st == "recovering" and rover.rec_phase == "sand":
@@ -296,7 +342,23 @@ def rover_sheet(rover) -> dict:
         "water": [dict(w) for w in mem.water[-3:]],
         "recent": [m for (_t, _lvl, m) in list(mem.events)[-3:]],
         "lidar": round(float(rover.lidar_eff), 1), "slope_limit": round(f.slope_limit),
+        "health": _health_bits(rover),                          # protocol v9
     }
+
+
+def _health_bits(rover) -> dict:
+    h = rover.health
+    mine, helping = _rescue_rec(rover)
+    resc = None
+    if mine is not None:
+        resc = (f"{mine['helper']} is helping me ({mine['phase'].replace('_', ' ')})" if mine.get("helper")
+                else "I've called for help and no rover is free yet")
+    elif helping is not None:
+        resc = f"I'm helping {helping['rover']} ({helping['phase'].replace('_', ' ')})"
+    lh = h.last_hit
+    return {"hp": h.hp(), "status": h.status(), "short": h.short(), "diagnosis": h.diagnosis(), "rescue": resc,
+            "last_hit": None if lh is None else f"{lh['cause']} at {lh['t']:.0f} s"
+            + (f" ({lh['shock_g']:.1f} g)" if lh.get("shock_g") else ""), "state": rover.state}
 
 
 def fleet_sheet(sim) -> dict:
@@ -341,6 +403,7 @@ def fleet_sheet(sim) -> dict:
         "explored_pct": round(f.map.explored_pct(), 1), "mapped": round(mapped), "map_m2": round(map_m2),
         "areas": _areas(sectors, bands), "driven": round(sum(r.odometer for r in sim.rovers)),
         "rovers": [{"id": r.id, "state": r.state, "battery": round(r.battery * 100.0), "doing": _third(doing_text(r)),
+                    "hp": r.health.hp(), "hstatus": r.health.status(), "short": r.health.short(),
                     "why": _third(why_text(r)), "x": round(r.x, 1), "y": round(r.y, 1), "where": _where(r.x, r.y),
                     "problem": _third(_problem_now(r) or "") or None, "hazards": r.mem.n_hazards}
                    for r in sim.rovers],
@@ -354,6 +417,8 @@ def fleet_sheet(sim) -> dict:
         "lifeforms": int(f.lifeforms_seen), "herds": len(f.lifeform_herds), "life": lives[-3:],
         "hazards": hazards[-5:], "n_hazards": sum(r.mem.n_hazards for r in sim.rovers),
         "slope_limit": round(f.slope_limit), "slope_initial": round(float(cfg.slope_limit_initial_deg)),
+        "spares": dict(getattr(f, "spares", {}) or {}), "wrecks": [dict(w) for w in getattr(f, "wrecks", [])],
+        "rescues": f.rescues_msg() if hasattr(f, "rescues_msg") else [],
     }
 
 
@@ -438,6 +503,7 @@ def fact_lines(sheet: dict, topic: str) -> list:
         "location": ["where", "doing"],
         "why": ["doing", "why", "battery"],
         "unknown": ["doing", "battery", "where", "mapped", "targets", "samples", "hazards", "life", "water"],
+        "health": ["health", "diagnosis", "rescue", "last_hit", "spares", "wrecks"],
     }.get(topic, ["doing", "battery", "where"])
     out = []
     for key in order:
@@ -502,6 +568,16 @@ def _rover_clauses(s: dict) -> dict:
     if s.get("recent"):
         c["recent"] = "latest log: " + s["recent"][-1]
     c["slope"] = f"the fleet's learned slope limit is {s['slope_limit']} deg"
+    hb = s.get("health")
+    if hb:                                                       # protocol v9
+        c["health"] = (f"my health is {hb['hp']} ({hb['status']})" + (f": {hb['short']}" if hb["status"] != "ok"
+                                                                       else ", all parts normal"))
+        if hb["status"] != "ok":
+            c["diagnosis"] = f"my self test says: {hb['diagnosis']}"
+        if hb.get("rescue"):
+            c["rescue"] = hb["rescue"]
+        if hb.get("last_hit"):
+            c["last_hit"] = f"my last hit: {hb['last_hit']}"
     return c
 
 
@@ -554,6 +630,17 @@ def _fleet_clauses(s: dict) -> dict:
     c["slope"] = (f"our slope limit is {s['slope_limit']} deg (we started at {s['slope_initial']} deg and learned it "
                   f"from stalls)" if s["slope_limit"] != s["slope_initial"] else
                   f"our slope limit is still {s['slope_limit']} deg")
+    if rov and "hp" in rov[0]:                                   # protocol v9
+        c["health"] = "health: " + "; ".join(f"{r['id']} {r['hp']} ({r['hstatus']}" + (f", {r['short']}" if
+                                             r["hstatus"] != "ok" else "") + ")" for r in rov)
+    if s.get("rescues"):
+        c["rescue"] = "rescues: " + "; ".join(
+            f"{x['helper'] or 'nobody yet'} for {x['rover']} ({x['phase'].replace('_', ' ')}"
+            + (f", {x['plan']}" if x.get("plan") else "") + ")" for x in s["rescues"])
+    if s.get("spares"):
+        c["spares"] = "spare parts at the lander: " + ", ".join(f"{k} {v}" for k, v in s["spares"].items())
+    if s.get("wrecks"):
+        c["wrecks"] = "wrecks: " + ", ".join(f"{w['rover']} at {_xy(w['x'], w['y'])}" for w in s["wrecks"])
     return c
 
 
@@ -636,6 +723,8 @@ def _rover_answer(s: dict, topic: str) -> str:
         return _sentences(c["where"], c["doing"])
     if topic == "why":
         return _sentences(c["doing"], f"Why: {s['why']}")
+    if topic == "health":                                        # protocol v9
+        return _sentences(c.get("health", ""), c.get("diagnosis", ""), c.get("rescue", ""))
     return _sentences("I can't answer that: I only know what my own sensors and memory recorded",
                       "Ask me about my status, exploration, finds, samples, battery, hazards, lifeforms, water, "
                       "position or why I'm going somewhere")
@@ -680,6 +769,8 @@ def _fleet_answer(s: dict, topic: str) -> str:
         return _sentences(c["water"])
     if topic == "location":
         return _sentences(c["where"])
+    if topic == "health":                                        # protocol v9
+        return _sentences(c.get("health", ""), c.get("rescue", ""), c.get("spares", ""), c.get("wrecks", ""))
     if topic == "why":
         return _sentences("Each rover picks its own goal", *(
             f"{r['id']} is {r['doing']}: {re.split(r' [(]|; |, with', r['why'])[0]}" for r in rov))

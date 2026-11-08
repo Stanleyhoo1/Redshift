@@ -85,10 +85,11 @@ function InlineQuestion({ m, req, answer, res, now }) {
             data-default={o.id === auto || undefined}
             data-suggested={o.suggested || undefined}
             data-place={nums[o.id] ? true : undefined}
-            disabled={pending}
+            data-unsafe={o.safe === false || undefined}
+            disabled={pending || o.safe === false}
             aria-busy={(pending && answer.option === o.id) || undefined}
             onClick={() => sendAnswer(req.id, o.id)}
-            title={o.suggested ? "Gemma's suggestion" : o.id === auto ? 'The safe default: taken if nobody answers' : nums[o.id] ? `Marker ${nums[o.id]} on the map` : undefined}
+            title={o.safe === false ? `Not safe by the rules${o.note ? `: ${o.note}` : ''}` : o.note ? `${o.suggested ? "Gemma's suggestion. " : ''}${o.note}` : o.suggested ? "Gemma's suggestion" : o.id === auto ? 'The safe default: taken if nobody answers' : nums[o.id] ? `Marker ${nums[o.id]} on the map` : undefined}
             {...placeChipProps(req, o, hover)}
           >
             {nums[o.id] && (
@@ -98,6 +99,7 @@ function InlineQuestion({ m, req, answer, res, now }) {
             )}
             {o.label}
             {o.suggested && <small className="msg-sugg">Gemma suggests</small>}
+            {o.safe === false && <small className="msg-unsafe">not safe</small>}
             {o.id === auto && <small>safe default</small>}
           </button>
         ))}
