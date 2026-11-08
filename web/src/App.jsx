@@ -10,6 +10,7 @@ import { RequestCards } from './components/RequestCards.jsx'
 import { FollowPill } from './components/FollowPill.jsx'
 import { CameraViewer } from './components/CameraViewer.jsx'
 import { SensorDetail } from './components/SensorDetail.jsx'
+import { SetupScreen } from './components/SetupScreen.jsx'
 import { startConnection, wsUrl } from './net/connection.js'
 import { appStore, simStore, useApp, useSim } from './state/store.js'
 import { stopPlacing } from './lib/placement.js'
@@ -109,6 +110,16 @@ export default function App() {
 
   useEffect(() => startConnection(), [])
 
+  // v7: while the sim waits for a launch, the setup screen is open and cannot be dismissed. The launched
+  // world's init (phase "running") closes it. An older sim never sends phase "setup".
+  const phase = useSim((s) => s.phase)
+  useEffect(() => {
+    const m = appStore.get().modal
+    const forcedOpen = m?.kind === 'setup' && !!m.forced
+    if (phase === 'setup' && !forcedOpen) appStore.patch({ modal: { kind: 'setup', forced: true } })
+    else if (phase !== 'setup' && forcedOpen) appStore.patch({ modal: null })
+  }, [phase])
+
   // After a reset the followed or selected rover may no longer exist.
   useEffect(() => {
     if (follow && !roverMeta.some((m) => m.id === follow)) {
@@ -177,6 +188,7 @@ export default function App() {
       <Sidebar follow={follow} selected={selected} onSelect={select} onFocusEvent={focusEvent} />
       {modal?.kind === 'camera' && <CameraViewer key={`cam:${modal.rover}`} roverId={modal.rover} view={modal.view} />}
       {modal?.kind === 'sensors' && <SensorDetail key={`sd:${modal.key}`} roverId={modal.rover} focus={modal.focus} />}
+      {modal?.kind === 'setup' && <SetupScreen key={modal.forced ? 'setup-forced' : 'setup'} forced={!!modal.forced} />}
     </div>
   )
 }

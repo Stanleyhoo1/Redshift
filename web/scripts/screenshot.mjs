@@ -30,6 +30,20 @@ page.on('console', (msg) => {
 })
 page.on('pageerror', (err) => problems.push(`[pageerror] ${err.message}`))
 
+// v7: a sim started with AUTO_LAUNCH=0 (the default) waits in its setup phase, and the setup screen would
+// cover the page. Launch it as built first (POST /api/launch {}), so the shots show the running dashboard.
+// An older sim has no GET /api/config (404) and a running one says "running": nothing to do then.
+try {
+  const r = await fetch(new URL('/api/config', url))
+  const cfg = r.ok ? await r.json() : null
+  if (cfg?.phase === 'setup') {
+    const res = await fetch(new URL('/api/launch', url), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    console.log(`the sim waited in its setup phase: POST /api/launch {} -> ${res.status}`)
+  }
+} catch {
+  // the sim cannot be asked (no proxy, older sim): take the shots as before
+}
+
 const t0 = Date.now()
 await page.goto(url, { waitUntil: 'domcontentloaded' })
 const shot = async (name) => {

@@ -1,0 +1,743 @@
+/* The setup screen (v7 launch settings). One loud thing: the gravity numeral, whose width, weight and
+   ink follow the gravity (gravityLook in lib/setup.js). Everything else stays quiet. */
+
+/* "New mission" (dismissible): a centred dialog over the dimmed dashboard. */
+.ix-modal.su {
+  --su-pad: 24px;
+  width: min(1240px, 96vw);
+  height: auto;
+  max-height: 94vh;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Forced (the sim waits for a launch): the whole window at every width, not a dialog. There is nothing to
+   see behind it yet. Hairlines run edge to edge; the content sits in a centred column at most 1240 px wide
+   (--su-gutter is the space on each side of that column, 0 below 1240 px). */
+.ix-backdrop:has(> .su-forced) {
+  place-items: stretch;
+  background: var(--void);
+}
+
+.ix-modal.su.su-forced {
+  --su-gutter: max(0px, (100vw - 1240px) / 2);
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: radial-gradient(120% 70% at 50% 0%, #0d1520, var(--void) 72%);
+  animation: ix-fade 200ms ease-out;
+}
+
+.su-forced > .su-head,
+.su-forced > .su-foot {
+  padding-left: calc(var(--su-pad) + var(--su-gutter));
+  padding-right: calc(var(--su-pad) + var(--su-gutter));
+}
+
+.su-forced > .su-body {
+  padding-left: var(--su-gutter);
+  padding-right: var(--su-gutter);
+}
+
+.su-forced > .su-body.su-state,
+.su-forced > .su-body.su-legacy {
+  max-width: none;
+  padding-left: calc(var(--su-pad) + var(--su-gutter));
+  padding-right: calc(var(--su-pad) + var(--su-gutter));
+}
+
+.su-forced > .su-body.su-legacy > * {
+  max-width: 512px;
+}
+
+.su-head {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 22px 24px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.su-titles {
+  min-width: 0;
+}
+
+.su-title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+  font-stretch: 108%;
+  line-height: 1.15;
+  letter-spacing: -0.005em;
+}
+
+.su-lede {
+  max-width: 64ch;
+  margin: 6px 0 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.su-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  grid-template-columns: minmax(320px, 5fr) minmax(0, 7fr);
+}
+
+.su-body.su-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 32px 24px;
+}
+
+.su-body.su-legacy {
+  display: block;
+  max-width: 560px;
+  padding: 20px 24px 24px;
+}
+
+.su-planet {
+  min-width: 0;
+  padding: 20px 24px 24px;
+  border-right: 1px solid var(--line);
+}
+
+.su-rest {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+  padding: 20px 24px 24px;
+}
+
+.su-trio {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 6px 24px;
+}
+
+.su-sec {
+  min-width: 0;
+}
+
+.su-sec-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.su-sec-title {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--ink-2);
+}
+
+.su-sec-head .su-sec-title {
+  margin: 0;
+}
+
+.su-field {
+  margin-bottom: 14px;
+}
+
+.su-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.su-label {
+  font-size: 14px;
+  font-weight: 560;
+  color: var(--ink);
+}
+
+.su-value {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.su-help {
+  max-width: 60ch;
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-3);
+}
+
+.su-help-bad,
+.su-error {
+  color: #ff9f94;
+}
+
+.su-error {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.su-note {
+  margin: 16px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.su-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- range: a thin track filled in signal cyan up to the thumb ---- */
+
+.su-range {
+  --fill: 50%;
+  display: block;
+  width: 100%;
+  height: 22px;
+  margin: 6px 0 0;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.su-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--signal) var(--fill), var(--line-2) var(--fill));
+}
+
+.su-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border: 2px solid var(--void);
+  border-radius: 50%;
+  background: var(--ink);
+  box-shadow: 0 0 0 1px var(--line-2);
+}
+
+.su-range::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line-2);
+}
+
+.su-range::-moz-range-progress {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--signal);
+}
+
+.su-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--void);
+  border-radius: 50%;
+  background: var(--ink);
+}
+
+.su-range:focus-visible {
+  outline: none;
+}
+
+.su-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px var(--signal);
+}
+
+.su-range:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 2px var(--signal);
+}
+
+/* ---- gravity: the numeral is the hero ---- */
+
+.su-g-read {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  min-height: 112px;
+}
+
+.su-g-num {
+  font-size: clamp(76px, 8.4vw, 116px);
+  line-height: 0.86;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  transition:
+    font-stretch 260ms ease-out,
+    font-weight 260ms ease-out,
+    color 260ms ease-out;
+}
+
+.su-g-unit {
+  padding-bottom: 6px;
+  font-size: 28px;
+  font-weight: 500;
+  color: var(--ink-2);
+}
+
+.su-g-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  margin-left: auto;
+  padding-bottom: 8px;
+}
+
+.su-g-name {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.su-g-ms {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+
+.su-g-ms sup {
+  font-size: 0.7em;
+}
+
+.su-range-g {
+  margin-top: 14px;
+}
+
+.su-presets {
+  margin-top: 12px;
+  padding: 0;
+}
+
+.su-preset-g {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+/* ---- the slope figure ---- */
+
+.su-fig {
+  margin: 18px 0 0;
+}
+
+.su-fig svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 180px;
+  overflow: visible;
+}
+
+.su-fig-wedge {
+  fill: rgba(79, 224, 239, 0.1);
+}
+
+.su-fig-ground {
+  fill: none;
+  stroke: var(--line-2);
+  stroke-width: 1.5;
+}
+
+.su-fig-arc {
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1;
+}
+
+.su-fig-climb {
+  fill: none;
+  stroke: var(--signal);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.su-fig-tow {
+  fill: none;
+  stroke: var(--amber);
+  stroke-width: 1.6;
+  stroke-dasharray: 5 4;
+}
+
+.su-fig-rover rect {
+  fill: var(--ink);
+}
+
+.su-fig-rover circle {
+  fill: var(--void);
+  stroke: var(--ink);
+  stroke-width: 1.4;
+}
+
+.su-fig text {
+  font: 600 12px var(--font);
+  font-variant-numeric: tabular-nums;
+  fill: var(--ink);
+}
+
+.su-fig .su-fig-tow-label {
+  fill: var(--amber);
+}
+
+.su-fig-cap {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.su-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.su-key::before {
+  content: '';
+  flex: none;
+  width: 18px;
+  border-top: 2px solid var(--signal);
+}
+
+.su-key-tow::before {
+  border-top: 2px dashed var(--amber);
+}
+
+.su-fig-note {
+  margin-top: 4px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-3);
+}
+
+/* ---- seed ---- */
+
+.su-seed {
+  margin-top: 22px;
+}
+
+.su-seed-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.su-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.su-input:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}
+
+.su-input[aria-invalid='true'] {
+  border-color: #ff9f94;
+}
+
+/* ---- rovers: a stepper and one pip per rover ---- */
+
+.su-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.su-step {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: none;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.su-step:hover:not(:disabled) {
+  border-color: var(--ink-3);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.su-step:disabled {
+  color: var(--ink-3);
+  opacity: 0.5;
+  cursor: default;
+}
+
+.su-step svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+
+.su-count {
+  min-width: 2ch;
+  font-size: 22px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.su-pips {
+  display: flex;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.su-pips span {
+  flex: 1 1 0;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line-2);
+}
+
+.su-pips span.on {
+  background: var(--signal);
+}
+
+.su-toggle {
+  padding: 6px 0;
+}
+
+.su-seg {
+  padding: 0;
+}
+
+/* ---- features: hairline rows, a square mark that fills when on ---- */
+
+.su-count-text {
+  margin-right: auto;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+
+.su-link {
+  padding: 2px 4px;
+  border: 0;
+  background: none;
+  color: var(--signal);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.su-link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.su-link:disabled {
+  color: var(--ink-3);
+  cursor: default;
+}
+
+.su-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  column-gap: 24px;
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.su-tile {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  column-gap: 10px;
+  row-gap: 2px;
+  align-items: center;
+  /* a row next to a taller one keeps its name and help together at the top */
+  align-content: start;
+  padding: 9px 4px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.su-tile:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.su-tile-mark {
+  grid-row: 1;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--ink-3);
+  border-radius: 3px;
+}
+
+.su-tile-name {
+  grid-column: 2;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.su-tile-help {
+  grid-column: 2;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--ink-3);
+}
+
+.su-tile[aria-pressed='true'] .su-tile-mark {
+  border-color: var(--signal);
+  background: var(--signal);
+}
+
+.su-tile[aria-pressed='true'] .su-tile-name {
+  color: var(--ink);
+}
+
+/* ---- footer: what lands where, and Launch ---- */
+
+.su-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--line);
+}
+
+.su-foot-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  margin-right: auto;
+}
+
+.su-summary {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--ink-2);
+}
+
+.su-launch {
+  flex: none;
+  padding: 11px 30px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--signal);
+  color: var(--void);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.su-launch:hover:not(:disabled) {
+  background: #7aeaf5;
+}
+
+.su-launch:disabled {
+  background: var(--line-2);
+  color: var(--ink-3);
+  cursor: default;
+}
+
+.su-launch:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+@media (max-width: 860px) {
+  .ix-modal.su {
+    --su-pad: 16px;
+    width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    border: 0;
+    border-radius: 0;
+  }
+  .su-head {
+    padding: 16px 16px 12px;
+  }
+  .su-title {
+    font-size: 21px;
+  }
+  .su-body {
+    display: block;
+  }
+  .su-planet {
+    padding: 16px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  /* the numeral is at its smallest here: no empty band above it */
+  .su-g-read {
+    min-height: 0;
+    margin-top: 8px;
+  }
+  .su-rest {
+    padding: 16px;
+  }
+  .su-body.su-state,
+  .su-body.su-legacy {
+    padding: 20px 16px;
+  }
+  .su-tiles {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .su-foot {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 12px 16px;
+  }
+  .su-foot-text {
+    flex: 1 1 100%;
+  }
+  .su-launch {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .su-g-num {
+    transition: none;
+  }
+  .ix-modal.su.su-forced {
+    animation: none;
+  }
+}
