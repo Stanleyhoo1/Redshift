@@ -97,15 +97,14 @@ def _canyon(ter, h: np.ndarray, reach0: np.ndarray):
         total = float(s[-1])
         # centreline ground, smoothed along the path (window about 16 m)
         hc = np.array([ter.height_at(float(x), float(y)) for x, y in zip(px, py)])
-        win = 33
+        win = 61
         pad = np.pad(hc, win // 2, mode="edge")
         g = np.convolve(pad, np.ones(win) / win, mode="valid")
-        gs = np.abs(np.gradient(g, 0.5))
         budget = math.tan(math.radians(lim - 1.5))
         ramp_len = None
-        for L in np.arange(18.0, 0.4 * total, 1.0):
-            gmax = max(float(gs[s <= L].max()), float(gs[s >= total - L].max()))
-            if depth / L + gmax <= budget:
+        for L in np.arange(18.0, 0.45 * total, 1.0):
+            fs = np.abs(np.gradient(g - depth * np.clip(np.minimum(s, total - s) / L, 0.0, 1.0), 0.5))
+            if max(float(fs[s <= L + 1.0].max()), float(fs[s >= total - L - 1.0].max())) <= budget:
                 ramp_len = float(L)
                 break
         if ramp_len is None:
