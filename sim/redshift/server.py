@@ -10,6 +10,11 @@ starts and loads the model in the background (about 40 s the first time), so it 
 rovers need it. POST /api/chat and POST /api/answer go to sim.advisor (advisor.py). A reset cancels
 questions still queued for Gemma about the old world.
 
+Version 7: with AUTO_LAUNCH=0 (the default) the server builds the world from its env vars and waits in the
+setup phase (frozen at t = 0; hazards, chat and answers get 409) until POST /api/launch, which may change any
+launch setting first (GET /api/config lists them). POST /api/reset and every launch build the new world
+before stopping the old one, so a failed build leaves the old world running.
+
     uvicorn redshift.server:app --port 8000           (what Docker runs)
     python -m redshift.server [--viewer] [--port 8000] (native run, optional MuJoCo viewer)
 """
@@ -31,7 +36,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from .config import Config
+from .config import PRESETS, SETTINGS, Config, physics_table
 from .gemma import close_planner, get_planner
 from .hazards import TYPES as HAZARD_TYPES
 from .hazards import HazardError
@@ -49,6 +54,15 @@ def _auto_reset_s() -> float:
 
 
 AUTO_RESET_S = _auto_reset_s()
+NOT_LAUNCHED = "The mission has not launched yet."
+
+
+def launch_at_start() -> bool:
+    """AUTO_LAUNCH=1 (or the AUTO_RESET_S demo loop) starts the mission when the server starts. Otherwise
+    the server builds the world and waits in the setup phase for POST /api/launch (v7)."""
+    return os.environ.get("AUTO_LAUNCH", "0").strip().lower() in ("1", "true", "yes", "on") or AUTO_RESET_S > 0
+
+
 CLIENT_QUEUE_MAX = 40          # about 8 s of ticks; a client further behind than that gets a fresh init
 MAX_DEBT_S = 2.0               # if the sim falls this far behind real time, stop trying to catch up
 
@@ -92,6 +106,7 @@ class SimRunner:
         self._thread: threading.Thread | None = None
         self.speed = 0.0               # measured sim seconds per wall second
         self.errors = 0
+        self.started = False           # v7: False while the world waits in the setup phase
 
     @contextmanager
     def locked(self):
@@ -118,6 +133,7 @@ class SimRunner:
         return camera.render_jpeg(self.sim, rover_id, "fpv", 320, 240, runner=self)
 
     def start(self) -> None:
+        self.started = True
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="redshift-sim", daemon=True)
         self._thread.start()
@@ -203,6 +219,9 @@ class AppState:
         self.clients: set = set()
         self.reset_lock: asyncio.Lock | None = None
         self.broadcaster: asyncio.Task | None = None
+        # v7: "setup" while the world is built but frozen until POST /api/launch (only the lifespan sets
+        # it; without one, as in the tests, the server behaves as before)
+        self.phase = "running"
 
 
 state = AppState()
@@ -211,7 +230,18 @@ state = AppState()
 def build_init_text() -> str:
     with state.runner.locked() as sim:
         msg = sim.init_message()
+        msg["phase"] = state.phase           # v7, server-level fields: not in Simulation.init_message
+        msg["config"] = sim.cfg.settings()
     return dumps(msg)
+
+
+def _describe(cfg: Config) -> str:
+    return (f"seed {cfg.seed}, {cfg.num_rovers} rovers, {cfg.gravity_g:g} g, map {cfg.map_size:g} m, "
+            f"{cfg.sim_speed:g}x real time")
+
+
+def _bad(error: str, status: int = 400, **extra) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": error, **extra}, status_code=status)
 
 
 async def broadcast_loop() -> None:
@@ -243,23 +273,59 @@ async def broadcast_loop() -> None:
             _log("broadcast failed:\n" + traceback.format_exc())
 
 
-async def restart_sim(seed: int) -> None:
-    """Stop the current sim, start a fresh one with this seed and re-init every client."""
-    async with state.reset_lock:
-        old = state.runner
-        cfg = (old.cfg if old is not None else Config.from_env()).with_seed(seed)
-        if old is not None:
-            await asyncio.to_thread(old.stop)
-        if state.planner is not None:
-            state.planner.cancel()     # drop questions about the old world
-        new = await asyncio.to_thread(SimRunner, cfg)
-        # swap and re-init every client in one go (no await), so nobody sees the new sim's ticks first
-        state.runner = new
-        new.start()
-        init = build_init_text()
-        for c in list(state.clients):
-            c.restart_with(init)
-    _log(f"reset: seed {seed}")
+def _reset_lock() -> asyncio.Lock:
+    """Serialises restarts and launches (made here on first use when no lifespan ran, as in the tests)."""
+    if state.reset_lock is None:
+        state.reset_lock = asyncio.Lock()
+    return state.reset_lock
+
+
+def _reinit_clients() -> None:
+    """Send every client a fresh init (no await in here, so no tick of the new world arrives first)."""
+    init = build_init_text()
+    for c in list(state.clients):
+        c.restart_with(init)
+
+
+async def _restart(cfg: Config) -> None:
+    """Build a world from cfg, then stop the old one, start the new one and re-init every client. The caller
+    holds the reset lock. The new world is built first: if that fails (the exception propagates) the old
+    world is untouched and keeps running. Order after the build, as before v7: stop the old world, THEN
+    cancel. old.stop() joins the old sim thread and its advisor worker, which submit to the shared planner
+    outside the sim lock; cancelling earlier would let a question they send in that window take Gemma's one
+    slot ahead of the new world's first questions. The new world submits nothing until it steps."""
+    new = await asyncio.to_thread(SimRunner, cfg)
+    old = state.runner
+    if old is not None:
+        await asyncio.to_thread(old.stop)
+    if state.planner is not None:
+        state.planner.cancel()         # drop questions about the old world (nothing of it runs any more)
+    # swap and re-init every client in one go (no await), so nobody sees the new sim's ticks first
+    state.runner = new
+    state.phase = "running"
+    new.start()
+    _reinit_clients()
+    _log(f"new world: {_describe(cfg)}")
+
+
+async def restart_sim(cfg: Config) -> None:
+    """Replace the current world with a fresh one built from cfg, running at once."""
+    async with _reset_lock():
+        await _restart(cfg)
+
+
+async def launch_sim(cfg: Config) -> None:
+    """Start the mission: the built world itself if cfg is what it was built with and it never ran,
+    otherwise a new world built from cfg."""
+    async with _reset_lock():
+        runner = state.runner
+        if runner is not None and not runner.started and runner.cfg == cfg:
+            state.phase = "running"
+            runner.start()
+            _reinit_clients()
+            _log(f"launch: {_describe(cfg)}")
+            return
+        await _restart(cfg)
 
 
 async def auto_reset_loop() -> None:
@@ -285,7 +351,7 @@ async def auto_reset_loop() -> None:
             elif now - done_since >= AUTO_RESET_S:
                 seed = random.randint(1, 99999)
                 _log(f"exploration finished, landing on a new planet (seed {seed})")
-                await restart_sim(seed)
+                await restart_sim(runner.cfg.with_seed(seed))
         except Exception:
             _log("auto reset failed:\n" + traceback.format_exc())
 
@@ -317,9 +383,14 @@ async def lifespan(app: FastAPI):
     _log(f"gemma planner: {st['state']}, model {st['requested_model']} via {st['backend']} {st['url']} "
          f"(budget {st['budget_ms']:.0f} ms per call)")
     state.runner = await asyncio.to_thread(SimRunner, cfg)
-    state.runner.start()
-    _log(f"simulation running: seed {cfg.seed}, {cfg.num_rovers} rovers, {cfg.gravity_g:g} g, "
-         f"map {cfg.map_size:g} m, {cfg.sim_speed:g}x real time")
+    if launch_at_start():
+        state.phase = "running"
+        state.runner.start()
+        _log(f"simulation running: {_describe(cfg)}")
+    else:   # v7: the world is built and waits (frozen at t = 0) for POST /api/launch from the setup screen
+        state.phase = "setup"
+        _log(f"world built, waiting for launch (POST /api/launch, or AUTO_LAUNCH=1 to start at once): "
+             f"{_describe(cfg)}")
     watch = asyncio.create_task(planner_watch())
     state.broadcaster = asyncio.create_task(broadcast_loop())
     auto = asyncio.create_task(auto_reset_loop()) if AUTO_RESET_S > 0 else None
@@ -355,8 +426,9 @@ except Exception as _e:  # noqa: BLE001
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("Redshift sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, "
-                             "/api/hazard, /api/chat, /api/answer, /api/camera/{rover_id}.jpg.\n")
+    return PlainTextResponse("Redshift sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/config, "
+                             "/api/launch, /api/reset, /api/hazard, /api/chat, /api/answer, "
+                             "/api/camera/{rover_id}.jpg.\n")
 
 
 @app.get("/api/health")
@@ -373,22 +445,71 @@ async def truth():
     return Response(content=text, media_type="application/json", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/config")
+async def get_config():
+    """v7 launch settings for the setup screen: the settings of the world the server holds (current), what
+    the env vars give (defaults), the settings table (fields), presets, and the predicted climb and tow
+    limits per gravity step (physics)."""
+    defaults = Config.from_env()
+    runner = state.runner
+    cfg = runner.cfg if runner is not None else defaults
+    return {"ok": True, "phase": state.phase, "current": cfg.settings(), "defaults": defaults.settings(),
+            "fields": [s.to_json() for s in SETTINGS], "presets": PRESETS, "physics": physics_table(cfg)}
+
+
 @app.post("/api/reset")
 async def reset(request: Request):
+    """Restart now and run (also from the setup phase): {"seed": 7} as before, plus any launch setting (v7).
+    Keys left out keep the current world's settings. The new world is built before the old one stops."""
     body = (await request.body()).strip()
-    seed = state.runner.cfg.seed if state.runner is not None else Config.from_env().seed
+    runner = state.runner
+    base = runner.cfg if runner is not None else Config.from_env()
+    data = {}
     if body:
         try:
             data = json.loads(body)
         except ValueError:
-            return JSONResponse({"ok": False, "error": 'Body must be JSON like {"seed": 7}'}, status_code=400)
-        if isinstance(data, dict) and data.get("seed") is not None:
-            try:
-                seed = int(data["seed"])
-            except (TypeError, ValueError):
-                return JSONResponse({"ok": False, "error": "seed must be an integer"}, status_code=400)
-    await restart_sim(seed)
-    return {"ok": True, "seed": seed}
+            return _bad('Body must be JSON like {"seed": 7}')
+        data = dict(data) if isinstance(data, dict) else {}       # anything else was ignored before v7
+    if data.get("seed") is None:
+        data.pop("seed", None)
+    else:
+        try:
+            data["seed"] = int(data["seed"])                       # as before: "8" and 7.9 are accepted
+        except (TypeError, ValueError, OverflowError):
+            return _bad("seed must be an integer")
+    cfg, errors = Config.from_settings(base, data)
+    if errors:
+        return _bad("; ".join(errors), errors=errors)
+    try:
+        await restart_sim(cfg)
+    except Exception as e:  # noqa: BLE001 (the old world keeps running)
+        _log("reset failed:\n" + traceback.format_exc())
+        return _bad(f"Could not build the new world: {e}", 500)
+    return {"ok": True, "seed": cfg.seed, "config": cfg.settings()}
+
+
+@app.post("/api/launch")
+async def launch(request: Request):
+    """v7: start the mission with these launch settings, e.g. {"gravity_g": 1.0, "num_rovers": 4}. Keys left
+    out keep the built world's values; {} launches the world as built. While running it starts a new mission."""
+    runner = state.runner
+    if runner is None:
+        return _bad("simulation not running", 503)
+    body = (await request.body()).strip()
+    try:
+        data = json.loads(body) if body else {}
+    except ValueError:
+        return _bad('Body must be JSON like {"gravity_g": 1.5, "num_rovers": 4}')
+    cfg, errors = Config.from_settings(runner.cfg, data)
+    if errors:
+        return _bad("; ".join(errors), errors=errors)
+    try:
+        await launch_sim(cfg)
+    except Exception as e:  # noqa: BLE001 (the current world keeps running)
+        _log("launch failed:\n" + traceback.format_exc())
+        return _bad(f"Could not build the new world: {e}", 500)
+    return {"ok": True, "phase": state.phase, "config": state.runner.cfg.settings()}
 
 
 @app.post("/api/hazard")
@@ -400,6 +521,8 @@ async def hazard(request: Request):
     runner = state.runner
     if runner is None:
         return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    if state.phase == "setup":
+        return _bad(NOT_LAUNCHED, 409)
     body = (await request.body()).strip()
     try:
         data = json.loads(body) if body else {}
@@ -451,6 +574,8 @@ async def chat(request: Request):
     runner = state.runner
     if runner is None:
         return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    if state.phase == "setup":
+        return _bad(NOT_LAUNCHED, 409)
     data = await _json_body(request)
     if data is None:
         return JSONResponse({"ok": False, "error": 'Body must be JSON like {"text": "rover 2 explore north"}'},
@@ -476,6 +601,8 @@ async def answer(request: Request):
     runner = state.runner
     if runner is None:
         return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    if state.phase == "setup":
+        return _bad(NOT_LAUNCHED, 409)
     data = await _json_body(request)
     if data is None or not isinstance(data.get("id"), str) or not isinstance(data.get("option"), str):
         return JSONResponse({"ok": False, "error": 'Body must be JSON like {"id": "q3", "option": "reroute"}'},

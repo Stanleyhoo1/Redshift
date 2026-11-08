@@ -444,3 +444,265 @@ def test_advisor_sends_the_configured_gravity():
             assert "planet (gravity 1 g," in system and "gravity 2 g" not in system, kind
         else:
             assert "a planet" in system and "super-Earth" not in system, kind
+
+
+# ====================================================================== server: setup phase and endpoints
+from redshift import server  # noqa: E402
+
+
+class Req:
+    """Stands in for a FastAPI Request: the endpoints only read the body."""
+
+    def __init__(self, body=None):
+        if body is None:
+            self._b = b""
+        elif isinstance(body, bytes):
+            self._b = body
+        else:
+            self._b = json.dumps(body).encode()
+
+    async def body(self):
+        return self._b
+
+
+def call(endpoint, *args):
+    """Run one endpoint coroutine. Returns (HTTP status, JSON body)."""
+    out = asyncio.run(endpoint(*args))
+    if hasattr(out, "status_code"):
+        return out.status_code, json.loads(out.body)
+    return 200, json.loads(json.dumps(out))
+
+
+class FakeClient:
+    """Keeps what the server queued for one WebSocket client."""
+
+    def __init__(self):
+        self.sent = []
+
+    def restart_with(self, text):
+        self.sent = [text]
+
+    def send_later(self, text):
+        self.sent.append(text)
+        return True
+
+    def init(self):
+        return json.loads(self.sent[0]) if self.sent else None
+
+
+@pytest.fixture
+def setup_phase(monkeypatch):
+    """The server as AUTO_LAUNCH=0 leaves it: a small world built but not started, phase "setup"."""
+    runner = server.SimRunner(Config(seed=42, **SMALL))
+    client = FakeClient()
+    monkeypatch.setattr(server.state, "runner", runner)
+    monkeypatch.setattr(server.state, "phase", "setup")
+    monkeypatch.setattr(server.state, "clients", {client})
+    monkeypatch.setattr(server.state, "reset_lock", None)
+    monkeypatch.setattr(server.state, "planner", None)
+    yield runner, client
+    current = server.state.runner
+    if current is not None and current is not runner:
+        current.stop()
+    runner.stop()
+
+
+def test_init_carries_phase_and_config(setup_phase):
+    runner, _ = setup_phase
+    msg = json.loads(server.build_init_text())
+    assert msg["type"] == "init" and msg["phase"] == "setup" and msg["config"] == runner.cfg.settings()
+    plain = runner.sim.init_message()
+    assert "phase" not in plain and "config" not in plain           # test_smoke pins init_message's keys
+    assert server.AppState().phase == "running"                      # no lifespan (tests): running, as before
+    assert runner.started is False
+
+
+def test_launch_at_start(monkeypatch):
+    monkeypatch.setattr(server, "AUTO_RESET_S", 0.0)
+    monkeypatch.delenv("AUTO_LAUNCH", raising=False)
+    assert server.launch_at_start() is False
+    for value in ("1", "true", "yes", "on", " ON "):
+        monkeypatch.setenv("AUTO_LAUNCH", value)
+        assert server.launch_at_start() is True, value
+    monkeypatch.setenv("AUTO_LAUNCH", "0")
+    assert server.launch_at_start() is False
+    monkeypatch.setattr(server, "AUTO_RESET_S", 60.0)                # the unattended demo loop starts at once
+    assert server.launch_at_start() is True
+
+
+def test_reset_with_a_seed_restarts_and_runs(setup_phase):
+    runner, client = setup_phase
+    code, body = call(server.reset, Req({"seed": 7}))
+    new = server.state.runner
+    assert code == 200 and body == {"ok": True, "seed": 7, "config": new.cfg.settings()}, body
+    assert new is not runner and new.started and server.state.phase == "running"
+    assert new.cfg == runner.cfg.with_seed(7)                          # only the seed changed
+    assert runner._stop.is_set()                                       # the old world was stopped
+    init = client.init()
+    assert init["world"]["seed"] == 7 and init["phase"] == "running" and init["config"]["seed"] == 7
+    # as before v7: a numeric string, a float, an empty body (same seed) and a body that is not an object
+    assert call(server.reset, Req({"seed": "8"}))[1]["seed"] == 8
+    assert call(server.reset, Req({"seed": 9.7}))[1]["seed"] == 9
+    assert call(server.reset, Req())[1]["seed"] == 9
+    assert call(server.reset, Req([1, 2]))[1]["seed"] == 9
+    # v7: launch settings ride along; keys left out keep the current world's values
+    code, body = call(server.reset, Req({"seed": 10, "gravity_g": 1.5}))
+    assert code == 200 and server.state.runner.cfg.gravity_g == 1.5 and server.state.runner.cfg.map_size == 60.0
+
+
+def test_reset_refuses_bad_input_and_keeps_the_world(setup_phase):
+    runner, _ = setup_phase
+    for body, part in (({"seed": -1}, "seed must be between 0 and 2147483647"),
+                       ({"seed": "abc"}, "seed must be an integer"),
+                       ({"seed": 7, "map_size": 65}, "map_size must be in steps of 10 m"),
+                       ({"gravity_g": "heavy"}, "gravity_g must be a number"),
+                       (b"{not json", 'Body must be JSON like {"seed": 7}')):
+        code, out = call(server.reset, Req(body))
+        assert code == 400 and out["ok"] is False and part in out["error"], (body, out)
+    assert server.state.runner is runner and server.state.phase == "setup" and not runner.started
+
+
+def test_a_failed_build_keeps_the_old_world(setup_phase, monkeypatch):
+    runner, _ = setup_phase
+
+    def broken(cfg, planner=None):
+        raise RuntimeError("out of memory for this map")
+
+    monkeypatch.setattr(server, "SimRunner", broken)
+    code, out = call(server.reset, Req({"seed": 5}))
+    assert code == 500 and out["error"] == "Could not build the new world: out of memory for this map", out
+    assert server.state.runner is runner and server.state.phase == "setup"
+    assert not runner._stop.is_set()                                   # never stopped
+
+
+def test_a_reset_cancels_gemma_after_the_old_world_stopped(setup_phase, monkeypatch):
+    """The old world's sim thread and advisor worker may still submit until old.stop() joins them, so the
+    shared planner's queue is cleared only after that (as before v7)."""
+    runner, _ = setup_phase
+    p = _planner(g.FakeBackend(latency_s=0.0))
+    order = []
+    stop, cancel = runner.stop, p.cancel
+    monkeypatch.setattr(runner, "stop", lambda *a, **k: (order.append("stop"), stop(*a, **k))[1])
+    monkeypatch.setattr(p, "cancel", lambda *a, **k: (order.append("cancel"), cancel(*a, **k))[1])
+    monkeypatch.setattr(server.state, "planner", p)
+    try:
+        assert call(server.reset, Req({"seed": 7}))[0] == 200
+        assert order == ["stop", "cancel"], order
+    finally:
+        server.state.runner.stop()        # the new world uses p: stop it before p closes
+        p.close()
+
+
+def test_get_config(setup_phase, monkeypatch):
+    runner, _ = setup_phase
+    _clear_env(monkeypatch)
+    code, body = call(server.get_config)
+    assert code == 200 and body["ok"] is True and body["phase"] == "setup"
+    assert set(body) == {"ok", "phase", "current", "defaults", "fields", "presets", "physics"}
+    assert body["current"] == runner.cfg.settings() and body["current"]["map_size"] == 60
+    assert body["defaults"] == Config.from_env().settings() and body["defaults"]["mesas"] is True
+    assert [f["key"] for f in body["fields"]] == list(SETTING_KEYS)
+    assert body["fields"][0] == SETTINGS_BY_KEY["gravity_g"].to_json()
+    assert body["presets"] == PRESETS
+    assert len(body["physics"]) == 26 and body["physics"] == C.physics_table(runner.cfg)
+
+
+def test_launch_from_setup_starts_the_built_world(setup_phase):
+    runner, client = setup_phase
+    code, body = call(server.launch, Req({"gravity_g": 2.0, "map_size": 60}))     # the values it was built with
+    assert code == 200 and body == {"ok": True, "phase": "running", "config": runner.cfg.settings()}, body
+    assert server.state.runner is runner and runner.started and server.state.phase == "running"
+    init = client.init()
+    assert init["phase"] == "running" and init["config"] == runner.cfg.settings()
+    t0, end = runner.sim.t, time.perf_counter() + 5.0
+    while runner.sim.t <= t0 and runner.errors == 0 and time.perf_counter() < end:
+        time.sleep(0.05)
+    assert runner.sim.t > t0                                            # the world moves now
+
+
+def test_launch_with_changed_settings_builds_a_new_world(setup_phase):
+    runner, client = setup_phase
+    code, body = call(server.launch, Req({"gravity_g": 1.0, "num_rovers": 4}))
+    new = server.state.runner
+    assert code == 200 and body["config"]["gravity_g"] == 1.0 and body["config"]["num_rovers"] == 4, body
+    assert new is not runner and new.started and runner._stop.is_set() and not runner.started
+    assert new.cfg == replace(runner.cfg, gravity_g=1.0, num_rovers=4)    # everything else as built
+    init = client.init()
+    assert init["phase"] == "running" and init["world"]["gravity_g"] == 1.0 and len(init["rovers"]) == 4
+    assert init["config"]["gravity_g"] == 1.0 and init["config"]["num_rovers"] == 4
+    code, _ = call(server.launch, Req({}))           # a launch while running is a new mission: always rebuilt
+    assert code == 200 and server.state.runner is not new and server.state.runner.cfg == new.cfg
+
+
+def test_launch_refuses_bad_settings(setup_phase):
+    runner, _ = setup_phase
+    for body, part in (({"gravity_g": 9}, "gravity_g must be between 0.5 and 3 g"),
+                       ({"num_rovers": "four"}, "num_rovers must be a number"),
+                       ({"warp": 1}, "unknown setting 'warp'"),
+                       ({"water": 1, "wear": "max"},
+                        "water must be true or false; wear must be one of off, normal, harsh"),
+                       ([1, 2], "Body must be a JSON object"),
+                       (b"{oops", 'Body must be JSON like {"gravity_g": 1.5, "num_rovers": 4}')):
+        code, out = call(server.launch, Req(body))
+        assert code == 400 and out["ok"] is False and part in out["error"], (body, out)
+    _, out = call(server.launch, Req({"water": 1, "wear": "max"}))
+    assert out["errors"] == ["water must be true or false", "wear must be one of off, normal, harsh"]
+    assert server.state.runner is runner and not runner.started and server.state.phase == "setup"
+
+
+def test_a_failed_launch_keeps_the_running_world(setup_phase, monkeypatch):
+    runner, _ = setup_phase
+    assert call(server.launch, Req({}))[0] == 200 and runner.started
+
+    def broken(cfg, planner=None):
+        raise RuntimeError("out of memory for this map")
+
+    monkeypatch.setattr(server, "SimRunner", broken)
+    code, out = call(server.launch, Req({"gravity_g": 1.0}))
+    assert code == 500 and "Could not build the new world: out of memory" in out["error"], out
+    assert server.state.runner is runner and runner._thread is not None and server.state.phase == "running"
+
+
+def test_setup_phase_refuses_world_changes(setup_phase):
+    runner, _ = setup_phase
+    for endpoint, body in ((server.hazard, {"type": "dust_storm"}), (server.chat, {"text": "rover 1, come home"}),
+                           (server.answer, {"id": "q1", "option": "reroute"})):
+        code, out = call(endpoint, Req(body))
+        assert code == 409 and out == {"ok": False, "error": "The mission has not launched yet."}, (endpoint, out)
+    assert runner.sim.hazards.to_msgs(runner.sim.t) == []
+    assert call(server.launch, Req({}))[0] == 200
+    code, out = call(server.hazard, Req({"type": "dust_storm"}))
+    assert code == 200 and out["hazard"]["type"] == "dust_storm", out
+
+
+def test_server_start_waits_in_the_setup_phase(monkeypatch):
+    from fastapi.testclient import TestClient
+    _clear_env(monkeypatch)
+    for name in V7_ENV.values():
+        monkeypatch.setenv(name, "0")
+    for name, value in (("WEAR", "off"), ("MAP_SIZE", "60"), ("NUM_ROVERS", "2")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("AUTO_LAUNCH", raising=False)
+    monkeypatch.setattr(server, "AUTO_RESET_S", 0.0)
+    planner = g.GemmaPlanner(g.GemmaConfig(enabled=False), start=False)
+    monkeypatch.setattr(server, "get_planner", lambda: planner)
+    monkeypatch.setattr(server, "close_planner", lambda: None)
+    for name in ("runner", "planner", "reset_lock", "broadcaster", "phase"):
+        monkeypatch.setattr(server.state, name, getattr(server.state, name))     # restored afterwards
+    monkeypatch.setattr(server.state, "clients", set())
+    try:
+        with TestClient(server.app) as http:
+            assert server.state.phase == "setup" and not server.state.runner.started
+            assert "/api/launch" in http.get("/").text
+            cfg = http.get("/api/config").json()
+            assert cfg["phase"] == "setup" and cfg["current"]["num_rovers"] == 2 and cfg["current"]["map_size"] == 60
+            r = http.post("/api/hazard", json={"type": "dust_storm"})
+            assert r.status_code == 409 and r.json()["error"] == "The mission has not launched yet."
+            with http.websocket_connect("/ws") as ws:
+                init = ws.receive_json()
+                assert init["type"] == "init" and init["phase"] == "setup" and init["config"]["num_rovers"] == 2
+            r = http.post("/api/launch", json={})
+            assert r.status_code == 200 and r.json()["phase"] == "running", r.text
+            assert server.state.runner.started
+    finally:
+        planner.close()
