@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Redshift: technical summary</title>
+<style>
+  @page { size: A4; margin: 9mm 10mm 8mm; }
+  :root {
+    --ink: #1b1d24; --dim: #555a66; --rule: #d9dbe2; --accent: #c2452d; --band: #f4f1ee;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #fff; color: var(--ink); }
+  body { font: 8.2pt/1.32 Lato, "Liberation Sans", sans-serif; }
+  header { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 2px solid var(--accent); padding-bottom: 3pt; margin-bottom: 5pt; }
+  h1 { font-size: 17pt; margin: 0; letter-spacing: 0.3pt; }
+  h1 span { color: var(--accent); }
+  .sub { font-size: 8.6pt; color: var(--dim); }
+  .tag { font-size: 7.6pt; color: var(--dim); text-align: right; }
+  h2 { font-size: 8.6pt; text-transform: uppercase; letter-spacing: 0.6pt; color: var(--accent); margin: 6pt 0 2pt; }
+  p { margin: 0 0 3pt; }
+  ul { margin: 0 0 3pt; padding-left: 10pt; }
+  li { margin: 0 0 1.4pt; }
+  b { font-weight: 700; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12pt; }
+  table { width: 100%; border-collapse: collapse; font-size: 7.6pt; margin: 1pt 0 3pt; }
+  th, td { text-align: left; vertical-align: top; padding: 1.6pt 3pt; border-bottom: 1px solid var(--rule); }
+  th { background: var(--band); font-weight: 700; }
+  .arch { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 3pt; margin: 2pt 0 4pt; font-size: 7.4pt; }
+  .box { border: 1px solid var(--rule); border-radius: 3pt; padding: 3pt 4pt; background: #fff; }
+  .box.hot { border-color: var(--accent); }
+  .box h3 { font-size: 7.6pt; margin: 0 0 1pt; }
+  .flow { grid-column: 1 / -1; color: var(--dim); font-size: 7.2pt; }
+  .callout { background: var(--band); border-left: 3px solid var(--accent); padding: 3pt 5pt; margin: 2pt 0 3pt; }
+  footer { margin-top: 4pt; padding-top: 3pt; border-top: 1px solid var(--rule); font-size: 7pt; color: var(--dim); display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Red<span>shift</span></h1>
+    <div class="sub">A rover fleet that explores an unknown super-Earth on its own, with no map and no link home</div>
+  </div>
+  <div class="tag">Agentverse 2026, Robotics track<br>Technical summary</div>
+</header>
+
+<div class="cols">
+<div>
+
+<h2>User and problem</h2>
+<p><b>User:</b> a planetary mission team sending rovers where nobody can drive them. Mars is up to 22 minutes away by radio; a planet around another star is years away. Every hazard has to be handled by the rover itself, from its own sensors, before anyone on Earth could hear about it.</p>
+<p><b>Need:</b> NASA's Spirit rover was lost in 2009 when its wheels dug into soft soil it could not see. Perseverance carries only a few dozen sample tubes, so every sample is a judgement call. A rover has to notice trouble, back off, and judge what is worth keeping, all by itself.</p>
+
+<h2>What it does</h2>
+<ul>
+  <li><b>Perceive:</b> each rover has a 1008-ray LiDAR (8 m, 5 sweeps/s), a mast camera, an IMU, wheel encoders, motor torque feedback, a belly wetness probe and a spectrometer. It knows nothing else: no map, no ground truth.</li>
+  <li><b>Map and share:</b> LiDAR builds one fleet height map of a 120 m sector. Frontiers (the edge of the known) are split between rovers so they spread out.</li>
+  <li><b>Learn on the fly:</b> the fleet starts assuming 30 deg climbs. A stall with motors near their limit lowers the shared limit ("slope 21 deg with motors at 87%") and every rover replans.</li>
+  <li><b>Adapt mid-run:</b> judges place rockfalls, soft sand, a toppling spire, a dust storm, a motor fault or a herd of creatures anywhere, live. Rovers only find out through their sensors and visibly replan.</li>
+  <li><b>Science and life:</b> lakes found from missing LiDAR echoes plus the camera; moving LiDAR clusters tracked as possible life and watched from at least 4 m; samples taken with the right tool into 3 tubes and cached at the lander.</li>
+  <li><b>Explainable:</b> every event names the reading that caused it, and the dashboard shows each rover's camera, LiDAR, slip and load next to what it does.</li>
+</ul>
+
+<h2>System architecture</h2>
+<div class="arch">
+  <div class="box"><h3>Sensors (simulated)</h3>MuJoCo physics at 2 g: LiDAR ray casts, camera renders, IMU, encoders, motor torques.</div>
+  <div class="box hot"><h3>Tier 1: rule brain</h3>Per rover, 5 Hz. Map update, frontiers, anytime A*, state machine, all safety reactions. <b>Always in control.</b></div>
+  <div class="box"><h3>Tier 2: Gemma (local)</h3>Own thread, never blocks tier 1. Picks among goals tier 1 already checked, reads camera + numbers, parses operator text.</div>
+  <div class="box"><h3>Fleet layer</h3>Shared height map, frontier claims, slope limit, soft, water and keep-out zones, sample cache.</div>
+  <div class="box"><h3>Actuators</h3>Skid-steer wheel torques, instruments (drill, scoop, sniffer, swab).</div>
+  <div class="box"><h3>Mission control</h3>FastAPI + WebSocket to a React / Three.js dashboard: map, sensors, events, hazards, chat.</div>
+  <div class="flow">Sensors &rarr; tier 1 &rarr; actuators every 200 ms. Tier 2 suggests; tier 1 checks every suggestion against the map, slope limit and battery before using it.</div>
+</div>
+
+</div>
+<div>
+
+<h2>Where each model runs</h2>
+<table>
+  <tr><th>Component</th><th>Runs on</th><th>Budget</th><th>Measured</th></tr>
+  <tr><td>Rule brain (map, A*, decisions), per rover</td><td>CPU, Python. Intel Core 5 210H laptop</td><td>40 ms per 200 ms cycle</td><td>avg 3.3 ms, p95 8.4 ms, max 34 ms; 0 of 10,500 cycles over budget (3 rovers, 700 s, 6 hazards)</td></tr>
+  <tr><td>Gemma 4 E2B (gemma4:e2b) via Ollama</td><td>Local GPU. RTX 4070 laptop</td><td>3 s per call, dropped at 4 s</td><td>goal choice about 0.3 s, camera + sensor anomaly about 0.4 s (warm)</td></tr>
+  <tr><td>Camera frames (for Gemma and liquid check)</td><td>MuJoCo OpenGL, same machine</td><td>throttled, counted as sensor time</td><td>320 x 240 for checks</td></tr>
+  <tr><td>Physics and sensor simulation</td><td>CPU, MuJoCo</td><td>n/a (stands in for the world)</td><td>whole sim 5.6x faster than real time</td></tr>
+</table>
+<p><b>No cloud service anywhere.</b> Everything runs on one laptop and works with the network cable pulled. With Gemma off or offline the rovers run on rules alone.</p>
+
+<h2>Critical failure mode: stuck in soft ground</h2>
+<div class="callout">
+  <b>Detect:</b> wheels turning but rover hardly moving: slip over 60% for 1.5 s, on gentle ground, with at least two loaded wheels spinning (rules out slopes, turns and a rover hung on a rock).<br>
+  <b>React:</b> stop, report "wheels spinning but not moving (slip 85%). Soft ground", mark a generous soft zone that the whole fleet avoids, back out along its own ruts, replan. Near known soft ground it trusts weaker evidence. Failsafe: dig out after 30 s.
+</div>
+
+<h2>Safety</h2>
+<ul>
+  <li><b>Rules hold authority.</b> Gemma can only choose from options the rules already judged safe. A bad, slow or missing answer means the rules decide.</li>
+  <li><b>When unsure, slow down, then ask.</b> Anything unexpected makes the rover slow down before it replans. If the rover still cannot tell what it sees, it holds still and asks mission control, taking the safe option if nobody answers in time.</li>
+  <li><b>Always able to get home:</b> battery for the trip back plus 15% (25% when dust covers the lander's solar panels).</li>
+  <li><b>Planetary protection:</b> possible life is watched from 4 m or more and never touched; a rover backs off if a creature approaches.</li>
+  <li><b>Operator commands are checked</b> by the same rules, and refused with reasons if unsafe.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>A simulation, not hardware. Position comes from the simulator (stands in for localisation; no SLAM).</li>
+  <li>LiDAR hits on creatures and liquid are routed by object id, a stated shortcut for scan-vs-map separation.</li>
+  <li>The rovers share one map instantly; real inter-rover links would be patchy.</li>
+  <li>The liquid check is a colour test on the camera picture. A 2B-parameter model can misread a scene, which is why it only advises.</li>
+  <li>Wear, towing and the camera object detector are built on side branches but not in this demo build.</li>
+</ul>
+
+</div>
+</div>
+
+<footer>
+  <span>Simulator: MuJoCo 3D physics, 2 g, 120 m sector, 3 rovers. Stack: Python, FastAPI, React, Three.js, Ollama.</span>
+  <span>github.com/Stanleyhoo1/Redshift</span>
+</footer>
+
+</body>
+</html>
