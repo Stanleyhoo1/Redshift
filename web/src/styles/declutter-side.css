@@ -138,3 +138,9 @@
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
+
+/* Rover rows: the brain latency only shows when it runs high; otherwise it is in the row's tooltip. */
+.side .rover .brain-chip[data-level='ok'],
+.side .rover .brain-chip[data-level='none'] {
+  display: none;
+}
