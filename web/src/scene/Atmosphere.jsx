@@ -4,6 +4,7 @@ import * as THREE from 'three'
 import { useSim } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { ATMOSPHERE, VOID } from '../lib/theme.js'
+import { worldPalette } from '../lib/biomes.js'
 import { SUN, createSkyMaterial } from './sky.js'
 import { atmo } from './sceneConstants.js'
 
@@ -30,6 +31,23 @@ const sunDust = new THREE.Color('#c48a5c')
 const fillSky = new THREE.Color(ATMOSPHERE.fillSky)
 const fillGround = new THREE.Color(ATMOSPHERE.fillGround)
 const fillDust = new THREE.Color('#8a6a55')
+
+// v7 biomes: this world's air (sky dome, haze, sun and fill light). Without a biome: today's colours.
+function airColours(world) {
+  const a = worldPalette(world).air
+  const c = (hex) => new THREE.Color(hex)
+  return {
+    haze: c(a.haze),
+    sun: c(a.sunLight),
+    fillSky: c(a.fillSky),
+    fillGround: c(a.fillGround),
+    zenith: c(a.zenith),
+    sky: c(a.sky),
+    horizon: c(a.horizon),
+    groundHaze: c(a.groundHaze),
+    glow: c(a.sunGlow),
+  }
+}
 
 const _corner = new THREE.Vector3()
 const _dir = new THREE.Vector3()
@@ -88,6 +106,8 @@ export function Atmosphere() {
   const setDpr = useThree((s) => s.setDpr)
   const map = useSim((s) => s.map)
   const dusting = useSim((s) => s.hazards.some((h) => h.type === 'dust_storm' && h.active))
+  const world = useSim((s) => s.world)
+  const air = useMemo(() => airColours(world), [world])
   const graphics = useGraphics()
   const high = graphics === 'high'
   const sun = useRef()
@@ -99,6 +119,15 @@ export function Atmosphere() {
   const fog = useMemo(() => new THREE.FogExp2(hazeColor.clone(), HAZE_DENSITY), [])
   const target = useMemo(() => new THREE.Object3D(), [])
   useEffect(() => () => (skyMat.dispose(), skyGeo.dispose()), [skyMat, skyGeo])
+  useEffect(() => {
+    const u = skyMat.uniforms
+    u.uZenith.value.copy(air.zenith)
+    u.uSky.value.copy(air.sky)
+    u.uHorizon.value.copy(air.horizon)
+    u.uGroundHaze.value.copy(air.groundHaze)
+    u.uGlowCol.value.copy(air.glow)
+    if (hemi.current) hemi.current.groundColor.copy(air.fillGround)
+  }, [air, skyMat])
 
   // Renderer and scene setup, before the first frame so materials compile once.
   useLayoutEffect(() => {
@@ -141,7 +170,7 @@ export function Atmosphere() {
 
     // Haze: absolute distance (zooming in clears it), plus the storm: about 40 % haze at
     // the point the camera looks at, whatever the zoom.
-    fog.color.copy(hazeColor).lerp(dustColor, a)
+    fog.color.copy(air.haze).lerp(dustColor, a)
     const dustDensity = 0.72 / Math.max(8, D)
     fog.density = HAZE_DENSITY + (Math.max(HAZE_DENSITY, dustDensity) - HAZE_DENSITY) * a
     if (scene.background?.isColor) scene.background.set(VOID)
@@ -155,11 +184,11 @@ export function Atmosphere() {
     const L = sun.current
     if (L) {
       L.intensity = SUN_INTENSITY * (1 - 0.6 * a)
-      L.color.copy(sunColor).lerp(sunDust, a)
+      L.color.copy(air.sun).lerp(sunDust, a)
     }
     if (hemi.current) {
       hemi.current.intensity = FILL_INTENSITY * (1 - 0.15 * a)
-      hemi.current.color.copy(fillSky).lerp(fillDust, a)
+      hemi.current.color.copy(air.fillSky).lerp(fillDust, a)
     }
 
     // Fit the shadow camera to the visible ground, snapped to whole texels so shadows

@@ -2,6 +2,7 @@ import { useSim } from '../state/store.js'
 import { fixed, mmss } from '../lib/format.js'
 import { stateStyle } from '../lib/theme.js'
 import { gravityG } from './globeMath.js'
+import { biomeOf } from '../lib/biomes.js'
 import { globeSettled, leaveGlobe, useViewMode } from './viewMode.js'
 import '../styles/globe.css'
 
@@ -17,11 +18,15 @@ export function SectorCard({ cardRef, onSelect }) {
   const meta = useSim((s) => s.roverMeta)
   const rovers = useSim((s) => s.rovers)
   const settled = useViewMode(globeSettled)
+  const biome = biomeOf(world)
   const size = map ? `${Math.round(map.width)} x ${Math.round(map.depth)} m` : 'Size unknown'
   return (
     <section ref={cardRef} className="globe-card" data-settled={settled || undefined} aria-label="Landing sector" onPointerDown={(e) => e.stopPropagation()}>
       <h2 className="gc-title">Landing sector</h2>
-      <p className="gc-sub">{size}, not to scale</p>
+      <p className="gc-sub">
+        {size}, not to scale
+        {biome && <span className="gc-biome">{biome.name}</span>}
+      </p>
       <dl className="gc-stats">
         <div>
           <dt>Explored</dt>

@@ -1,5 +1,6 @@
 import { mulberry } from '../scene/proceduralTextures.js'
 import { SUN_DIR } from '../scene/sceneConstants.js'
+import { worldPalette } from '../lib/biomes.js'
 
 // Plain numbers for the planet view (no React, no three.js), so Node can test them.
 // Directions are [x, y, z] arrays in the planet's own frame: y is the spin axis (north up),
@@ -155,5 +156,5 @@ export function planetLook(world) {
   const site = siteFromSeed(seed)
   const frame = siteFrame(site.lat, site.lon)
   const g = gravityG(world)
-  return { seed, site, frame, sun: sunDirFor(frame), surface: seedLook(seed), name: planetName(world), g, radiusKm: planetRadiusKm(g) }
+  return { seed, site, frame, sun: sunDirFor(frame), surface: seedLook(seed), name: planetName(world), g, radiusKm: planetRadiusKm(g), palette: worldPalette(world) }
 }
