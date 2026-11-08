@@ -11,7 +11,7 @@ function SlopeLimit() {
   const delta = changed ? current - prev : 0
   const pct = (v) => `${Math.max(0, Math.min(100, (v / GAUGE_MAX) * 100))}%`
   return (
-    <div className="stat stat-limit">
+    <div className="stat stat-limit" title={`Slope limit, started at ${degrees(initial)} deg (the tick on the bar)`}>
       <div className="stat-label">Slope limit</div>
       <div className="stat-value limit-value" key={changedAt ?? 'base'} data-flash={changed || undefined}>
         {degrees(current)}
@@ -23,7 +23,6 @@ function SlopeLimit() {
           </span>
         )}
       </div>
-      <div className="stat-sub">(started at {degrees(initial)})</div>
       {Number.isFinite(current) && (
         <div className="gauge" aria-hidden="true">
           <i className="gauge-fill" style={{ width: pct(current) }} />
@@ -32,15 +31,6 @@ function SlopeLimit() {
       )}
     </div>
   )
-}
-
-function TargetPips({ targets, total }) {
-  const pips = targets.map((t) => (
-    <i key={t.id} className="pip" data-status={t.status} style={{ '--kind': kindStyle(t.kind).color }} title={`${kindStyle(t.kind).label}, ${t.status}`} />
-  ))
-  const rest = Math.max(0, Math.min(24, (total ?? 0) - targets.length))
-  for (let k = 0; k < rest; k++) pips.push(<i key={`rest${k}`} className="pip" data-status="unknown" />)
-  return <div className="pips" data-many={targets.length + rest > 9 || undefined}>{pips}</div>
 }
 
 export const LifeIcon = () => (
@@ -63,12 +53,7 @@ function Science({ fleet, targets }) {
         {fixed(fleet.science_score, 0)}
         <small> pts</small>
       </div>
-      <div className="cache-row" aria-hidden="true">
-        {cached.slice(0, 14).map((t) => (
-          <i key={t.id} className="tube" data-full style={{ '--c': kindStyle(t.kind).color }} title={`${kindStyle(t.kind).label} ${t.id}${Number.isFinite(t.value) ? `, ${t.value}/10` : ''}`} />
-        ))}
-      </div>
-      <div className="stat-sub">
+      <div className="stat-sub" title={cached.map((t) => `${kindStyle(t.kind).label} ${t.id}${Number.isFinite(t.value) ? ` ${t.value}/10` : ''}`).join(', ') || undefined}>
         {nCached ? `${nCached} cached` : 'Cache empty'}
         {carried ? `, ${carried} carried` : ''}
       </div>
@@ -113,7 +98,9 @@ export function FleetStats() {
           {found}
           <small> of {total ?? '--'}</small>
         </div>
-        <TargetPips targets={targets} total={total} />
+        <div className="meter" aria-hidden="true" title={`${found} of ${total ?? '--'} found`}>
+          <i style={{ width: `${total ? Math.max(0, Math.min(100, (found / total) * 100)) : 0}%` }} />
+        </div>
         <div className="stat-sub">
           {sampled} sampled
           {life !== null && (

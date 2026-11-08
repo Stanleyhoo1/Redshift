@@ -29,7 +29,7 @@ function goalText(rover, targets, lander, tracks) {
     if (rover.state === 'returning' && lander && Math.hypot(rover.goal[0] - lander.x, rover.goal[1] - lander.y) < lander.radius + 3) {
       return `To the lander, ${d} m away`
     }
-    return `Goal (${fixed(rover.goal[0], 1)}, ${fixed(rover.goal[1], 1)}), ${d} m away`
+    return `Heading to its goal, ${d} m away`
   }
   if (rover.state === 'recovering') return 'Backing off, replanning'
   if (rover.state === 'returning') return 'Heading back to the lander'
@@ -49,7 +49,13 @@ const RoverCard = memo(function RoverCard({ meta, rover, targets, lander, hazard
         aria-pressed={selected}
         data-following={lit || undefined}
         data-fault={rover?.state === 'fault' || undefined}
-        title={selected ? 'Close the sensor panel' : `Show ${meta.name}'s sensors and follow it`}
+        title={[
+          selected ? 'Close the sensor panel' : `Show ${meta.name}'s sensors and follow it`,
+          rover?.goal ? `Goal (${fixed(rover.goal[0], 1)}, ${fixed(rover.goal[1], 1)})` : null,
+          Number.isFinite(rover?.brain?.avg_ms) ? `Brain ${fixed(rover.brain.avg_ms, 1)} ms average` : null,
+        ]
+          .filter(Boolean)
+          .join('\n')}
         style={{ '--rover': meta.color }}
         onClick={toggle}
         onKeyDown={(e) => {
