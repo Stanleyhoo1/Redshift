@@ -166,6 +166,7 @@ const surface = /* glsl */ `
   // rims in darker, boldly banded rock; dune fields in a warmer, lighter sand that fades out
   // at the edge, with long crests across the wind.
   float duneAmt = 0.0;
+  float duneCrest = 1.0;
   if (uV7 > 0.5) {
     float wall = smoothstep(0.82, 0.58, cosS); // about 35 to 55 deg
     float wb = sin(vWorld.y * 2.4 + (mB.r - 0.5) * 2.5 + (det.r - 0.5) * 0.8);
@@ -180,11 +181,14 @@ const surface = /* glsl */ `
       float a = 1.0 - smoothstep(0.5, 1.0, rr + (macro - 0.5) * 0.25);
       if (a <= 0.0) continue;
       vec2 wd = vec2(cos(dz.w), -sin(dz.w));
-      float crest = sin(dot(dd, wd) * 0.9 + sin(dot(dd, vec2(-wd.y, wd.x)) * 0.12) * 2.0);
-      duneAmt = max(duneAmt, a * (0.9 + 0.1 * crest));
+      // Long crests across the wind: a gentle windward rise, a short darker slip face.
+      float ph = fract(dot(dd, wd) * 0.14 + sin(dot(dd, vec2(-wd.y, wd.x)) * 0.09) * 0.35);
+      float face = smoothstep(0.72, 0.8, ph) * (1.0 - smoothstep(0.9, 1.0, ph));
+      if (a > duneAmt) duneCrest = mix(1.04, 0.8, face) * (0.97 + 0.06 * ph);
+      duneAmt = max(duneAmt, a);
     }
     duneAmt *= 1.0 - wall;
-    vec3 sand = uDuneSand * (0.9 + 0.12 * det.r + 0.06 * macro);
+    vec3 sand = uDuneSand * (0.9 + 0.12 * det.r + 0.06 * macro) * mix(1.0, duneCrest, duneAmt);
     albedo = mix(albedo, sand, duneAmt * 0.8);
   }
 

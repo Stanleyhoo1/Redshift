@@ -2,7 +2,8 @@
 // detail against a real sim with the v7 terrain flags on. Slope tint off, Reality on, then an
 // overview and a closer shot of the first feature of each kind. Exits 1 on a console error.
 // Usage: node scripts/terrain-look-check.mjs [url] [outDir]
-// Env: CHROME, WIDTH, HEIGHT, WAIT_S (seconds to let the fleet map before the shots)
+// Env: CHROME, WIDTH, HEIGHT, WAIT_S (seconds to let the fleet map before the shots),
+//   REALITY=0 (leave Reality off), GRAPHICS=low
 import { chromium } from 'playwright-core'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -41,6 +42,7 @@ for (const [label, want] of [['Slope colours', false], ['Reality', process.env.R
   const b = page.locator('button.toggle', { hasText: label }).first()
   if ((await b.getAttribute('aria-pressed')) !== String(want)) await b.click()
 }
+if (process.env.GRAPHICS === 'low') await page.locator('.gfx-seg button', { hasText: 'Low' }).click()
 await page.waitForTimeout(2500)
 const info = await page.evaluate(() => {
   const s = window.__redshift.state()
