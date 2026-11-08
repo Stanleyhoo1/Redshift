@@ -141,6 +141,9 @@ SETTINGS: tuple = (
     Setting("flora", "bool", "Alien flora", "features", "Fungal trees and glowing bushes. Rovers keep 4 m away."),
     Setting("ground_detail", "bool", "Ground detail", "features",
             "Pebbles, hoodoos, rock bands and wind streaks. Looks only."),
+    Setting("biomes", "bool", "Biomes", "features", "Each world gets its own ground, colours and terrain mix."),
+    Setting("life_variety", "bool", "More lifeforms", "features",
+            "Skitterers, drifters, crawlers and burrowers join the grazers."),
     Setting("wear", "choice", "Wear", "wear",
             "How fast wheels and motors wear out. A worn-out rover breaks down and needs a tow.",
             choices=(("off", "Off", "Rovers never wear out."),
@@ -293,6 +296,8 @@ class Config:
     ice_sheets: bool = False
     ground_detail: bool = False
     flora: bool = False
+    biomes: bool = False            # v7 biomes: own ground, colours and terrain mix per seed (v7_biomes.py)
+    life_variety: bool = False      # v7: more lifeform kinds than the grazers (lifeforms track)
     wear: bool = False
     wear_rate: float = 1.0          # how fast parts wear: 1.0 normal, 4.0 harsh (WEAR_RATES)
 
@@ -449,6 +454,8 @@ class Config:
             ice_sheets=_env_bool("ICE_SHEETS", True),
             ground_detail=_env_bool("GROUND_DETAIL", True),
             flora=_env_bool("FLORA", True),
+            biomes=_env_bool("BIOMES", True),
+            life_variety=_env_bool("LIFE_VARIETY", True),
             wear=wear != "off",
             wear_rate=WEAR_RATES.get(wear, 1.0),
         )

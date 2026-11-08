@@ -4185,6 +4185,26 @@ kbd {
   color: var(--ink-3);
 }
 
+/* v7 biomes: the world's ground under its name, small. */
+.facts-biome {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 3px;
+  font-size: 12px;
+  font-weight: 450;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.facts-biome i {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
 /* The Samples tab. */
 .samples {
   flex: 1;

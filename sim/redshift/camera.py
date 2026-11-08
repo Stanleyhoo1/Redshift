@@ -272,7 +272,12 @@ def _ray_factor(h: int, w: int, fovy: float) -> np.ndarray:
     return k
 
 
-def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float) -> np.ndarray:
+def _visuals():
+    from . import visuals
+    return visuals
+
+
+def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float, horizon=None) -> np.ndarray:
     """Distance haze of a dense atmosphere: blend toward the horizon colour with distance along the ray
     (exponential, nothing within visuals.FOG_START_M), never on the sky (farther than SKY_DIST_M)."""
     from .visuals import FOG_END_M, FOG_START_M, HORIZON_RGB, HAZE_MAX
@@ -280,7 +285,7 @@ def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float) -> np.ndarray:
     d = np.clip(dist - FOG_START_M, 0.0, None)
     f = (1.0 - np.exp(d * (-3.0 / (FOG_END_M - FOG_START_M)))) * HAZE_MAX
     f[dist > SKY_DIST_M] = 0.0
-    fog = np.asarray(HORIZON_RGB, np.float32) * 255.0
+    fog = np.asarray(HORIZON_RGB if horizon is None else horizon, np.float32) * 255.0
     out = rgb.astype(np.float32)
     out += (fog - out) * f[..., None]
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)
@@ -474,6 +479,7 @@ class GLRenderer:
                 mujoco.mjv_updateScene(g.model, s.data, g.option(hide_groups), None, g.cam,
                                        mujoco.mjtCatBit.mjCAT_ALL.value, g.scn)
                 t = float(s.data.time)
+                horizon = _visuals().horizon_rgb(s.cfg) if getattr(s.cfg, "biomes", False) else None
             break
         else:
             raise RuntimeError("the model kept changing while rendering")
@@ -497,7 +503,7 @@ class GLRenderer:
         rgb = rgb[::-1]                                     # OpenGL rows start at the bottom
         dep = _linear_depth(raw[::-1], spec.near, spec.far) if raw is not None else None
         if look:
-            rgb = _haze(rgb, dep, spec.fovy)
+            rgb = _haze(rgb, dep, spec.fovy, horizon)
         return Frame(np.ascontiguousarray(rgb), dep if depth else None, spec, t, pos, yaw)
 
 

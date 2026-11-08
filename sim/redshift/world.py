@@ -397,6 +397,10 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
     ox, oy = cfg.origin
     spans_i = _tile_spans(cfg.nx, cfg.hfield_tile)
     spans_j = _tile_spans(cfg.ny, cfg.hfield_tile)
+    from . import v7_biomes
+
+    def _secondary(x: float, y: float) -> bool:          # v7 biomes: tiles in the secondary region
+        return v7_biomes.tile_biome(terrain, x, y) == "secondary"
 
     assets, geoms, tile_meta = [], [], []
     for (j0, j1) in spans_j:
@@ -414,7 +418,7 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
             )
             geoms.append(
                 f'<geom name="g_{name}" type="hfield" hfield="{name}" pos="{cxw:.4f} {cyw:.4f} {lo:.4f}" '
-                f'material="{visuals.ground_material(i0, j0, cfg.seed)}" group="{GROUP_TERRAIN}" '
+                f'material="{visuals.ground_material(i0, j0, cfg.seed, _secondary(cxw, cyw))}" group="{GROUP_TERRAIN}" '
                 f'friction="{cfg.terrain_friction} 0.005 0.0001"/>'
             )
             tile_meta.append((j0, i0, j1 - j0 + 1, i1 - i0 + 1, lo, rz))
@@ -547,7 +551,7 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
     {visuals.crystal_mesh("mineral_xtal", 0.26, 0.035, 0.06)}
   </asset>
   <worldbody>
-    {visuals.lights_xml()}
+    {visuals.lights_xml(cfg)}
     {''.join(geoms)}
     {''.join(bodies)}
   </worldbody>

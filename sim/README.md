@@ -50,6 +50,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `tests/test_v4.py` | Water (a hole in the map, identified, avoided, the water sensor failsafe), spire fall and replan, motion tracks, observing a lifeform at a safe distance, the first-sighting question, point-and-click hazards and every 400, sampling, tubes and the cache, and the v4 message fields. |
 | `tests/test_v5.py` | Questions: intent (questions vs commands), Gemma's answer checks (a bad number or id falls back to the rules), grounded rule answers for every topic, fleet vs per-rover replies, `reply_to`, `stats`, camera sizes up to 1280 x 720. |
 | `tests/test_v6.py` | Place commands: polite orders vs questions, place parsing (keyword parser and checked Gemma answers), the resolver and its qualifiers, "nothing known", the closest free rover, `choose_place` answered by `POST /api/answer` and by chat, the survey and its report, requests that never expire by default (and the countdown when `OPERATOR_TIMEOUT_S` is above 0). |
+| `tests/test_v7_biomes.py` | Biomes: the pick (deterministic, never rust as primary, every biome reachable over seeds 0 to 400), the region field and `terrain.biome_id_at`, the feature weights (frost has no flora, salt no geysers, ash no ice), init `world.biome` and `features.biome_map`, flags off byte-identical to the world before biomes, and camera safety: every biome's ground colours stay outside the target spotting tolerance, and from open ground on every biome the target spotting finds only real markers, the liquid check sees no liquid and the plant check labels no ground. |
 | `tests/test_v7_settings.py` | Launch settings (protocol v7): the settings table and its parser (every bad value and its message), the round trip, `from_env` clamps and feature switches, the slope thresholds derived from gravity (identical at 2 g), Gemma's gravity text, the setup phase, `GET /api/config`, `POST /api/launch`, settings in `POST /api/reset`, the 409s, and no em dash in the files this step touched. |
 
 `test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
@@ -163,9 +164,20 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `CAMERA_SHADOWS` | 1 | 0 = camera renders without the sun's shadows (about 3 times faster with software OpenGL) |
 | `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase until `POST /api/launch` (the setup screen); 1 = start at once. `AUTO_RESET_S` above 0 also starts at once |
 | `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features (0 leaves one out). Off in a bare `Config()`, on in `Config.from_env()`. Code: `v7_landforms.py` (mesas, canyon, pits, boulder fields), `v7_surface.py` (dunes, ice sheets, wheel friction composer, low traction rule), `v7_geysers.py`, `v7_flora.py`; ground detail is drawn by the web only |
+| `BIOMES` | 1 | v7 biomes (`v7_biomes.py`): the seed picks a primary biome and a secondary one in soft regions; they scale the v7 feature counts and set the camera colours. Off in a bare `Config()` |
+| `LIFE_VARIETY` | 1 | more lifeform kinds than the grazers (stream `[seed, 7113]`). Off in a bare `Config()` |
 | `WEAR` | normal | `off`, `normal` or `harsh` (parts wear out about 4 times sooner). Accepted and echoed in `config`; wear itself is not part of this build yet |
 
 More Gemma settings (timeouts, tokens, model loading) are in `GEMMA.md`.
+
+## Biomes (v7)
+
+`v7_biomes.py` holds the `BIOMES` table: per biome a name, the feature weights, the lifeform weights, and the camera colours (soil ramp, pebbles, rock, sun and ambient light, sky). `Terrain.__init__` calls `v7_biomes.attach` right after the height field and before any v7 feature, so every generator can scale its count:
+
+- `pick(cfg)`: `(primary, secondary)` from `default_rng([seed, 7112])`; the primary is never `rust`, the secondary is any other id (rust allowed). None with biomes off.
+- `Region`: the secondary share 0..1, a few soft Gaussian blobs warped by long waves, thresholded at a seeded quantile so it covers 25 to 40 percent of the sector, and kept at 0 round the lander.
+- `terrain.biome` (`{id, name, secondary}` or None), `terrain.biome_id_at(x, y)`, `weight(terrain, feature)` (1.0 with biomes off; else 0 when the primary weight is 0, otherwise 0.75 primary + 0.25 secondary) and `count(terrain, feature, n)` (exactly n when the weight is 1). The canyon is built only when `weight >= 0.5`. Counts change after each generator's own draws, so with biomes off the worlds are byte for byte the old ones (the test checks hashes of the heights, the features message, the materials and the textures).
+- Camera look: `visuals.textures(seed, biome)` paints the regolith (four primary variants plus two of the secondary, used on tiles whose centre lies in the secondary region), rocks and sky in the biome's colours, and the sun, ambient and haze follow it. Every colour is checked to stay outside the target spotting tolerance of every marker colour and off the blue liquid rule, so no biome's ground, nor one biome's patch seen against another's, can trip the camera checks.
 
 ## Sensors
 

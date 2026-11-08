@@ -13,6 +13,8 @@ import math
 
 import numpy as np
 
+from . import v7_biomes
+
 DUNE_K = 7103
 ICE_K = 7107
 
@@ -58,8 +60,9 @@ def make_dunes(terrain, cfg) -> list:
     half = cfg.map_size / 2.0
     X, Y, H = terrain.X, terrain.Y, terrain.heights
     out, placed = [], []
-    for k in range(_count(rng, terrain.area)):
-        for _ in range(60):
+    tries = 60 if v7_biomes.weight(terrain, "dunes") <= 1.0 else 200     # v7 biomes: dune worlds look harder
+    for k in range(v7_biomes.count(terrain, "dunes", _count(rng, terrain.area))):
+        for _ in range(tries):
             r = float(rng.uniform(7.5, 12.5))
             x, y = (float(v) for v in rng.uniform(-half, half, 2))
             if _clear(x, y, r, placed, cfg, half, terrain):
@@ -91,7 +94,7 @@ def make_ice(terrain, cfg, avoid: list) -> list:
     X, Y, H = terrain.X, terrain.Y, terrain.heights
     out = []
     placed = [(a["x"], a["y"], a["radius"]) for a in avoid]
-    for k in range(_count(rng, terrain.area)):
+    for k in range(v7_biomes.count(terrain, "ice_sheets", _count(rng, terrain.area))):
         best = None                                                  # flattest spot seen, for a fallback
         for _ in range(200):
             r = float(rng.uniform(3.0, 7.0))

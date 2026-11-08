@@ -91,6 +91,13 @@
   color: var(--ink-3);
 }
 
+.gc-biome {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-2, #c9d2dc);
+}
+
+
 .gc-stats {
   display: grid;
   grid-template-columns: repeat(3, auto);
