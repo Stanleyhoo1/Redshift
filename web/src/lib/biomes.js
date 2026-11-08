@@ -47,9 +47,9 @@ export const BIOMES = {
   },
   frost: {
     name: 'Frost plains',
-    ground: { dustLight: '#e2e9ef', dust: '#b2bfcb', soil: '#7d8b99', rock: '#58636f', rockLight: '#909dab', strataA: '#a2b3c4', strataB: '#46515e', pebble: '#f3f6f9', dune: '#cbd7e2' },
+    ground: { dustLight: '#cdd6df', dust: '#a2b0be', soil: '#748392', rock: '#58636f', rockLight: '#909dab', strataA: '#a2b3c4', strataB: '#46515e', pebble: '#f3f6f9', dune: '#cbd7e2' },
     air: { zenith: '#2d3a52', sky: '#7d90aa', horizon: '#c9d4df', haze: '#a9b7c6', groundHaze: '#56616e', sunLight: '#f4f6fb', sunGlow: '#dfe4f2', fillSky: '#b4c2d4', fillGround: '#4c5560' },
-    map: ['#5d6875', '#9eacba', '#e1e8ee'],
+    map: ['#5a6572', '#97a6b5', '#d3dce5'],
   },
   ash: {
     name: 'Ash wastes',
