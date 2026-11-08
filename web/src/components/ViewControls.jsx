@@ -4,6 +4,7 @@ import { resetSim } from '../net/connection.js'
 import { shortName } from '../lib/format.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { useGraphics, visualPrefs } from '../state/visualPrefs.js'
+import { ViewModeControl } from '../globe/ViewModeControl.jsx'
 import '../styles/scene.css'
 
 // The realistic ground is the first impression: slope colours start off (once per page
@@ -15,6 +16,8 @@ function GraphicsControl() {
   const graphics = useGraphics()
   return (
     <div className="hud-group">
+      {/* v7 planet view: View, Sector | Planet, laid out like the Graphics row below it */}
+      <ViewModeControl />
       <div className="gfx-row">
         <div className="hud-label" id="gfx-label">
           Graphics

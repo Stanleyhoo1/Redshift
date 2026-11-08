@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
-import { Html } from '@react-three/drei'
+import { Html } from '../globe/PlaneHtml.jsx'
 import * as THREE from 'three'
 import { appStore, roverPoses, simStore, useSim } from '../state/store.js'
 import { clearPlaceHover, hasPlaces, hoverKey, placeNumbers, sendAnswer, setPlaceHover, shortPlace, useAnswer, usePlaceHover } from '../lib/answers.js'
