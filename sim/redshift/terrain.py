@@ -164,11 +164,14 @@ class Terrain:
         self._placed = []                  # (x, y, radius) of mounds and craters
         self._ridges = []                  # ridge spines (p0, p1)
         self.heights = self._make_heights(rng)
+        from . import v7_surface
+        v7_surface.build(self, cfg)                        # v7 dunes and ice sheets (own streams)
         self.wet = np.zeros(self.heights.shape, bool)     # under liquid
         self.wet_id = np.zeros(self.heights.shape, np.int8)   # 1 + index into self.water, 0 = dry
         self.water: list = []
         if cfg.water:
             self._make_water(frng)
+            v7_surface.after_water(self)
         self.min_h = float(self.heights.min())
         self.max_h = float(self.heights.max())
         self.slope = slope_deg(self.heights, self.res)
