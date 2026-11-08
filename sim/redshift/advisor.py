@@ -194,9 +194,10 @@ class Advisor:
 
     def _gravity_kw(self) -> dict:
         """Gemma is told this world's gravity (v7). Only passed when it is not 2 g: at 2 g the call and the
-        prompt stay exactly as before (tests wrap submit_choice with the old signature)."""
+        prompt stay exactly as before (tests wrap submit_choice with the old signature). Exactly 2 g only:
+        a world at 2.04 g (GRAVITY_G=2.04) is told 2.04."""
         gv = float(self.cfg.gravity_g)
-        return {} if round(gv, 1) == 2.0 else {"gravity_g": gv}
+        return {} if gv == 2.0 else {"gravity_g": gv}
 
     def close(self) -> None:
         self._stop.set()

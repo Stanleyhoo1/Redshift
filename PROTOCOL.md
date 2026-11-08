@@ -395,7 +395,7 @@ A launch and a reset send every client a fresh `init` with phase `"running"`.
 | Key | Type | Range | Env var (default) | Meaning |
 |---|---|---|---|---|
 | `gravity_g` | float | 0.5 to 3, step 0.1 | `GRAVITY_G` (2.0) | gravity in Earth g; the climb and tow limits and the slope thresholds follow it (Sim notes below) |
-| `seed` | int | 0 to 2147483647 | `SEED` (42) | same seed, same terrain, targets and life |
+| `seed` | int | 0 to 2147483647 | `SEED` (42) | same seed, same terrain, targets and life (`SEED` and `POST /api/reset` also take larger seeds, as before) |
 | `num_rovers` | int | 1 to 8 | `NUM_ROVERS` (3) | rovers that land |
 | `map_size` | int (m) | 60 to 200, step 10 | `MAP_SIZE` (120) | width of the square sector |
 | `water`, `spires`, `lifeforms` | bool | | none (true) | the version 4 features |
@@ -422,7 +422,9 @@ A launch and a reset send every client a fresh `init` with phase `"running"`.
 
 (Shortened: `current` and `defaults` carry every key of the table, `fields` every row, `physics` 26 rows.
 Values have the table's type: `int` settings are JSON integers (`"map_size": 120`), except that an env
-value off the 10 m grid, e.g. `MAP_SIZE=95.5`, is reported as it is (`95.5`).)
+value off the 10 m grid, e.g. `MAP_SIZE=95.5`, is reported as it is (`95.5`). Such a value, or any value
+outside the table that `current` holds, may be sent back to `POST /api/launch` unchanged: a value equal to
+the current world's is no change and always passes.)
 
 - `current`: the settings of the world the sim holds now (built and waiting, or running). `defaults`: what
   the env vars give.
@@ -437,29 +439,42 @@ value off the 10 m grid, e.g. `MAP_SIZE=95.5`, is reported as it is (`95.5`).)
 ### `POST /api/launch`
 
 Body: any launch settings, for example `{"gravity_g": 1.0, "num_rovers": 4}`. Keys left out keep the values
-of the world the sim holds; `{}` launches it as built.
+of the world the sim holds when the launch is carried out (launches and resets go one at a time, so one
+that waits behind another builds on the settings that one left); `{}` launches it as built. Numbers keep to
+their step: `gravity_g` 2.04 is refused (`gravity_g must be in steps of 0.1 g`), float noise such as
+1.7000000000000002 counts as 1.7.
 
 - From the setup phase with nothing changed, the built world starts. Otherwise (changed settings, or a
   launch while running, which starts a new mission) a new world is built first, then the old one stops.
+- A launch sent while the sim was in the setup phase starts the mission once. If another launch (or a
+  reset) started it while this one waited, nothing is rebuilt: `200` as below when this launch asked for
+  the same settings as the running world, else `409 {"ok": false, "error": "Another launch started the
+  mission first. Use New mission to change its settings."}`. So two setup screens, or a script and a
+  person, launching together land one mission.
 - `200 {"ok": true, "phase": "running", "config": {...}}`; every client gets a fresh `init`.
 - `400 {"ok": false, "error": "gravity_g must be between 0.5 and 3 g; water must be true or false", "errors": ["gravity_g must be between 0.5 and 3 g", "water must be true or false"]}`:
   every problem found, and nothing changes. The texts: `unknown setting 'warp' (use one of gravity_g, seed, ...)`,
   `<key> must be true or false`, `<key> must be one of off, normal, harsh`, `<key> must be a number`,
   `<key> must be a finite number`, `<key> must be a whole number`, `<key> must be between <min> and <max> <unit>`,
   `<key> must be in steps of <step> <unit>`, `Body must be a JSON object like {"gravity_g": 1.5, "num_rovers": 4}`.
+  The texts name settings by key; the dashboard's setup screen shows them with the field labels.
 - `500 {"ok": false, "error": "Could not build the new world: ..."}`: the world the sim held is untouched
   (and keeps running if it was). `503` before the sim has a world.
 
 ### `POST /api/reset` additions
 
 - Takes any launch setting next to `seed`, for example `{"seed": 7, "gravity_g": 1.5}`. Keys left out keep
-  the current world's values (so "Reset sim" keeps gravity, fleet and features and only changes the seed).
-- `seed` keeps its old leniency (`"8"` and `7.9` work, an empty body keeps the seed, a body that is not an
-  object is ignored) but must be 0 to 2147483647: otherwise 400 (`seed must be between 0 and 2147483647`,
-  `seed must be an integer`). Bad settings give 400 as for `POST /api/launch`; a failed build gives 500 and
-  the old world keeps running.
+  the current world's values (so "Reset sim" keeps gravity, fleet and features and only changes the seed),
+  read when the reset is carried out: a reset queued behind a launch keeps that launch's settings.
+- Keeps its old leniency: keys that are not launch settings are ignored (and listed in `ignored`), and
+  `seed` works as before (`"8"` and `7.9` work, an empty body keeps the seed, a body that is not an object
+  is ignored, any seed of 0 or more works, also above the setup screen's 2147483647). A negative seed gives
+  400 `seed must be 0 or more` (it never built a world), one that is not a number `seed must be an integer`.
+  Bad launch settings give 400 as for `POST /api/launch`; a failed build gives 500 and the old world keeps
+  running.
 - Works from the setup phase too: the mission starts at once.
-- Returns `{"ok": true, "seed": 7, "config": {...}}`.
+- Returns `{"ok": true, "seed": 7, "config": {...}}`, plus `"ignored": ["rovers"]` when the body had keys
+  that are not settings.
 
 ### Sim notes
 
@@ -476,13 +491,15 @@ of the world the sim holds; `{}` launches it as built.
   (8.4 deg at 2 g, 17.0 at 1 g); below that the cap holds it at 24 deg. Later steps (canyon ramps, tow paths
   and their announcements) read `cfg.tow_limit_deg` rather than computing their own, so the setup screen,
   `physics` and the rovers always quote the same number.
-- Gemma's prompts state each request's gravity: at 2 g the text is byte for byte as before ("super-Earth
-  (gravity 2 g, ..."); at 1 g and below the world is "an unknown planet (gravity 1 g, ...". Operator commands
+- Gemma's prompts state each request's gravity: at exactly 2 g the text is byte for byte as before
+  ("super-Earth (gravity 2 g, ..."); any other gravity is written as it is ("gravity 2.04 g" for
+  `GRAVITY_G=2.04`); at 1 g and below the world is "an unknown planet (gravity 1 g, ...". Operator commands
   and chat answers name the world without a number ("a super-Earth", at 1 g and below "a planet"), since
   they may only quote their own inputs.
-- `Config.from_env` clamps `SEED`, `NUM_ROVERS`, `SIM_SPEED`, `MAP_SIZE` and `GRAVITY_G` to the table's
-  ranges. The feature env vars are on when unset; set, they are on only for `1`, `true`, `yes` or `on`. An
-  unknown `WEAR` gives normal.
+- `Config.from_env` clamps `NUM_ROVERS`, `SIM_SPEED`, `MAP_SIZE` and `GRAVITY_G` to the table's ranges
+  (values inside the range are kept as given, also off the step grid). `SEED` is only kept from going
+  negative: as before version 7, `SEED=3000000000` builds that very world. The feature env vars are on when
+  unset; set, they are on only for `1`, `true`, `yes` or `on`. An unknown `WEAR` gives normal.
 
 ## HTTP
 
@@ -501,7 +518,7 @@ Nothing required. The server must ignore any text the client sends.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SEED` | 42 | terrain and target layout (0 to 2147483647) |
+| `SEED` | 42 | terrain and target layout (0 or more; the setup screen offers 0 to 2147483647) |
 | `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
 | `SIM_SPEED` | 3.0 | sim seconds per wall second (0.5 to 10) |
 | `MAP_SIZE` | 120 | map width in metres (60 to 200) |

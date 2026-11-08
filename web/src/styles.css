@@ -877,6 +877,20 @@ code {
   font-weight: 600;
 }
 
+/* Follow with 4 to 8 rovers: Off and up to four rovers per row in even columns, not a ragged wrap that
+   leaves the last rover alone on a line. Three rovers keep the plain row above. */
+.seg.seg-follow-many {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.seg-follow-many button {
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 0;
+}
+
 .dot {
   display: inline-block;
   flex: none;

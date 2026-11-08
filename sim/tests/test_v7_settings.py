@@ -87,6 +87,10 @@ PARSE_CASES = [                                          # (request body, part o
     ({"map_size": 300}, "map_size must be between 60 and 200 m"),
     ({"map_size": 65}, "map_size must be in steps of 10 m"),
     ({"sim_speed": 20}, "sim_speed must be between 0.5 and 10x"),
+    ({"gravity_g": 2.04}, "gravity_g must be in steps of 0.1 g"),      # floats keep to their step too
+    ({"gravity_g": 1.96}, "gravity_g must be in steps of 0.1 g"),
+    ({"sim_speed": 2.2}, "sim_speed must be in steps of 0.5x"),
+    ({"gravity_g": 0.5 + 12 * 0.1}, None),               # 1.7000000000000002: float noise is on the grid
     ({"seed": -1}, "seed must be between 0 and 2147483647"),
     ({"seed": 2147483648}, "seed must be between 0 and 2147483647"),
     ({"seed": 10 ** 400}, "seed must be between 0 and 2147483647"),     # huge ints do not overflow
@@ -126,6 +130,27 @@ def test_from_settings_applies_the_changes_and_keeps_the_rest():
     off, _ = Config.from_settings(cfg, {"wear": "off"})
     assert off.wear is False and off.wear_rate == 1.0
     assert Config.from_settings(base, {})[0] is base                                      # nothing to change
+
+
+def test_float_settings_land_on_their_step():
+    cfg, errors = Config.from_settings(Config(), {"gravity_g": 0.5 + 12 * 0.1, "sim_speed": 0.5 * 6 + 1e-12})
+    assert errors == [] and cfg.gravity_g == 1.7 and cfg.sim_speed == 3.0      # exactly, no float noise
+    assert SETTINGS_BY_KEY["gravity_g"].parse(3) == (3.0, None)
+
+
+def test_base_values_off_the_table_can_be_sent_back():
+    """An env var (or a reset) can give a world settings the setup screen does not offer. GET /api/config
+    reports them in `current`, and sending `current` back is no change, so it passes."""
+    base = Config(map_size=125.0, gravity_g=2.04, sim_speed=1.2, seed=3000000000)
+    sent = json.loads(json.dumps(base.settings()))
+    assert sent["map_size"] == 125 and sent["gravity_g"] == 2.04 and sent["seed"] == 3000000000
+    back, errors = Config.from_settings(base, sent)
+    assert errors == [] and back == base, errors
+    _, errors = Config.from_settings(base, {"map_size": 135, "gravity_g": 2.06, "seed": 3000000001, "sim_speed": 1.3})
+    assert errors == ["map_size must be in steps of 10 m", "gravity_g must be in steps of 0.1 g",
+                      "seed must be between 0 and 2147483647", "sim_speed must be in steps of 0.5x"], errors
+    _, errors = Config.from_settings(Config(), {"water": 1, "num_rovers": True, "map_size": "120"})
+    assert len(errors) == 3, errors              # equal to base's value (True == 1, 3 == True) is not enough
 
 
 def test_from_settings_reports_every_problem():
@@ -191,6 +216,10 @@ def test_from_env_clamps_come_from_the_settings_table(monkeypatch):
         monkeypatch.delenv(name)
     monkeypatch.setenv("MAP_SIZE", "125")                    # inside the range: kept as given (no step here)
     assert Config.from_env().map_size == 125.0
+    monkeypatch.setenv("SEED", "3000000000")                 # not clamped above: as before v7, that very world
+    assert Config.from_env().seed == 3000000000
+    monkeypatch.setenv("SEED", "1e400")                      # unreadable: the default
+    assert Config.from_env().seed == 42
     assert Config.from_env(seed=9).seed == 9                  # overrides still win
 
 
@@ -364,6 +393,21 @@ def test_gemma_prompts_state_the_configured_gravity(gravity, text):
         want = plain if gravity > 1.0 else plain.replace("a super-Earth", "a planet")
         assert system == want and ("super-Earth" in system) == (gravity > 1.0), kind
         assert "gravity" not in system and g.estimate_tokens(system + user) < 400, kind
+
+
+def test_gemma_is_told_a_gravity_near_2g_as_it_is():
+    """Only exactly 2 g keeps the old text; a world at 2.04 g (GRAVITY_G=2.04) is told 2.04."""
+    for gravity, text in ((2.04, "super-Earth (gravity 2.04 g,"), (1.96, "super-Earth (gravity 1.96 g,"),
+                          (2.0004, "super-Earth (gravity 2 g,")):
+        prompts = _prompts(gravity)
+        for kind in ("choice", "interpretation", "describe"):
+            assert text in prompts[kind][0], (gravity, kind)
+            assert g.estimate_tokens("".join(prompts[kind])) < 400, (gravity, kind)
+    adv = type("A", (), {"cfg": Config(gravity_g=2.04)})()
+    from redshift.advisor import Advisor
+    assert Advisor._gravity_kw(adv) == {"gravity_g": 2.04}
+    adv.cfg = Config()
+    assert Advisor._gravity_kw(adv) == {}
 
 
 class SystemRecorder(g.FakeBackend):
@@ -552,7 +596,7 @@ def test_reset_with_a_seed_restarts_and_runs(setup_phase):
 
 def test_reset_refuses_bad_input_and_keeps_the_world(setup_phase):
     runner, _ = setup_phase
-    for body, part in (({"seed": -1}, "seed must be between 0 and 2147483647"),
+    for body, part in (({"seed": -1}, "seed must be 0 or more"),
                        ({"seed": "abc"}, "seed must be an integer"),
                        ({"seed": 7, "map_size": 65}, "map_size must be in steps of 10 m"),
                        ({"gravity_g": "heavy"}, "gravity_g must be a number"),
@@ -560,6 +604,17 @@ def test_reset_refuses_bad_input_and_keeps_the_world(setup_phase):
         code, out = call(server.reset, Req(body))
         assert code == 400 and out["ok"] is False and part in out["error"], (body, out)
     assert server.state.runner is runner and server.state.phase == "setup" and not runner.started
+
+
+def test_reset_keeps_its_old_leniency(setup_phase):
+    """Before v7 POST /api/reset read only the seed: other keys were ignored and any seed numpy takes worked.
+    It still does; unknown keys come back in `ignored`."""
+    code, body = call(server.reset, Req({"seed": 3000000000}))
+    assert code == 200 and body["seed"] == 3000000000 and server.state.runner.cfg.seed == 3000000000, body
+    assert "ignored" not in body
+    code, body = call(server.reset, Req({"seed": 7, "rovers": 4, "foo": {"x": 1}}))
+    assert code == 200 and body["seed"] == 7 and body["ignored"] == ["rovers", "foo"], body
+    assert server.state.runner.cfg.num_rovers == 3 and server.state.runner.cfg.seed == 7
 
 
 def test_a_failed_build_keeps_the_old_world(setup_phase, monkeypatch):
@@ -663,6 +718,91 @@ def test_a_failed_launch_keeps_the_running_world(setup_phase, monkeypatch):
     assert server.state.runner is runner and runner._thread is not None and server.state.phase == "running"
 
 
+def _together(*calls):
+    """Run endpoint calls the way overlapping HTTP requests run: every one reaches the reset lock (held
+    here) before the first gets it, then they go in order. Returns [(status, body), ...]."""
+    async def main():
+        lock = server._reset_lock()
+        await lock.acquire()
+        tasks = []
+        for endpoint, body in calls:
+            tasks.append(asyncio.ensure_future(endpoint(Req(body))))
+            for _ in range(5):
+                await asyncio.sleep(0)          # this request now waits for the lock
+        lock.release()
+        return await asyncio.gather(*tasks)
+    out = []
+    for r in asyncio.run(main()):
+        out.append((r.status_code, json.loads(r.body)) if hasattr(r, "status_code") else (200, r))
+    return out
+
+
+def test_two_launches_from_setup_land_once(setup_phase):
+    runner, client = setup_phase
+    (c1, b1), (c2, b2) = _together((server.launch, {}), (server.launch, {"map_size": 60}))
+    assert c1 == c2 == 200 and b1["config"] == b2["config"] == runner.cfg.settings(), (b1, b2)
+    assert server.state.runner is runner and runner.started and runner._thread is not None   # not rebuilt
+    assert server.state.phase == "running" and client.init()["phase"] == "running"
+
+
+def test_a_second_launch_from_setup_with_other_settings_is_refused(setup_phase):
+    runner, _ = setup_phase
+    (c1, _b1), (c2, b2) = _together((server.launch, {}), (server.launch, {"num_rovers": 2}))
+    assert c1 == 200 and c2 == 409 and b2 == {"ok": False, "error": server.ALREADY_LAUNCHED}, b2
+    assert server.state.runner is runner and runner.started and runner.cfg.num_rovers == 3
+
+
+def test_a_launch_from_setup_behind_a_rebuilding_one_keeps_that_world(setup_phase):
+    runner, _ = setup_phase
+    (c1, b1), (c2, b2) = _together((server.launch, {"num_rovers": 2}), (server.launch, {}))
+    new = server.state.runner
+    assert c1 == c2 == 200 and new is not runner and new.started and new.cfg.num_rovers == 2, (b1, b2)
+    assert b2["config"]["num_rovers"] == 2
+
+
+def test_launch_sim_called_twice_from_setup(setup_phase):
+    """The state is read when launch_sim is called, so two launches asked for together start one mission."""
+    runner, _ = setup_phase
+
+    async def main():
+        return await asyncio.gather(server.launch_sim(runner.cfg), server.launch_sim(runner.cfg))
+    assert asyncio.run(main()) == ["started", "already"]
+    assert server.state.runner is runner and runner.started and runner._thread is not None
+    # a launch while running is a new mission, as documented
+    assert asyncio.run(server.launch_sim(runner.cfg)) == "rebuilt" and server.state.runner is not runner
+
+
+def test_a_reset_behind_a_launch_keeps_the_launched_settings(setup_phase):
+    """'Reset sim' (new seed, same settings) queued behind a launch builds on the launched world, not on the
+    world it saw when it came in."""
+    (c1, _), (c2, b2) = _together((server.launch, {"num_rovers": 2}), (server.reset, {"seed": 9}))
+    cfg = server.state.runner.cfg
+    assert c1 == c2 == 200 and (cfg.seed, cfg.num_rovers) == (9, 2), b2
+    assert b2["config"]["num_rovers"] == 2
+
+
+def test_a_launch_behind_a_reset_builds_on_the_reset_world(setup_phase):
+    runner, _ = setup_phase
+    server.state.phase = "running"                    # a New mission, not the setup screen
+    (c1, _), (c2, b2) = _together((server.reset, {"seed": 9}), (server.launch, {"gravity_g": 1.0}))
+    cfg = server.state.runner.cfg
+    assert c1 == c2 == 200 and (cfg.seed, cfg.gravity_g) == (9, 1.0), b2
+
+
+def test_auto_reset_skips_a_world_that_was_replaced(setup_phase):
+    runner, _ = setup_phase
+    make = server._next_planet(runner, 5)
+    assert make(runner.cfg) == runner.cfg.with_seed(5)
+    other = object()
+    server.state.runner, saved = other, server.state.runner
+    try:
+        assert make(runner.cfg) is None
+    finally:
+        server.state.runner = saved
+    server.state.runner = runner
+    assert asyncio.run(server.restart_sim(lambda cur: None)) is None and server.state.runner is runner
+
+
 def test_setup_phase_refuses_world_changes(setup_phase):
     runner, _ = setup_phase
     for endpoint, body in ((server.hazard, {"type": "dust_storm"}), (server.chat, {"text": "rover 1, come home"}),
@@ -717,6 +857,8 @@ V7_TOUCHED = (
     "web/src/App.jsx", "web/src/components/ViewControls.jsx", "web/src/styles.css", "web/src/scene/Scene.jsx",
     "web/src/net/connection.js", "web/src/state/simState.js", "web/mock/mock-server.mjs",
     "web/scripts/setup-unit.mjs", "web/scripts/setup-check.mjs", "web/scripts/screenshot.mjs",
+    "web/src/components/Modal.jsx", "web/src/components/Sidebar.jsx", "sim/GEMMA.md",
+    "docs/superpowers/specs/2026-11-08-redshift-v7-design.md", "docs/superpowers/plans/2026-11-08-redshift-v7.md",
 )
 
 

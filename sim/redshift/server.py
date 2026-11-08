@@ -36,7 +36,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from .config import PRESETS, SETTINGS, Config, physics_table
+from .config import PRESETS, SETTINGS, SETTINGS_BY_KEY, Config, physics_table
 from .gemma import close_planner, get_planner
 from .hazards import TYPES as HAZARD_TYPES
 from .hazards import HazardError
@@ -308,24 +308,98 @@ async def _restart(cfg: Config) -> None:
     _log(f"new world: {_describe(cfg)}")
 
 
-async def restart_sim(cfg: Config) -> None:
-    """Replace the current world with a fresh one built from cfg, running at once."""
+class SettingsRefused(Exception):
+    """Config.from_settings refused a request's settings (errors: its readable texts)."""
+
+    def __init__(self, errors: list):
+        super().__init__("; ".join(errors))
+        self.errors = list(errors)
+
+
+class AlreadyLaunched(Exception):
+    """A launch asked for from the setup phase found the mission already started with other settings."""
+
+
+ALREADY_LAUNCHED = "Another launch started the mission first. Use New mission to change its settings."
+
+
+def _current_cfg() -> Config:
+    return state.runner.cfg if state.runner is not None else Config.from_env()
+
+
+def _settings_cfg(base: Config, data: dict, seed: int | None = None) -> Config:
+    """base with these launch settings (and seed, if given) applied, or SettingsRefused."""
+    cfg, errors = Config.from_settings(base, data)
+    if errors:
+        raise SettingsRefused(errors)
+    return cfg if seed is None else cfg.with_seed(seed)
+
+
+def _resolve(cfg):
+    """cfg is a Config, or a function that makes one from the current world's cfg. Called under the reset
+    lock, so a request queued behind another restart or launch builds on the settings that one left, not on
+    the world it saw when it came in."""
+    return cfg(_current_cfg()) if callable(cfg) else cfg
+
+
+async def restart_sim(cfg) -> Config | None:
+    """Replace the current world with a fresh one, running at once. cfg: a Config, or a function of the
+    current world's cfg (see _resolve) that may return None to do nothing. Returns the cfg built from."""
     async with _reset_lock():
-        await _restart(cfg)
+        cfg = _resolve(cfg)
+        if cfg is not None:
+            await _restart(cfg)
+        return cfg
 
 
-async def launch_sim(cfg: Config) -> None:
-    """Start the mission: the built world itself if cfg is what it was built with and it never ran,
-    otherwise a new world built from cfg."""
+_NOW = object()
+
+
+def launch_sim(cfg, *, seen=_NOW, from_setup: bool | None = None):
+    """Start the mission (a coroutine to await): the built world itself if cfg is what it was built with and
+    it never ran, otherwise a new world built from cfg (a Config, or a function of the current world's cfg).
+
+    seen and from_setup are the world and phase the launch was asked from (default: as they are when
+    launch_sim is called, not when the reset lock comes free). A launch asked from the setup phase starts that
+    mission once: if another launch (or a reset) started it while this one waited for the lock, nothing is
+    rebuilt. The coroutine then returns "already" when its settings match the running world and raises
+    AlreadyLaunched when they do not. Otherwise it returns "started" or "rebuilt"."""
+    if seen is _NOW:
+        seen = state.runner
+    if from_setup is None:
+        from_setup = state.phase == "setup"
+    return _launch(cfg, seen, from_setup)
+
+
+async def _launch(cfg, seen, from_setup: bool) -> str:
     async with _reset_lock():
         runner = state.runner
+        cfg = _resolve(cfg)
+        if from_setup and runner is not None and (runner is not seen or runner.started):
+            if runner.cfg == cfg:
+                _log("launch: the mission had already started with these settings")
+                return "already"
+            raise AlreadyLaunched(ALREADY_LAUNCHED)
         if runner is not None and not runner.started and runner.cfg == cfg:
             state.phase = "running"
             runner.start()
             _reinit_clients()
             _log(f"launch: {_describe(cfg)}")
-            return
+            return "started"
         await _restart(cfg)
+        return "rebuilt"
+
+
+def _next_planet(runner: SimRunner, seed: int):
+    """auto_reset_loop's new world, for restart_sim: the current settings with a new seed, decided under the
+    reset lock. If a reset or launch replaced the finished world meanwhile, nothing happens (the new world
+    gets its own countdown)."""
+    def make(cur: Config):
+        if state.runner is not runner:
+            return None
+        _log(f"exploration finished, landing on a new planet (seed {seed})")
+        return cur.with_seed(seed)
+    return make
 
 
 async def auto_reset_loop() -> None:
@@ -349,9 +423,7 @@ async def auto_reset_loop() -> None:
             if done_since is None:
                 done_since = now
             elif now - done_since >= AUTO_RESET_S:
-                seed = random.randint(1, 99999)
-                _log(f"exploration finished, landing on a new planet (seed {seed})")
-                await restart_sim(runner.cfg.with_seed(seed))
+                await restart_sim(_next_planet(runner, random.randint(1, 99999)))
         except Exception:
             _log("auto reset failed:\n" + traceback.format_exc())
 
@@ -460,10 +532,10 @@ async def get_config():
 @app.post("/api/reset")
 async def reset(request: Request):
     """Restart now and run (also from the setup phase): {"seed": 7} as before, plus any launch setting (v7).
-    Keys left out keep the current world's settings. The new world is built before the old one stops."""
+    Keys left out keep the current world's settings. The new world is built before the old one stops.
+    As before v7, keys that are not settings are ignored (listed in `ignored`) and any seed of 0 or more
+    works, also above the setup screen's 2147483647."""
     body = (await request.body()).strip()
-    runner = state.runner
-    base = runner.cfg if runner is not None else Config.from_env()
     data = {}
     if body:
         try:
@@ -471,41 +543,52 @@ async def reset(request: Request):
         except ValueError:
             return _bad('Body must be JSON like {"seed": 7}')
         data = dict(data) if isinstance(data, dict) else {}       # anything else was ignored before v7
-    if data.get("seed") is None:
-        data.pop("seed", None)
-    else:
+    seed = data.pop("seed", None)
+    if seed is not None:
         try:
-            data["seed"] = int(data["seed"])                       # as before: "8" and 7.9 are accepted
+            seed = int(seed)                                       # as before: "8" and 7.9 are accepted
         except (TypeError, ValueError, OverflowError):
             return _bad("seed must be an integer")
-    cfg, errors = Config.from_settings(base, data)
-    if errors:
-        return _bad("; ".join(errors), errors=errors)
-    try:
-        await restart_sim(cfg)
+        if seed < 0:                                               # numpy cannot seed with one
+            return _bad("seed must be 0 or more")
+    ignored = [k for k in data if k not in SETTINGS_BY_KEY]
+    data = {k: v for k, v in data.items() if k in SETTINGS_BY_KEY}
+    try:   # checked now, so a bad body gets its 400 at once; applied again to the then current world
+        _settings_cfg(_current_cfg(), data)
+        cfg = await restart_sim(lambda cur: _settings_cfg(cur, data, seed))
+    except SettingsRefused as e:
+        return _bad(str(e), errors=e.errors)
     except Exception as e:  # noqa: BLE001 (the old world keeps running)
         _log("reset failed:\n" + traceback.format_exc())
         return _bad(f"Could not build the new world: {e}", 500)
-    return {"ok": True, "seed": cfg.seed, "config": cfg.settings()}
+    out = {"ok": True, "seed": cfg.seed, "config": cfg.settings()}
+    if ignored:
+        out["ignored"] = ignored
+    return out
 
 
 @app.post("/api/launch")
 async def launch(request: Request):
     """v7: start the mission with these launch settings, e.g. {"gravity_g": 1.0, "num_rovers": 4}. Keys left
-    out keep the built world's values; {} launches the world as built. While running it starts a new mission."""
+    out keep the built world's values; {} launches the world as built. While running it starts a new mission.
+    Asked for from the setup phase it starts the mission once (two setup screens launching together do not
+    land twice: see launch_sim)."""
     runner = state.runner
     if runner is None:
         return _bad("simulation not running", 503)
+    seen, from_setup = runner, state.phase == "setup"           # what this request was made against
     body = (await request.body()).strip()
     try:
         data = json.loads(body) if body else {}
     except ValueError:
         return _bad('Body must be JSON like {"gravity_g": 1.5, "num_rovers": 4}')
-    cfg, errors = Config.from_settings(runner.cfg, data)
-    if errors:
-        return _bad("; ".join(errors), errors=errors)
-    try:
-        await launch_sim(cfg)
+    try:   # checked now, so a bad body gets its 400 at once; applied again to the then current world
+        _settings_cfg(_current_cfg(), data)
+        await launch_sim(lambda cur: _settings_cfg(cur, data), seen=seen, from_setup=from_setup)
+    except SettingsRefused as e:
+        return _bad(str(e), errors=e.errors)
+    except AlreadyLaunched as e:
+        return _bad(str(e), 409)
     except Exception as e:  # noqa: BLE001 (the current world keeps running)
         _log("launch failed:\n" + traceback.format_exc())
         return _bad(f"Could not build the new world: {e}", 500)

@@ -167,11 +167,11 @@ function LowerTabs({ tab, setTab, onFocusEvent, selected }) {
   )
 }
 
-export function Sidebar({ follow, selected, onSelect, onFocusEvent }) {
+export function Sidebar({ follow, selected, onSelect, onFocusEvent, inert = false }) {
   // With Comms open the fleet stats fold into one row, so the conversation has room.
   const [tab, setTab] = useState('events')
   return (
-    <aside className="side" data-tab={tab}>
+    <aside className="side" data-tab={tab} inert={inert}>
       <header className="side-head">
         <div className="side-head-top">
           <Wordmark />

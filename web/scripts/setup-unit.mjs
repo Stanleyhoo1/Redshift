@@ -2,7 +2,7 @@
 // fields in src/state/simState.js and the HTTP helpers in src/net/connection.js (with a stand-in fetch).
 // Usage: node scripts/setup-unit.mjs
 import assert from 'node:assert/strict'
-import { SEED_FIELD, diffSettings, fieldsByGroup, formatValue, gravityLook, metersPerSecond2, parseSeed, physicsAt, presetName, snap, summary } from '../src/lib/setup.js'
+import { SEED_FIELD, diffSettings, fieldsByGroup, formatValue, gravityLook, gravityText, metersPerSecond2, parseSeed, physicsAt, presetName, readableError, snap, summary } from '../src/lib/setup.js'
 
 const GRAV = { key: 'gravity_g', type: 'float', label: 'Gravity', group: 'planet', help: '', min: 0.5, max: 3, step: 0.1, unit: 'g' }
 const MAP = { key: 'map_size', type: 'int', label: 'Sector size', group: 'sector', help: '', min: 60, max: 200, step: 10, unit: 'm' }
@@ -37,6 +37,12 @@ assert.deepEqual(groups.simulation.map((f) => f.key), ['sim_speed', 'future'])
 assert.equal(parseSeed(' 42 '), 42)
 assert.equal(parseSeed('0'), 0)
 for (const bad of ['', '-1', '4.5', 'abc', '2147483648', '99999999999', null]) assert.equal(parseSeed(bad), null, String(bad))
+// the held world's seed is fine as it is, even above the range (a reset or SEED may give one)
+assert.equal(parseSeed('3000000000', SEED_FIELD, 3000000000), 3000000000)
+assert.equal(parseSeed(' 3000000000 ', SEED_FIELD, 3000000000), 3000000000)
+assert.equal(parseSeed('3000000001', SEED_FIELD, 3000000000), null)
+assert.equal(parseSeed('7', SEED_FIELD, 3000000000), 7)
+assert.equal(parseSeed('-1', SEED_FIELD, -1), null)
 const rows = [{ gravity_g: 1.9, climb_deg: 22.6, tow_deg: 8.8 }, { gravity_g: 2, climb_deg: 21.3, tow_deg: 8.4 }]
 assert.equal(physicsAt(rows, 2.04).climb_deg, 21.3)
 assert.equal(physicsAt([], 2), null)
@@ -57,6 +63,19 @@ assert.notEqual(heavy.color, mid.color)
 
 // value text and the summary sentence under the form
 assert.equal(formatValue(GRAV, 2), '2.0 g')
+assert.equal(formatValue(GRAV, 0.5 + 12 * 0.1), '1.7 g')
+assert.equal(formatValue(GRAV, 2.04), '2.04 g') // a world an env var started off the 0.1 g grid
+assert.equal(gravityText(3), '3.0')
+assert.equal(gravityText(1.23456), '1.235')
+assert.equal(gravityText('x'), '')
+
+// a refused launch reads with the screen's labels, one sentence per problem
+assert.equal(readableError('gravity_g must be between 0.5 and 3 g; num_rovers must be between 1 and 8', FIELDS), 'Gravity must be between 0.5 and 3 g. Rovers must be between 1 and 8.')
+assert.equal(readableError('map_size must be in steps of 10 m', FIELDS), 'Sector size must be in steps of 10 m.')
+assert.equal(readableError("unknown setting 'warp' (use one of gravity_g, seed)", FIELDS), "unknown setting 'warp' (use one of gravity_g, seed).")
+assert.equal(readableError('Another launch started the mission first. Use New mission to change its settings.', FIELDS), 'Another launch started the mission first. Use New mission to change its settings.')
+assert.equal(readableError('warp_drive must be a number', FIELDS), 'warp_drive must be a number.') // a key this table does not know
+assert.equal(readableError('', FIELDS), '')
 assert.equal(formatValue(MAP, 120), '120 m')
 assert.equal(formatValue(SPEED, 3), '3x real time')
 assert.equal(formatValue(ROVERS, 4), '4')

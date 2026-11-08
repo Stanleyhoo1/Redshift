@@ -9,7 +9,7 @@ from dataclasses import dataclass, fields, replace
 def _env_int(name: str, default: int) -> int:
     try:
         return int(float(os.environ.get(name, default)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -102,10 +102,17 @@ class Setting:
             return None, f"{k} must be a whole number"
         if not self.min <= value <= self.max:        # before any conversion: a huge int cannot overflow
             return None, f"{k} must be between {_num_text(self.min)} and {_with_unit(self.max, self.unit)}"
-        value = int(value) if self.type == "int" else float(value)
-        if self.type == "int" and self.step > 1 and (value - int(self.min)) % int(self.step):
+        if self.type == "int":
+            value = int(value)
+            if self.step > 1 and (value - int(self.min)) % int(self.step):
+                return None, f"{k} must be in steps of {_with_unit(self.step, self.unit)}"
+            return value, None
+        # a float on the step grid, give or take float noise (1.7000000000000002 is 1.7); 2.04 g is refused,
+        # so every launched gravity is one the setup screen and the physics table show
+        n = (float(value) - self.min) / self.step
+        if abs(n - round(n)) > 1e-6:
             return None, f"{k} must be in steps of {_with_unit(self.step, self.unit)}"
-        return value, None
+        return round(self.min + round(n) * self.step, 6), None
 
     def clamp(self, value):
         """value limited to [min, max] (from_env: an env var out of range is clamped, not refused)."""
@@ -365,16 +372,21 @@ class Config:
     @classmethod
     def from_settings(cls, base: "Config", data) -> tuple:
         """Apply launch settings (a JSON object keyed like SETTINGS; keys left out keep base's values).
-        Returns (new Config, []) or (None, [every problem found, readable])."""
+        Returns (new Config, []) or (None, [every problem found, readable]). A number equal to base's own
+        value is no change and always passes, even off the table's range or step (an env var or a reset may
+        give a world one, e.g. MAP_SIZE=125), so GET /api/config `current` can be sent back as it is."""
         if not isinstance(data, dict):
             return None, ['Body must be a JSON object like {"gravity_g": 1.5, "num_rovers": 4}']
         changes, errors = {}, []
+        own = base.settings()
         for key, value in data.items():
             s = SETTINGS_BY_KEY.get(key)
             if s is None:
                 errors.append(f"unknown setting {key!r} (use one of {', '.join(SETTINGS_BY_KEY)})")
                 continue
             val, err = s.parse(value)
+            if err and s.type in ("int", "float") and _same_number(value, own.get(key)):
+                val, err = own[key], None
             if err:
                 errors.append(err)
             elif key == "wear":
@@ -416,7 +428,7 @@ class Config:
         if wear not in ("off", *WEAR_RATES):
             wear = "normal"
         base = cls(
-            seed=int(S["seed"].clamp(_env_int("SEED", 42))),
+            seed=max(0, _env_int("SEED", 42)),      # not clamped above: as before v7, SEED=3000000000 builds that world
             num_rovers=int(S["num_rovers"].clamp(_env_int("NUM_ROVERS", 3))),
             sim_speed=float(S["sim_speed"].clamp(_env_float("SIM_SPEED", 3.0))),
             map_size=float(S["map_size"].clamp(_env_float("MAP_SIZE", 120.0))),
@@ -445,6 +457,15 @@ class Config:
 
 # declared type of each Config field ("float", "int", ...): from_settings stores floats as floats
 _FIELD_TYPES = {f.name: f.type for f in fields(Config)}
+
+
+def _same_number(value, own) -> bool:
+    """value (from a request) is a real, finite number equal to own (base's setting)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or isinstance(own, bool):
+        return False
+    if not isinstance(own, (int, float)) or (isinstance(value, float) and not math.isfinite(value)):
+        return False
+    return value == own
 
 
 def physics_table(cfg: Config) -> list:
