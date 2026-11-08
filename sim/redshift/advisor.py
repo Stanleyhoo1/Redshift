@@ -135,6 +135,19 @@ FREE_CHARGE = 0.5         # a rover charging below this battery is not free for 
 REQUEST_KIND = {"lifeform": "lifeform", "choose_place": "choose_place", "rescue": "rescue"}   # else: "anomaly"
 # protocol v8: decisions a rover makes on its own (autonomous mode), or Gemma's suggestion (supervised)
 CONF_FLOOR = 0.5          # below this Gemma confidence the safest option is taken
+DET_OVERRIDE = 0.9        # an onboard detection this sure of a different class wins over Gemma's obstacle label
+DET_WAIT_S = 1.5          # sim s: a new-obstacle interpretation waits this long for the detector's look ...
+DET_WAIT_WALL_S = 1.0     # ... and the camera frame for Gemma this long (wall s) for a detection of that moment
+DETECTOR_WHAT = {"spire": "a fallen spire", "boulder": "a boulder", "rock": "a rock"}
+
+
+def detector_overrides(det: dict, gemma_class: str | None) -> bool:
+    """True if a confident detector class (rock, boulder, spire) contradicts Gemma's label for the obstacle."""
+    if det is None or det.get("conf", 0.0) < DET_OVERRIDE:
+        return False
+    if det["label"] in ("rock", "boulder"):
+        return gemma_class != "rock"
+    return True                   # spire: Gemma has no spire class, so any label of its own contradicts it
 SAFEST = {k: v[0][0] for k, v in QUESTION_OPTIONS.items()}
 DECISION_LABEL = {"tow": "tow it home", "salvage": "salvage parts", "leave": "leave it",
                   "reroute": "go around", "proceed_slowly": "approach slowly", "wait": "wait",
@@ -453,6 +466,24 @@ class Advisor:
         return deadline is None or deadline - time.perf_counter() > 0.002
 
     # ================================================================== 1. goal choice
+    @staticmethod
+    def _goal_why(c: dict, base: dict | None) -> str:
+        """Why Gemma's pick beats the rules' pick, from the real numbers only, so every comparison the
+        log shows is true. Empty when there is no measurable advantage."""
+        if not base or c.get("kind") != "frontier":
+            return ""
+        bits = []
+        sz, bsz = int(c.get("size") or 0), int(base.get("size") or 0)
+        if bsz and sz >= bsz * 1.25 and sz - bsz >= 3:
+            bits.append(f"more unknown ground at its edge ({sz} vs {bsz} cells)")
+        pl, bpl = c.get("plen"), base.get("plen")
+        if pl is not None and bpl is not None and bpl > 0 and pl <= bpl * 0.8 and bpl - pl >= 3:
+            bits.append(f"a shorter drive ({pl:.0f} vs {bpl:.0f} m)")
+        sm, bsm = c.get("smax"), base.get("smax")
+        if sm is not None and bsm is not None and bsm - sm >= 3:
+            bits.append(f"a gentler route (steepest {sm:.0f} vs {bsm:.0f} deg)")
+        return ", ".join(bits)
+
     def on_goal_chosen(self, rover, t: float, goal, path, size: int, reached: bool) -> None:
         """The rules just picked `goal` (the rover drives there now). Maybe ask Gemma."""
         if not self.planner.online or rover.id in self.choices or rover.state != "exploring":
@@ -604,13 +635,20 @@ class Advisor:
             need = rover.energy_for_distance(c["plen"] + 1.3 * math.hypot(gx, gy)) + rover.battery_margin
             if not still or taken or need > rover.battery:
                 return
+            base = next((b for b in job.cands if b["id"] == "f1"), None)
+            adv = self._goal_why(c, base)
+            if not adv:                    # no measurable advantage: state the facts only, never a false comparison
+                pl, sm = c.get("plen"), c.get("smax")
+                adv = (f"Gemma's pick: {int(c.get('size') or 0)} cells of unknown edge"
+                       + (f", {pl:.0f} m drive" if pl is not None else "")
+                       + (f", steepest {sm:.0f} deg" if sm is not None else ""))
             rover.goal, rover.goal_size, rover.goal_t = (gx, gy), c["size"], t
             rover._set_path(t, c["path"])
             rover.plan_t = -1e9            # re-plan from where the rover is now (the rules' A*)
             rover.sticky_goal = (gx, gy)
             rover.next_goal_eval = t + 30.0
-            rover.mem.on_goal(t, "gemma", _clean(res.reason).strip("'\" "))
-            self._log(t, "info", f"{rover.id} switching to {c['label']} (Gemma, {lat:.1f} s): {why}", rover.id,
+            rover.mem.on_goal(t, "gemma", adv)
+            self._log(t, "info", f"{rover.id} switching to {c['label']} (Gemma, {lat:.1f} s): {adv}.", rover.id,
                       at=(gx, gy), source="gemma")
         elif c["kind"] == "target":
             ts = f.targets[c["tidx"]]
@@ -704,6 +742,14 @@ class Advisor:
         job["image"] = bool(jpeg)
         if jpeg:
             self.frames += 1
+        if job.get("type") != "describe" and not self.wait_for_gemma:
+            # the onboard detector's result for the same moment goes with the frame: wait briefly for a
+            # detection made at or after the anomaly (the camera thread runs the detector)
+            vb = getattr(self._rover(job["rover"]), "vision", None)
+            end = time.monotonic() + DET_WAIT_WALL_S
+            while (vb is not None and vb.latest is not None and vb.latest.t < job["t"] - 0.1
+                   and time.monotonic() < end and not self._stop.is_set()):
+                time.sleep(0.05)
         self._camera_evidence(job)
         if job.get("type") == "describe":
             tk = self.planner.submit_description(job["rover"], job["t"], job["perception"], job["obs"], jpeg)
@@ -730,6 +776,32 @@ class Advisor:
             (job["obs"] if job.get("type") == "describe" else job["anomaly"])["camera_sees"] = seen
             if "facts" in job:
                 job["facts"]["camera_sees"] = seen
+        if job.get("type") != "describe":
+            det = self._detector_for(job, self.sim.t)
+            if det is not None:
+                job["detector"] = det
+                job["anomaly"]["camera_detector"] = f"{det['label']} {det['conf']:.2f}"
+
+    def _detector_for(self, job: dict, t: float):
+        """The onboard detector's strongest obstacle class (rock, boulder, spire) at this anomaly, or None:
+        the rover's own camera rule result (rover.anomaly["camera"]) or a fresh detection near the place."""
+        rover = self._rover(job["rover"])
+        if rover is None or job.get("kind") != "new_obstacle":
+            return None
+        a = getattr(rover, "anomaly", None)
+        if isinstance(a, dict) and a.get("t") == job["t"] and isinstance(a.get("camera"), dict):
+            return {"label": a["camera"]["label"], "conf": float(a["camera"]["conf"])}
+        vb = getattr(rover, "vision", None)
+        res = vb.fresh(t) if vb is not None else None
+        if res is None or res.t < job["t"] - 0.5 or job.get("at") is None:
+            return None
+        ax, ay = job["at"]
+        cands = [o for o in res.objects if o["label"] in ("rock", "boulder", "spire")
+                 and math.hypot(o["x"] - ax, o["y"] - ay) < 3.0]
+        if not cands:
+            return None
+        o = max(cands, key=lambda c: c["conf"])
+        return {"label": o["label"], "conf": float(o["conf"])}
 
     def _poll_interpretations(self, t: float) -> None:
         with self._mu:
@@ -741,6 +813,11 @@ class Advisor:
                 res = self.planner.poll(tk)
                 if res is None and self.clock() - job["wall"] < self.planner.cfg.timeout_s + 12.0:
                     continue               # still thinking (or the camera is slow)
+            if job.get("kind") == "new_obstacle" and job.get("type") != "describe" and t - job["t"] < DET_WAIT_S:
+                vb = getattr(self._rover(job["rover"]), "vision", None)
+                if (vb is not None and vb.latest is not None and vb.latest.t < job["t"] - 0.1
+                        and self._detector_for(job, t) is None):
+                    continue               # the detector has not seen this moment yet: its class comes first
             with self._mu:
                 self._done.remove(item)
             if job.get("type") == "describe":
@@ -779,9 +856,19 @@ class Advisor:
             job["gemma_class"] = res.classification
             label = res.classification.replace("_", " ")
             src = "camera and sensors" if job["image"] else "sensors"
-            head = (f"{rid} Gemma ({src}, {res.latency_ms / 1000.0:.1f} s): "
-                    f"{'maybe ' if res.action == 'ask_operator' else ''}{label}, confidence {res.confidence:.2f}. "
-                    f"{_quote(res.reason)}")
+            det = self._detector_for(job, t) or job.get("detector")
+            if det is not None:
+                job["facts"]["camera_detector"] = f"{det['label']} {det['conf']:.2f}"
+            if det is not None and detector_overrides(det, res.classification):
+                # a confident onboard detection of a different class wins over Gemma's label
+                what = DETECTOR_WHAT.get(det["label"], det["label"])
+                job["gemma_class"] = "rock"
+                head = (f"{rid} Gemma ({src}, {res.latency_ms / 1000.0:.1f} s) said {label} "
+                        f"({res.confidence:.2f}). Camera detector: {det['label']} {det['conf']:.2f}, so {what}.")
+            else:
+                head = (f"{rid} Gemma ({src}, {res.latency_ms / 1000.0:.1f} s): "
+                        f"{'maybe ' if res.action == 'ask_operator' else ''}{label}, confidence {res.confidence:.2f}. "
+                        f"{_quote(res.reason)}")
             if ask:
                 tail = "Asking the operator; holding position meanwhile."
             elif phrase is None:

@@ -1119,6 +1119,8 @@ class HazardManager:
             if math.hypot(tr.x - spot[0], tr.y - spot[1]) < 20.0 and tr.observer is None:
                 tr.done_until = -1e9
                 tr.ignored = False
+        # the fleet reacts to this herd even if other rovers already watch herds (fleet._assign_observers)
+        f.injected_herds = [hh for hh in getattr(f, "injected_herds", []) if t < hh[3]] + [(spot[0], spot[1], rover.id, t + 30.0)]
         h = self._new("lifeform", t, rover=rover.id, x=spot[0], y=spot[1])
         sim.fleet.log(t, "hazard", f"A herd of creatures wanders into view of {rover.name}.", None, at=spot)
         if charge:                                    # protocol v9 demo: its territorial member charges the rover

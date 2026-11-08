@@ -177,7 +177,8 @@ function Filters({ filter, setFilter, counts, meta, hasDecisions, hasDamage }) {
   )
   return (
     <div className="evf-row" role="toolbar" aria-label="Filter the event log">
-      {chip('all', 'All', counts.all, { title: 'Every event' })}
+      {chip('key', 'Highlights', counts.key, { title: 'Decisions, discoveries, hazards, warnings and damage (no routine lines)' })}
+      {chip('all', 'All', counts.all, { title: 'Every event, including routine planning lines' })}
       {meta.map((m) =>
         chip(
           m.id,
@@ -216,7 +217,12 @@ function Filters({ filter, setFilter, counts, meta, hasDecisions, hasDamage }) {
   )
 }
 
+// Highlights: what a judge should see (decisions, damage, hazards, warnings, discoveries), without the routine
+// info lines (frontier switches, headings). The default view.
+const isKey = (e) => !!(e.decision || e.damage || (e.level && e.level !== 'info'))
+
 const EMPTY = {
+  key: 'Decisions, discoveries, hazards and damage will appear here. "All" shows every routine line too.',
   all: 'Rover decisions and discoveries will appear here.',
   fleet: 'No fleet-wide events yet.',
   decisions: 'No decisions logged yet. In autonomous mode every choice a rover makes on its own (and why) appears here.',
@@ -230,15 +236,16 @@ export function EventLog({ onFocusEvent, hidden }) {
   const initSeq = useSim((s) => s.initSeq)
   const gen = useSim((s) => s.gen)
   const v8 = useSim((s) => typeof s.fleet.mode === 'string')
-  const [filter, setFilter] = useState('all')
+  const [filter, setFilter] = useState('key')
   const [limit, setLimit] = useState(PAGE)
   const list = useRef(null)
   const atTop = useRef(true)
   const byId = useMemo(() => Object.fromEntries(meta.map((m) => [m.id, m])), [meta])
 
   const counts = useMemo(() => {
-    const c = { all: events.length, fleet: 0, decisions: 0, damage: 0 }
+    const c = { all: events.length, key: 0, fleet: 0, decisions: 0, damage: 0 }
     for (const e of events) {
+      if (isKey(e)) c.key++
       if (e.rover) c[e.rover] = (c[e.rover] || 0) + 1
       else c.fleet++
       if (e.decision) c.decisions++
@@ -249,6 +256,7 @@ export function EventLog({ onFocusEvent, hidden }) {
 
   const shown = useMemo(() => {
     if (filter === 'all') return events
+    if (filter === 'key') return events.filter(isKey)
     if (filter === 'fleet') return events.filter((e) => !e.rover)
     if (filter === 'decisions') return events.filter((e) => e.decision)
     if (filter === 'damage') return events.filter((e) => e.damage)
@@ -256,7 +264,7 @@ export function EventLog({ onFocusEvent, hidden }) {
   }, [events, filter])
 
   // A rover that left (sim reset) cannot stay the filter.
-  if (filter !== 'all' && filter !== 'fleet' && filter !== 'decisions' && filter !== 'damage' && meta.length && !byId[filter]) setFilter('all')
+  if (filter !== 'all' && filter !== 'key' && filter !== 'fleet' && filter !== 'decisions' && filter !== 'damage' && meta.length && !byId[filter]) setFilter('all')
 
   const pick = (id) => {
     setFilter(id)

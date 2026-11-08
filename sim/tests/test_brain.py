@@ -152,7 +152,7 @@ def test_provisional_goal_then_gemma_switch():
     sw = gemma_events(sim, "switching to")
     assert sw, "Gemma never changed a goal"
     for e in sw:
-        assert re.match(rf"{e['rover']} switching to (frontier|sample) .+ \(Gemma, \d+\.\d s\): '.*\d+.*'$", e["msg"]), e
+        assert re.match(rf"{e['rover']} switching to (frontier|sample) .+ \(Gemma, \d+\.\d s\): .*\d+.*$", e["msg"]), e
         assert "at" in e
     # one event per switch, never more than the questions asked
     assert len(sw) <= len(seen)

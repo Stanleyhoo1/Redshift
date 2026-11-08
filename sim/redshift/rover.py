@@ -2227,9 +2227,10 @@ class Rover:
                 break
 
     # ================================================================== lifeforms: observe from a safe distance
-    def can_observe(self, t: float, tr) -> bool:
-        """Free, healthy, enough battery, close enough: may switch to observing this track."""
-        if self.state != "exploring" or self.held or self.op_goal is not None or self.degraded:
+    def can_observe(self, t: float, tr, busy_ok: bool = False) -> bool:
+        """Free, healthy, enough battery, close enough: may switch to observing this track. busy_ok: an
+        injected demo herd may also interrupt a trip to a target (investigating)."""
+        if self.state not in (("exploring", "investigating") if busy_ok else ("exploring",)) or self.held or self.op_goal is not None or self.degraded:
             return False
         if self.dir_bias is not None and t < self.dir_bias[2]:
             return False

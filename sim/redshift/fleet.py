@@ -120,6 +120,7 @@ class Fleet:
         self.dropoffs: list = []           # [(x, y, t)] LiDAR holes the camera said were not liquid
         self.tracker = Tracker()           # moving LiDAR clusters (lifeforms)
         self.observed_areas: list = []     # [(x, y, t)] where an observation ended (no repeat for a while)
+        self.injected_herds: list = []     # [(x, y, rover id, until)] demo herds brought in (hazards.py): always observed
         self.lifeform_herds: list = []     # [(x, y, most individuals seen at once)] confirmed lifeforms
         self.lifeforms_seen = 0
         self.announced: list = []          # [(x, y, t)] sightings already logged without an observer
@@ -525,22 +526,32 @@ class Fleet:
         observing = [r for r in self.rovers if r.state == "observing" and r.obs is not None]
         max_obs = 2 if len(self.rovers) >= 3 else 1     # the others keep exploring
         self.dismissed_herds = [d for d in self.dismissed_herds if t - d[2] < HERD_DISMISSED_S]
+        self.injected_herds = [h for h in self.injected_herds if t < h[3]]
         for tr in tracker.confirmed():
             if tr.observer is not None or tr.ignored or tr.status == "lost" or t < tr.done_until:
                 continue
             px, py = tr.predict(t)
-            if any(math.hypot(px - dx, py - dy) < HERD_DISMISSED_M for dx, dy, _ in self.dismissed_herds):
+            # a herd the operator just brought in (POST /api/hazard lifeform) always gets a reaction: it skips
+            # the observer cap and the "watched a moment ago" / "dismissed" bookkeeping of the old place
+            inj = next((h for h in self.injected_herds if math.hypot(px - h[0], py - h[1]) < 10.0), None)
+            if inj is None and any(math.hypot(px - dx, py - dy) < HERD_DISMISSED_M for dx, dy, _ in self.dismissed_herds):
                 tr.ignored = True           # the operator said to leave this herd alone (protocol v7)
                 continue
             if any(o2.observer is not None and math.hypot(o2.x - px, o2.y - py) < 12.0 for o2 in tracker.confirmed()):
                 continue                    # its herd is already being watched
-            if any(math.hypot(px - ax, py - ay) < 15.0 for ax, ay, _ in self.observed_areas):
+            if inj is None and any(math.hypot(px - ax, py - ay) < 15.0 for ax, ay, _ in self.observed_areas):
                 continue                    # that herd was watched a moment ago
-            cands = [r for r in self.rovers if r.can_observe(t, tr)] if len(observing) < max_obs else []
+            free = len(observing) < max_obs or inj is not None
+            cands = [r for r in self.rovers if r.can_observe(t, tr)] if free else []
+            if inj is not None and not cands:
+                cands = [r for r in self.rovers if r.id == inj[2] and r.can_observe(t, tr, busy_ok=True)]
             if cands:
-                r = min(cands, key=lambda r_: math.hypot(r_.x - px, r_.y - py))
+                tgt = next((r_ for r_ in cands if inj is not None and r_.id == inj[2]), None)
+                r = tgt or min(cands, key=lambda r_: math.hypot(r_.x - px, r_.y - py))
                 r.start_observing(t, tr)
                 observing.append(r)
+                if inj is not None:
+                    self.injected_herds = [h for h in self.injected_herds if h is not inj]
                 continue
             if tr in fresh and not any(math.hypot(px - ax, py - ay) < 15.0 and t - at < 120.0
                                        for ax, ay, at in self.announced):
