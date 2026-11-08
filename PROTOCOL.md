@@ -586,6 +586,8 @@ Nothing required. The server must ignore any text the client sends.
 | `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase for `POST /api/launch`; 1 = start at once (`AUTO_RESET_S` above 0 also starts at once) |
 | `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features, 0 = leave it out (each is built in its own v7 step) |
 | `BIOMES`, `LIFE_VARIETY` | 1 | version 7 biomes (own ground, colours and terrain mix per seed) and more lifeform kinds, 0 = off |
+
+| `LIFE_VARIETY` | 1 | version 7 "More lifeforms": skitterers, drifters, crawlers and burrowers join the grazers, chosen by biome. 0 = grazers only, exactly as before |
 | `WEAR` | normal | `off`, `normal` or `harsh`: how fast wheels and motors wear out |
 
 ### Landforms (`MESAS`, `CANYON`, `PITS`, `BOULDER_FIELDS`)
@@ -596,6 +598,29 @@ Optional `features` keys, sent only when the flag is on:
 - `canyon`: `{id, path: [[x, y]...], width, depth, ramps: [{x, y, heading, length}]}` or null.
 - `pits`: `[{id, kind, x, y, radius, depth}]`. `kind` is `sinkhole` or `skylight`.
 - `boulder_fields`: `[{id, x, y, radius, count, rocks}]`. The boulders are geoms `bfield_<i>` and are in the truth heights like rocks; `rocks` lists that field's boulders as `[x, y, size]` (size: mean horizontal half-size, m), in geom order.
+
+### More lifeforms (`LIFE_VARIETY`)
+
+On by default from the environment, off in `Config()`. Launch setting key `life_variety` ("More lifeforms",
+group `features`). With it off, `lifeforms` are grazers only and every message is exactly as before.
+
+- `lifeforms[].kind` is one of `grazer`, `skitterer`, `drifter`, `crawler`, `burrower`. The other fields are as
+  in version 4 (`id, kind, x, y, z, yaw, speed, size`). For a drifter `z` is the height of its bell (1.5 to
+  3.5 m above the ground); for a burrower `z` goes below the ground while it is down.
+- A burrower also has `up`: 0 (down, under the ground) to 1 (all the way up). Clients draw its mound always
+  and its head by `up`. No other kind sends `up`.
+- Each group of creatures gets a kind from the biome weights at its home spot (the primary biome when the
+  terrain has no regions; every kind weighs the same when biomes are off), and a couple of extra groups are
+  added. The lifeform hazard brings a group whose kind follows the weights at the spot it picked.
+- Kinds: grazer (herds of 3 to 4), skitterer (swarms of 6 to 14, 0.4 to 0.55 m, run up to 1.4 m/s and scatter
+  from a rover within 8 m), drifter (2 to 5, drift with their group's wind at about 0.2 m/s), crawler (1 or 2,
+  1.6 to 2 m long, at most 0.15 m/s), burrower (3 to 6; up for 3 to 6 s, down for 6 to 14 s, and never up
+  within 5 m of a rover).
+- Rovers only see LiDAR points and camera frames. They keep at least 4 m from any track, and 6 m (following at
+  8 m) from a track their LiDAR measures at 1.5 m or more or whose camera label names a crawler or a shell. They
+  also stop for a fresh unconfirmed cluster within that distance ahead. With Gemma, the describe prompt lists
+  what the kinds look like, so a track `label` can name one ("possible skitterer swarm, small and fast").
+- Event text for the lifeform hazard names the group ("A swarm of skitterers wanders into view of Rover 1.").
 
 ### Dunes and ice sheets
 

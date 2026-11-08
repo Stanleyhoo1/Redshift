@@ -64,6 +64,9 @@ HOLE_MIN_RAYS = 7          # missing steep returns straight ahead before a hole 
 HOLE_FRONT = math.radians(35.0)   # only straight ahead (inside the camera's view)
 LIQUID_MIN_PCT = 3.0       # blue liquid in at least this share of the lower camera image
 CREATURE_STOP_M = 3.5      # any rover stops if a tracked creature is this close ahead
+LARGE_TRACK_M = 1.5        # v7 life variety: a track this big (LiDAR) is treated as a large creature ...
+LARGE_KEEP_M = 6.0         # ... and kept at least this far away (crawlers: 6 m, not 4 m)
+LARGE_WORDS = ("crawler", "shell")    # or the rover's own camera named it a crawler
 VERB = {"drill": "drilled a core from", "scoop": "scooped ice from", "sniffer": "sniffed the gas at",
         "swab": "swabbed the trace at"}
 BRAKE_KV = 400.0       # wheel brake stiffness while the motor controller is down (normal servo: motor_kv)
@@ -1693,9 +1696,27 @@ class Rover:
         i, j = f.map.ij(x, y)
         return bool(f.map.known[j, i] and np.isfinite(c[j, i]))
 
+    def keep_m(self, tr) -> float:
+        """How far to stay from this track. With life variety on, a large creature (by the LiDAR size or
+        a camera label saying crawler or shell) is kept at 6 m; everything else at the usual 4 m. Only the
+        rover's own readings decide, never the true kind."""
+        cfg = self.cfg
+        if not cfg.life_variety or tr is None:
+            return cfg.observe_min_dist
+        label = (tr.label or "").lower()
+        if tr.size >= LARGE_TRACK_M or any(w in label for w in LARGE_WORDS):
+            return max(cfg.observe_min_dist, LARGE_KEEP_M)
+        return cfg.observe_min_dist
+
+    def standoff_m(self, tr) -> float:
+        """Follow at this distance (2 m beyond the keep distance for a large creature)."""
+        return max(self.cfg.observe_standoff, self.keep_m(tr) + 2.0)
+
     def _standoff_goal(self, px: float, py: float, d: float):
         """A safe spot about the standoff distance from the creature, on our side of it."""
         sd = self.cfg.observe_standoff
+        if self.cfg.life_variety and self.obs is not None:
+            sd = self.standoff_m(self.fleet.tracker.get(self.obs["track"]))
         base = math.atan2(self.y - py, self.x - px)
         for off in (0.0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2):
             gx, gy = px + sd * math.cos(base + off), py + sd * math.sin(base + off)
@@ -1753,12 +1774,24 @@ class Rover:
                                  f"{cfg.observe_standoff:.0f} m to observe.", self.id, at=(px, py))
         # the closest tracked creature (any of the herd) decides when to back off
         dn, near = d, (px, py)
-        for o2 in f.tracker.near(self.x, self.y, cfg.observe_min_dist + 1.0, t):
-            qx, qy = o2.predict(t)
-            dq = math.hypot(qx - self.x, qy - self.y)
-            if dq < dn:
-                dn, near = dq, (qx, qy)
-        if dn < cfg.observe_min_dist + 0.5:
+        keep = cfg.observe_min_dist
+        if cfg.life_variety:               # v7: each track its own keep distance (large ones 6 m)
+            keep = self.keep_m(tr)
+            dn -= keep
+            for o2 in f.tracker.near(self.x, self.y, LARGE_KEEP_M + 1.0, t):
+                qx, qy = o2.predict(t)
+                k2 = self.keep_m(o2)
+                dq = math.hypot(qx - self.x, qy - self.y)
+                if dq - k2 < dn:
+                    dn, near, keep = dq - k2, (qx, qy), k2
+            dn += keep
+        else:
+            for o2 in f.tracker.near(self.x, self.y, cfg.observe_min_dist + 1.0, t):
+                qx, qy = o2.predict(t)
+                dq = math.hypot(qx - self.x, qy - self.y)
+                if dq < dn:
+                    dn, near = dq, (qx, qy)
+        if dn < keep + 0.5:
             bx, by = self.x - 1.2 * math.cos(self.yaw), self.y - 1.2 * math.sin(self.yaw)
             self._face(*near)
             if self._safe_cell(bx, by) and f.water_zone_at(bx, by, margin=0.5) is None:
@@ -1766,10 +1799,11 @@ class Rover:
             if t - self.last_backoff_t > 20.0:
                 self.last_backoff_t = t
                 f.log(t, "info", f"{self.id} a creature is {dn:.1f} m away. Backing off to keep at least "
-                                 f"{cfg.observe_min_dist:.0f} m (planetary protection).", self.id, at=near)
+                                 f"{keep:.0f} m (planetary protection).", self.id, at=near)
             self.path = []
             return True
-        if o["mode"] != "follow" or d <= cfg.observe_standoff + 1.0:
+        sd = self.standoff_m(tr) if cfg.life_variety else cfg.observe_standoff
+        if o["mode"] != "follow" or d <= sd + 1.0:
             self.path = []
             self.goal = None
             self._face(px, py)
@@ -2079,6 +2113,11 @@ class Rover:
             return True
         if self.fleet.tracker.tracks and self.fleet.tracker.near(self.x, self.y, self.cfg.observe_min_dist, t):
             return True
+        if self.cfg.life_variety and self.fleet.tracker.tracks:      # v7: a large creature inside 6 m
+            for tr in self.fleet.tracker.near(self.x, self.y, LARGE_KEEP_M, t):
+                px, py = tr.predict(t)
+                if math.hypot(px - self.x, py - self.y) < self.keep_m(tr):
+                    return True
         return False
 
     def _hold_if_blocked(self) -> None:
@@ -2162,8 +2201,16 @@ class Rover:
             v = min(v, cfg.observe_v)
         if v > 0.0 and self.fleet.tracker.tracks:
             # planetary protection: never drive at a creature the LiDAR tracks
-            for tr in self.fleet.tracker.near(self.x, self.y, CREATURE_STOP_M, t):
+            lv = cfg.life_variety          # v7: a large creature stops the rover further out, and so does a
+            near_tr = self.fleet.tracker.near(self.x, self.y, LARGE_KEEP_M if lv else CREATURE_STOP_M, t)
+            if lv:                         # fresh cluster not yet confirmed as moving (a slow crawler)
+                near_tr = near_tr + [tr for tr in self.fleet.tracker.tracks
+                                     if not tr.confirmed and tr.n >= 2 and t - tr.last_seen < 1.0
+                                     and math.hypot(tr.x - self.x, tr.y - self.y) <= LARGE_KEEP_M]
+            for tr in near_tr:
                 px, py = tr.predict(t)
+                if lv and math.hypot(px - self.x, py - self.y) > max(CREATURE_STOP_M, self.keep_m(tr) - 0.5):
+                    continue
                 if abs(wrap(math.atan2(py - self.y, px - self.x) - self.yaw)) < 0.9:
                     v = 0.0
                     if t - self.last_backoff_t > 30.0:
