@@ -2,7 +2,7 @@
 
 Autonomous rovers exploring an unknown super-Earth. Built for the Agentverse 2026 Robotics track.
 
-Three rovers land on a planet with twice Earth's gravity. There is no map and no link home: a message to Earth would take years to arrive. Each rover senses the ground with a simulated LiDAR, IMU, wheel encoders and a camera, decides where to go, and drives there in a physics simulation (MuJoCo). The fleet shares one map of a 120 m region, splits up the unexplored ground, learns how steep a slope it can really climb, and replans when the world changes under it: rockfalls, hidden soft sand, dust storms, toppling crystal spires and breakdowns. Along the way it finds lakes (LiDAR gets no echo off liquid), meets slow alien grazers that it stops to observe from a safe distance, and collects samples into a limited set of tubes that it caches at the lander. Each rover also runs an onboard object detector on its own camera (rocks, spires, creatures, water, science targets) and acts on what it sees. A small Gemma model running locally makes the rovers' judgement calls (or suggests them to a human in supervised mode) and talks with mission control in plain language. A web dashboard shows the planet appearing as the rovers explore.
+Three rovers land on a planet with twice Earth's gravity. There is no map and no link home: a message to Earth would take years to arrive, so everything runs on board, including the AI. Each rover senses the ground with a simulated LiDAR, IMU, wheel encoders and a camera, decides where to go, and drives there in a physics simulation (MuJoCo). The fleet shares one map of a 120 m region, splits up the unexplored ground, learns how steep a slope it can really climb, and replans when the world changes under it: rockfalls, hidden soft sand, dust storms, toppling crystal spires and breakdowns. Along the way it finds lakes (LiDAR gets no echo off liquid), meets slow alien grazers that it stops to observe from a safe distance, and collects samples into a limited set of tubes that it caches at the lander. Each rover also runs an onboard object detector on its own camera (rocks, spires, creatures, water, science targets) and acts on what it sees. A small Gemma model running locally makes the rovers' judgement calls. If a human crew member is on the mission (for example in the lander or an orbiting habitat), they can talk to the rovers in plain language, give orders, and switch to supervised mode to approve decisions themselves. Nothing ever goes back to Earth. A web dashboard shows the planet appearing as the rovers explore.
 
 ## How it fits the judging
 
@@ -10,9 +10,9 @@ Three rovers land on a planet with twice Earth's gravity. There is no map and no
 |---|---|
 | Perception-driven action | Every decision comes from the rover's own sensors and every event says which reading caused it ("slip 82%", "slope 21 deg with motors at 87%", "Camera: creature 4 m ahead (0.99) where LiDAR track k1 moves"). The onboard detector boxes what each camera sees, live on the dashboard. Click an event to fly to where it happened. |
 | Adaptation to change | Judges pick a hazard and click where it should happen, and the scene changes mid-run. The rovers only find out through their sensors (LiDAR sees new rocks or a fallen spire across the path, wheel slip reveals sand, LiDAR returns shrink in dust, LiDAR points that move become a tracked creature, a teammate reports a fault) and visibly replan. |
-| Operational autonomy | Two stated budgets, measured live: each rover's rule brain gets 40 ms per 200 ms cycle, and Gemma calls get 3 s (about 0.3 to 1.5 s on an RTX 4070). Autonomous by default: Gemma makes the judgement calls and every decision is logged with its confidence and reason; below 0.5 confidence the safest option wins. Flip to Supervised and the rovers ask mission control before every decision, holding still (unless staying is the danger) until answered, and heading home on their own if the battery runs low while waiting. |
+| Operational autonomy | Two stated budgets, measured live: each rover's rule brain gets 40 ms per 200 ms cycle, and Gemma calls get 3 s (about 0.3 to 1.5 s on an RTX 4070). Autonomous by default: Gemma makes the judgement calls and every decision is logged with its confidence and reason; below 0.5 confidence the safest option wins. Flip to Supervised (for when a crew member is on site) and the rovers ask the crew before every decision, holding still (unless staying is the danger) until answered, and heading home on their own if the battery runs low while waiting. |
 | Relevance and impact | Planetary rovers cannot wait minutes or years for instructions. The failure that ended NASA's Spirit rover, getting stuck in soft soil, is detected and handled on screen. Rovers fill a small number of sample tubes and cache them at the lander, the way Perseverance does for Mars Sample Return, so they have to judge which finds are worth a tube. Possible life is observed from at least 4 m and never touched (planetary protection). |
-| Ambition and quality | Real physics at 2 g, a coordinated fleet, online learning, creature tracking from LiDAR, lake detection from missing returns, a science sampling loop, an onboard camera object detector, a two-tier brain (fast rules plus a local Gemma model), natural-language command by place with chat memory, and a polished, realistic mission control. |
+| Ambition and quality | Real physics at 2 g, a coordinated fleet, online learning, creature tracking from LiDAR, lake detection from missing returns, a science sampling loop, an onboard camera object detector, a two-tier brain (fast rules plus a local Gemma model), natural-language command by place with chat memory, and a polished, realistic crew dashboard. |
 
 ## Quick start (Docker)
 
@@ -62,6 +62,8 @@ The rules always keep control of safety: Gemma's picks are only taken from optio
 
 ## Using the dashboard
 
+The dashboard plays two roles: the judges' window into what the rovers sense and decide, and the console of a crew member on the mission. The hazard buttons are for the demo (the rovers are never told about them); Comms, the request cards and the Autonomous / Supervised switch are what a crew member on site would use.
+
 - **Sensor panel:** click a rover card, the rover itself, or press 1 to 3. Live camera (onboard or chase view, rendered by MuJoCo), LiDAR radar, IMU, wheel slip, motor load, spectrometer, and brain time against the budget.
 - **Hazards bar:** pick Rockfall, Soft sand, Falling spire or Lifeform, then click the map where it should happen (a ghost marker shows the spot; Esc cancels; right-click lets the sim choose a spot on a rover's route). If a spot is unsafe (on the lander, in water, too steep, would trap a rover) the bar says why and you can click somewhere else. Dust storm is one click for the whole map. Motor fault: press it, then click a rover. Each run has enough boulders for about 25 rockfalls and 20 spare spires to drop on open ground (any standing spire can also be toppled once); Reset sim restores them.
 - **Samples tab:** every sample collected so far, sorted by science value, with the instrument used (drill, scoop, gas sniffer, swab), the lab result, and whether it is still on a rover or cached at the lander. Rover cards show their 3 tube slots and a progress bar while sampling.
@@ -110,7 +112,7 @@ npm run dev     # http://localhost:5173
 PROTOCOL.md          message format between the sim and the UI
 docker-compose.yml   runs both services
 sim/                 MuJoCo world, rover agents, hazards, cameras, Gemma advisor, FastAPI + WebSocket server
-web/                 React + Three.js mission control dashboard
+web/                 React + Three.js crew dashboard
 ```
 
 ## How the rovers decide
@@ -123,15 +125,15 @@ Fast tier (rules, 5 times per sim second, inside a 40 ms budget):
 4. **Learn on the fly.** The fleet starts out assuming it can climb 30 degrees. A stall on a slope (with the motors near their limit) lowers the limit for everyone.
 5. **Stay safe.** Anything unexpected makes the rover slow down before it replans. It backs out of soft ground, routes around new rocks, crawls in dust, and keeps enough battery to get home plus a 15% margin (more when dust covers the lander's solar panels).
 6. **Spot water.** Liquid gives no LiDAR echo. A patch of missing returns that the camera shows as liquid becomes a lake on the shared map and everyone routes around it; a hole that is not liquid is treated as a drop-off.
-7. **Watch for life.** LiDAR points that move between scans become a track, and the camera detector confirms it is a creature. The rover follows at about 6 m (never closer than 4 m) and Gemma or mission control decides whether to keep following; it logs the herd's size and speed.
+7. **Watch for life.** LiDAR points that move between scans become a track, and the camera detector confirms it is a creature. The rover follows at about 6 m (never closer than 4 m) and Gemma (or the crew, in supervised mode) decides whether to keep following; it logs the herd's size and speed.
 8. **Collect samples.** The spectrometer estimates each target's science value. A rover samples with the right tool (drill for minerals, scoop for ice, sniffer for vents, swab for organic traces), but skips low-value targets when only one tube is left, and caches full tubes at the lander.
 9. **See with the camera.** An onboard detector (RGB and depth pixels only) labels rocks, boulders, spires, creatures, water, minerals, ice, vents and traces. It confirms water and creatures, tells a fallen spire from rocks, and spots targets before the spectrometer reaches them. Its accuracy against the truth is measured in the sim (`GET /api/vision/stats`); the rovers never see the truth.
 
 Slow tier (local Gemma, a few times a minute, inside a 3 s budget):
 
 10. **Second opinion on goals.** Gemma picks between the safe options the rules prepared (frontiers, samples, going home) and explains why, quoting readings.
-11. **Judgement calls.** Gemma looks at the camera image, the detector's boxes and the sensor numbers and decides what to do about anything unexpected (autonomous), or suggests it to mission control (supervised).
-12. **Understand the operator.** Typed instructions become structured commands that the rules check before acting, with a short memory of the conversation.
+11. **Judgement calls.** Gemma looks at the camera image, the detector's boxes and the sensor numbers and decides what to do about anything unexpected (autonomous), or suggests it to the crew (supervised).
+12. **Understand the crew.** Typed instructions become structured commands that the rules check before acting, with a short memory of the conversation.
 
 ## Two minute demo
 
