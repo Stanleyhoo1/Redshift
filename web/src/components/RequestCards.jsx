@@ -7,6 +7,8 @@ import { useNow } from '../lib/useNow.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { CAM_RETRY_DOWN, LidarRadar, cameraProblem } from './SensorPanel.jsx'
 import { SourceTag } from './Planner.jsx'
+import { FoldButton, useFold } from './Fold.jsx'
+import '../styles/declutter-top.css'
 
 // Clarification requests (PROTOCOL.md version 3, `requests`): a rover that cannot
 // interpret what it senses asks the operator, and takes the safe default when nobody
@@ -298,7 +300,7 @@ function Outcome({ kind, q, name, answer, ghost }) {
   )
 }
 
-function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
+function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect, onFold }) {
   const answer = useAnswer(q.id)
   const hover = usePlaceHover()
   const name = meta?.name || q.rover || 'A rover'
@@ -342,6 +344,7 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
               Waiting for you
             </span>
           )}
+          {onFold && <FoldButton open onToggle={onFold} label="questions" className="rq-fold" />}
         </header>
         <p className="rq-q">{cleanMsg(q.question, q.rover, byId)}</p>
         {kind ? (
@@ -431,6 +434,8 @@ export function RequestCards({ onSelect, collapsed = false, onExpand }) {
   const compact = useCompact()
   const stackRef = useHudRect('requests') // v6: the camera keeps place candidates out from under the card
   const byId = useMemo(() => Object.fromEntries(meta.map((m) => [m.id, m])), [meta])
+  const [unfolded, setUnfolded] = useFold('top.questions', true)
+  const [listOpen, setListOpen] = useState(false)
 
   // When the question in the main card leaves the open list, keep it on screen for a
   // moment with what happened: answered (by us), expired (safe default), or closed.
@@ -493,10 +498,36 @@ export function RequestCards({ onSelect, collapsed = false, onExpand }) {
     const all = [main, ...rest]
     return (
       <div className="rq-stack" ref={stackRef} data-collapsed="">
-        {all.slice(0, 3).map((q) => (
+        {all.slice(0, 2).map((q) => (
           <RequestStrip key={q.id} q={q} meta={byId[q.rover]} byId={byId} now={now} onOpen={() => openStrip(q.id)} />
         ))}
-        {all.length > 3 && <div className="rq-more">{all.length - 3} more waiting</div>}
+        {all.length > 2 && <div className="rq-more">+{all.length - 2} more waiting</div>}
+      </div>
+    )
+  }
+  // Folded: one chip with the count. It pulses again whenever a new question arrives
+  // (the key is the newest question's id, so the animation restarts).
+  if (!unfolded) {
+    const n = open.length
+    if (!n) return null
+    const newest = open[open.length - 1]
+    return (
+      <div className="rq-stack rq-stack-folded" ref={stackRef}>
+        <button
+          type="button"
+          key={newest.id}
+          className="hud rq-chip"
+          style={{ '--rover': byId[newest.rover]?.color || '#8d99aa' }}
+          aria-expanded={false}
+          onClick={() => setUnfolded(true)}
+          title="Show the questions"
+        >
+          <span className="rover-dot" aria-hidden="true" />
+          <b>{n}</b> {n === 1 ? 'question' : 'questions'} waiting
+          <svg className="fold-chev" viewBox="0 0 12 12" aria-hidden="true">
+            <path d="M4.5 3l3 3-3 3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
       </div>
     )
   }
@@ -512,11 +543,21 @@ export function RequestCards({ onSelect, collapsed = false, onExpand }) {
         now={now}
         imgSize={compact ? 114 : 138}
         onSelect={onSelect}
+        onFold={() => setUnfolded(false)}
       />
-      {rest.slice(0, 2).map((q) => (
-        <RequestStrip key={q.id} q={q} meta={byId[q.rover]} byId={byId} now={now} onOpen={() => openStrip(q.id)} />
-      ))}
-      {rest.length > 2 && <div className="rq-more">{rest.length - 2} more waiting</div>}
+      {rest.length > 0 && (
+        <button type="button" className="rq-more rq-more-btn" aria-expanded={listOpen} onClick={() => setListOpen(!listOpen)} title={listOpen ? 'Hide the other questions' : 'Show the other questions'}>
+          +{rest.length} more waiting
+          <svg className="fold-chev" viewBox="0 0 12 12" aria-hidden="true" data-open={listOpen || undefined}>
+            <path d="M4.5 3l3 3-3 3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      )}
+      {listOpen &&
+        rest.slice(0, 5).map((q) => (
+          <RequestStrip key={q.id} q={q} meta={byId[q.rover]} byId={byId} now={now} onOpen={() => openStrip(q.id)} />
+        ))}
+      {listOpen && rest.length > 5 && <div className="rq-more">{rest.length - 5} more</div>}
     </div>
   )
 }
