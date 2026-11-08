@@ -2,7 +2,8 @@
 // flies the camera to each vent, waits for an eruption at the first one and shoots it erupting.
 // Exits 1 on any console error or warning, or when the sim sends no geysers.
 // Usage: node scripts/v7-geysers-check.mjs [url] [outDir]
-// Env: CHROME, WIDTH, HEIGHT, WAIT_S (longest wait for an eruption, wall seconds, default 90)
+// Env: CHROME, WIDTH, HEIGHT, WAIT_S (longest wait for an eruption, wall seconds, default 90),
+// LOW=1 (switch Graphics to Low first)
 import { chromium } from 'playwright-core'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -48,7 +49,7 @@ await page.waitForFunction(() => window.__redshift && window.__redshift.state().
 await page.waitForTimeout(2500)
 
 const shot = async (name) => {
-  const p = path.join(outDir, `geysers-${name}.png`)
+  const p = path.join(outDir, `geysers-${process.env.LOW === '1' ? 'low-' : ''}${name}.png`)
   await page.screenshot({ path: p })
   console.log(`saved ${p}`)
 }
@@ -61,6 +62,7 @@ if (!vents.length) {
   console.error('FAIL: the sim sent no geysers')
   failed = true
 } else {
+  if (process.env.LOW === '1') await page.getByRole('button', { name: 'Low', exact: true }).click()
   await page.keyboard.press('r')
   await page.waitForTimeout(800)
   for (const v of vents.slice(0, 3)) {
@@ -68,22 +70,34 @@ if (!vents.length) {
     await page.waitForTimeout(900)
     await shot(`${v.id}-${v.active ? 'active' : 'idle'}`)
   }
-  // Wait for any vent to erupt, then shoot it a second and a few seconds into the eruption.
-  const t0 = Date.now()
+  // Park the camera on the idle vent due next, wait for it to erupt, then shoot the column as it
+  // builds and once more from close in (at SIM_SPEED=6 an eruption lasts only 1.3 to 2.5 wall s).
+  const geysers = () => page.evaluate(() => window.__redshift.state().features?.geysers || [])
+  const due = (await geysers()).filter((g) => !g.active).sort((a, b) => a.next_s - b.next_s)[0]
   let hit = null
-  while (!hit && Date.now() - t0 < waitS * 1000) {
-    hit = await page.evaluate(() => (window.__redshift.state().features?.geysers || []).find((g) => g.active) || null)
-    if (!hit) await page.waitForTimeout(500)
+  if (due) {
+    await page.evaluate(([x, y, h]) => window.__redshift.view(x, y, 20, 14, 10 + 1.6 * h), [due.x, due.y, due.height])
+    const t0 = Date.now()
+    while (!hit && Date.now() - t0 < waitS * 1000) {
+      hit = (await geysers()).find((g) => g.id === due.id && g.active) || null
+      if (!hit) await page.waitForTimeout(150)
+    }
   }
   if (hit) {
-    await page.evaluate(([x, y, h]) => window.__redshift.view(x, y + 0, 20, 18, 14 + 2 * h), [hit.x, hit.y, hit.height])
-    await page.waitForTimeout(500)
+    await page.waitForTimeout(1000)
     await shot(`${hit.id}-erupting`)
-    await page.evaluate(([x, y]) => window.__redshift.view(x, y, 200, 40, 16), [hit.x, hit.y])
-    await page.waitForTimeout(300)
+    await page.evaluate(([x, y]) => window.__redshift.view(x, y, 200, 35, 11), [hit.x, hit.y])
+    await page.waitForTimeout(150)
     await shot(`${hit.id}-erupting-close`)
     console.log(`eruption at ${hit.id}, height ${hit.height} m`)
   } else console.log(`no eruption within ${waitS} s`)
+  // Reality off: only the vents (and keep-out rings) on ground the fleet knows.
+  const z = zones[0]
+  await page.keyboard.press('r')
+  if (z) await page.evaluate(([x, y, r]) => window.__redshift.view(x, y, 10, 50, 4 * r), z)
+  else await page.evaluate(([x, y]) => window.__redshift.view(x, y, 10, 50, 30), [vents[0].x, vents[0].y])
+  await page.waitForTimeout(800)
+  await shot(z ? 'zone-reality-off' : 'reality-off')
 }
 for (let k = 0; k < fontBlocked; k++) {
   const i = problems.findIndex((p) => p.includes('Failed to load resource'))
