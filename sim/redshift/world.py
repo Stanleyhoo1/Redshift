@@ -479,6 +479,10 @@ def build_world(cfg: Config, terrain, rover_spawns: list) -> World:
                              f'pos="{bx:.3f} {by:.3f} {w.level - 0.01 - 0.0007 * k:.4f}" euler="0 0 {yaw:.4f}" '
                              f'material="water" group="{GROUP_WATER}" contype="0" conaffinity="0"/>')
 
+    if getattr(cfg, "geysers", False):              # v7 geyser vent cones (seen by LiDAR, solid)
+        from .v7_geysers import vent_geoms_xml
+        geoms += vent_geoms_xml(getattr(terrain, "geysers", []))
+
     bodies, actuators, sensors, rover_ids = [], [], [], []
     z0 = rover_spawn_height(cfg)
     for (rid, x, y, yaw, color) in rover_spawns:
