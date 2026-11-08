@@ -168,3 +168,27 @@
     animation: none;
   }
 }
+
+/* The head wraps instead of running out of the narrower card; the fold chevron sits in the
+   top right corner. */
+.hud-request {
+  position: relative;
+}
+
+.rq-head {
+  flex-wrap: wrap;
+  row-gap: 4px;
+  padding-right: 22px;
+}
+
+.rq-fold {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  margin: 0;
+}
+
+.rq-q {
+  font-size: 14px;
+  line-height: 1.4;
+}
