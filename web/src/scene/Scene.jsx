@@ -20,6 +20,8 @@ import { IceSheets } from './IceSheets.jsx'
 import { IceZones } from './IceZones.jsx'
 import { Flora } from './Flora.jsx'
 import { Geysers } from './Geysers.jsx'
+import { BoulderFields } from './BoulderFields.jsx'
+import { MapMarkers } from './MapMarkers.jsx'
 import { GroundDetail } from './GroundDetail.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
@@ -115,6 +117,8 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <IceZones />
       <Flora reality={view.reality} />
       <Geysers reality={view.reality} />
+      <BoulderFields reality={view.reality} />
+      <MapMarkers reality={view.reality} />
       <GroundDetail reality={view.reality} />
       <Lander />
       {view.frontiers && <Frontiers />}

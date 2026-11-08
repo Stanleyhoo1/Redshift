@@ -217,6 +217,8 @@ learns them all). `node scripts/v6-check.mjs` (mock started with
 `MOCK_FIRST_QUESTION_S=99999`, preview running) sends an ambiguous order, saves one
 screenshot and clicks a marker.
 
+Version 7 terrain visuals: map markers keep the small features readable from the sector overview. Each fungal tree (a cap glyph in its violet to teal cap colour), bush (a lime bulb cluster), geyser vent (an ochre ring round a white throat that pulses while it erupts) and boulder field (three grey stones) gets one constant-size glyph (one instanced draw call), shown like the models (Reality on, or once the ground there is mapped) and faded out as the camera comes within about 50 m, gone under 24 m, so close-ups show the models. Boulder fields are drawn as real rocks from `boulder_fields[].rocks`.
+
 Version 7 in the mock (the default; `MOCK_PROTOCOL=6` for the previous behaviour): launch settings with
 the sim's table, presets and physics rows (`GET /api/config`), `POST /api/launch` (a second launch sent
 from the setup phase lands nothing new, as in the sim) and settings in `POST /api/reset` (same error texts as
