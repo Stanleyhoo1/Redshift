@@ -50,7 +50,7 @@ class Config:
     water: bool = True             # lakes (and maybe a river), see terrain.py
     spires: bool = True            # alien crystal spires
     lifeforms: bool = True         # herds of grazers (lifeforms.py)
-    reserve_spires: int = 4        # hidden spare spire bodies for "drop a new spire here"
+    reserve_spires: int = 20       # hidden spare spire bodies for "drop a new spire here"
 
     # ---- physics ----
     timestep: float = 0.005
@@ -136,7 +136,7 @@ class Config:
     exp_cost_us: float = 3.0        # measured cost of one A* expansion on the dev machine
 
     # ---- hazards (see hazards.py) ----
-    num_boulders: int = 24          # hidden boulder bodies allocated in the model for rockfalls (3 to 5 per rockfall)
+    num_boulders: int = 100         # hidden boulder bodies allocated in the model for rockfalls (3 to 5 per rockfall)
     sand_radius: float = 2.5
     sand_friction: float = 0.3      # wheel friction inside a sand patch (normal: wheel_friction)
     sand_wheel_damping: float = 0.3  # extra wheel joint damping inside a patch (rolling resistance)
