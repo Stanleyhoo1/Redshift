@@ -143,7 +143,7 @@ export function Geysers({ reality }) {
   useFrame(({ clock }, dt) => {
     if (!mound.current || !steam.current) return
     const t = reducedMotion ? 0 : clock.elapsedTime
-    const step = Math.min(dt, 0.25)
+    const step = Math.min(dt, 1) // wall time, so the fade takes about a second at any frame rate
     const F = fades.current
     let np = 0
     for (let k = 0; k < MAX; k++) {
