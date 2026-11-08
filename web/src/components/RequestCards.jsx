@@ -6,7 +6,7 @@ import { autoDefault, clearPlaceHover, hasPlaces, hoverKey, isWaiting, optionLab
 import { useNow } from '../lib/useNow.js'
 import { useHudRect } from '../lib/useHudRect.js'
 import { CAM_RETRY_DOWN, LidarRadar, cameraProblem } from './SensorPanel.jsx'
-import { SourceTag } from './Planner.jsx'
+import { GemmaStar, SourceTag } from './Planner.jsx'
 
 // Clarification requests (PROTOCOL.md version 3, `requests`): a rover that cannot
 // interpret what it senses asks the operator, and takes the safe default when nobody
@@ -361,11 +361,12 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
                     type="button"
                     className="rq-opt"
                     data-default={isDefault || undefined}
+                    data-suggested={o.suggested || undefined}
                     data-place={n ? true : undefined}
                     aria-busy={(pending && answer.option === o.id) || undefined}
                     disabled={pending}
                     onClick={() => sendAnswer(q.id, o.id)}
-                    title={n ? `${o.label} (marker ${n} on the map)` : undefined}
+                    title={n ? `${o.label} (marker ${n} on the map)${o.suggested ? ", Gemma's suggestion" : ''}` : o.suggested ? "Gemma's suggestion" : undefined}
                     {...placeChipProps(q, o, hover)}
                   >
                     {n ? (
@@ -377,6 +378,12 @@ function RequestCard({ q, ghost, meta, byId, source, now, imgSize, onSelect }) {
                       </span>
                     ) : (
                       <span className="rq-opt-label">{o.label}</span>
+                    )}
+                    {o.suggested && (
+                      <span className="rq-sugg">
+                        <GemmaStar className="src-star" />
+                        Gemma suggests
+                      </span>
                     )}
                     {isDefault && (
                       <span className="rq-safe">

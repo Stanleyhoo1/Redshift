@@ -11,7 +11,9 @@ Sensors (all the rover knows about the world):
   position       ground truth, treated as GPS-like localisation (no SLAM)
 
   water sensor   a wetness probe on the chassis belly (only matters if the rover ever drives into liquid)
-  camera         mast camera (camera.py), used by the rules for a quick colour check of a LiDAR hole
+  camera         mast camera (camera.py), used by the rules for a quick colour check of a LiDAR hole, and
+                 its onboard object detector (vision.py, protocol v8): self.vision holds the latest
+                 detections; the decision cycle only reads them (water, creatures, new obstacles, targets)
 
 States (protocol enum): exploring, investigating, returning, charging, recovering, idle, fault, observing.
 
@@ -60,6 +62,7 @@ from .config import Config
 from .memory import RoverMemory
 from .planner import PENDING, downsample, path_length
 from .terrain import KIND_LABEL
+from .vision import VisionBrain
 from .world import GROUP_ROCK
 
 LIDAR_GROUPS = np.array([1, 1, 1, 0, 0, 1], np.uint8)   # terrain, rocks, targets and creatures, liquid; never
@@ -97,6 +100,10 @@ GROUND_WARMUP = 25     # ... after this many such sweeps
 GROUND_ALPHA = 0.08    # running mean of the median slope and height of newly mapped ground
 GROUND_SLOPE_DEG = 8.0  # "different ground": median slope this much above the running mean (and 1.8 times it) ...
 GROUND_HEIGHT_M = 2.5  # ... or median height this far from it
+RESURVEY_SHARE = 0.15  # protocol v8: an operator focus on an area with less unknown than this share is a re-survey
+RESURVEY_EARLY_S = 10.0  # ... and so is one whose area turns out to be explored this soon after arriving
+RESURVEY_RING = (0.6, 0.8, 0.4)  # loop waypoints at these fractions of the circle's radius (first safe one wins)
+RESURVEY_POINTS = 8    # waypoints around the loop
 
 
 def wrap(a: float) -> float:
@@ -303,6 +310,7 @@ class Rover:
         self.mem = RoverMemory(self)
         self._count_replan = False
         self.vis_lost_t = None
+        self.vision = VisionBrain(self)    # protocol v8: onboard object detection (results from the camera thread)
 
         self.read_pose()
         self.last_xy = (self.x, self.y)
@@ -596,13 +604,16 @@ class Rover:
     def _on_hole(self, t: float, at: tuple, rays: int, pts: np.ndarray, spread) -> None:
         """A hole ahead in two sweeps: slow down, look with the camera, and decide liquid or drop-off."""
         d = math.hypot(at[0] - self.x, at[1] - self.y)
-        pct = self.camera_liquid_pct()
+        cam = self.vision.water_near(at, t)          # protocol v8: the onboard detector saw water there
+        pct = None if cam is not None else self.camera_liquid_pct()
         details = {"at": at, "dist": round(d, 1), "rays": int(rays)}
+        if cam is not None:
+            details["camera_water"] = cam["conf"]
         if pct is not None:
             details["camera_liquid_pct"] = pct
         if spread is not None:
             details["edge_spread"] = round(spread, 2)
-        liquid = pct is not None and pct >= LIQUID_MIN_PCT
+        liquid = cam is not None or (pct is not None and pct >= LIQUID_MIN_PCT)
         flat_guess = pct is None and spread is not None and spread < 0.08
         f = self.fleet
         if liquid or flat_guess:
@@ -612,7 +623,10 @@ class Rover:
             f.add_water_zone(t, self, zx, zy, zr)
             if new_body:
                 self.note_interest(t, zx, zy, "water", "water", "the water")
-            if liquid:
+            if cam is not None:
+                msg = (f"{self.id} Camera: water ahead ({cam['conf']:.2f}) where LiDAR gets no returns {d:.0f} m "
+                       f"ahead. Confirmed liquid: marking a lake and routing around it.")
+            elif liquid:
                 msg = (f"{self.id} LiDAR gets no returns {d:.0f} m ahead and the camera shows a liquid surface "
                        f"({pct:.0f}% of the lower view is blue). Marking a lake and routing around it.")
             else:
@@ -799,6 +813,8 @@ class Rover:
             pct = d.get("camera_liquid_pct")
             seen = (f"the camera saw liquid ({pct:.0f}% of the lower view blue)" if pct is not None
                     else "the hole had a flat, level edge")
+            if d.get("camera_water") is not None:
+                seen = f"the camera's detector saw water ({d['camera_water']:.2f})"
             self.mem.on_hazard("water", t, at, f"no LiDAR returns {d.get('dist', 0.0):.0f} m ahead and {seen}")
 
     def _check_new_obstacles(self, t: float) -> None:
@@ -971,6 +987,7 @@ class Rover:
         self._check_visibility(t)
         if self.scan_changes > 0:
             self._check_new_obstacles(t)
+        self.vision.tick(t)                # decisions from the latest camera detections (protocol v8)
         self.hold_for_plan = False
         self.block_info = None
 
@@ -1259,6 +1276,8 @@ class Rover:
         if self.op_goal is not None:
             self._op_drive(t)
             return
+        if self.vision.drive_check(t):     # protocol v8: checking something the camera saw beyond the spectrometer
+            return
         # an already found target that nobody is sampling?
         if t >= self.next_target_check:
             self.next_target_check = t + 3.0
@@ -1277,6 +1296,12 @@ class Rover:
                         return
             k, d = f.unclaimed_target(t, self)
             reach = 8.0 if self.degraded else 30.0     # no far investigations while unsure
+            if not self.degraded and f.priority is not None and f.priority["kind"] == "sampling":
+                reach = 90.0                           # protocol v8: "prioritize sampling"
+            fc = self.focus
+            if k is not None and fc is not None and fc.get("mode") == "resurvey" and math.hypot(
+                    f.targets[k].spec.x - fc["x"], f.targets[k].spec.y - fc["y"]) > fc["r"] + self.cfg.focus_margin:
+                k = None                               # a re-survey stops only for what is inside its circle
             b = self.dir_bias
             if k is not None and b is not None and t < b[2]:    # operator: "explore north"
                 ts_ = f.targets[k].spec
@@ -1290,6 +1315,9 @@ class Rover:
                 f.log(t, "info", f"{self.id} heading to sample {ts.spec.id} ({KIND_LABEL[ts.spec.kind]}, "
                                  f"found by {ts.found_by}), {d:.0f} m away.", self.id, at=(ts.spec.x, ts.spec.y))
                 return
+        if self.focus is not None and self.focus.get("mode") == "resurvey":
+            self._resurvey_drive(t)           # protocol v8: a loop through the circle, rescanning
+            return
         need = self.goal is None
         reached = False
         if not need:
@@ -1308,9 +1336,14 @@ class Rover:
                 self._hold_if_blocked()       # out of compute: keep the current plan, finish next cycle
                 return
             if res is None and self.focus is not None:
-                why = "battery" if self.goal_fail_reason == "battery" else "explored"
-                self.end_focus(t, why)        # nothing unknown left nearby (or out of range): normal exploring
-                if why == "explored":
+                if self.goal_fail_reason == "battery":
+                    why = "battery"
+                else:                         # nothing unknown left nearby, or what is left cannot be reached
+                    fc = self.focus
+                    _kn, unk = self.fleet.map.area_cells(fc["x"], fc["y"], fc["r"] + self.cfg.focus_margin)
+                    why = "explored" if unk < FOCUS_MIN_UNKNOWN else "blocked"
+                self.end_focus(t, why)
+                if why in ("explored", "blocked"):
                     self.goal, self.path = None, []
                     self.next_goal_try = t
                     return
@@ -1708,15 +1741,21 @@ class Rover:
 
     # ================================================================== exploring an area (protocol v7 focus)
     def start_focus(self, t: float, x: float, y: float, r: float, reason: str, label: str, dur: float,
-                    cid=None, qid=None, what: str | None = None, kind: str | None = None) -> dict:
+                    cid=None, qid=None, what: str | None = None, kind: str | None = None,
+                    mode: str | None = None) -> dict:
         """Concentrate on the unknown ground within r of (x, y) for about dur sim seconds once there (reason
-        "operator" or "interest"). The frontier choice does the rest (fleet.choose_goal); _focus_step ends it."""
+        "operator" or "interest"). The frontier choice does the rest (fleet.choose_goal); _focus_step ends it.
+        mode (protocol v8): "explore", or "resurvey" (a loop through the circle for the whole time, rescanning);
+        None: an operator focus on an area that is already mostly mapped is a re-survey."""
         if self.focus is not None:
             self.end_focus(t, "replaced", quiet=self.focus["reason"] == "interest")
+        if mode is None:
+            mode = "resurvey" if reason == "operator" and self.mostly_mapped(x, y, r) else "explore"
         fc = {"x": float(x), "y": float(y), "r": float(r), "reason": reason, "label": label, "dur": float(dur),
               "t0": t, "arrived": None, "until": None, "cid": cid, "qid": qid, "what": what, "kind": kind,
               "mapped0": self.mem.mapped_cells, "next_check": t + FOCUS_CHECK_S,
-              "gain_t": t, "gain_cells": self.mem.mapped_cells}
+              "gain_t": t, "gain_cells": self.mem.mapped_cells, "mode": mode, "loop": None, "wp": 0, "laps": 0,
+              "odo0": None, "found0": None}
         self.focus = fc
         self._focus_arrival(t)
         self.sticky_goal = None
@@ -1724,6 +1763,11 @@ class Rover:
             self.goal, self.path = None, []        # pick a frontier in the circle now
             self.next_goal_try = self.next_goal_eval = t
         return fc
+
+    def mostly_mapped(self, x: float, y: float, r: float) -> bool:
+        """Is the circle already mapped but for a little unknown ground (protocol v8 re-survey)?"""
+        kn, unk = self.fleet.map.area_cells(x, y, r)
+        return unk < max(4 * FOCUS_MIN_UNKNOWN, RESURVEY_SHARE * (kn + unk))
 
     def _task_focus(self, t: float, task: dict) -> None:
         fs = task["focus"]
@@ -1736,6 +1780,8 @@ class Rover:
             fc["arrived"] = t                    # the clock starts when the rover is there
             fc["until"] = t + fc["dur"]
             fc["mapped0"] = self.mem.mapped_cells
+            fc["odo0"] = self.odometer
+            fc["found0"] = self._found_in(fc)
             near = fc["r"] + self.cfg.focus_margin
             if self.goal is not None and math.hypot(self.goal[0] - fc["x"], self.goal[1] - fc["y"]) > near:
                 self.next_goal_eval = t          # a goal picked on the way in: choose one inside now
@@ -1752,7 +1798,7 @@ class Rover:
             self.end_focus(t, "unreached")
         elif fc["reason"] == "interest" and self.op_goal is not None:
             self.end_focus(t, "new command", quiet=True)
-        elif fc["arrived"] is not None and t >= fc["next_check"]:
+        elif fc["arrived"] is not None and t >= fc["next_check"] and fc.get("mode") != "resurvey":
             fc["next_check"] = t + FOCUS_CHECK_S
             if self.mem.mapped_cells > fc["gain_cells"]:
                 fc["gain_t"], fc["gain_cells"] = t, self.mem.mapped_cells
@@ -1760,11 +1806,14 @@ class Rover:
             done = FOCUS_MIN_UNKNOWN if fc["reason"] == "operator" else max(FOCUS_MIN_UNKNOWN,
                                                                              INTEREST_DONE_SHARE * (kn + unk))
             stalled = self.state == "exploring" and t - fc["gain_t"] > FOCUS_STALL_S.get(fc["reason"], 30.0)
-            if unk < done or stalled:
-                self.end_focus(t, "explored")
+            if unk < done and fc["reason"] == "operator" and t - fc["arrived"] < RESURVEY_EARLY_S:
+                self._to_resurvey(t)             # protocol v8: nothing left to explore there: re-survey it
+            elif unk < done or stalled:
+                self.end_focus(t, "explored" if unk < done else "blocked")
 
     def end_focus(self, t: float, why: str, quiet: bool = False) -> None:
-        """why: "time", "explored" (nothing unknown left nearby), "battery", "unreached", "replaced", "new
+        """why: "time", "explored" (nothing unknown left nearby), "blocked" (unknown ground left that the rover
+        cannot reach or stopped gaining), "battery", "unreached", "replaced", "new
         command", "held" or the state that ended it. The advisor reports what was mapped and found there."""
         fc, self.focus = self.focus, None
         if fc is None:
@@ -1796,7 +1845,12 @@ class Rover:
                 "samples": [dict(d) for d in self.mem.samples if d["t"] >= t0],
                 "water": [dict(w) for w in self.mem.water if w["t"] >= t0],
                 "life": [dict(e) for e in self.mem.life if e["t"] >= t0],
-                "spires": spires, "what": fc.get("what")}
+                "spires": spires, "what": fc.get("what"), "mode": fc.get("mode", "explore"),
+                "laps": int(fc.get("laps", 0)),
+                "driven": round(self.odometer - fc["odo0"]) if there and fc.get("odo0") is not None else 0,
+                "changes": self.fleet.map.changes_in(fc["x"], fc["y"], fc["r"], fc["arrived"]) if there else 0,
+                "new_found": sorted(self._found_in(fc) - (fc.get("found0") or set())) if there else [],
+                "hazards": [dict(h) for h in self.mem.hazards if h["t"] >= t0]}
 
     def focus_msg(self) -> dict | None:
         fc = self.focus
@@ -1804,7 +1858,73 @@ class Rover:
             return None
         left = fc["dur"] if fc["until"] is None else max(0.0, fc["until"] - self.t_now)
         return {"x": round(fc["x"], 1), "y": round(fc["y"], 1), "r": round(fc["r"], 1), "reason": fc["reason"],
-                "label": fc["label"], "ends_in": round(left, 1)}
+                "label": fc["label"], "ends_in": round(left, 1), "mode": fc.get("mode", "explore")}
+
+    # ================================================================== re-survey (protocol v8)
+    def _found_in(self, fc: dict) -> set:
+        """Ids of the targets the fleet knows inside the focus circle."""
+        r = fc["r"] + self.cfg.focus_margin
+        return {ts.spec.id for ts in self.fleet.targets
+                if ts.status is not None and math.hypot(ts.spec.x - fc["x"], ts.spec.y - fc["y"]) <= r}
+
+    def _to_resurvey(self, t: float) -> None:
+        fc = self.focus
+        fc["mode"], fc["loop"], fc["wp"] = "resurvey", None, 0
+        self.goal, self.path = None, []
+        self.fleet.log(t, "info", f"{self.id} {fc['label']} is already mapped: re-surveying it instead, a loop through "
+                                  f"it for the rest of the {fc['dur']:.0f} s.", self.id, at=(fc["x"], fc["y"]))
+
+    def _resurvey_loop(self, fc: dict) -> list:
+        """Up to RESURVEY_POINTS safe waypoints on a ring through the circle (mapped, passable, off the water),
+        starting with the one nearest the rover and going round."""
+        f = self.fleet
+        pts = []
+        for k in range(RESURVEY_POINTS):
+            a = 2.0 * math.pi * k / RESURVEY_POINTS
+            for frac in RESURVEY_RING:
+                rr = max(3.0, frac * fc["r"])
+                x, y = fc["x"] + rr * math.cos(a), fc["y"] + rr * math.sin(a)
+                if self._safe_cell(x, y) and f.water_zone_at(x, y, margin=1.5) is None and f.in_reach(x, y):
+                    pts.append((round(x, 1), round(y, 1)))
+                    break
+        if not pts:
+            return []
+        k0 = min(range(len(pts)), key=lambda k: math.hypot(pts[k][0] - self.x, pts[k][1] - self.y))
+        return pts[k0:] + pts[:k0]
+
+    def _resurvey_drive(self, t: float) -> None:
+        """Drive the loop through the circle again and again while the focus lasts; LiDAR, the spectrometer and
+        the tracker keep working as usual (a target found inside the circle is sampled, a creature is watched,
+        new rocks are rerouted around). A waypoint with no path is skipped."""
+        fc = self.focus
+        if fc["loop"] is None:
+            fc["loop"], fc["wp"] = self._resurvey_loop(fc), 0
+            if not fc["loop"]:
+                self.end_focus(t, "noloop")
+                self.goal, self.path = None, []
+                self.next_goal_try = t
+                return
+        loop = fc["loop"]
+        gx, gy = loop[fc["wp"] % len(loop)]
+        if math.hypot(gx - self.x, gy - self.y) < 1.5:
+            fc["wp"] += 1
+            if fc["wp"] % len(loop) == 0:
+                fc["laps"] += 1
+            self.goal, self.path = None, []
+            return
+        if self.goal != (gx, gy):
+            self.goal, self.path, self.goal_t = (gx, gy), [], t
+        if not self._need_replan(t):
+            return
+        path = self.fleet.plan(t, self, self.goal)
+        self._after_replan(t, path)
+        if path is PENDING:
+            self._hold_if_blocked()
+        elif path is None:
+            fc["wp"] += 1                      # no way to that waypoint now: the next one
+            self.goal, self.path = None, []
+        else:
+            self._set_path(t, path)
 
     # ================================================================== curiosity (interest focus, protocol v7)
     def note_interest(self, t: float, x: float, y: float, kind: str, what: str, label: str | None = None) -> bool:
@@ -1822,6 +1942,8 @@ class Rover:
             return False
         if self.dir_bias is not None and t < self.dir_bias[2]:
             return False                   # the operator asked for a direction: that comes first
+        if self.fleet.priority is not None:
+            return False                   # protocol v8: and so does a fleet priority
         if self.battery < max(0.4, self.need_home + self.battery_margin + 0.15):
             return False                   # low battery: no detours
         f = self.fleet
@@ -2596,6 +2718,9 @@ class Rover:
         }
         if self.focus is not None:
             msg["focus"] = self.focus_msg()
+        vis = self.vision.msg()
+        if vis is not None:
+            msg["vision"] = vis            # protocol v8: latest detections of the onboard camera
         if self.sampling is not None:
             sm = self.sampling
             msg["sampling"] = {"target": self.fleet.targets[sm["tidx"]].spec.id, "instrument": sm["instrument"],

@@ -48,6 +48,15 @@ the rovers safe. Tier 2 only advises, on other threads, and the rules check ever
    lines of it. Lifeforms: a herd nobody asked about yet is followed at the standoff while the question is
    open (no holding still); hazards, water and a low battery end the follow, with a chat line.
 
+9. Protocol v8. Autonomy mode (fleet.mode): "autonomous" (default) never waits for the operator: where a rover would
+   ask (an anomaly, a lifeform sighting, several places matching a command) Gemma decides (the rules when Gemma is
+   offline, the safest option below 0.5 confidence); each decision is an event with a `decision` object plus a chat
+   line. "supervised" asks every such decision, with Gemma's pick marked as a suggestion. Fleet priorities
+   ("prioritize the gaps", "the north", "water", "sampling", "back to normal") weigh every rover's goal choice
+   (fleet.priority_bonus) and are managed here (plan per rover, reassignment, done). Unexplored gaps are a place kind.
+   An operator focus on a mapped area is a re-survey (rover.py). Area questions ("what did we find there?") get a
+   fact sheet scoped to that place (answers.area_facts).
+
 Requests never expire by default (OPERATOR_TIMEOUT_S 0): the rover holds until the operator answers,
 except for the safety moves in Rover._may_move_while_asking (a lifeform question is answered while following).
 Above 0 the old countdown and safe default apply. A new operator job for a rover drops that rover's open
@@ -65,10 +74,14 @@ import time
 import traceback
 from collections import OrderedDict
 
+import numpy as np
+
 from . import places as P
-from .answers import PER_ROVER_TOPICS, fact_lines, fleet_sheet, rover_sheet, rule_answer
+from . import gaps as G
+from .answers import (PER_ROVER_TOPICS, area_answer, area_facts, fact_lines, fleet_sheet, rover_sheet, rule_answer,
+                      why_text)
 from .chatmem import ChatMemory, Ref
-from .fleet import OVERLAP_RADIUS, compass
+from .fleet import MODES, OVERLAP_RADIUS, PRIORITY_WATER_M, compass
 from .gemma import (_MENTIONED_AFTER_RE, _MENTIONED_BEFORE_RE, _PLACE_VERB_RE, _SAMPLE_WORD_RE, GemmaConfig,
                     GemmaPlanner, _fleet_context, _place_words, _resolve_rover, parse_command, question_intent,
                     wants_each)
@@ -119,6 +132,23 @@ GO_PLAN_S = 10.0          # an operator go_to whose plan takes longer than this 
 MAX_CHAT = 400
 FREE_CHARGE = 0.5         # a rover charging below this battery is not free for a place command
 REQUEST_KIND = {"lifeform": "lifeform", "choose_place": "choose_place"}     # anything else: "anomaly"
+# protocol v8: decisions a rover makes on its own (autonomous mode), or Gemma's suggestion (supervised)
+CONF_FLOOR = 0.5          # below this Gemma confidence the safest option is taken
+SAFEST = {k: v[0][0] for k, v in QUESTION_OPTIONS.items()}
+DECISION_LABEL = {"reroute": "go around", "proceed_slowly": "approach slowly", "wait": "wait",
+                  "back_out": "back out and go around", "follow": "keep following", "observe_here": "observe from here",
+                  "keep_exploring": "keep exploring"}
+OPTION_FIX = {("new_obstacle", "back_out"): "reroute", ("slip", "reroute"): "back_out",
+              ("low_visibility", "reroute"): "proceed_slowly", ("low_visibility", "back_out"): "wait",
+              ("no_returns", "back_out"): "reroute"}      # Gemma's action as one of the operator's options
+LIFE_FROM_GEMMA = {"approach": "follow", "observe": "observe_here", "ignore": "keep_exploring"}
+DECISION_CHAT_S = 30.0    # the same decision by the same rover is said in chat at most this often (sim s)
+PRIORITY_CHECK_S = 2.0    # a fleet priority is checked (counts, reassignment, done) this often (sim s)
+_WE_RE = re.compile(r"\b(?:we|us|our|ours|the fleet|everyone|everybody|y'?all)\b")
+_MODEQ_RE = re.compile(r"\b(?:mode|autonom\w*|supervis\w*|priorit\w*|who decides)\b")
+# an area question: "anything near the lake?", "what's at the vent?", "what's around rover 2?"
+_AREA_PREP_RE = re.compile(r"\b(?:near|at|around|by|next to|close to|beside|over at|from|in|on)\s+(?:the\s+|that\s+|this\s+)?$")
+_NEAR_ROVER_Q_RE = re.compile(r"\b(?:near|around|by|close to|next to|beside)\s+(?:rover\s*(\d+)|r(\d+)|(?:the\s+)?lander)\b")
 
 
 def _dur(s: float) -> str:
@@ -198,6 +228,9 @@ class Advisor:
         self.first_pending = bool(self.cfg.operator_ask_first)
         self.asked_herds: list = []                  # protocol v7: herds asked about {"ids", "x", "y", "t", "qid"}
         self.mem = ChatMemory()                      # protocol v7: what the chat talked about (references)
+        self.place_jobs: list = []                   # protocol v8: Gemma deciding (or suggesting) between places
+        self.said_decision: dict = {}                # (rover, kind, choice) -> sim t it was last said in chat
+        self._prio_next = 0.0                        # next fleet priority check (sim s)
         self._done: list = []                        # (job, ticket) from the worker
         self._mu = threading.Lock()
         self._jobs: queue.Queue = queue.Queue()
@@ -239,8 +272,13 @@ class Advisor:
             time.sleep(0.001)
         return None
 
-    def _log(self, t, level, msg, rover=None, at=None, source=None):
-        self.fleet.log(t, level, _clean(msg), rover, at=at, source=source)
+    def _log(self, t, level, msg, rover=None, at=None, source=None, decision=None):
+        self.fleet.log(t, level, _clean(msg), rover, at=at, source=source, decision=decision)
+
+    @property
+    def supervised(self) -> bool:
+        """Protocol v8: the operator is asked every decision (otherwise the rovers decide and log it)."""
+        return self.fleet.mode == "supervised"
 
     # ================================================================== protocol
     def planner_msg(self) -> dict:
@@ -326,6 +364,8 @@ class Advisor:
                 e = {"id": o[0], "label": o[1]}
                 if len(o) >= 4:
                     e["x"], e["y"] = round(float(o[2]), 1), round(float(o[3]), 1)
+                if q.get("suggest") == o[0]:
+                    e["suggested"] = True            # protocol v8: Gemma's pick
                 opts.append(e)
             dl = q.get("deadline")
             out.append({"id": q["id"], "rover": q["rover"], "kind": REQUEST_KIND.get(q["kind"], "anomaly"), "t": q["t"],
@@ -360,6 +400,11 @@ class Advisor:
                 self._poll_answers(t)
             if self._done:
                 self._poll_interpretations(t)
+            if self.place_jobs:
+                self._poll_place_jobs(t)
+            if self.fleet.priority is not None and t >= self._prio_next:
+                self._prio_next = t + PRIORITY_CHECK_S
+                self._priority_tick(t)
             if self.requests:
                 now = self.clock()
                 for q in [q for q in self.requests.values() if q.get("deadline") is not None and now >= q["deadline"]]:
@@ -586,9 +631,8 @@ class Advisor:
                "anomaly": self._anomaly_payload(rover, facts), "perception": self._perception(rover),
                "facts": facts, "wall": self.clock(), "image": False}
         if not self.planner.online:
-            if first:                      # Gemma offline or warming: the rules ask on their own
-                with self._mu:
-                    self._done.append((job, None))
+            with self._mu:                 # Gemma offline or warming: the rules decide (v8) or ask (supervised)
+                self._done.append((job, None))
             return
         if self.wait_for_gemma:
             self._run_job(job)
@@ -620,6 +664,8 @@ class Advisor:
                    "detail": "no LiDAR returns where flat ground was expected straight ahead"}
             if a.get("camera_liquid_pct") is not None:
                 out["camera_liquid_pct"] = a["camera_liquid_pct"]
+            if a.get("camera_water") is not None:          # protocol v8: the onboard detector saw water there
+                out["camera_water"] = a["camera_water"]
             if a.get("edge_spread") is not None:
                 out["edge_spread"] = a["edge_spread"]
             return out
@@ -650,6 +696,7 @@ class Advisor:
         job["image"] = bool(jpeg)
         if jpeg:
             self.frames += 1
+        self._camera_evidence(job)
         if job.get("type") == "describe":
             tk = self.planner.submit_description(job["rover"], job["t"], job["perception"], job["obs"], jpeg)
         else:
@@ -659,6 +706,22 @@ class Advisor:
             self._wait(tk)
         with self._mu:
             self._done.append((job, tk))
+
+    def _camera_evidence(self, job: dict) -> None:
+        """Protocol v8: the onboard detector's objects near the anomaly (or the moving track) go to Gemma as an
+        extra reading, e.g. "boulder 0.78 at 4.2 m". Worker thread: only reads the rover's latest result."""
+        rover = self._rover(job["rover"])
+        vb = getattr(rover, "vision", None)
+        if vb is None:
+            return
+        try:
+            seen = vb.describe_near(job.get("at"), self.sim.t)
+        except Exception:                  # noqa: BLE001 (evidence is optional)
+            seen = None
+        if seen:
+            (job["obs"] if job.get("type") == "describe" else job["anomaly"])["camera_sees"] = seen
+            if "facts" in job:
+                job["facts"]["camera_sees"] = seen
 
     def _poll_interpretations(self, t: float) -> None:
         with self._mu:
@@ -678,13 +741,32 @@ class Advisor:
                 self._on_interpretation(job, res, t)
 
     def _on_interpretation(self, job: dict, res, t: float) -> None:
+        """Gemma's look at an anomaly (or None: Gemma offline or no answer). Supervised (protocol v8): every anomaly
+        becomes a question with Gemma's pick as the suggestion. Autonomous: the rover decides at once (Gemma, the
+        rules when Gemma is offline, the safest option below 0.5 confidence) and logs the decision."""
         rover = self._rover(job["rover"])
         if rover is None:
             return
         kind, rid = job["kind"], rover.id
         ok = res is not None and res.ok
-        wants = job["first"] or (ok and (res.action == "ask_operator" or res.confidence < self.cfg.operator_ask_below))
-        ask = wants and self._can_ask(rover, t, job["first"])
+        ask = self.supervised and self._can_ask(rover, t, True, every=True)
+        pending = [q for q in self.requests.values() if q["rover"] == rid] if self.supervised and not ask else []
+        if pending:
+            # supervised: the operator is already deciding for this rover (often the same rockfall seen again
+            # from where it holds). Do not decide behind their back; the safety rules keep it safe meanwhile.
+            self._log(t, "info", f"{rid} also sees: {self._anomaly_text(kind, job['facts'])}. Still waiting for your "
+                                 f"answer to its open question; the safety rules keep it safe meanwhile.", rid,
+                      at=job["at"])
+            return
+        choice = by = conf = why = None
+        phrase = mode = None
+        if not ask:
+            choice, by, conf, why = self._anomaly_choice(kind, res if ok else None)
+            if by == "gemma" or choice != RULE_REACTION[kind]:
+                phrase, mode = self._apply_action(rover, kind, choice, t, job)
+                if mode == "override":              # safety rule wins over Gemma's pick
+                    why = f"Gemma said {DECISION_LABEL.get(choice, choice)} ({conf:.2f}); safety rule wins: {phrase}"
+                    choice, by = RULE_REACTION[kind], "safety rule"
         if ok:
             job["gemma_class"] = res.classification
             label = res.classification.replace("_", " ")
@@ -693,11 +775,10 @@ class Advisor:
                     f"{'maybe ' if res.action == 'ask_operator' else ''}{label}, confidence {res.confidence:.2f}. "
                     f"{_quote(res.reason)}")
             if ask:
-                tail = "Asking the operator; creeping along the safe route meanwhile."
-            elif res.action == "ask_operator":
+                tail = "Asking the operator; holding position meanwhile."
+            elif phrase is None:
                 tail = "Keeping the rule reaction."
             else:
-                phrase, mode = self._apply_action(rover, kind, res.action, t, job)
                 tail = {"agree": "Agrees with the rules: ", "override": "Safety rule wins: ",
                         "noted": ""}.get(mode, "Doing it: ")
                 tail = (tail + phrase + ".") if tail else phrase[0].upper() + phrase[1:] + "."
@@ -707,6 +788,54 @@ class Advisor:
                                  f"Keeping the rule reaction.", rid, at=job["at"])
         if ask:
             self._open_request(rover, kind, job, res if ok else None, t, tried=res is not None)
+            return
+        busy = " (the operator has another question open)" if self.supervised else ""
+        self._decided(rover, kind, self._anomaly_text(kind, job["facts"]), [o for o, _ in QUESTION_OPTIONS[kind]],
+                      choice, by, conf, (why or "") + busy, job["at"], t)
+
+    def _anomaly_choice(self, kind: str, res) -> tuple:
+        """(choice, by, confidence, why) for an anomaly the rover decides itself (protocol v8)."""
+        if res is None:
+            return RULE_REACTION[kind], "rules", None, "Gemma offline or no answer: the rules' reaction"
+        act = res.action if res.action != "ask_operator" else (res.model_action or "ask_operator")
+        if res.confidence < CONF_FLOOR or act == "ask_operator":
+            return SAFEST[kind], "rules", res.confidence, (f"Gemma unsure ({res.confidence:.2f}, maybe "
+                                                           f"{res.classification.replace('_', ' ')}): the safest option")
+        return act, "gemma", res.confidence, _clean(res.reason).strip("'\" ")
+
+    @staticmethod
+    def _anomaly_text(kind: str, a: dict) -> str:
+        """The decision's question in a few words, with the numbers ("New rocks 4 m ahead, 0.6 m tall")."""
+        if kind == "new_obstacle":
+            if a.get("shape") == "long":
+                return f"A long, low obstacle {a.get('dist', 0.0):.0f} m ahead, {a.get('length', 0.0):.1f} m long"
+            return f"New rocks {a.get('dist', 0.0):.0f} m ahead, {a.get('height', 0.0):.1f} m tall"
+        if kind == "slip":
+            return f"Wheel slip {a.get('slip', 0.0) * 100:.0f}%, ground speed {a.get('ground_speed', 0.0):.2f} m/s"
+        if kind == "no_returns":
+            cam = f", camera {a['camera_liquid_pct']:.0f}% blue" if a.get("camera_liquid_pct") is not None else ""
+            return f"No LiDAR returns {a.get('dist', 0.0):.0f} m ahead{cam}"
+        return f"LiDAR range down to {a.get('lidar_range', 0.0):.0f} m"
+
+    def _decided(self, rover, kind: str, question: str, options: list, choice: str, by: str, conf, why: str, at,
+                 t: float, label: str | None = None, chat: bool = True, request_id=None, reply_to=None,
+                 force: bool = False) -> None:
+        """Protocol v8: a decision the rover made instead of asking: an event with a `decision` object, readable
+        on its own ("r2 decided (Gemma 0.82): go around. New rocks 4 m ahead, 0.6 m tall."), and a chat line (the
+        same decision by the same rover at most once in DECISION_CHAT_S)."""
+        rid = rover.id
+        label = label or DECISION_LABEL.get(choice, choice.replace("_", " "))
+        opts = list(options) + ([choice] if choice not in options else [])
+        dec = {"question": question, "options": opts, "choice": choice, "by": "gemma" if by == "gemma" else "rules",
+               "confidence": None if conf is None else round(float(conf), 2), "why": _clean(why)[:160]}
+        who = f"Gemma {conf:.2f}" if by == "gemma" else by
+        text = f"decided ({who}): {label}. {question}."
+        self._log(t, "info", f"{rid} {text}", rid, at=at, source="gemma" if by == "gemma" else None, decision=dec)
+        key = (rid, kind, choice)
+        if chat and (force or t - self.said_decision.get(key, -1e9) >= DECISION_CHAT_S):
+            self.said_decision[key] = t
+            self.say(rid, t, text[:1].upper() + text[1:], "info", source="gemma" if by == "gemma" else "rules",
+                     request_id=request_id, reply_to=reply_to)
 
     def _apply_action(self, rover, kind: str, action: str, t: float, job: dict) -> tuple:
         """Apply a SAFE action on top of the rules' reaction. Returns (phrase, mode) with mode
@@ -769,12 +898,14 @@ class Advisor:
             self.fleet.invalidate_costs()
 
     # ================================================================== 3. questions
-    def _can_ask(self, rover, t: float, first: bool) -> bool:
+    def _can_ask(self, rover, t: float, first: bool, every: bool = False) -> bool:
+        """every (supervised, protocol v8): no cooldown, and up to one open question per rover."""
         if rover.state in PARKED or any(q["rover"] == rover.id for q in self.requests.values()):
             return False
-        if sum(1 for q in self.requests.values() if q["kind"] != "choose_place") >= self.cfg.max_open_questions:
+        cap = max(self.cfg.max_open_questions, len(self.sim.rovers)) if every else self.cfg.max_open_questions
+        if sum(1 for q in self.requests.values() if q["kind"] != "choose_place") >= cap:
             return False
-        return first or t - self.last_question.get(rover.id, -1e9) >= self.cfg.question_cooldown_s
+        return first or every or t - self.last_question.get(rover.id, -1e9) >= self.cfg.question_cooldown_s
 
     def _question(self, rover, kind: str, job: dict, res, tried: bool) -> str:
         a = job["facts"]
@@ -791,19 +922,41 @@ class Advisor:
                  f"({a.get('rays', 0)} rays).{cam}")
         else:
             q = f"My LiDAR only reaches {a.get('lidar_range', 0.0):.0f} m (normally {self.cfg.lidar_range:.0f} m)."
+        if a.get("camera_sees") and kind in ("new_obstacle", "no_returns"):
+            q += f" Camera: {a['camera_sees']}."
         if res is not None:
             q += f" Gemma thinks: {res.classification.replace('_', ' ')} (confidence {res.confidence:.2f})."
+            sug = self._suggest(kind, res)
+            if sug is not None:
+                q += f" Gemma suggests: {self._labels_of(kind)[sug].lower()} ({res.confidence:.2f})."
         elif tried:
             q += " Gemma could not tell."
         return q + " What should I do?"
+
+    @staticmethod
+    def _labels_of(kind: str) -> dict:
+        return {o: lab for o, lab in QUESTION_OPTIONS[kind]}
+
+    @staticmethod
+    def _suggest(kind: str, res):
+        """Gemma's pick as one of the operator's options (protocol v8 suggestion), or None."""
+        if res is None:
+            return None
+        act = res.action if res.action != "ask_operator" else res.model_action
+        if res.confidence < CONF_FLOOR or act in (None, "ask_operator"):
+            return SAFEST[kind]
+        act = OPTION_FIX.get((kind, act), act)
+        return act if act in dict(QUESTION_OPTIONS[kind]) else None
 
     def _open_request(self, rover, kind: str, job: dict, res, t: float, tried: bool) -> None:
         self.req_seq += 1
         qid = f"q{self.req_seq}"
         opts = QUESTION_OPTIONS[kind]
+        job["res"] = res                  # Gemma's look, for a decision if the mode switches to autonomous
         q = {"id": qid, "rover": rover.id, "t": round(t, 1), "question": self._question(rover, kind, job, res, tried),
              "options": opts, "default": opts[0][0], "deadline": self._deadline(),
-             "image": f"/api/camera/{rover.id}.jpg?view=fpv", "kind": kind, "job": job}
+             "image": f"/api/camera/{rover.id}.jpg?view=fpv", "kind": kind, "job": job,
+             "suggest": self._suggest(kind, res)}
         self.requests[qid] = q
         self.last_question[rover.id] = t
         rover.question_hold = True        # stay put until the operator answers (safety moves still allowed)
@@ -919,9 +1072,10 @@ class Advisor:
         job = {"type": "describe", "rover": rover.id, "track": tr.id, "t": float(t), "at": (px, py), "first": False,
                "obs": obs, "perception": self._perception(rover), "wall": self.clock(), "image": False, "qid": None}
         rec = self._herd_record(tr, px, py)
-        if rec is None and self._can_ask(rover, t, True):
-            rec = {"ids": set(rover.obs["seen"]) | {tr.id}, "x": px, "y": py, "t": t, "qid": None}
-            self.asked_herds.append(rec)
+        if self.supervised and self._can_ask(rover, t, True, every=True):   # v8: every sighting asks
+            if rec is None:
+                rec = {"ids": set(rover.obs["seen"]) | {tr.id}, "x": px, "y": py, "t": t, "qid": None}
+                self.asked_herds.append(rec)
             rec["qid"] = job["qid"] = self._open_life_request(rover, tr, job, None, t)
             rover.follow_while_asking(t, job["qid"])
         if rec is not None and rover.obs is not None:
@@ -968,8 +1122,10 @@ class Advisor:
                     rover.obs["life"] = True
                     f.confirm_lifeform(tr, t)
                 q = self.requests.get(job["qid"])
-                if q is not None:                # the open question now carries Gemma's guess
-                    q["question"] = self._life_question(q["job"]["ask"], res)
+                if q is not None:                # the open question now carries Gemma's guess and suggestion
+                    q["job"]["res"] = res
+                    q["suggest"] = self._life_choice(res)[0]
+                    q["question"] = self._life_question(q["job"]["ask"], res, q["suggest"])
                 src = "camera" if job["image"] else "track numbers"
                 f.log(t, "discovery" if life else "info",
                       f"{rover.id} Gemma ({src}, {res.latency_ms / 1000.0:.1f} s): {res.label} (confidence "
@@ -980,7 +1136,8 @@ class Advisor:
                                  f"({res.error.split(':')[0]}). Following while the operator decides.", rover.id,
                       at=job["at"])
             return
-        # a herd asked about before (or no room for another question right now): Gemma decides, else the rules
+        # nobody asks (autonomous, protocol v8; or no room for another question): the rover decides and logs it
+        choice, by, conf, why = self._life_choice(res if ok else None)
         if ok:
             tr.label = res.label
             life = res.classification == "lifeform"
@@ -990,29 +1147,38 @@ class Advisor:
             src = "camera" if job["image"] else "track numbers"
             head = (f"{rover.id} Gemma ({src}, {res.latency_ms / 1000.0:.1f} s): {res.label} "
                     f"(confidence {res.confidence:.2f}). {_quote(res.reason)}")
-            if res.action == "ignore" and not life:
-                tail = "Not a lifeform. Resuming exploration."
-            elif unsure:
-                tail = "Watching from here."
-            elif res.action == "approach" or (life and res.action != "observe"):
-                tail = f"Approaching to {sd:.0f} m to observe."
-            else:
-                tail = "Watching from here."
+            tail = {"keep_exploring": "Not a lifeform. Resuming exploration.", "observe_here": "Watching from here.",
+                    "follow": f"Approaching to {sd:.0f} m to observe."}[choice]
             f.log(t, "discovery" if life else "info", f"{head} {tail}", rover.id, at=job["at"], source="gemma")
         elif res is not None and res.error and not res.error.startswith(("gemma ", "cancelled", "superseded")):
             f.log(t, "info", f"{rover.id} no usable answer from Gemma about track {tr.id} "
                              f"({res.error.split(':')[0]}). The rules decide.", rover.id, at=job["at"])
-        if ok and res.action == "ignore" and res.classification != "lifeform":
-            rover.set_obs_mode(t, "stop")
-        elif ok and res.action == "observe" or unsure:
-            rover.set_obs_mode(t, "here")
-        else:
-            rover.set_obs_mode(t, "follow")
+        rover.set_obs_mode(t, {"keep_exploring": "stop", "observe_here": "here", "follow": "follow"}[choice])
+        busy = " (the operator has another question open)" if self.supervised else ""
+        o = job["obs"]
+        what = (f"Possible lifeform {o['distance']:.0f} m away, {o['speed']:.1f} m/s, about {o['size']:.1f} m"
+                + (f" ({res.label})" if ok and res.label else ""))
+        self._decided(rover, "lifeform", what, [k for k, _ in LIFE_OPTIONS], choice, by, conf, (why or "") + busy,
+                      job["at"], t)
 
-    def _life_question(self, a: dict, res=None) -> str:
-        """The lifeform question (protocol v7): what was seen, Gemma's guess once it has looked, and that the
-        rover follows at the standoff while it waits."""
+    def _life_choice(self, res) -> tuple:
+        """(option, by, confidence, why) for a lifeform sighting the rover decides itself (protocol v8): Gemma's
+        action, the rules (follow carefully) when Gemma is offline, observe from here below 0.5 confidence."""
+        if res is None or not res.ok:
+            return "follow", "rules", None, "Gemma offline or no answer: the rules follow carefully at the standoff"
+        act = res.action if res.action != "ask_operator" else res.model_action
+        if res.confidence < CONF_FLOOR or act in (None, "ask_operator"):
+            return "observe_here", "rules", res.confidence, f"Gemma unsure ({res.confidence:.2f}): the safest option"
+        if act == "ignore" and res.classification == "lifeform":
+            act = "approach"
+        return LIFE_FROM_GEMMA.get(act, "observe_here"), "gemma", res.confidence, _clean(res.reason).strip("'\" ")
+
+    def _life_question(self, a: dict, res=None, suggest: str | None = None) -> str:
+        """The lifeform question (protocol v7): what was seen, Gemma's guess and suggestion (v8) once it has looked,
+        and that the rover follows at the standoff while it waits."""
         guess = f" Gemma thinks: {res.label} (confidence {res.confidence:.2f})." if res is not None else ""
+        if res is not None and suggest:
+            guess += f" Gemma suggests: {dict(LIFE_OPTIONS)[suggest].lower()} ({res.confidence:.2f})."
         return (f"Possible lifeform {a['d']:.0f} m {a['dir']} (LiDAR track {a['track']}, {a['speed']:.1f} m/s, about "
                 f"{a['size']:.1f} m).{guess} I'm following at about {self.cfg.observe_standoff:.0f} m (never closer "
                 f"than {self.cfg.observe_min_dist:.0f} m) while I wait, in case it wanders off. Keep following, "
@@ -1199,6 +1365,10 @@ class Advisor:
             self._cmd_avoid(float(cmd["x"]), float(cmd["y"]), float(cmd.get("radius") or 3.0), t, src)
         elif typ == "question":
             self._ask(cmd, c, t, res)
+        elif typ == "prioritize":
+            self._cmd_prioritize(cmd, t, src, c)
+        elif typ == "set_mode":
+            self._cmd_mode(cmd, t, src, c)
 
     def _who(self, named, hint, text) -> str | None:
         """Who a message is for. The text itself decides when it names a rover or everyone; otherwise
@@ -1225,7 +1395,10 @@ class Advisor:
         named = self._who(cmd.get("rover"), c.get("hint"), c.get("text"))
         text = res.text or c.get("text") or ""
         ref = self._question_ref(c.get("text") or text)      # protocol v7: "what did you find there?"
-        if named in ids:
+        low = str(c.get("text") or text).lower()
+        if ref is not None and named not in ids and _WE_RE.search(low):
+            speakers = ["fleet"]            # protocol v8: "what did we find there?" is the fleet at that place
+        elif named in ids:
             speakers = [named]
         elif named == "all":
             speakers = list(ids) if (wants_each(text) and topic in PER_ROVER_TOPICS) else ["fleet"]
@@ -1244,12 +1417,30 @@ class Advisor:
             facts = fact_lines(sheet, topic)
             rules = rule_answer(sheet, topic)
             context = None
-            if ref is not None:
-                line = self._ref_fact(ref, r)
-                facts = [line] + facts[:6]
-                rules = self._sentence(line)
-                where = ref.label if ref.label.startswith("(") else f"{ref.label} at ({ref.x:.0f}, {ref.y:.0f})"
-                context = [f"'there' or 'it' means {where}, from the chat"]
+            if ref is not None and topic != "battery":
+                where = ref.label if "(" in ref.label else f"{ref.label} at ({ref.x:.0f}, {ref.y:.0f})"
+                if topic in ("unknown", "status", "location"):
+                    topic = "finds"           # "what's at the vent?": what is known there
+                if topic == "why":
+                    line = self._why_there(ref, r)
+                    facts = [line] + facts[:4]
+                    rules = self._sentence(line)
+                else:                        # protocol v8: only what is known at that place
+                    facts = area_facts(self.sim, ref.x, ref.y, ref.label, ref.r, ref.kind)
+                    rules = area_answer(facts)
+                context = [f"'there' or 'it' means {where}, from the chat; answer about that place only"]
+            elif _MODEQ_RE.search(low):       # "are you in autonomous mode?", "what's the priority?"
+                lines = self._mode_facts()
+                facts, rules = lines + facts[:3], self._sentence("; ".join(lines))
+                topic = "status"
+            elif topic == "exploration" and r is None:
+                extra = self._gap_fact(t)
+                if extra and re.search(r"\b(?:left|remain\w*|still|unexplored|unmapped|gaps?|holes?|missing)\b", low):
+                    facts = [extra] + facts[:5]       # "what's left to explore?": the gaps and frontiers first
+                    rules = self._sentence(extra) + " " + rules
+                elif extra:
+                    facts = facts[:5] + [extra]
+                    rules = rules + " " + self._sentence(extra)
             job = {"speaker": sp, "cid": c["cid"], "rules": rules, "topic": topic, "wall": self.clock(),
                    "ticket": None, "budget": budget}
             if self.planner.online:
@@ -1422,8 +1613,15 @@ class Advisor:
         after = (rover.battery - need + rover.battery_margin) * 100.0
         if job.get("place"):
             task = job.get("task") or {}
+            fs = task.get("focus")
             tail = f" I'll survey there for about {SURVEY_S:.0f} s." if task.get("investigate") else (
-                f" I'll explore around it for about {_dur(self.cfg.focus_s)}." if task.get("focus") else "")
+                f" I'll explore around it for about {_dur(self.cfg.focus_s)}." if fs else "")
+            if fs and rover.mostly_mapped(fs["x"], fs["y"], fs["r"]):     # protocol v8: a re-survey
+                kn, unk = self.fleet.map.area_cells(fs["x"], fs["y"], fs["r"])
+                rs = (f"it is already {100.0 * kn / max(kn + unk, 1):.0f}% mapped, so I'll re-survey it for about "
+                      f"{_dur(self.cfg.focus_s)}: a loop through it, rescanning for changes and anything missed.")
+                tail = (f" I'll survey there for about {SURVEY_S:.0f} s; {rs}" if task.get("investigate")
+                        else " " + rs[0].upper() + rs[1:])
             self._reply(rid, t, f"{rid}: {job.get('announce') or ''}Heading to {job['place']} at ({x:g}, {y:g}), "
                                 f"{plen:.0f} m. Max slope on the way {smax:.0f} deg, battery after return about "
                                 f"{after:.0f}%.{tail}", "ack", job["src"])
@@ -1623,6 +1821,11 @@ class Advisor:
                 lines.append((r.id, f"charging first ({r.battery * 100:.0f}%), then exploring", "ack"))
             else:
                 lines.append((r.id, "resuming exploration" if was else "already exploring", "ack"))
+        if rid in (None, "all") and len(lines) > 1 and not any("resuming" in txt for _, txt, _ in lines):
+            other = [f"{r_id} {txt}" for r_id, txt, _ in lines if txt != "already exploring"]
+            self._reply("fleet", t, "Nothing to resume: every rover is already exploring on its own"
+                        + (f" ({'; '.join(other)})" if other else "") + ".", "ack", src)
+            return
         self._reply_many(rid, lines, t, src)
 
     def _cmd_avoid(self, x: float, y: float, radius: float, t: float, src: str) -> None:
@@ -1688,7 +1891,8 @@ class Advisor:
             return
         cands = P.candidates(self.sim, place, tid, t)
         if not cands:
-            text = P.nothing_known(self.sim, place, tid, t, fleet=named is None)
+            text = self._no_gaps_text(t) if place == "gaps" else P.nothing_known(self.sim, place, tid, t,
+                                                                                 fleet=named is None)
             self._reply(named or "fleet", t, (f"{named}: " if named else "") + text, "info", "rules")
             return
         qual, ordinal = cmd.get("qualifier") or "none", cmd.get("ordinal")
@@ -1736,8 +1940,13 @@ class Advisor:
             note = "I can't tell them apart by that. "
         elif qual == "ordinal" and ordinal:
             note = f"There is no number {ordinal}. "
-        self._open_place_request(r, cands, place if tid is None else "target", inv, t, src, announce + note, sample,
-                                 explore=explore, side=side)
+        kind = place if tid is None else "target"
+        if not self.supervised:            # protocol v8: Gemma decides which one (the rules when offline)
+            self._decide_place(r, cands, kind, inv, t, src, announce + note, sample, explore, side, c.get("text"))
+            return
+        qid = self._open_place_request(r, cands, kind, inv, t, src, announce + note, sample, explore=explore,
+                                       side=side)
+        self._ask_place_suggestion(r, qid, c.get("text"), t)
 
     def _go_place(self, r, p, inv: bool, t: float, src: str, announce: str = "", sample: bool = False,
                   explore: bool = False, side: str | None = None) -> None:
@@ -1750,10 +1959,15 @@ class Advisor:
         p = P.refresh(self.sim, p, t)
         label = "the herd's area" if p.kind == "lifeform" else p.dest()
         self._note_ref(self._place_ref(p, r.id, "the herd" if p.kind == "lifeform" else None))
+        if p.kind == "gaps" and side is None:      # protocol v8: an unexplored gap is an area to explore
+            rad = max(6.0, min(20.0, (p.zones[0][2] if p.zones else 6.0) + 3.0))
+            self._cmd_area(r.id, p.x, p.y, label, t, src, radius=rad, announce=announce, mode="explore",
+                           what=f" (about {p.size:.0f} m2 of unknown ground)")
+            return
         if side is not None and explore:
             dx, dy = DIRS[side]
             off = self.cfg.focus_offset
-            where = "the lander" if p.kind == "lander" else label
+            where = "the lander" if p.kind == "lander" else (f"the {p.sub}" if p.kind == "water" else label)
             self._cmd_area(r.id, p.x + off * dx, p.y + off * dy, f"the area {side} of {where}", t, src,
                            announce=announce)
             return
@@ -1860,7 +2074,7 @@ class Advisor:
         return bool(fm.known[j, i] and math.isfinite(self.fleet.cost(t)[j, i]))
 
     def _cmd_area(self, rid, x: float, y: float, label: str, t: float, src: str, radius: float | None = None,
-                  announce: str = "") -> None:
+                  announce: str = "", mode: str | None = None, what: str = "") -> None:
         """Explore an area now (protocol v7 focus): no known spot to drive to first, so the rover's frontier
         choice takes it into the circle (unknown ground inside first, then the nearest edge) and it stays."""
         half = (self.cfg.nx - 1) * self.cfg.res / 2.0
@@ -1902,26 +2116,33 @@ class Advisor:
         kn, unk = self.fleet.map.area_cells(x, y, rad)
         self._free_up(r, t, "exploring an area for the operator")
         r.state = "exploring"
-        r.start_focus(t, x, y, rad, "operator", label, self.cfg.focus_s, cid=self._reply_to, qid=self._request_id)
+        fc = r.start_focus(t, x, y, rad, "operator", label, self.cfg.focus_s, cid=self._reply_to,
+                           qid=self._request_id, mode=mode)
         d = math.hypot(x - r.x, y - r.y)
         where = "I'm in it" if d <= rad else f"it is {d:.0f} m {compass(x - r.x, y - r.y)} of me"
-        self._reply(r.id, t, f"{r.id}: {announce}Exploring around {label} for about {_dur(self.cfg.focus_s)}, "
-                             f"within {rad:.0f} m; {where}. About {100.0 * unk / max(kn + unk, 1):.0f}% of that area is "
-                             f"still unmapped.", "ack", src)
+        if fc["mode"] == "resurvey":            # protocol v8: already mapped: a loop through it, rescanning
+            self._reply(r.id, t, f"{r.id}: {announce}{label[:1].upper() + label[1:]} is already "
+                                 f"{100.0 * kn / max(kn + unk, 1):.0f}% mapped, so I'll re-survey it for about "
+                                 f"{_dur(self.cfg.focus_s)}: a loop through it within {rad:.0f} m, rescanning for "
+                                 f"changes and anything missed; {where}.", "ack", src)
+        else:
+            self._reply(r.id, t, f"{r.id}: {announce}Exploring around {label}{what} for about "
+                                 f"{_dur(self.cfg.focus_s)}, within {rad:.0f} m; {where}. About "
+                                 f"{100.0 * unk / max(kn + unk, 1):.0f}% of that area is still unmapped.", "ack", src)
         self._log(t, "info", f"{r.id} exploring around {label} for the operator (within {rad:.0f} m).", r.id,
                   at=(x, y), source="operator")
         self._note_ref(Ref("area", float(x), float(y), label, rover=r.id, t=t, r=rad))
 
     def _open_place_request(self, r, cands: list, place: str, inv: bool, t: float, src: str, prefix: str,
-                            sample: bool, explore: bool = False, side: str | None = None) -> None:
+                            sample: bool, explore: bool = False, side: str | None = None) -> str:
         """Several places match: ask which one (numbered options with x, y for the map, plus Never mind).
-        The rover holds position meanwhile."""
+        The rover holds position meanwhile. Returns the request id."""
         for q in [q for q in self.requests.values() if q["rover"] == r.id and q["kind"] == "choose_place"]:
             self._close(q["id"], "superseded", t)
         self.req_seq += 1
         qid = f"q{self.req_seq}"
         frm = (r.x, r.y)
-        shown = sorted(cands, key=lambda p: math.hypot(p.x - frm[0], p.y - frm[1]))[:P.MAX_OPTIONS]
+        shown = self._rank_places(cands, place, frm)[:P.MAX_OPTIONS]
         opts = [(f"p{k + 1}", P.option_label(p, frm), round(p.x, 1) + 0.0, round(p.y, 1) + 0.0)
                 for k, p in enumerate(shown)]
         opts.append(("cancel", "Never mind"))
@@ -1939,6 +2160,7 @@ class Advisor:
         self.mem.mention_list([self._place_ref(p, r.id) for p in shown])     # "the second one" picks from these
         self._log(t, "info", f"{r.id} knows {P.count_noun(place, len(cands))}: asking the operator which one. "
                              f"Holding position meanwhile.", r.id, at=frm, source="operator")
+        return qid
 
     def _apply_place_choice(self, rover, q: dict, option: str, t: float, quiet: bool = False) -> None:
         job = q["job"]
@@ -1960,7 +2182,7 @@ class Advisor:
                 self._reply(rover.id, t, f"{rover.id}: can't, {busy}.", "refuse", "rules")
                 return
             self._go_place(rover, p, job["investigate"], t, job["src"], sample=job.get("sample", False),
-                           explore=job.get("explore", False), side=job.get("side"))
+                           explore=job.get("explore", False), side=job.get("side"), announce=job.get("announce", ""))
         finally:
             self._reply_to, self._request_id = prev
 
@@ -2001,7 +2223,11 @@ class Advisor:
         when the command said investigate)."""
         fs = task.get("focus")
         mins = _dur(self.cfg.focus_s)
-        if task.get("investigate"):
+        rs = rover.focus is not None and rover.focus.get("mode") == "resurvey" and not task.get("investigate")
+        if rs:                               # protocol v8
+            msg = (f"{rover.id}: arrived at {task['label']}. Re-surveying it for about {mins}: a loop through it "
+                   f"within {fs['r']:.0f} m, rescanning for changes and anything missed.")
+        elif task.get("investigate"):
             msg = (f"{rover.id}: arrived at {task['label']}. Surveying for about {SURVEY_S:.0f} s: turning slowly "
                    f"through 360 deg while my LiDAR watches for movement."
                    + (f" Then I'll explore around it for about {mins}." if fs else ""))
@@ -2087,7 +2313,7 @@ class Advisor:
                   f"{parts[1]}", rover.id, at=(rover.x, rover.y), source="operator")
         at = sv.get("at") or (rover.x, rover.y)
         self.mem.add_report(Ref("area", float(at[0]), float(at[1]), label, rover=rover.id, t=t, r=10.0), text,
-                            rover.id, t)
+                            rover.id, t, mention=why != "new command")
 
     # ================================================================== 8. protocol v7: area focus reports
     def focus_report(self, rover, fc: dict, s: dict, t: float, why: str, quiet: bool = False) -> None:
@@ -2104,8 +2330,20 @@ class Advisor:
             found.append(f"{n} spire{'s' if n != 1 else ''}")
         for e in s["life"][-1:]:
             found.append((f"a herd of {e['n']}" if e["n"] > 1 else "a creature") + f" (watched {e['dur']:.0f} s)")
+        resurvey = s.get("mode") == "resurvey"
         if not s["there"]:
             head = f"Didn't reach {label}"
+        elif resurvey:                       # protocol v8: what the loop through it found or changed
+            laps = s.get("laps", 0)
+            head = (f"Re-surveyed {label} for {s['dur']:.0f} s: drove {s.get('driven', 0)} m through it"
+                    + (f" ({laps} lap{'s' if laps != 1 else ''})" if laps else "")
+                    + ", rescanning with LiDAR and the spectrometer")
+            news = [f"{n} (missed on the first pass)" for n in s.get("new_found") or []]
+            if s.get("changes"):
+                news.insert(0, f"{s['changes']} map samples changed since it was mapped")
+            for e in s["life"][-1:]:
+                news.append((f"a herd of {e['n']}" if e["n"] > 1 else "a creature") + f" (watched {e['dur']:.0f} s)")
+            found = news
         elif why == "explored" and s["dur"] < 3.0 and s["mapped"] < 1:
             head = f"Around {label} everything within {s['r']} m is already mapped ({s['pct']}%)"
         else:
@@ -2113,22 +2351,37 @@ class Advisor:
                     f"within {s['r']} m is now {s['pct']}% mapped")
         body = ("Found " + ", ".join(found) + (f"; sampled {', '.join(sampled)}" if sampled else "") + ".") if found \
             else ("Nothing new found there." if s["there"] else "")
+        if resurvey and s["there"]:
+            body = ("Changes: " + "; ".join(found) + (f". Sampled {', '.join(sampled)}" if sampled else "") + ".") \
+                if found else ("No changes since it was mapped, and nothing new found"
+                               + (f"; sampled {', '.join(sampled)}" if sampled else "") + ".")
         tail = {"time": "Back to normal exploration.",
                 "explored": "Nothing unknown left nearby. Back to normal exploration.",
+                "blocked": f"Couldn't reach the rest of the unknown ground there (steep or blocked); "
+                           f"{max(0, 100 - int(round(float(s.get('pct') or 0))))}% of it is still unmapped. "
+                           f"Back to normal exploration.",
                 "battery": f"Stopped: battery {rover.battery * 100:.0f}%, returning to the lander.",
                 "unreached": f"Gave up after {t - fc['t0']:.0f} s: no way into that area yet. Back to normal exploration.",
                 "held": "Stopped: holding for the operator.", "new command": "Stopped for a new command.",
                 "resume": "Stopped: resuming normal exploration.", "replaced": "Stopped: a new area to explore.",
                 "returning": "Stopped: returning to the lander.", "charging": "Stopped: charging at the lander.",
-                "idle": "Stopped."}.get(why, "Back to normal exploration.")
+                "idle": "Stopped.", "noloop": "No safe loop through it on mapped ground. Back to normal exploration."
+                }.get(why, "Back to normal exploration.")
         text = f"{head}. {body} {tail}".replace("  ", " ").replace(" .", ".")
+        if resurvey and s["there"] and s["dur"] < 10.0 and why not in ("time",) and not found:
+            reason = {"new command": "a new command came in", "held": "holding for the operator",
+                      "battery": f"battery {rover.battery * 100:.0f}%, returning to the lander",
+                      "replaced": "a new area to explore", "resume": "resuming normal exploration",
+                      "returning": "returning to the lander", "charging": "charging at the lander",
+                      "noloop": "no safe loop through it on mapped ground"}.get(why, why)
+            text = f"Stopped re-surveying {label} after {s['dur']:.0f} s: {reason}."
         ref = Ref("area", s["x"], s["y"], label, rover=rid, t=t, r=s["r"])
         if fc["reason"] == "operator":
             if not quiet:
                 self.say(rid, t, text, "info", reply_to=fc.get("cid"), request_id=fc.get("qid"))
                 self._log(t, "discovery" if found else "info", f"{rid} {head[0].lower() + head[1:]}.", rid,
                           at=(s["x"], s["y"]), source="operator")
-            self.mem.add_report(ref, text, rid, t, s)
+            self.mem.add_report(ref, text, rid, t, s, mention=why not in ("new command", "replaced", "resume", "held"))
             return
         if quiet:
             return
@@ -2136,6 +2389,465 @@ class Advisor:
         self._log(t, "discovery" if found else "info",
                   f"{rid} done looking around {label}: {s['dur']:.0f} s, mapped {s['mapped']} m2 of new ground, "
                   f"{what}.", rid, at=(s["x"], s["y"]))
+
+    # ================================================================== 9. protocol v8: deciding between places
+    @staticmethod
+    def _rank_places(cands: list, place: str, frm: tuple) -> list:
+        """The rules' order: unexplored gaps by size and distance (gaps.score), anything else nearest first."""
+        if place == "gaps":
+            return sorted(cands, key=lambda p: -G.score({"m2": p.size or 0.0, "x": p.x, "y": p.y}, frm[0], frm[1]))
+        return sorted(cands, key=lambda p: math.hypot(p.x - frm[0], p.y - frm[1]))
+
+    def _no_gaps_text(self, t: float) -> str:
+        f = self.fleet
+        allg = f.refresh_gaps(t, max_age=1.0)
+        stuck = sum(1 for g in allg if not g["frontiers"])
+        n_fr = len(f.usable_frontiers(t))
+        head = "I don't see any unexplored gaps inside the map that a rover can reach"
+        head += f" ({stuck} more sit{'s' if stuck == 1 else ''} in steep ground nobody can drive to)." if stuck else "."
+        tail = (f" The unknown ground left is beyond the {n_fr} frontier{'s' if n_fr != 1 else ''} at the edge of the "
+                f"map; the rovers are exploring those.") if n_fr else " Exploration is nearly done."
+        return head + tail
+
+    def _place_candidates(self, r, shown: list) -> list:
+        frm = (r.x, r.y)
+        return [{"id": f"p{k + 1}", "kind": "place", "summary": P.option_label(p, frm)} for k, p in enumerate(shown)]
+
+    def _place_job(self, r, shown: list, kind: str, n: int, inv: bool, t: float, src: str, prefix: str, sample: bool,
+                   explore: bool, side, text) -> dict:
+        return {"rover": r.id, "cands": {f"p{k + 1}": p for k, p in enumerate(shown)}, "place": kind, "n": n,
+                "investigate": bool(inv), "cid": self._reply_to, "src": src, "sample": sample, "explore": bool(explore),
+                "side": side, "prefix": prefix, "t": t, "wall": self.clock(), "ticket": None, "qid": None,
+                "text": str(text or "")[:120]}
+
+    def _submit_place(self, r, job: dict, shown: list, t: float) -> None:
+        """Ask Gemma to pick one of the places (a choice request with kind "place" candidates)."""
+        perception = dict(self._perception(r), operator_asked=job["text"] or "go there")
+        job["ticket"] = self.planner.submit_choice(r.id, t, perception, self._place_candidates(r, shown), default="p1")
+        self.choices.pop(r.id, None)       # this rover's goal question would replace it in Gemma's queue
+        self.last_ask[r.id] = t
+        self.place_jobs.append(job)
+        if self.wait_for_gemma:
+            self._wait(job["ticket"])
+            self._poll_place_jobs(t)
+
+    def _decide_place(self, r, cands: list, kind: str, inv: bool, t: float, src: str, prefix: str, sample: bool,
+                      explore: bool, side, text) -> None:
+        """Autonomous: several places match and nothing picks one: Gemma picks (the rules' order otherwise: the
+        best gap, or the nearest place). The ack says which one and who picked it."""
+        shown = self._rank_places(cands, kind, (r.x, r.y))[:P.MAX_OPTIONS]
+        job = self._place_job(r, shown, kind, len(cands), inv, t, src, prefix, sample, explore, side, text)
+        if self.planner.online and len(shown) > 1:
+            self._submit_place(r, job, shown, t)
+        else:
+            self._resolve_place_job(job, None, t)
+
+    def _ask_place_suggestion(self, r, qid: str, text, t: float) -> None:
+        """Supervised: Gemma's pick for an open choose_place request, shown as a suggestion when it comes."""
+        q = self.requests.get(qid)
+        if q is None or not self.planner.online:
+            return
+        shown = [q["job"]["cands"][o[0]] for o in q["options"] if o[0] in q["job"]["cands"]]
+        job = self._place_job(r, shown, q["job"]["place"], len(shown), False, t, "gemma", "", False, False, None, text)
+        job["qid"] = qid
+        self._submit_place(r, job, shown, t)
+
+    def _poll_place_jobs(self, t: float) -> None:
+        for job in list(self.place_jobs):
+            res = self.planner.poll(job["ticket"])
+            if res is None and self.clock() - job["wall"] < self.planner.cfg.timeout_s + 2.0:
+                continue
+            self.place_jobs.remove(job)
+            if job["qid"] is not None:
+                self._place_suggestion(job, res)
+            else:
+                self._resolve_place_job(job, res, t)
+
+    def _place_suggestion(self, job: dict, res) -> None:
+        q = self.requests.get(job["qid"])
+        if q is None or res is None or not res.ok or res.confidence < CONF_FLOOR or res.choice not in job["cands"]:
+            return
+        q["suggest"], q["suggest_conf"] = res.choice, res.confidence
+        label = self._labels(q).get(res.choice, res.choice)
+        q["question"] += f" Gemma suggests: {label[:1].lower() + label[1:]} ({res.confidence:.2f})."
+
+    def _resolve_place_job(self, job: dict, res, t: float) -> None:
+        r = self._rover(job["rover"])
+        if r is None:
+            return
+        ok = res is not None and res.ok and res.choice in job["cands"]
+        what = "the best gap for size and distance" if job["place"] == "gaps" else "the nearest one"
+        if ok and res.confidence >= CONF_FLOOR:
+            choice, by, conf, why = res.choice, "gemma", res.confidence, _clean(res.reason).strip("'\" ")
+        elif ok:
+            choice, by, conf, why = "p1", "rules", res.confidence, f"Gemma unsure ({res.confidence:.2f}): {what}"
+        else:
+            choice, by, conf, why = "p1", "rules", None, f"{what} (Gemma offline or no answer)" if len(
+                job["cands"]) > 1 else "the only one"
+        p = job["cands"][choice]
+        label = P.option_label(p, (r.x, r.y))
+        noun = P.count_noun(job["place"], job["n"])
+        who = f"Gemma picked it, {conf:.2f}" if by == "gemma" else "my rules picked it"
+        lab = label[:1].lower() + label[1:]
+        job["announce"] = job["prefix"] + (f"I know {noun}; going for the {lab} ({who}). " if job["n"] > 1 else "")
+        self._decided(r, "place", f"Which of {noun} for '{job['text']}'", list(job["cands"]), choice, by, conf, why,
+                      (p.x, p.y), t, label=label, chat=False)
+        prev = (self._reply_to, self._request_id)
+        self._reply_to = job["cid"]
+        try:
+            self._apply_place_choice(r, {"id": None, "job": job}, choice, t)
+        finally:
+            self._reply_to, self._request_id = prev
+
+    # ================================================================== 10. protocol v8: autonomy mode
+    def _cmd_mode(self, cmd: dict, t: float, src: str, c: dict) -> None:
+        mode = cmd.get("mode")
+        text = str(c.get("text") or "").lower()
+        once = mode == "autonomous" and self.supervised and self.requests and not re.search(
+            r"\b(?:from now on|mode|always|autonom\w*|switch|any ?more|from here on|stop asking|don'?t ask|robots?)\b",
+            text)
+        if once:                            # "you decide": settle the open questions now, stay supervised
+            n = len(self.requests)
+            self._reply("fleet", t, f"OK, deciding the {n} open question{'s' if n != 1 else ''} myself. Still in "
+                                    f"supervised mode: say 'you decide from now on' to switch.", "ack", src)
+            self._decide_open(t)
+            return
+        self.set_mode(mode, t, src=src, chat=True)
+
+    def set_mode(self, mode: str, t: float | None = None, src: str = "rules", chat: bool = False) -> str:
+        """Protocol v8: "autonomous" or "supervised" (POST /api/mode, or the chat). Switching to autonomous decides
+        every open question at once. Returns "ok", or "bad" for an unknown mode."""
+        if mode not in MODES:
+            return "bad"
+        t = self.sim.t if t is None else t
+        frm = "fleet"
+        if self.fleet.mode == mode:
+            text = ("Already in autonomous mode: the rovers decide on their own and log every decision."
+                    if mode == "autonomous" else "Already in supervised mode: I ask you before every decision.")
+            if chat:
+                self._reply(frm, t, text, "ack", src)
+            return "ok"
+        self.fleet.mode = mode
+        n = len(self.requests)
+        if mode == "autonomous":
+            text = ("Autonomous mode: the rovers decide on their own (Gemma, or the rules when Gemma is offline) and "
+                    "log every decision here and in the event log." + (f" Deciding the {n} open question"
+                                                                        f"{'s' if n != 1 else ''} now." if n else ""))
+        else:
+            text = ("Supervised mode: I'll ask you before every decision (anomalies, lifeform sightings, which place), "
+                    "with Gemma's pick marked as a suggestion. A rover holds while it waits, unless staying is the "
+                    "danger.")
+        if chat:
+            self._reply(frm, t, text, "ack", src)
+        else:
+            self.say(frm, t, text, "info")
+        self._log(t, "info", f"Autonomy mode: {mode} (operator).", None, source="operator")
+        if mode == "autonomous" and n:
+            self._decide_open(t)
+        return "ok"
+
+    def _decide_open(self, t: float) -> int:
+        """Every open question is decided by its rover now (Gemma's look or suggestion, else the rules) and logged."""
+        n = 0
+        for q in list(self.requests.values()):
+            q, rover = self._close(q["id"], "decided", t)
+            n += 1
+            if rover is None:
+                continue
+            job = q["job"]
+            if q["kind"] == "choose_place":
+                cands = job["cands"]
+                choice = q.get("suggest") if q.get("suggest") in cands else next(iter(cands))
+                by = "gemma" if q.get("suggest") in cands else "rules"
+                conf = q.get("suggest_conf") if by == "gemma" else None
+                p = cands[choice]
+                why = "Gemma's suggestion" if by == "gemma" else "the first option (nearest, or the best gap)"
+                self._decided(rover, "place", f"Which of {P.count_noun(job['place'], len(cands))}", list(cands), choice,
+                              by, conf, why, (p.x, p.y), t, label=P.option_label(p, (rover.x, rover.y)), force=True,
+                              request_id=q["id"], reply_to=job.get("cid"))
+                self._apply_place_choice(rover, q, choice, t)
+            elif q["kind"] == "lifeform":
+                choice, by, conf, why = self._life_choice(job.get("res"))
+                self._decided(rover, "lifeform", self._life_question(job["ask"]).split(")")[0] + ")", [o for o, _ in
+                              LIFE_OPTIONS], choice, by, conf, why, job.get("at", (rover.x, rover.y)), t, force=True,
+                              request_id=q["id"])
+                self._apply_life(rover, choice, t, q)
+            else:
+                choice, by, conf, why = self._anomaly_choice(q["kind"], job.get("res"))
+                phrase, mode = self._apply_action(rover, q["kind"], choice, t, job)
+                if mode == "override":
+                    choice, by = RULE_REACTION[q["kind"]], "safety rule"
+                self._decided(rover, q["kind"], self._anomaly_text(q["kind"], job["facts"]),
+                              [o for o, _ in QUESTION_OPTIONS[q["kind"]]], choice, by, conf, why, job["at"], t,
+                              force=True, request_id=q["id"])
+        return n
+
+    # ================================================================== 11. protocol v8: fleet priorities
+    _LATER = {"reboot": ("joins after its reboot", "join after their reboots"),
+              "hold": ("is holding (say resume)", "are holding (say resume)"),
+              "task": ("finishes its current task first", "finish their current tasks first"),
+              "dir": ("keeps to the direction you gave it first", "keep to the directions you gave them first")}
+
+    def _joins_later(self, r, t: float):
+        """Why a rover joins a fleet priority later (its own task, charging, a fault), or None if it joins now."""
+        if r.state == "fault":
+            return "reboot"
+        if self._busy_reason(r) is not None or (r.state == "charging" and r.battery < FREE_CHARGE):
+            return f"joins after charging (battery {r.battery * 100:.0f}%)"
+        if r.held:
+            return "hold"
+        if r.op_goal is not None or self.go_jobs.get(r.id) or (r.focus is not None and r.focus["reason"] == "operator"):
+            return "task"
+        if r.dir_bias is not None and t < r.dir_bias[2]:
+            return "dir"
+        return None
+
+    def _later_text(self, t: float) -> str:
+        """'r1 and r3 finish their current tasks first; r2 joins after charging (battery 27%)', or ''."""
+        groups: dict = {}
+        for r in self.sim.rovers:
+            why = self._joins_later(r, t)
+            if why:
+                groups.setdefault(why, []).append(r.id)
+        out = []
+        for why, ids in groups.items():
+            one, many = self._LATER.get(why, (why, why))
+            out.append(f"{' and '.join(ids)} {one if len(ids) == 1 else many}")
+        return "; ".join(out)
+
+    def _wake(self, r, t: float) -> None:
+        """A rover that joins a priority picks a new goal now."""
+        if r.focus is not None and r.focus["reason"] == "interest":
+            r.end_focus(t, "replaced", quiet=True)
+        r.pending_interest = None
+        r.sticky_goal = None
+        r.next_goal_eval = r.next_goal_try = t
+        self.choices.pop(r.id, None)
+
+    def _frontiers_where(self, t: float, p: dict) -> list:
+        f = self.fleet
+        kind = p["kind"]
+        out = []
+        for fr in f.usable_frontiers(t):
+            x, y = fr[0], fr[1]
+            if kind == "direction" and f.in_direction(x, y, p["direction"]):
+                out.append(fr)
+            elif kind == "water" and f.water_zones and f.water_zone_gap(x, y) < PRIORITY_WATER_M:
+                out.append(fr)
+            elif kind == "water" and not f.water_zones and p.get("low_h") is not None and \
+                    float(f.map.h.ravel()[fr[3]]) <= p["low_h"]:
+                out.append(fr)
+        return out
+
+    def _cmd_prioritize(self, cmd: dict, t: float, src: str, c: dict) -> None:
+        f = self.fleet
+        kind = cmd.get("priority")
+        old = f.priority
+        if kind == "none":
+            if old is None:                  # nothing to drop: "back to normal" means normal exploration
+                self._cmd_resume(None, t, src)
+                return
+            f.priority = None
+            self._reply("fleet", t, f"Back to normal exploration: dropped the priority on {old['label']}. Every rover "
+                                    f"picks its own frontiers again.", "ack", src)
+            self._log(t, "info", f"Fleet priority on {old['label']} cleared (operator).", None, source="operator")
+            return
+        f.priority = None
+        rep = f"Replacing the priority on {old['label']}. " if old is not None else ""
+        p = {"kind": kind, "since": t, "cid": self._reply_to, "assign": {}, "labs": {}, "direction": None}
+        later = self._later_text(t)
+        free = [r for r in self.sim.rovers if self._joins_later(r, t) is None]
+        if kind == "gaps":
+            gaps = f.explorable_gaps(t, max_age=0.5)
+            if not gaps:
+                self._reply("fleet", t, rep + self._no_gaps_text(t) + " Nothing to prioritize.", "info", "rules")
+                return
+            p.update(label="the unexplored gaps inside the map", count=len(gaps))
+            f.priority = p
+            plan = self._assign_gaps(p, gaps, free, t)
+            groups: dict = {}
+            for rid, g, d in plan:
+                groups.setdefault(g["lab"], (g, []))[1].append((rid, d))
+            bits = []
+            for k, (g, who) in enumerate(groups.values()):
+                ids = " and ".join(rid for rid, _ in who)
+                dist = " and ".join(f"{d:.0f}" for _, d in who)
+                verb = ("takes" if len(who) == 1 else "take") if k == 0 else ""
+                bits.append(f"{ids} {verb + ' ' if verb else ''}the one at ({g['x']:.0f}, {g['y']:.0f}) "
+                            f"({g['m2']:.0f} m2, {dist} m away)")
+            stuck = sum(1 for g in f.gaps if not g["frontiers"])
+            head = (f"Prioritizing {len(gaps)} unexplored gap{'s' if len(gaps) != 1 else ''} inside the map"
+                    + (f" ({stuck} more sit{'s' if stuck == 1 else ''} in steep ground nobody can reach)" if stuck else ""))
+            text = head + (": " + ", ".join(bits) + "." if bits else ".")
+        elif kind == "direction":
+            d = cmd.get("direction") or "north"
+            p.update(direction=d, label=f"the {d} of the map")
+            frs = self._frontiers_where(t, p)
+            if not frs:
+                self._reply("fleet", t, rep + f"No reachable frontier is left to the {d} (seen from the lander), so "
+                                              f"there is nothing to prioritize there.", "info", "rules")
+                return
+            p["count"] = len(frs)
+            f.priority = p
+            bits = self._nearest_bits(free, frs)
+            text = (f"Prioritizing the {d}: {len(frs)} reachable frontier{'s' if len(frs) != 1 else ''} that way (seen "
+                    f"from the lander)" + (": " + ", ".join(bits) + "." if bits else "."))
+        elif kind == "water":
+            if f.water_zones:
+                n_b = len(P.water_bodies(f.water_zones))
+                p.update(label="the ground next to the known water")
+                frs = self._frontiers_where(t, p)
+                if not frs:
+                    self._reply("fleet", t, rep + f"The ground around the {n_b} known bod{'ies' if n_b != 1 else 'y'} "
+                                                  f"of water is already mapped (no frontier within "
+                                                  f"{PRIORITY_WATER_M:.0f} m). Nothing to prioritize; we keep looking "
+                                                  f"for more water as we explore.", "info", "rules")
+                    return
+                head = (f"Prioritizing water: {len(frs)} frontier{'s' if len(frs) != 1 else ''} within "
+                        f"{PRIORITY_WATER_M:.0f} m of the {n_b} known bod{'ies' if n_b != 1 else 'y'} of water")
+            else:
+                hs = f.map.h[f.map.known]
+                p.update(label="low ground, where water collects", low_h=float(np.percentile(hs, 25)) if hs.size else 0.0)
+                frs = self._frontiers_where(t, p)
+                head = (f"No water found yet, so I'm prioritizing low ground, where liquid collects: {len(frs)} frontier"
+                        f"{'s' if len(frs) != 1 else ''} below {p['low_h']:.1f} m. Once we find water, its edge comes "
+                        f"first")
+            p["count"] = len(frs)
+            f.priority = p
+            bits = self._nearest_bits(free, frs)
+            text = head + (": " + ", ".join(bits) + "." if bits else ".")
+        else:                                # sampling
+            waiting = [k for k, ts in enumerate(f.targets) if ts.status in ("found", "investigating")]
+            if not waiting:
+                done = sum(1 for ts in f.targets if ts.status == "sampled")
+                self._reply("fleet", t, rep + f"No found target is waiting to be sampled ({done} sampled so far). "
+                                              f"Nothing to prioritize.", "info", "rules")
+                return
+            p.update(label="sampling the found targets", count=len(waiting))
+            f.priority = p
+            bits = self._assign_samples(free, t)
+            text = (f"Prioritizing sampling: {len(waiting)} found target{'s' if len(waiting) != 1 else ''} wait"
+                    + (": " + ", ".join(bits) if bits else "") + ". Rovers now fetch found targets from up to 90 m.")
+        for r in free:
+            self._wake(r, t)
+        text = rep + text + (f" {later}." if later else "") + " Say 'back to normal' to stop."
+        self._reply("fleet", t, text, "ack", src)
+        self._log(t, "info", f"Fleet priority: {p['label']} ({p['count']} left, operator).", None, source="operator")
+
+    def _nearest_bits(self, free: list, frs: list) -> list:
+        out = []
+        for r in free:
+            fr = min(frs, key=lambda fr_: math.hypot(fr_[0] - r.x, fr_[1] - r.y))
+            out.append(f"{r.id} starts with one {math.hypot(fr[0] - r.x, fr[1] - r.y):.0f} m "
+                       f"{compass(fr[0] - r.x, fr[1] - r.y)}")
+        return out
+
+    def _assign_gaps(self, p: dict, gaps: list, rovers: list, t: float) -> list:
+        """Each rover its best gap (size and distance), a different one while there are enough. [(rid, gap, m)]."""
+        by_lab = {g["lab"]: g for g in gaps}
+        pairs = sorted(((G.score(g, r.x, r.y), r.id, g["lab"]) for r in rovers for g in gaps), reverse=True)
+        labs, taken = {}, set()
+        for _s, rid, lab in pairs:            # greedy: the best (rover, gap) pairs first, one gap per rover
+            if rid in labs or lab in taken:
+                continue
+            labs[rid] = lab
+            taken.add(lab)
+        for r in rovers:                       # more rovers than gaps: the rest share their best one
+            if r.id not in labs:
+                labs[r.id] = max(gaps, key=lambda g: G.score(g, r.x, r.y))["lab"]
+        plan = []
+        for r in rovers:
+            g = by_lab[labs[r.id]]
+            p["labs"][r.id], p["assign"][r.id] = g["lab"], (g["x"], g["y"])
+            plan.append((r.id, g, math.hypot(g["x"] - r.x, g["y"] - r.y)))
+        return plan
+
+    def _assign_samples(self, rovers: list, t: float) -> list:
+        """Free rovers with a free tube and the battery start on the nearest found target nobody is sampling."""
+        f = self.fleet
+        out = []
+        for r in rovers:
+            if r.target_idx is not None:
+                out.append(f"{r.id} is already on {f.targets[r.target_idx].spec.id}")
+                continue
+            if r.state != "exploring" or r.free_tubes() <= 0:
+                if r.free_tubes() <= 0:
+                    out.append(f"{r.id} caches its full tubes first")
+                continue
+            best = None
+            for k, ts in enumerate(f.targets):
+                if ts.status != "found" or ts.investigator is not None or not r.can_investigate(t, ts):
+                    continue
+                d = math.hypot(ts.spec.x - r.x, ts.spec.y - r.y)
+                need = r.energy_for_distance(1.3 * d + 1.3 * math.hypot(ts.spec.x, ts.spec.y)) + r.battery_margin + 0.05
+                if r.battery > need and (best is None or d < best[1]):
+                    best = (k, d)
+            if best is None:
+                continue
+            k, d = best
+            ts = f.targets[k]
+            ts.status, ts.investigator = "investigating", r.id
+            r.start_investigation(t, k)
+            out.append(f"{r.id} takes {ts.spec.id} ({KIND_LABEL[ts.spec.kind]}, {d:.0f} m)")
+            self._log(t, "info", f"{r.id} heading to sample {ts.spec.id} (fleet priority: sampling), {d:.0f} m.", r.id,
+                      at=(ts.spec.x, ts.spec.y), source="operator")
+        return out
+
+    def _priority_tick(self, t: float) -> None:
+        """Every few seconds while a fleet priority is set: counts, reassignment, and the end ("Done: ...")."""
+        f = self.fleet
+        p = f.priority
+        kind, done = p["kind"], None
+        if kind == "gaps":
+            gaps = f.explorable_gaps(t)
+            p["count"] = len(gaps)
+            p["places"] = [{"x": g["x"], "y": g["y"], "r": g["r"]} for g in gaps[:24]]
+            if not gaps:
+                done = (f"Done: no unexplored gaps left inside the map that a rover can reach "
+                        f"({f.map.explored_pct():.0f}% of the map explored). Back to normal exploration.")
+            else:
+                self._reassign_gaps(p, gaps, t)
+        elif kind in ("direction", "water"):
+            if kind == "water" and f.water_zones and p.get("low_h") is not None:
+                p["low_h"], p["label"] = None, "the ground next to the known water"
+                self._log(t, "info", "Fleet priority: water found, now the ground next to it comes first.", None)
+            p["count"] = len(self._frontiers_where(t, p))
+            if p["count"] == 0 and (kind == "direction" or f.water_zones):
+                done = (f"Done with the {p['direction']}: no reachable frontier left that way." if kind == "direction"
+                        else "Done: no unexplored ground left next to the known water.") + " Back to normal exploration."
+        else:
+            p["count"] = sum(1 for ts in f.targets if ts.status in ("found", "investigating"))
+            if p["count"] == 0:
+                done = "Done: every found target is sampled. Back to normal exploration."
+        if done:
+            f.priority = None
+            self.say("fleet", t, done, "info", reply_to=p.get("cid"))
+            self._log(t, "info", f"Fleet priority on {p['label']} done.", None)
+
+    def _reassign_gaps(self, p: dict, gaps: list, t: float) -> None:
+        """Keep each rover on its gap while it is there; a finished gap's rover takes the best one left; a rover
+        that became free (charged, task done) joins."""
+        f = self.fleet
+        labs, assign = {}, {}
+        for rid, (x, y) in p["assign"].items():
+            lab = G.gap_at(f.gap_grid, f.map, x, y)
+            g = next((g for g in gaps if g["lab"] == lab), None) or next(
+                (g for g in gaps if math.hypot(g["x"] - x, g["y"] - y) <= g["r"] + 4.0), None)
+            if g is not None:
+                labs[rid], assign[rid] = g["lab"], (g["x"], g["y"])
+        for r in self.sim.rovers:
+            if r.id in labs or self._joins_later(r, t) is not None:
+                continue
+            busy = set(labs.values())
+            pool = [g for g in gaps if g["lab"] not in busy] or gaps
+            g = max(pool, key=lambda g_: G.score(g_, r.x, r.y))
+            labs[r.id], assign[r.id] = g["lab"], (g["x"], g["y"])
+            was = p["assign"].get(r.id)
+            what = f"finished the gap at ({was[0]:.0f}, {was[1]:.0f}); next" if was else "joins the gaps priority"
+            self._log(t, "info", f"{r.id} {what}: the one at ({g['x']:.0f}, {g['y']:.0f}) ({g['m2']:.0f} m2).", r.id,
+                      at=(g["x"], g["y"]), source="operator")
+            self._wake(r, t)
+        p["labs"], p["assign"] = labs, assign
 
     # ---- references in questions ("what did you find there?")
     def _question_ref(self, text: str):
@@ -2149,43 +2861,63 @@ class Advisor:
                 return ref
         if _QREF_RE.search(low):
             return self.mem.there
+        m = _NEAR_ROVER_Q_RE.search(low)          # protocol v8: "anything interesting around rover 2?"
+        if m:
+            rid = f"r{m.group(1) or m.group(2)}" if (m.group(1) or m.group(2)) else None
+            ro = self._rover(rid) if rid else None
+            if ro is not None:
+                return Ref("area", float(ro.x), float(ro.y), f"{ro.id}'s position", rover=ro.id, t=self.sim.t)
+            if rid is None:
+                return Ref("lander", 0.0, 0.0, "the lander", t=self.sim.t)
+        if kind is not None and kind not in ("lander", "gaps") and _AREA_PREP_RE.search(low[:span[0]]):
+            ref = self.mem.last_of(kind)          # "anything near the lake?", "what's at the vent?"
+            if ref is not None:
+                return ref
+            cands = P.candidates(self.sim, kind, None, self.sim.t)
+            if cands:
+                ro = self._rover(self.mem.rover)
+                frm = (ro.x, ro.y) if ro is not None else (0.0, 0.0)
+                p = min(cands, key=lambda c: math.hypot(c.x - frm[0], c.y - frm[1]))
+                rr = 0.5 * (p.size or 0.0) + 10.0 if p.kind == "water" else None
+                return Ref(p.kind, float(p.x), float(p.y), p.dest(), id=p.id, t=self.sim.t, place=p, r=rr)
         return None
 
-    def _ref_fact(self, ref: Ref, rover) -> str:
-        """One grounded fact line about a place the chat talked about: what this rover (or the fleet) explored
-        there, and what the fleet knows within its radius."""
-        f = self.fleet
-        rad = float(ref.r or self.cfg.focus_r)
-        me = rover is not None
-        bits = []
-        rovers = [rover] if me else list(self.sim.rovers)
-        for r in rovers:
-            s = r.mem.focus_near(ref.x, ref.y)
-            if s is not None and s["there"]:
-                who = "I" if me else r.id
-                found = [d["id"] for d in s["targets"]]
-                bits.append(f"{who} explored around it for {s['dur']:.0f} s and mapped {s['mapped']} m2 of new ground"
-                            + (f", finding {', '.join(found)}" if found else ""))
-                break
-        near = [ts for ts in f.targets if ts.status is not None
-                and math.hypot(ts.spec.x - ref.x, ts.spec.y - ref.y) <= rad]
-        if near:
-            bits.append(f"targets known within {rad:.0f} m of it: " + ", ".join(
-                f"{ts.spec.id} ({KIND_LABEL[ts.spec.kind]}, {ts.status})" for ts in near[:5]))
-        for wb in P.water_bodies(f.water_zones):
-            dd = math.hypot(wb.x - ref.x, wb.y - ref.y)
-            if ref.kind != "water" and dd <= rad + 0.5 * (wb.size or 0.0):
-                bits.append(f"{wb.noun().lower()} {dd:.0f} m from it")
-                break
-        for hx, hy, n in f.lifeform_herds:
-            dd = math.hypot(hx - ref.x, hy - ref.y)
-            if dd <= rad + 10.0:
-                bits.append(f"{'a herd of ' + str(n) if n > 1 else 'a creature'} seen about {dd:.0f} m from it")
-                break
-        if not bits:
-            bits.append(f"{'I' if me else 'we'} know of nothing else within {rad:.0f} m of it")
+    def _why_there(self, ref: Ref, rover) -> str:
+        """Why this rover (or the fleet) went to the place the chat talked about: the operator's command that sent
+        it there, or its own reason (protocol v8)."""
         where = ref.label if ref.label.startswith("(") else f"{ref.label} at ({ref.x:.0f}, {ref.y:.0f})"
-        return f"about {where}: " + "; ".join(bits)
+        cmd = self.mem.command
+        cr = cmd.get("ref") if cmd else None
+        if cr is not None and math.hypot(cr.x - ref.x, cr.y - ref.y) < 12.0 and (
+                rover is None or cmd.get("rid") in (None, rover.id) or cr.rover == rover.id):
+            who = "me" if rover is not None else (cr.rover or "a rover")
+            return f"why {where}: you asked {who} to: '{cmd['text']}'"
+        if rover is not None:
+            s = rover.mem.focus_near(ref.x, ref.y, 15.0)
+            if s is not None and s.get("reason") == "interest":
+                return f"why {where}: I found {s.get('what') or 'something new'} there and looked around it for more"
+            return f"why {where}: " + why_text(rover)
+        return f"why {where}: the rover that went there chose it for its own goal"
+
+    def _mode_facts(self) -> list:
+        f = self.fleet
+        mode = ("the fleet is in autonomous mode: the rovers decide on their own and log every decision"
+                if f.mode == "autonomous" else "the fleet is in supervised mode: the operator is asked before every "
+                                               "decision, with Gemma's pick as a suggestion")
+        p = f.priority
+        prio = (f"fleet priority: {p['label']} ({p.get('count', 0)} left)" if p is not None
+                else "no fleet priority is set")
+        return [mode, prio]
+
+    def _gap_fact(self, t: float) -> str | None:
+        gaps = self.fleet.explorable_gaps(t)
+        n_fr = len(self.fleet.usable_frontiers(t))
+        if not gaps:
+            return f"{n_fr} frontier{'s' if n_fr != 1 else ''} left at the edge of the known map, no unexplored gaps inside it"
+        g = max(gaps, key=lambda g_: g_["m2"])
+        return (f"{n_fr} frontier{'s' if n_fr != 1 else ''} left at the edge of the known map, and {len(gaps)} unexplored "
+                f"gap{'s' if len(gaps) != 1 else ''} inside it, the biggest about {g['m2']:.0f} m2 at "
+                f"({g['x']:.0f}, {g['y']:.0f})")
 
     @staticmethod
     def _sentence(line: str) -> str:

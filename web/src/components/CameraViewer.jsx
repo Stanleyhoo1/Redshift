@@ -1,19 +1,23 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { appStore, useSim } from '../state/store.js'
+import { appStore, setShowBoxes, useApp, useSim } from '../state/store.js'
 import { fixed, mmss } from '../lib/format.js'
 import { stateStyle } from '../lib/theme.js'
-import { useNow } from '../lib/useNow.js'
-import { useCameraStream } from './useCameraStream.js'
+import { closeImage, fmtRate, useCamRate, useCameraStream } from './useCameraStream.js'
 import { CloseButton, Modal, RoverSwitch, roverFromKey } from './Modal.jsx'
+import { BoxesButton } from './SensorPanel.jsx'
+import { drawDetections } from '../lib/detections.js'
 
-// Large camera viewer (PROTOCOL.md version 5 allows frames up to 1280 x 720). Polls only
-// this view, about 3 frames a second, one request at a time; the sensor panel's small
-// feed pauses meanwhile. Scroll zooms (digitally) around the cursor, drag pans, a
-// double-click resets. A camera HUD sits on top: heading, attitude, speed, battery.
+// Large camera viewer (PROTOCOL.md version 5 allows frames up to 1280 x 720). Streams only
+// this view, one request at a time, as fast as the sim has new frames (up to 30 a second);
+// the sensor panel's small feed pauses meanwhile. Frames go to a canvas (swapped whole, no
+// flicker); the detector's boxes for exactly that frame (version 8) are drawn on a second
+// canvas that follows the zoom and pan with labels at a constant size. Scroll zooms
+// (digitally) around the cursor, drag pans, a double-click resets. A camera HUD sits on
+// top: heading, attitude, speed, battery.
 
 const MAX_W = 1280
 const MAX_H = 720
-const PERIOD = 330 // ms between frame starts
+const GAP = 33 // ms between frame starts at the most
 const STALE_S = 2.5 // older than this, the picture is called stale
 const ZMAX = 8
 const FPV_VFOV = 48 // assumed vertical field of view (deg) for the pitch ladder
@@ -141,7 +145,7 @@ function Reticle({ W, H, pitch, roll, ladder, fpv }) {
   )
 }
 
-function CamHud({ roverId, view, W, H, zoom, live, age, frameSize }) {
+function CamHud({ roverId, view, W, H, zoom, live, age, frameSize, rate }) {
   const meta = useSim((s) => s.roverMeta.find((m) => m.id === roverId) || null)
   const rover = useSim((s) => s.rovers[roverId] || null)
   const t = useSim((s) => s.t)
@@ -165,6 +169,7 @@ function CamHud({ roverId, view, W, H, zoom, live, age, frameSize }) {
       <div className="hc-corner hc-tr">
         <span>T+ {mmss(t)}</span>
         <span className="hc-dim">{frameSize ? `${frameSize.w}×${frameSize.h}` : ''}</span>
+        {rate && <span className="hc-dim hc-rate">{rate.toUpperCase()}</span>}
         {zoom > 1.01 && <span className="hc-zoom">ZOOM {zoom.toFixed(1)}×</span>}
       </div>
       <HeadingTape hdg={hdg} />
@@ -203,7 +208,12 @@ export function CameraViewer({ roverId: initialRover, view: initialView = 'fpv' 
   const [view, setView] = useState(initialView === 'chase' ? 'chase' : 'fpv')
   const wrap = useRef(null)
   const stage = useRef(null)
-  const img = useRef(null)
+  const img = useRef(null) // the picture canvas (zoomed and panned with a CSS transform)
+  const ovl = useRef(null) // detection boxes, drawn in stage pixels
+  const last = useRef(null) // the frame on screen; owns its decoded image
+  const boxes = useApp((a) => a.boxes)
+  const boxesRef = useRef(boxes)
+  boxesRef.current = boxes
   const area = useBoxSize(wrap)
   const z = useRef({ k: 1, x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
@@ -228,21 +238,82 @@ export function CameraViewer({ roverId: initialRover, view: initialView = 'fpv' 
   const dpr = Math.min(2, window.devicePixelRatio || 1)
   const reqW = clamp(Math.ceil((sw * dpr) / 128) * 128, 320, MAX_W)
   const reqH = Math.min(MAX_H, Math.round((reqW * 9) / 16))
-  const cam = useCameraStream({ roverId: known ? roverId : null, view, w: reqW, h: reqH, period: PERIOD, enabled: sw > 0 })
+  const dims = useRef({ sw, sh })
+  dims.current = { sw, sh }
+
+  // Boxes in stage pixels through the current zoom and pan, so they stay crisp and their
+  // labels keep one size at any zoom.
+  const drawOverlay = useCallback(() => {
+    const cv = ovl.current
+    if (!cv) return
+    const { sw: W0, sh: H0 } = dims.current
+    const px = Math.min(2, window.devicePixelRatio || 1)
+    const W = Math.max(1, Math.round(W0 * px))
+    const H = Math.max(1, Math.round(H0 * px))
+    if (cv.width !== W) cv.width = W
+    if (cv.height !== H) cv.height = H
+    const ctx = cv.getContext('2d')
+    ctx.clearRect(0, 0, W, H)
+    const f = last.current
+    if (!f || !boxesRef.current || !f.dets?.length) return
+    const q = z.current
+    drawDetections(ctx, f.dets, q.x * px, q.y * px, W0 * q.k * px, H0 * q.k * px, px, true, W, H)
+  }, [])
+  const onFrame = useCallback(
+    (f) => {
+      const cv = img.current
+      const old = last.current
+      last.current = f
+      if (cv) {
+        if (cv.width !== f.w) cv.width = f.w
+        if (cv.height !== f.h) cv.height = f.h
+        cv.getContext('2d').drawImage(f.image, 0, 0, f.w, f.h)
+      }
+      drawOverlay()
+      if (old) closeImage(old.image)
+    },
+    [drawOverlay],
+  )
+  useEffect(() => drawOverlay(), [boxes, sw, sh, drawOverlay])
+  useEffect(
+    () => () => {
+      if (last.current) closeImage(last.current.image)
+      last.current = null
+    },
+    [],
+  )
+
+  const cam = useCameraStream({ roverId: known ? roverId : null, view, w: reqW, h: reqH, minGap: GAP, enabled: sw > 0, onFrame })
   useEffect(() => {
     if (cam.natural?.w && cam.natural?.h) setNaturalAr(cam.natural.w / cam.natural.h)
   }, [cam.natural])
-  const now = useNow(500)
-  const age = cam.frame ? Math.max(0, now - cam.at / 1000) : null
-  const live = !!cam.frame && !cam.problem && age < STALE_S
+  const rate = useCamRate(cam.stats, cam.hasFrame)
+  const age = cam.hasFrame ? rate.since : null
+  const live = cam.hasFrame && !cam.problem && age < STALE_S
+  const rateText = live ? fmtRate(rate) : ''
+  const nDets = rate.dets ? rate.dets.length : null
 
-  const apply = useCallback((animate = false) => {
-    const el = img.current
-    if (!el) return
-    const { k, x, y } = z.current
-    el.style.transition = animate ? 'transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1)' : 'none'
-    el.style.transform = `translate(${x}px, ${y}px) scale(${k})`
-  }, [])
+  const fade = useRef(0)
+  const apply = useCallback(
+    (animate = false) => {
+      const el = img.current
+      if (!el) return
+      const { k, x, y } = z.current
+      el.style.transition = animate ? 'transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1)' : 'none'
+      el.style.transform = `translate(${x}px, ${y}px) scale(${k})`
+      // The boxes jump to the new transform; during an animated zoom they step aside.
+      drawOverlay()
+      const o = ovl.current
+      if (!o) return
+      clearTimeout(fade.current)
+      if (animate) {
+        o.style.opacity = '0'
+        fade.current = setTimeout(() => (o.style.opacity = ''), 210)
+      } else o.style.opacity = ''
+    },
+    [drawOverlay],
+  )
+  useEffect(() => () => clearTimeout(fade.current), [])
   const clampPan = useCallback(() => {
     const q = z.current
     q.x = clamp(q.x, sw * (1 - q.k), 0)
@@ -315,6 +386,7 @@ export function CameraViewer({ roverId: initialRover, view: initialView = 'fpv' 
     if (id) return setRoverId(id)
     const k = e.key.toLowerCase()
     if (k === 'v') setView((v) => (v === 'fpv' ? 'chase' : 'fpv'))
+    else if (k === 'd') setShowBoxes(!appStore.get().boxes)
     else if (k === '+' || k === '=') zoomAt(sw / 2, sh / 2, z.current.k * 1.4, true)
     else if (k === '-' || k === '_') zoomAt(sw / 2, sh / 2, z.current.k / 1.4, true)
     else if (k === '0') reset()
@@ -341,9 +413,11 @@ export function CameraViewer({ roverId: initialRover, view: initialView = 'fpv' 
             Chase
           </button>
         </span>
-        <span className="ix-live" data-state={live ? 'live' : cam.frame ? 'stale' : 'off'} role="status">
+        {cam.hasFrame && <BoxesButton className="ix-boxes-lg" hasDets={nDets !== null} />}
+        <span className="ix-live" data-state={live ? 'live' : cam.hasFrame ? 'stale' : 'off'} role="status">
           <i aria-hidden="true" />
-          {live ? 'Live' : cam.frame ? `Stale, ${Math.round(age)} s old` : cam.problem ? 'No picture' : 'Connecting'}
+          {live ? 'Live' : cam.hasFrame ? `Stale, ${Math.round(age)} s old` : cam.problem ? 'No picture' : 'Connecting'}
+          {rateText && <span className="ix-live-rate">{rateText}</span>}
         </span>
         <CloseButton onClick={close} />
       </header>
@@ -359,10 +433,11 @@ export function CameraViewer({ roverId: initialRover, view: initialView = 'fpv' 
           onPointerCancel={endDrag}
           onDoubleClick={reset}
         >
-          {cam.frame && <img ref={img} src={cam.frame} alt={`${name}, ${view === 'fpv' ? 'onboard' : 'chase'} camera`} draggable={false} />}
-          {cam.frame && <CamHud roverId={roverId} view={view} W={sw} H={sh} zoom={zoom} live={live} age={age} frameSize={cam.natural} />}
-          {(!cam.frame || cam.problem) && (
-            <div className="cv-off" data-over={!!cam.frame || undefined}>
+          <canvas ref={img} className="cv-pic" role="img" aria-label={`${name}, ${view === 'fpv' ? 'onboard' : 'chase'} camera`} style={cam.hasFrame ? undefined : { visibility: 'hidden' }} />
+          <canvas ref={ovl} className="cv-boxes" aria-hidden="true" />
+          {cam.hasFrame && <CamHud roverId={roverId} view={view} W={sw} H={sh} zoom={zoom} live={live} age={age} frameSize={cam.natural} rate={rateText} />}
+          {(!cam.hasFrame || cam.problem) && (
+            <div className="cv-off" data-over={cam.hasFrame || undefined}>
               <b>{cam.problem ? cam.problem.title : 'Connecting camera'}</b>
               {cam.problem && <span>{cam.problem.sub}</span>}
               {cam.problem && (
@@ -376,13 +451,18 @@ export function CameraViewer({ roverId: initialRover, view: initialView = 'fpv' 
       </div>
       <footer className="ix-foot">
         <span>
-          <kbd>Scroll</kbd> zoom <kbd>Drag</kbd> pan <kbd>Double-click</kbd> reset <kbd>V</kbd> FPV or Chase <kbd>1</kbd>-<kbd>{Math.min(9, meta.length) || 1}</kbd> rover <kbd>Esc</kbd> close
+          <kbd>Scroll</kbd> zoom <kbd>Drag</kbd> pan <kbd>Double-click</kbd> reset <kbd>V</kbd> FPV or Chase <kbd>D</kbd> boxes <kbd>1</kbd>-<kbd>{Math.min(9, meta.length) || 1}</kbd> rover <kbd>Esc</kbd> close
         </span>
         <span className="ix-foot-r">
           {zoomed && (
             <button type="button" className="ix-link" onClick={reset}>
               Reset zoom
             </button>
+          )}
+          {cam.hasFrame && (
+            <span className="ix-dim" title="Objects the rover's detector found in the frame on screen">
+              {nDets === null ? 'No detections for this view' : !boxes ? `${nDets} detected, boxes hidden` : `${nDets} detected`}
+            </span>
           )}
           <b>{zoom.toFixed(1)}×</b>
           {cam.natural && (

@@ -90,9 +90,13 @@ class ChatMemory:
     def set_command(self, cmd: dict, rid, ref: Ref | None, text: str) -> None:
         self.command = {"cmd": dict(cmd), "rid": rid, "ref": ref, "text": text}
 
-    def add_report(self, ref: Ref, text: str, rover: str, t: float, summary: dict | None = None) -> None:
+    def add_report(self, ref: Ref, text: str, rover: str, t: float, summary: dict | None = None,
+                   mention: bool = True) -> None:
+        """mention False (protocol v8): a report cut short by a new command does not take "there" from the place
+        that command named."""
         self.reports.append({"ref": ref, "text": text, "rover": rover, "t": t, "summary": summary})
-        self.mention(ref)
+        if mention:
+            self.mention(ref)
 
     # ------------------------------------------------------------------ reading
     def pick(self, ordinal: int) -> Ref | None:

@@ -86,8 +86,8 @@ def spot(sim, x0, y0, rmin, rmax, avoid=()):
 
 
 def _water_world(planner=None):
-    sim = Simulation(Config(seed=42, plan_clock="model", lifeforms=False, focus_s=40.0, curiosity=False),
-                     planner=planner, wait_for_gemma=planner is not None)
+    sim = Simulation(Config(seed=42, plan_clock="model", lifeforms=False, focus_s=40.0, curiosity=False,
+                            autonomy_mode="supervised"), planner=planner, wait_for_gemma=planner is not None)
     sim.run_for(40.0)
     f = sim.fleet
     px, py = spot(sim, 0.0, 0.0, 9.0, 16.0)
@@ -291,7 +291,7 @@ def test_operator_focus_stays_then_reports(world):
     assert re.match(rf"Exploring around \({fx}, {fy}\) for about 40 s, within 15 m; ", ack["text"]), ack["text"]
     assert r.focus is not None and r.focus["reason"] == "operator"
     fm = sim.tick_message()["rovers"][0]["focus"]
-    assert set(fm) == {"x", "y", "r", "reason", "label", "ends_in"} and fm["reason"] == "operator"
+    assert set(fm) == {"x", "y", "r", "reason", "label", "ends_in", "mode"} and fm["reason"] == "operator"   # v8 mode
     assert fm["label"] == f"({fx}, {fy})" and 0.0 < fm["ends_in"] <= 40.0
     goals = []
 
@@ -487,7 +487,7 @@ def _bring_herd(sim, rid="r1"):
 
 def test_follow_a_new_herd_while_asking():
     p = fake_planner()
-    sim = Simulation(Config(seed=42, plan_clock="model"), planner=p, wait_for_gemma=True)
+    sim = Simulation(Config(seed=42, plan_clock="model", autonomy_mode="supervised"), planner=p, wait_for_gemma=True)
     try:
         sim.run_for(5.0)
         _bring_herd(sim)
@@ -546,7 +546,8 @@ def test_follow_a_new_herd_while_asking():
 # ====================================================================== waiting never outlasts the battery
 def test_waiting_rover_returns_before_the_battery_runs_out():
     p = fake_planner()
-    sim = Simulation(Config(seed=42, operator_timeout_s=0.0, **LEGACY), planner=p, wait_for_gemma=True)
+    sim = Simulation(Config(seed=42, operator_timeout_s=0.0, autonomy_mode="supervised", **LEGACY), planner=p,
+                     wait_for_gemma=True)
     try:
         sim.run_for(12.0)
         adv = sim.advisor

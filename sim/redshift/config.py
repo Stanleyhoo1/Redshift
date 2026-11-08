@@ -168,6 +168,7 @@ class Config:
     operator_ask_first: bool = True      # always check the first anomaly after start or reset with the operator
     question_cooldown_s: float = 60.0    # per rover, sim seconds between two questions
     max_open_questions: int = 2          # fleet wide
+    autonomy_mode: str = "autonomous"    # protocol v8: "autonomous" (Gemma decides) or "supervised" (ask the operator)
 
     @property
     def nx(self) -> int:
@@ -213,5 +214,7 @@ class Config:
             operator_timeout_s=max(0.0, _env_float("OPERATOR_TIMEOUT_S", 0.0)),
             operator_ask_below=min(1.01, max(0.0, _env_float("OPERATOR_ASK_BELOW", 0.75))),
             operator_ask_first=_env_bool("OPERATOR_ASK_FIRST", True),
+            autonomy_mode="supervised" if os.environ.get("AUTONOMY_MODE", "").strip().lower() == "supervised"
+            else "autonomous",
         )
         return replace(base, **overrides) if overrides else base

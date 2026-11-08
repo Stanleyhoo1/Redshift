@@ -81,6 +81,7 @@ function FocusArea({ meta }) {
     r: 0,
     reason: '',
     label: null,
+    mode: null, // v8: 'explore' | 'resurvey' | null
     // what the circle was last draped for
     dx: NaN,
     dy: NaN,
@@ -112,8 +113,9 @@ function FocusArea({ meta }) {
       p.y = f.y
       p.r = f.r
       p.reason = f.reason
-      if (p.label !== f.label) {
+      if (p.label !== f.label || p.mode !== f.mode) {
         p.label = f.label
+        p.mode = f.mode
         p.sec = -2 // rewrite the tag
       }
     }
@@ -202,6 +204,8 @@ function FocusArea({ meta }) {
         text.current.textContent = sec >= 0 ? `${focusMapLabel(f)} · ${sec} s` : focusMapLabel(f)
       }
       if (el.dataset.reason !== p.reason) el.dataset.reason = p.reason
+      const mode = p.mode || ''
+      if (el.dataset.mode !== mode) el.dataset.mode = mode
     }
     // Opacity in 1/40 steps, so the style is only written while fading.
     const ta = Math.round(p.alpha * 40) / 40

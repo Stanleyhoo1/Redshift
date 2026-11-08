@@ -15,7 +15,8 @@ or Gemma 3 4B on older Ollama) on ONE background thread beside the rules. It
   (c) turns the operator's typed messages ("rover 2 go to 10, -5", "can we investigate the lake
       for signs of life": go_to_place, protocol v6) into structured commands, or "unclear" with a
       clarifying question. A regex parser does the same when Gemma is
-      offline or answers something invalid, and
+      offline or answers something invalid (protocol v8 adds "prioritize" for a fleet priority,
+      "set_mode" for the autonomy mode and the place "gaps" for unexplored pockets of the map), and
   (d) describes something the LiDAR tracker saw moving (camera image plus track numbers): a
       lifeform or not, a short label ("possible lifeform, six legs, about 1.2 m"), what to do
       (approach to observe, observe from here, ignore) and a confidence, and
@@ -112,20 +113,23 @@ LOCAL_URL = "http://localhost:11434"                 # Ollama when the sim runs 
 DEFAULT_MODEL = "gemma4:e2b"
 FALLBACK_MODELS = ("gemma4:e2b", "gemma4:e4b", "gemma3:4b")
 
-CANDIDATE_KINDS = ("frontier", "target", "return", "wait")
+CANDIDATE_KINDS = ("frontier", "target", "return", "wait", "place")    # place: which of several places (v8)
 ACTIONS = ("reroute", "back_out", "proceed_slowly", "wait", "ask_operator")
 CLASSES = ("rock", "steep_slope", "soft_ground", "dust", "liquid", "other_rover", "crater_edge", "clear", "unknown")
 DESCRIBE_CLASSES = ("lifeform", "rock", "other_rover", "dust", "unknown")
 DESCRIBE_ACTIONS = ("approach", "observe", "ignore", "ask_operator")
 MAX_LABEL_WORDS = 10
 COMMANDS = ("go_to", "go_to_place", "explore_direction", "sample_target", "return_home", "hold", "resume",
-            "avoid_area", "repeat", "question", "unclear")
+            "avoid_area", "repeat", "prioritize", "set_mode", "question", "unclear")
 TOPICS = ("status", "history", "exploration", "finds", "samples", "battery", "hazards", "lifeforms", "water",
           "location", "why", "unknown")
 DIRECTIONS = ("north", "south", "east", "west", "north-east", "north-west", "south-east", "south-west")
 # protocol v6: commands that name a place the fleet knows ("go to the water source"); v7: "there" is the place
 # the chat talked about last (resolved by the advisor's chat memory), "mentioned" picks the one the chat named
-PLACES = ("water", "spire", "mineral", "ice", "vent", "trace", "target", "lifeform", "hazard", "lander", "there")
+PLACES = ("water", "spire", "mineral", "ice", "vent", "trace", "target", "lifeform", "hazard", "lander", "gaps",
+          "there")     # gaps (v8): the unexplored pockets inside the map
+PRIORITIES = ("gaps", "water", "sampling", "direction", "none")     # v8: a fleet priority; none = back to normal
+MODES = ("autonomous", "supervised")                                   # v8: who decides when a rover would ask
 QUALIFIERS = ("nearest", "farthest", "biggest", "smallest", "newest") + DIRECTIONS + ("near_rover", "ordinal",
                                                                                       "mentioned", "none")
 
@@ -137,7 +141,7 @@ MAX_TEXT = 300         # longest operator message
 SKIP_KEYS = {"scan", "path", "image", "images", "jpeg"}
 MAX_RESULTS = 512      # results kept for poll(); older tickets are forgotten
 MAX_LATENCIES = 200    # window for avg / p95
-COMMAND_NUM_PREDICT = 160
+COMMAND_NUM_PREDICT = 192
 ANSWER_NUM_PREDICT = 128
 MAX_ANSWER_WORDS = 60
 MAX_ANSWER_CHARS = 360
@@ -173,17 +177,17 @@ SYSTEM_INTERPRET = SYSTEM_BASE + (
     'Example reason: "slip 52% while ground speed 0.05 m/s: the wheels spin in soft ground."'
 )
 SYSTEM_COMMAND = (
-    "Turn an operator message into one command for a rover fleet. "
-    "Commands: go_to (x, y); go_to_place (place, target_id, qualifier, ordinal, near_rover, investigate, explore): "
-    "a known place, like the water, a vent, the herd, t7; explore_direction (direction); sample_target (target_id); "
-    "return_home, hold, resume; avoid_area (x, y, radius); repeat: the last command again (do that again, same "
-    "for rover 3); question (topic): asks for information; unclear (ask one short question). Polite requests to "
-    "act are commands. rover: an id, all, or none if not named (rover 2 is r2, the orange one the orange rover). "
-    "investigate: investigate, survey, look for life. explore: stay and map around it (explore around, look "
-    "around). place there: the place talked about last (there, it, the second one); qualifier mentioned: that "
-    "lake, the vent you mentioned. A direction without place or coordinates is explore_direction. Use only "
-    "numbers and ids from the message or lists, never a rover position; 0 or none if unused. ack: one short "
-    "sentence. JSON only."
+    "Turn the operator's message into ONE command for a rover fleet. JSON only. "
+    "Commands: go_to (x, y); go_to_place (place, target_id, qualifier, ordinal, near_rover, investigate, explore); "
+    "explore_direction (direction); sample_target (target_id); prioritize (priority, direction): the whole fleet "
+    "favours it until done, none = back to normal; set_mode (mode): supervised = ask the operator first, autonomous "
+    "= rovers decide; return_home; hold; resume; avoid_area (x, y, radius); repeat: do that again; question (topic): "
+    "asks for information; unclear: ask one short question. "
+    "place: a known place (the water, a vent, crystals are spire, the herd, t7); gaps: holes or unexplored patches "
+    "in the map; there: the place talked about last (there, it, the second one); qualifier mentioned: that lake. "
+    "explore: stay and map around it. investigate: survey, look for life. Polite requests to act are commands. "
+    "rover: an id, all, or none if not named. Use only numbers and ids from the message or lists; 0 or none if "
+    "unused. ack: one short sentence."
 )
 
 SYSTEM_DESCRIBE = SYSTEM_BASE + (
@@ -894,6 +898,8 @@ def build_schema(req: Request) -> dict:
                  "investigate": {"type": "boolean"},
                  "explore": {"type": "boolean"},
                  "direction": {"type": "string", "enum": list(DIRECTIONS) + ["none"]},
+                 "priority": {"type": "string", "enum": list(PRIORITIES)},
+                 "mode": {"type": "string", "enum": list(MODES) + ["none"]},
                  "x": {"type": "number"}, "y": {"type": "number"}, "radius": {"type": "number"},
                  "target_id": target,
                  "topic": {"type": "string", "enum": list(TOPICS) + ["none"]},
@@ -942,7 +948,8 @@ _SUBJ = r"(?:you|u|we|they|it|anyone|anybody|everyone|the fleet|the rovers?|any|
 _CMD_VERBS = (r"go|drive|head|move|return|come|hold|stop|halt|freeze|wait|park|resume|continue|carry on|keep|"
               r"sample|explore|scout|survey|avoid|stay|check|investigate|inspect|send|get|navigate|travel|recall|dock|"
               r"proceed|turn|back|visit|revisit|scan|search|examine|study|observe|watch|approach|swing by|stop by|"
-              r"look (?:at|around|for|into|over)|have a look|take a look|take a closer look")
+              r"look (?:at|around|for|into|over)|have a look|take a look|take a closer look|decide|prioriti[sz]e|"
+              r"switch|fill|focus|concentrate")
 _CMD_VERBS_Q = _CMD_VERBS            # "can you go home?" / "can we investigate the lake" are orders, not questions
 _Q_START_RE = re.compile(r"^(?:what|whats|what's|where|wheres|where's|why|how|hows|how's|which|who|when|is|are|am|"
                          r"was|were|any|anything|seen|seeing|found|got)\b"
@@ -1041,6 +1048,9 @@ _PLACE_RES = tuple((k, re.compile(rx)) for k, rx in (
                  r"wildlife|beasts?)\b"),
     ("target", r"\b(?:targets?|science sites?|sample sites?|discover(?:y|ies))\b"),
     ("lander", r"\b(?:lander|landing (?:site|pad)|home base|base)\b"),
+    ("gaps", r"\b(?:(?:unexplored|unmapped|unknown|blank|empty|dark|black|missing)\s+(?:gaps?|holes?|spots?|"
+             r"patch(?:es)?|areas?|pockets?|regions?|bits?|parts?|sections?|places?|zones?|patches)|gaps?|holes?|"
+             r"pockets? of (?:unknown|unexplored) (?:ground|land|terrain))\b"),
 ))
 _PLACE_VERB_RE = re.compile(r"\b(?:go|goes|going|head\w*|drive|move|navigate|travel|visit\w*|revisit\w*|return\w*|"
                             r"come back|get back|back to|investigat\w*|check\w*|look\w*|inspect\w*|survey\w*|scan\w*|"
@@ -1050,12 +1060,16 @@ _INVESTIGATE_RE = re.compile(r"\b(?:investigat\w*|survey\w*|look(?:ing)? for|"
                              r"search\w*|scan\w*|examin\w*|check(?:ing)? (?:for|around)|"
                              r"stud(?:y|ying)|observ\w*|watch\w*|signs? of|traces? of|evidence of)\b")
 # protocol v7: stay and explore an area ("explore around the lake", "go to the vent and look around")
-_EXPLORE_AREA_RE = re.compile(r"\b(?:explor\w*|look(?:ing)? around|have a look around|stick around|"
+_EXPLORE_AREA_RE = re.compile(r"\b(?:explor\w*|look(?:ing)? around|have a look around|stick around|focus(?:ing)? on|"
+                              r"concentrat\w* on|"
                               r"map (?:out )?(?:the area )?around)\b")
 _EXPLORE_SIDE_RE = re.compile(r"\bexplor\w*\s+(?:the\s+(?:area|ground|region|land|terrain)\s+)?(?:to\s+the\s+)?"
                               r"(north|south)[\s-]?(east|west)(?:ern)?\s+(?:side\s+)?of\b"
                               r"|\bexplor\w*\s+(?:the\s+(?:area|ground|region|land|terrain)\s+)?(?:to\s+the\s+)?"
                               r"(north|south|east|west)(?:ern)?\s+(?:side\s+)?of\b")
+# v8: "check the area east of the lake", "look at the ground north of the vent": an area on that side too
+_AREA_SIDE_RE = re.compile(r"\b(?:area|ground|region|land|terrain|side|part|zone|bit)\s+(?:to\s+the\s+)?"
+                           r"(?:(north|south)[\s-]?(east|west)|(north|south|east|west))(?:ern)?\s+(?:side\s+)?of\b")
 # chat references: the place talked about last ("go back there", "investigate it", "that spot")
 _THERE_RE = re.compile(r"\b(?:over\s+)?there\b(?!\s+(?:is|are|was|were|be)\b)"
                        r"|\bthat\s+(?:place|spot|area|location|site|one)\b"
@@ -1105,11 +1119,95 @@ _PLACE_SYNONYMS = {"lake": "water", "pond": "water", "river": "water", "stream":
                    "animal": "lifeform", "life": "lifeform", "lifeforms": "lifeform", "grazer": "lifeform",
                    "spires": "spire", "crystal": "spire", "vents": "vent", "minerals": "mineral", "outcrop": "mineral",
                    "traces": "trace", "organic": "trace", "targets": "target", "base": "lander", "hazards": "hazard",
-                   "rockfall": "hazard", "sand": "hazard"}
+                   "rockfall": "hazard", "sand": "hazard", "gap": "gaps", "hole": "gaps", "holes": "gaps",
+                   "unexplored": "gaps", "patches": "gaps", "crystals": "spire"}
 _QUAL_SYNONYMS = {"closest": "nearest", "near": "nearest", "furthest": "farthest", "largest": "biggest",
                   "big": "biggest", "small": "smallest", "latest": "newest", "new": "newest", "recent": "newest",
                   "northeast": "north-east", "northwest": "north-west", "southeast": "south-east",
                   "southwest": "south-west", "near rover": "near_rover", "nearrover": "near_rover"}
+
+
+# protocol v8: fleet priorities ("prioritize the gaps", "focus on the unexplored holes first", "back to normal")
+_PRIO_STRONG_RE = re.compile(r"\b(?:prioriti[sz]\w*|priorit(?:y|ies)|before anything else|most important|above all)\b")
+_PRIO_WEAK_RE = re.compile(r"\b(?:focus(?:ing)?|concentrat\w*)\s+(?:\w+\s+)?on\b|\bfirst\s*[.!]*$")
+_PRIO_FILL_RE = re.compile(r"\b(?:fill(?:ing)?|plug|cover)\b")
+_NORMAL_RE = re.compile(r"\b(?:back to normal|normal (?:exploration|exploring|mode|operations?)|as (?:normal|usual)|"
+                        r"(?:cancel|drop|clear|forget|remove|end|reset)\s+(?:the\s+|that\s+|this\s+|your\s+)?priorit\w*|"
+                        r"(?:stop|quit|no longer)\s+prioriti[sz]\w*|no (?:more\s+)?priorit\w*|de-?prioriti[sz]\w*)")
+_PRIO_SAMPLE_RE = re.compile(r"\b(?:sampl\w*|science(?: targets?)?|targets?|drill\w*|collect\w*)\b")
+_PRIO_WATER_RE = re.compile(r"\b(?:water|lakes?|ponds?|rivers?|streams?|liquids?|shores?)\b")
+_THE_WATER_RE = re.compile(r"\b(?:the|that|this)\s+(?:\w+\s+)?(?:lake|pond|river|stream|shore|water source|pool)\b")
+_GAP_PLURAL_RE = re.compile(r"\b(?:gaps|holes|(?:unexplored|unmapped|unknown|blank|empty|dark|black)\s+(?:areas|regions|"
+                            r"parts|bits|sections|places|zones|spots|patches|pockets))\b")
+_ONE_RE = re.compile(r"\b(?:one|a|an|single|nearest|closest|biggest|largest|smallest|second|third|last|that|this)\b")
+_GAP_VERB_RE = re.compile(r"\b(?:explor\w*|map\w*|scout\w*|search\w*|check\w*|cover\w*|survey\w*|look\w*|visit\w*|"
+                          r"go|head|send|fill\w*|finish\w*|complete\w*|clear\w*)\b")
+# protocol v8: autonomy mode ("switch to supervised mode", "you decide from now on")
+_SUPERVISED_RE = re.compile(r"\b(?:supervis\w*|human[- ]?(?:controlled|control|in the loop)|manual(?: mode| control)|"
+                            r"operator control|ask (?:me|us|the operator)\b(?! (?:what|where|why|how|about the))|"
+                            r"check with (?:me|us)|(?:my|our) (?:approval|permission)|approv\w* (?:every|each|all|the)|"
+                            r"let (?:me|us) decide|i(?:'ll| will| want to)? decide|we(?:'ll| will)? decide)\b")
+_AUTONOMOUS_RE = re.compile(r"\b(?:autonom\w*|full auto\w*|auto(?:matic)? mode|you decide|you choose|you pick|"
+                            r"decide (?:for |by )?yoursel(?:f|ves)|decide on your own|your call|up to you|"
+                            r"(?:make|take) (?:the |your own )?decisions?(?: yoursel(?:f|ves)| on your own)?|"
+                            r"don'?t ask(?: me| us)?|stop asking|no need to ask|without asking|(?:the )?robots? decides?|"
+                            r"gemma decides?)\b")
+_CHECK_ON_RE = re.compile(r"^(?:please\s+)?check\s+(?:in\s+)?on\b")
+# a bare "explore" with nothing else is "resume"; "explore <something I don't know>" gets a question back (v8)
+_EXPLORE_FILLER_RE = re.compile(r"\b(?:please|can|could|would|will|you|u|we|go|and|the|again|on|your|own|now|just|keep|"
+                                r"start|continue|carry|resume|explor\w*|scout\w*|search\w*|survey\w*|map|mapping|ok|"
+                                r"okay|then|all|of|everyone|everybody|rovers?|fleet|around|more|some|it|let'?s|lets|to|"
+                                r"for|a|bit|little|while|yoursel(?:f|ves)|freely|normally|like|before|back|guys|y'?all)\b")
+_EXPLORE_WHAT = ("Explore what? Name a place (the lake, t4, the vent), an area (north of the lander, around 10, -5), "
+                 "or say 'the unexplored gaps'.")
+
+
+def parse_mode(text: str) -> str | None:
+    """'switch to supervised mode' -> 'supervised', 'you decide from now on' -> 'autonomous', else None. When both
+    kinds of words appear ("from supervised to autonomous"), the later one wins."""
+    best = None
+    for mode, rx in (("supervised", _SUPERVISED_RE), ("autonomous", _AUTONOMOUS_RE)):
+        for m in rx.finditer(text or ""):
+            if mode == "autonomous" and re.search(r"\b(?:before|until|unless|when|if|till)\s+$", text[:m.start()]):
+                continue                    # "ask me before you decide": the operator decides
+            if best is None or m.start() > best[1]:
+                best = (mode, m.start())
+    return best[0] if best else None
+
+
+def parse_priority(rest: str, rover=None) -> dict | None:
+    """A fleet priority from the operator's words (rover mentions blanked), or None. 'prioritize the gaps', 'focus on
+    the unexplored holes first', 'fill in the gaps', 'prioritize the north', 'prioritize water', 'prioritize
+    sampling', 'back to normal' (priority none)."""
+    text = rest or ""
+    if _NORMAL_RE.search(text):
+        return {"type": "prioritize", "rover": None, "priority": "none", "direction": None}
+    strong, weak, fill = _PRIO_STRONG_RE.search(text), _PRIO_WEAK_RE.search(text), _PRIO_FILL_RE.search(text)
+    gap = dict(_PLACE_RES)["gaps"].search(text)
+    if not (strong or weak or fill):
+        # "explore the gaps", "map the blank spots": plural, nobody named, not one of them: the whole fleet's job
+        if gap and rover in (None, "all") and _GAP_PLURAL_RE.search(text) and not _ONE_RE.search(text) \
+                and _GAP_VERB_RE.search(text):
+            return {"type": "prioritize", "rover": None, "priority": "gaps", "direction": None}
+        return None
+    kind, direction = None, None
+    if gap:
+        kind = "gaps"
+    elif fill:
+        return None                         # "fill" alone means a gap ("fill in the gaps")
+    elif _PRIO_SAMPLE_RE.search(text):
+        kind = "sampling"
+    elif _PRIO_WATER_RE.search(text):
+        if not strong and _THE_WATER_RE.search(text):
+            return None                     # "focus on the lake": explore around that place, not a fleet priority
+        kind = "water"
+    else:
+        d = _DIR_ADJ_RE.search(text)
+        if d:
+            kind, direction = "direction", (f"{d.group(1)}-{d.group(2)}" if d.group(1) else d.group(3))
+    if kind is None:
+        return None
+    return {"type": "prioritize", "rover": None, "priority": kind, "direction": direction}
 
 
 def near_reference(low: str, rovers: list | None = None):
@@ -1176,7 +1274,18 @@ def parse_place(low: str, rest: str, rover, target, rovers: list, polite: bool =
     side_dir = None
     if side:
         side_dir = f"{side.group(1)}-{side.group(2)}" if side.group(1) else side.group(3)
+    else:
+        side = _AREA_SIDE_RE.search(text)         # v8: "check the area east of the lake"
+        if side:
+            side_dir = f"{side.group(1)}-{side.group(2)}" if side.group(1) else side.group(3)
     place, pspan = _place_words(text)
+    if place == "lander" and side is not None and not _EXPLORE_SIDE_RE.search(text):
+        side, side_dir = None, None               # "check out the area north of the lander": explore that way (v3)
+    if place == "gaps":                           # v8: "the unexplored area east of the lake" is about the lake
+        k2, s2 = _place_words(_blank(text, [pspan]))
+        if k2 is not None and k2 != "gaps" and re.search(r"\b(?:of|around|near|by|at|next to|beside)\s+(?:the\s+)?$",
+                                                         text[:s2[0]]):
+            place, pspan = k2, s2
     if place is None and target:
         place = "target"
     if place is None and life:
@@ -1188,11 +1297,11 @@ def parse_place(low: str, rest: str, rover, target, rovers: list, polite: bool =
             place = "there"
     if place is None:
         return None
-    explore = bool(_EXPLORE_AREA_RE.search(text)) or side is not None
+    explore = bool(_EXPLORE_AREA_RE.search(text)) or side is not None or place == "gaps"   # a gap is explored
     if place == "lander" and side is None:
         if _DIR_RE.search(text) or (_RETURN_RE.search(text) and not inv and not explore):
             return None                   # "north of the lander" (explore), "back to the lander" (return home)
-    mentioned = place != "there" and pspan is not None and bool(
+    mentioned = place not in ("there", "gaps") and pspan is not None and bool(
         _MENTIONED_AFTER_RE.match(text[pspan[1]:]) or _MENTIONED_BEFORE_RE.search(text[:pspan[0]]))
     if not (inv or polite or explore or pick is not None or mentioned or _PLACE_VERB_RE.search(text)
             or (place == "there" and _SAMPLE_WORD_RE.search(text))):
@@ -1332,6 +1441,15 @@ def command_ack(cmd: dict) -> str:
         return f"Avoiding the area around {_fmt_xy(cmd['x'], cmd['y'])}, radius {cmd['radius']:g} m."
     if typ == "question":
         return f"Answering a question about {cmd.get('topic', 'status')}."
+    if typ == "prioritize":
+        p = cmd.get("priority")
+        if p == "none":
+            return "Back to normal exploration."
+        what = {"gaps": "the unexplored gaps", "water": "water", "sampling": "sampling"}.get(p) or \
+            f"the {cmd.get('direction') or 'area'}"
+        return f"Prioritizing {what}."
+    if typ == "set_mode":
+        return f"Switching to {cmd.get('mode')} mode."
     return cmd.get("question") or _HELP
 
 
@@ -1375,8 +1493,13 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
     if _REPEAT_RE.match(_LEAD_RE.sub("", " ".join(rest.split())).strip(" ,;:")):
         return _done({"type": "repeat", "rover": rover})       # v7: "do that again", "same for rover 3"
     q_strength, q_topic = question_intent(low, rovers)
+    mode = parse_mode(rest)                   # v8: "switch to supervised mode", "you decide from now on"
+    if mode is not None and q_strength != "strong":
+        return _done({"type": "set_mode", "rover": None, "mode": mode})
     if q_strength == "strong":
         return _ask(rover, q_topic, 0.9)
+    if _CHECK_ON_RE.match(_q_core(low, rovers)[1]):
+        return _ask(rover, "status", 0.8)    # "check on rover 1": how it is doing
 
     tm = _TARGET_RE.search(rest)
     target = f"t{tm.group(1)}" if tm else None
@@ -1397,6 +1520,9 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
         if pair is None:
             return _unclear("Which area should the rovers avoid? Give x, y and a radius, like 'avoid 12, -4 radius 3'.")
         return _done({"type": "avoid_area", "x": pair[0], "y": pair[1], "radius": max(0.5, min(30.0, radius))})
+    prio = parse_priority(rest, rover) if pair is None and not target else None    # v8: a fleet priority
+    if prio is not None:
+        return _done(prio)
     looking = target and re.search(r"\b(?:look|survey|observe|watch)", rest) and not _SAMPLE_WORD_RE.search(rest)
     if target and not looking and (_SAMPLE_RE.search(rest) or not rest.strip() or rover is not None):
         if target_ids and target not in target_ids:
@@ -1421,6 +1547,8 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
     if dm:
         return _done({"type": "explore_direction", "rover": rover, "direction": _norm_direction(dm)})
     if _EXPLORE_RE.search(rest):
+        if re.sub(r"[^a-z]+", " ", _EXPLORE_FILLER_RE.sub(" ", rest)).strip():
+            return _unclear(_EXPLORE_WHAT)  # v8: "explore <something unknown>" is not a plain resume
         return _done({"type": "resume", "rover": rover})
     nums = [v for _, v in numbers_in_text(rest)]
     if len(nums) == 2 and (_GO_RE.search(rest) or explore):
@@ -1637,7 +1765,7 @@ def _fix_place(req: Request, cmd: dict) -> dict:
                 out["direction"] = p["direction"]
             return out
         if typ in ("go_to", "explore_direction", "unclear", "return_home", "sample_target", "resume", "hold",
-                   "repeat") and not _explicit_xy(req):
+                   "repeat", "prioritize", "set_mode") and not _explicit_xy(req):
             return dict(p)
         return cmd
     if typ == "go_to_place" and p.get("type") == "go_to" and _explicit_xy(req):
@@ -1659,6 +1787,69 @@ def _fix_refs(req: Request, cmd: dict) -> dict:
     if p.get("type") == "repeat" and typ != "repeat":
         return dict(p)
     if typ == "repeat" and p.get("type") not in (None, "repeat", "unclear", "question"):
+        return dict(p)
+    return cmd
+
+
+def _norm_word(v) -> str:
+    return " ".join(str(v if v is not None else "").strip().lower().replace("_", " ").split())
+
+
+_PRIORITY_SYNONYMS = {"gap": "gaps", "hole": "gaps", "holes": "gaps", "unexplored": "gaps", "unexplored gaps": "gaps",
+                      "sample": "sampling", "samples": "sampling", "targets": "sampling", "science": "sampling",
+                      "lake": "water", "lakes": "water", "normal": "none", "cancel": "none", "": "none"}
+
+
+def _priority_command(req: Request, data: dict) -> dict:
+    """Gemma's prioritize, checked: a known priority, a direction for 'direction', and the operator's words must
+    talk about a priority (or 'back to normal'). Raises ValueError (the keyword parser decides)."""
+    low = (req.text or "").lower()
+    p = _norm_word(data.get("priority"))
+    p = _PRIORITY_SYNONYMS.get(p, p)
+    d = _norm_word(data.get("direction")).replace(" ", "-")
+    d = {"northeast": "north-east", "northwest": "north-west", "southeast": "south-east", "southwest": "south-west"}.get(d, d)
+    if p in DIRECTIONS:
+        p, d = "direction", p
+    if p not in PRIORITIES:
+        raise ValueError(f"priority {data.get('priority')!r} not in {list(PRIORITIES)}")
+    if p == "none":
+        if not _NORMAL_RE.search(low):
+            raise ValueError("priority none without 'back to normal' or 'cancel the priority'")
+    elif not (_PRIO_STRONG_RE.search(low) or _PRIO_WEAK_RE.search(low) or _PRIO_FILL_RE.search(low)
+              or _GAP_PLURAL_RE.search(low)):
+        raise ValueError("prioritize, but the message does not ask for a priority")
+    if p == "direction" and d not in DIRECTIONS:
+        m = _DIR_RE.search(low)
+        if not m:
+            raise ValueError("prioritize a direction without a direction")
+        d = _norm_direction(m)
+    return {"type": "prioritize", "rover": None, "priority": p, "direction": d if p == "direction" else None}
+
+
+def _mode_command(req: Request, data: dict) -> dict:
+    """Gemma's set_mode, checked: a known mode, and the operator's words must be about who decides."""
+    m = _norm_word(data.get("mode"))
+    m = {"human": "supervised", "manual": "supervised", "supervise": "supervised", "auto": "autonomous",
+         "autonomy": "autonomous"}.get(m, m)
+    if m not in MODES:
+        raise ValueError(f"mode {data.get('mode')!r} not in {list(MODES)}")
+    said = parse_mode((req.text or "").lower())
+    if said is None and not re.search(r"\bmode\b", (req.text or "").lower()):
+        raise ValueError("set_mode, but the message is not about who decides")
+    return {"type": "set_mode", "rover": None, "mode": said or m}
+
+
+def _fix_task(req: Request, cmd: dict) -> dict:
+    """Post-check priorities, modes and bare resumes (v8) with the keyword parser: the operator's priority or mode
+    words win over another reading, and a 'resume' for a message that asks for something the parser could not
+    place ("explore the shiny stuff") becomes the parser's question back instead of a generic status reply."""
+    p = (req.parsed or {}).get("command") or {}
+    typ = cmd.get("type")
+    if p.get("type") in ("prioritize", "set_mode") and typ not in (p.get("type"), "question"):
+        return dict(p)
+    if p.get("type") in ("prioritize", "set_mode") and typ == p.get("type"):
+        return dict(cmd, **{k: v for k, v in p.items() if k in ("priority", "mode", "direction") and v})
+    if typ in ("resume", "hold", "return_home") and p.get("type") == "unclear" and p.get("question") == _EXPLORE_WHAT:
         return dict(p)
     return cmd
 
@@ -1800,6 +1991,10 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             cmd = {"type": typ, "rover": rv}
         elif typ == "go_to_place":
             cmd = _place_command(req, data, rv)
+        elif typ == "prioritize":
+            cmd = _priority_command(req, data)
+        elif typ == "set_mode":
+            cmd = _mode_command(req, data)
         elif typ == "question":
             topic = str(data.get("topic") or "").strip().lower()
             cmd = {"type": "question", "rover": rv, "topic": topic if topic in TOPICS else "unknown"}
@@ -1811,6 +2006,7 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
     cmd = _fix_go_to(req, cmd, data)
     cmd = _fix_place(req, cmd)
     cmd = _fix_refs(req, cmd)
+    cmd = _fix_task(req, cmd)
     cmd = _fix_intent(req, cmd)
     if cmd["type"] == "unclear":
         cmd["question"] = _strip_label(cmd["question"]) or _HELP
@@ -2163,10 +2359,13 @@ class FakeBackend(Backend):
         liq = anom.get("camera_liquid_pct")
         spread = anom.get("edge_spread")
         if "no_return" in typ:
+            cam_water = anom.get("camera_water")
             seen_liquid = (isinstance(liq, (int, float)) and liq >= 3.0) or (
+                isinstance(cam_water, (int, float)) and cam_water >= 0.5) or (
                 liq is None and isinstance(spread, (int, float)) and spread < 0.12)
             if seen_liquid:
-                cls, act, conf, keys = "liquid", "reroute", 0.85, ("camera_liquid_pct", "distance", "rays_missing")
+                cls, act, conf, keys = "liquid", "reroute", 0.85, ("camera_liquid_pct", "camera_water", "distance",
+                                                                   "rays_missing")
             else:
                 cls, act, conf, keys = "crater_edge", "reroute", 0.6, ("distance", "rays_missing")
         elif "slip" in typ or "sand" in typ:
@@ -2188,6 +2387,8 @@ class FakeBackend(Backend):
             v = anom.get(k, sens.get(k))
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 bits.append(_fmt_reading(k, v))
+        if isinstance(anom.get("camera_sees"), str) and anom["camera_sees"]:
+            bits.insert(0, f"camera sees {anom['camera_sees']}")   # protocol v8: the onboard detector
         if not bits:                          # quote any reading at all
             for k, v in list(anom.items()) + list(sens.items()):
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
@@ -2220,6 +2421,7 @@ class FakeBackend(Backend):
                 "explore": bool(c.get("explore")), "direction": c.get("direction", "none"),
                 "x": c.get("x", 0), "y": c.get("y", 0), "radius": c.get("radius", 0),
                 "target_id": c.get("target_id") or "none", "topic": c.get("topic", "none"),
+                "priority": c.get("priority") or "none", "mode": c.get("mode") or "none",
                 "question": c.get("question", ""), "ack": p["ack"], "confidence": 0.85}
 
     _LEADS = {"status": "Status: ", "history": "My log: ", "exploration": "Mapping so far: ", "finds": "Finds: ", "samples": "Samples: ",

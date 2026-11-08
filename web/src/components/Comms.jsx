@@ -83,11 +83,12 @@ function InlineQuestion({ m, req, answer, res, now }) {
             type="button"
             className="msg-opt"
             data-default={o.id === auto || undefined}
+            data-suggested={o.suggested || undefined}
             data-place={nums[o.id] ? true : undefined}
             disabled={pending}
             aria-busy={(pending && answer.option === o.id) || undefined}
             onClick={() => sendAnswer(req.id, o.id)}
-            title={o.id === auto ? 'The safe default: taken if nobody answers' : nums[o.id] ? `Marker ${nums[o.id]} on the map` : undefined}
+            title={o.suggested ? "Gemma's suggestion" : o.id === auto ? 'The safe default: taken if nobody answers' : nums[o.id] ? `Marker ${nums[o.id]} on the map` : undefined}
             {...placeChipProps(req, o, hover)}
           >
             {nums[o.id] && (
@@ -96,6 +97,7 @@ function InlineQuestion({ m, req, answer, res, now }) {
               </b>
             )}
             {o.label}
+            {o.suggested && <small className="msg-sugg">Gemma suggests</small>}
             {o.id === auto && <small>safe default</small>}
           </button>
         ))}

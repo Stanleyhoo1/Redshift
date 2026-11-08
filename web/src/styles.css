@@ -4722,3 +4722,644 @@ kbd {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ---------------------------------------------------------------- v8: autonomy mode switch */
+
+.mode-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 9px 0 0;
+  min-width: 0;
+}
+
+.mode-seg {
+  display: inline-flex;
+  flex: none;
+  padding: 2px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.mode-seg button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3);
+  font-size: 13px;
+  font-weight: 620;
+  cursor: pointer;
+  transition: color 120ms, background-color 120ms;
+}
+
+.mode-seg button:hover {
+  color: var(--ink);
+}
+
+.mode-seg button[aria-checked='true'] {
+  color: var(--void);
+  background: var(--ink);
+}
+
+.mode-seg button[data-mode='autonomous'][aria-checked='true'] {
+  background: linear-gradient(90deg, #c9d4ff, #e6d6ff);
+}
+
+.mode-seg button[data-mode='supervised'][aria-checked='true'] {
+  background: #ffd38a;
+}
+
+.mode-seg button[data-pending] {
+  animation: blink 1s ease-in-out infinite;
+}
+
+.mode-ico {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.mode-star {
+  fill: currentColor;
+  stroke: none;
+}
+
+/* One-line explanation on hover (and keyboard focus), under the switch. */
+.mode-seg button[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 40;
+  width: 300px;
+  padding: 7px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: #0d1420;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: left;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-3px);
+  transition: opacity 120ms, transform 120ms;
+}
+
+.mode-seg button[data-mode='supervised'][data-tip]::after {
+  left: auto;
+  right: -120px;
+}
+
+.mode-seg button:hover::after,
+.mode-seg button:focus-visible::after {
+  opacity: 1;
+  transform: none;
+  transition-delay: 250ms;
+}
+
+.mode-note {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mode-row[data-mode='supervised'] .mode-note {
+  color: #ffd38a;
+}
+
+.mode-note[data-error] {
+  color: #ff9f94;
+  white-space: normal;
+}
+
+/* Fleet priority chip (v8 `priority`) */
+.prio {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 7px;
+  margin: 9px 0 0;
+  padding: 4px 4px 4px 9px;
+  border: 1px solid rgba(243, 178, 74, 0.5);
+  border-radius: 8px;
+  background: rgba(243, 178, 74, 0.09);
+  color: #ffd99a;
+  font-size: 12.5px;
+}
+
+.prio-ico {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: var(--amber);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.prio-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.prio-text b {
+  font-weight: 640;
+  color: #ffe2b0;
+}
+
+.prio-x {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: #ffd99a;
+  cursor: pointer;
+}
+
+.prio-x:hover {
+  border-color: rgba(243, 178, 74, 0.6);
+  background: rgba(243, 178, 74, 0.15);
+}
+
+.prio-x svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.prio-busy {
+  padding-right: 6px;
+  color: var(--ink-3);
+}
+
+.prio-err {
+  flex-basis: 100%;
+  color: #ff9f94;
+}
+
+/* Tag on a prioritised place on the map (only when the sim sends positions) */
+.prio-tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border: 1px solid rgba(243, 178, 74, 0.7);
+  border-radius: 999px;
+  background: rgba(6, 9, 14, 0.78);
+  color: #ffd99a;
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 620;
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* Re-survey focus (v8 focus.mode): a solid ring icon on the tag */
+.focus-tag[data-mode='resurvey'] .focus-tag-ring {
+  border-style: solid;
+  border-right-color: transparent;
+}
+
+/* ---------------------------------------------------------------- v8: event log filters and decisions */
+
+.log[hidden] {
+  display: none;
+}
+
+.log {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.evf-row {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 0 8px 8px;
+}
+
+.evf {
+  --c: var(--ink-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: none;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 120ms, border-color 120ms, background-color 120ms;
+}
+
+.evf:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+.evf[aria-pressed='true'] {
+  color: var(--ink);
+  border-color: color-mix(in srgb, var(--c) 70%, transparent);
+  background: color-mix(in srgb, var(--c) 16%, transparent);
+}
+
+.evf:not([data-rover])[aria-pressed='true'] {
+  --c: var(--ink);
+  background: rgba(232, 238, 245, 0.1);
+}
+
+.evf[data-dec] {
+  --c: #b9a6ff;
+}
+
+.evf[data-dec][aria-pressed='true'] {
+  --c: #b9a6ff;
+  background: linear-gradient(90deg, rgba(110, 150, 255, 0.2), rgba(190, 125, 255, 0.2));
+}
+
+.evf-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c);
+}
+
+.evf-star {
+  width: 9px;
+  height: 9px;
+  fill: #b9c5ff;
+}
+
+.evf-n {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.evf[aria-pressed='true'] .evf-n {
+  color: var(--ink-2);
+}
+
+/* Long logs: rows off screen skip layout and paint until scrolled to. */
+.log-list > .ev {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 46px;
+}
+
+.log-more {
+  padding: 8px 0 2px;
+  text-align: center;
+}
+
+.log-more button {
+  padding: 4px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: none;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.log-more button:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+/* A decision a rover made on its own (event `decision`) */
+.ev[data-decision] {
+  --tint: rgba(140, 130, 255, 0.07);
+}
+
+.ev > .dec {
+  grid-column: 3;
+}
+
+.ev.ev-link > .dec {
+  margin: -4px 12px 7px calc(3.1em + 9px + 20px + 12px);
+}
+
+.dec {
+  margin-top: 5px;
+  min-width: 0;
+}
+
+.dec-sum {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px 6px;
+  max-width: 100%;
+  padding: 2px 6px 2px 2px;
+  border: 1px solid rgba(150, 150, 255, 0.28);
+  border-radius: 7px;
+  background: rgba(110, 130, 255, 0.06);
+  font-size: 12.5px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+}
+
+.dec-sum:hover {
+  border-color: rgba(170, 160, 255, 0.6);
+  background: rgba(110, 130, 255, 0.12);
+}
+
+.dec-by {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: rgba(232, 238, 245, 0.08);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 650;
+  line-height: 18px;
+}
+
+.dec-by[data-by='gemma'] {
+  color: #d3dbff;
+  background: linear-gradient(90deg, rgba(110, 150, 255, 0.26), rgba(190, 125, 255, 0.26));
+}
+
+.dec-conf {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.dec-conf[data-level='high'] {
+  color: #8ff0c0;
+}
+
+.dec-conf[data-level='low'] {
+  color: #ffc56e;
+}
+
+.dec-verb {
+  color: var(--ink-3);
+}
+
+.dec-choice {
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.dec-of {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+
+.dec-chev {
+  width: 9px;
+  height: 9px;
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 120ms;
+}
+
+.dec[data-open] .dec-chev {
+  transform: rotate(90deg);
+}
+
+.dec-body {
+  margin-top: 6px;
+  padding: 7px 9px;
+  border-left: 2px solid rgba(170, 160, 255, 0.45);
+  border-radius: 0 6px 6px 0;
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.dec-q {
+  margin: 0;
+  color: var(--ink);
+}
+
+.dec-q + .dec-opts,
+.dec-opts + .dec-q,
+.dec-q + .dec-q {
+  margin-top: 6px;
+}
+
+.dec-q > span {
+  display: inline-block;
+  min-width: 62px;
+  color: var(--ink-3);
+  font-weight: 600;
+}
+
+.dec-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0;
+  padding: 0 0 0 62px;
+  list-style: none;
+}
+
+.dec-opts li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  color: var(--ink-3);
+  line-height: 19px;
+}
+
+.dec-opts li[data-chosen] {
+  border-color: rgba(143, 240, 192, 0.6);
+  background: rgba(98, 214, 168, 0.12);
+  color: var(--ink);
+  font-weight: 620;
+}
+
+.dec-opts svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: #8ff0c0;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ---------------------------------------------------------------- v8: suggested options (supervised mode) */
+
+.rq-opt[data-suggested],
+.msg-opt[data-suggested] {
+  border-color: rgba(170, 160, 255, 0.75);
+  background: linear-gradient(90deg, rgba(110, 150, 255, 0.16), rgba(190, 125, 255, 0.16));
+  box-shadow: 0 0 0 1px rgba(170, 160, 255, 0.25);
+}
+
+.rq-opt[data-suggested]:hover:not(:disabled),
+.msg-opt[data-suggested]:hover:not(:disabled) {
+  border-color: #c4b8ff;
+  background: linear-gradient(90deg, rgba(110, 150, 255, 0.26), rgba(190, 125, 255, 0.26));
+}
+
+.rq-sugg {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1.2;
+  font-weight: 650;
+  color: #c9d2ff;
+}
+
+.msg-opt small.msg-sugg {
+  color: #c9d2ff;
+}
+
+/* ---------------------------------------------------------------- v8: camera detections */
+
+.sp-cam-canvas {
+  display: block;
+  width: var(--cam-w);
+  height: var(--cam-h);
+}
+
+.sp-cam-rate {
+  position: absolute;
+  top: 6px;
+  right: 7px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(4, 7, 11, 0.66);
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.ix-boxes {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: rgba(4, 7, 11, 0.7);
+  color: var(--ink-3);
+  cursor: pointer;
+}
+
+.ix-boxes svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ix-boxes:hover {
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+
+.ix-boxes[aria-pressed='true'] {
+  color: var(--life);
+  border-color: color-mix(in srgb, var(--life) 45%, transparent);
+}
+
+.ix-boxes[data-none] {
+  opacity: 0.5;
+}
+
+.ix-boxes-lg {
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--line-2);
+}
+
+.ix-boxes-lg svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* "Sees: creature 0.83 at 6 m, rock 0.64 at 4 m" */
+.sp-sees {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 9px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.sp-sees-list {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--ink);
+}
+
+.sp-sees-item {
+  margin-right: 6px;
+}
+
+.sp-sees-item i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+  border: 1.5px solid var(--c);
+  border-radius: 2px;
+  vertical-align: 0;
+}
+
+.sp-sees-ms {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}

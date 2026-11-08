@@ -296,7 +296,7 @@ def test_first_sighting_asks_the_operator():
     """Protocol v7: a herd nobody asked about yet is followed at once while the operator is asked (keep
     following, observe from here, keep exploring); each herd is asked about once."""
     p = fake_planner()
-    sim = make(planner=p, operator_timeout_s=60.0)
+    sim = make(planner=p, operator_timeout_s=60.0, autonomy_mode="supervised")
     try:
         _bring_herd(sim)
         r = next(o for o in sim.rovers if o.id == "r1")
@@ -349,7 +349,7 @@ def test_first_sighting_asks_the_operator():
 
 def test_lifeform_question_expires_to_observe_from_here():
     p = fake_planner()
-    sim = make(planner=p, operator_timeout_s=1.0)
+    sim = make(planner=p, operator_timeout_s=1.0, autonomy_mode="supervised")
     try:
         _bring_herd(sim)
         r = next(o for o in sim.rovers if o.id == "r1")

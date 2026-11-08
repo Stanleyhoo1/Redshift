@@ -8,6 +8,8 @@ A place is resolved from what the FLEET knows, never from ground truth it has no
   lifeform   live LiDAR tracks (grouped into herds) and the places herds were observed (fleet + rover memory)
   hazard     soft ground found by wheel slip, new rocks and fallen spires the rovers met
   lander     the lander
+  gaps       unexplored gaps inside the fleet's map (protocol v8, gaps.py): pockets of unknown ground with known ground
+             around most of their edge and a reachable frontier on it
 
 It also finds safe goals next to a place (for water a mapped, passable spot about 3 m from the edge on the
 side facing the rover; for a creature the observation standoff; never in water, soft ground or a no-go
@@ -42,11 +44,13 @@ DIRS = {"north": (0.0, 1.0), "south": (0.0, -1.0), "east": (1.0, 0.0), "west": (
 PLURAL = {"water": ("body of water", "bodies of water"), "spire": ("spire", "spires"),
           "mineral": ("mineral outcrop", "mineral outcrops"), "ice": ("ice deposit", "ice deposits"),
           "vent": ("vent", "vents"), "trace": ("organic trace", "organic traces"), "target": ("target", "targets"),
-          "lifeform": ("herd", "herds"), "hazard": ("hazard site", "hazard sites"), "lander": ("lander", "landers")}
+          "lifeform": ("herd", "herds"), "hazard": ("hazard site", "hazard sites"), "lander": ("lander", "landers"),
+          "gaps": ("unexplored gap", "unexplored gaps")}
 UNKNOWN = {"water": "any water", "spire": "any spires", "mineral": "any mineral outcrops", "ice": "any ice",
            "vent": "any vents", "trace": "any organic traces", "target": "any targets",
-           "lifeform": "any herds or creatures", "hazard": "any hazard sites", "lander": "the lander"}
-SUMMARY_KINDS = ("water", "vent", "ice", "mineral", "trace", "spire", "lifeform", "hazard")
+           "lifeform": "any herds or creatures", "hazard": "any hazard sites", "lander": "the lander",
+           "gaps": "any unexplored gaps inside the map that a rover can reach"}
+SUMMARY_KINDS = ("water", "vent", "ice", "mineral", "trace", "spire", "lifeform", "hazard", "gaps")
 _CANCEL_RE = re.compile(r"\b(?:never ?mind|cancel|none of (?:them|those|these)|neither|forget (?:it|about it)|"
                         r"no thanks|don'?t bother|skip it|nothing)\b")
 _ORD = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
@@ -55,7 +59,8 @@ _SUB_WORDS = {"lake": ("lake",), "pond": ("pond", "pool"), "stream": ("stream", 
               "herd": ("herd",), "creature": ("creature", "animal"), "spire": ("spire", "crystal"),
               "vent": ("vent",), "ice": ("ice",), "mineral": ("mineral", "outcrop"), "trace": ("trace", "organic"),
               "Soft ground": ("soft", "sand"), "New rocks": ("rocks", "rockfall", "boulder"),
-              "Fallen spire": ("fallen",), "Rock": ("rock",), "lander": ("lander",)}
+              "Fallen spire": ("fallen",), "Rock": ("rock",), "lander": ("lander",),
+              "gap": ("gap", "hole", "patch", "pocket", "spot")}
 
 
 @dataclass
@@ -90,6 +95,8 @@ class Place:
             return what + (", moving now" if self.live else ", seen earlier")
         if k == "hazard":
             return s
+        if k == "gaps":
+            return f"Unexplored gap about {self.size:.0f} m2"
         return "The lander"
 
     def dest(self) -> str:
@@ -106,6 +113,8 @@ class Place:
             return f"a viewpoint about {self.standoff:.0f} m from the {who}"
         if k == "hazard":
             return f"a safe spot by the {s.lower()}"
+        if k == "gaps":
+            return f"the unexplored gap at ({self.x:.0f}, {self.y:.0f})"
         return "the lander"
 
 
@@ -265,7 +274,15 @@ def candidates(sim, place: str, target_id: str | None = None, t: float | None = 
         return _hazards(sim)
     if place == "lander":
         return [Place("lander", "lander", "lander", 0.0, 0.0, standoff=float(sim.cfg.lander_radius) + 2.5)]
+    if place == "gaps":
+        return gap_places(sim, t)
     return []
+
+
+def gap_places(sim, t: float) -> list:
+    """The unexplored gaps a rover can reach the edge of (protocol v8), biggest first. zones: [(x, y, radius)]."""
+    return [Place(g["id"], "gaps", "gap", g["x"], g["y"], size=g["m2"], zones=[(g["x"], g["y"], g["r"])], standoff=0.0)
+            for g in sim.fleet.explorable_gaps(t, max_age=1.0)]
 
 
 def refresh(sim, p: Place, t: float) -> Place:

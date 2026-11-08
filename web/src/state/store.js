@@ -70,7 +70,26 @@ export const appStore = createStore({
   // v6: the place candidate under the pointer, `${requestId}:${optionId}`, shared by the
   // map markers, the request card and the chat chips so each lights the others.
   placeHover: null,
+  // v8: draw the detector's boxes over the camera pictures (remembered in localStorage).
+  boxes: readPref('redshift.boxes', 'on') !== 'off',
 })
+
+function readPref(key, fallback) {
+  try {
+    return localStorage.getItem(key) ?? fallback
+  } catch {
+    return fallback
+  }
+}
+
+export function setShowBoxes(on) {
+  appStore.patch({ boxes: !!on })
+  try {
+    localStorage.setItem('redshift.boxes', on ? 'on' : 'off')
+  } catch {
+    // private mode or storage disabled: this session only
+  }
+}
 
 export function dispatchSim(msg) {
   const now = nowSeconds()

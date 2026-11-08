@@ -48,12 +48,29 @@
 // Frontiers inside the circle win; a chat report (`info`) when the focus ends. A herd
 // sighting starts a follow at the observation distance at once and asks in the same
 // moment (`lifeform` request, once per herd); the rover keeps following until answered.
+// Version 8 additions: autonomy mode (`fleet.mode`, POST /api/mode, chat "switch to
+// supervised mode" / "you decide from now on"): autonomous rovers let the fake Gemma decide
+// what they would have asked (anomalies, herds, ambiguous places; the rules when it is
+// offline; below 0.5 confidence the safe option) and log each decision as an event with a
+// `decision` object plus a chat `info`; supervised rovers ask every time with Gemma's pick
+// marked (`suggested: true`, "Gemma suggests: ..." in the question); switching to
+// autonomous decides open requests at once. Unexplored gaps (flood fill of unknown pockets
+// inside the mapped area) as a place kind ("explore one of those holes") and fleet
+// `priority` ("prioritize the gaps", "prioritize the north", "back to normal"); mock extra,
+// not in the protocol: the gaps priority also lists `places` [x, y, r] so the map can mark
+// them. Re-survey: an operator focus on mapped ground becomes `focus.mode: "resurvey"`
+// (a loop through the circle, then a report). Object detection: each rover's `vision`
+// every tick, and the camera image now shows rocks, boulders, targets, creatures, spires,
+// water, rovers and the lander as simple shapes exactly where X-Detections boxes them
+// (headers X-Frame, X-Frame-Age-Ms, X-Detections on FPV frames). Faster camera: the newest
+// frame per view and size is kept and served at once while fresh (re-rendered at most
+// every 66 ms, or twice its render time); large frames render at half resolution.
 //
 // Run: node mock/mock-server.mjs
 // Env: PORT, SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
 //      GEMMA_ENABLED, GEMMA_MODEL, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S,
 //      MOCK_GEMMA (offline), MOCK_GEMMA_WARMUP_S, MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE,
-//      MOCK_PROTOCOL (2 to 6 = an older sim without the later fields), MOCK_CAMERA (off),
+//      MOCK_PROTOCOL (2 to 7 = an older sim without the later fields), MOCK_CAMERA (off), AUTONOMY_MODE,
 //      MOCK_ANSWER_DELAY_MS (extra thinking time before answers to questions)
 // Mock-only test hooks (not part of the protocol): POST /api/_mock/planner {"state"},
 // POST /api/_mock/ask {"rover"?}, POST /api/_mock/battery {"rover", "battery"},
@@ -98,7 +115,11 @@ const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma4:e2b'
 const GEMMA_BUDGET_MS = Number(process.env.GEMMA_BUDGET_MS || 3000)
 const GEMMA_WARMUP_S = Number(process.env.MOCK_GEMMA_WARMUP_S || 10)
 const FIRST_QUESTION_S = Number(process.env.MOCK_FIRST_QUESTION_S || 40)
-const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 7) // 2 to 6 = behave like an older sim (no later fields or endpoints)
+const PROTOCOL = Number(process.env.MOCK_PROTOCOL || 8) // 2 to 7 = behave like an older sim (no later fields or endpoints)
+// v8: who decides. Kept across resets (the operator's choice), like the fake Gemma.
+let autonomy = PROTOCOL >= 8 ? (process.env.AUTONOMY_MODE === 'supervised' ? 'supervised' : 'autonomous') : null
+const autonomous = () => autonomy === 'autonomous'
+const supervised = () => autonomy === 'supervised'
 // v6: 0 = requests never expire (the rover waits for the operator). Older protocols: 20 s.
 const OPERATOR_TIMEOUT_S = Math.max(0, Number(process.env.OPERATOR_TIMEOUT_S ?? (PROTOCOL >= 6 ? 0 : 20)) || 0)
 const requestDeadline = () => (OPERATOR_TIMEOUT_S > 0 ? wallNow() + OPERATOR_TIMEOUT_S : null)
@@ -722,6 +743,11 @@ function newSim(seed) {
     featuresVersion: 0, // bumped when a spire falls or appears: the next tick resends `features`
     featuresSent: 0,
     lastPlace: null, // v7: the place most recently named or visited by anyone ("explore there")
+    // v8
+    priority: null, // { kind, label, since } while set
+    gaps: null, // cached unexplored gaps (computeGaps)
+    gapsT: -1e9,
+    camSeen: new Map(), // target id -> sim t the camera last reported it (event rate limit)
   }
   for (const h of world.herds) spawnHerd(h.cx, h.cy, h.count)
   for (let r = 0; r < NUM_ROVERS; r++) {
@@ -775,6 +801,10 @@ function newSim(seed) {
       focus: null, // { x, y, r, reason, label, start, until, ... } while it concentrates on an area
       focusCooldownT: 0, // no curiosity focus before this sim time
       lastPlace: null, // { x, y, name }: the place it last went to or explored, for "explore there"
+      // v8
+      frameNo: 0, // camera frames and detector passes, numbered
+      vision: null, // the detector's latest result
+      visionAt: 0,
     })
   }
   addEvent(null, 'info', `Survey started. ${NUM_ROVERS} rover${NUM_ROVERS === 1 ? '' : 's'} deployed from the lander.`)
@@ -783,10 +813,11 @@ function newSim(seed) {
   computeFrontiers()
 }
 
-function addEvent(roverId, level, msg, at = null, source = null) {
+function addEvent(roverId, level, msg, at = null, source = null, decision = null) {
   const e = { t: r1(sim.t), rover: roverId, level, msg }
   if (at) e.at = [r1(at[0]), r1(at[1])]
   if (source) e.source = source
+  if (decision && PROTOCOL >= 8) e.decision = decision
   sim.pendingEvents.push(e)
   sim.events.push(e)
   if (sim.events.length > 50) sim.events.splice(0, sim.events.length - 50)
@@ -829,6 +860,10 @@ function gaussian(rand) {
 const dustActive = () => sim.hazards.some((h) => h.type === 'dust_storm' && h.active)
 const lidarRange = () => (dustActive() ? DUST_LIDAR_RANGE : LIDAR_RANGE)
 
+const SHADOW_NEAR2 = (3.5 / RES) ** 2 // cells closer than 3.5 m are always seen
+// Fixed per world: about 6% of the ground in blobs a few metres across.
+const shadowAt = (i, j) => vnoise(i * 0.09 + 31.7, j * 0.09 - 12.3) > 0.77
+
 function sense(rover) {
   // Mapping follows the LiDAR: a dust storm shrinks what each rover can add to the map.
   const R = Math.round((dustActive() ? DUST_LIDAR_RANGE + 0.5 : SENSOR_RADIUS) / RES)
@@ -843,6 +878,9 @@ function sense(rover) {
       const k = idx(i, j)
       if (sim.known[k]) continue
       if (world.waterId[k] >= 0) continue // v4: no LiDAR returns from liquid
+      // v8: hollows and the far side of rises stay in LiDAR shadow until a rover is close:
+      // pockets of unknown ground inside the map (the "unexplored gaps").
+      if (PROTOCOL >= 8 && di * di + dj * dj > SHADOW_NEAR2 && shadowAt(i, j)) continue
       sim.known[k] = 1
       sim.knownCount++
       rover.st.mapped++
@@ -1226,8 +1264,10 @@ function chooseExplorationGoal(rover) {
     if (g.ok) {
       const da = Math.round(Math.hypot(a.x - rover.x, a.y - rover.y))
       const db = Math.round(Math.hypot(b.x - rover.x, b.y - rover.y))
+      const word = (t) => `${capital(KIND_LABEL[t.kind])} ${t.id}`
+      const decision = { question: `Which target to sample first? ${free} free tube${free === 1 ? '' : 's'}, battery ${Math.round(rover.battery * 100)}%`, options: [word(a), word(b)], choice: word(a), by: 'gemma', confidence: r2(0.6 + Math.random() * 0.3), why: a.kind === 'trace' ? `an organic trace has the highest expected value; ${da} m against ${db} m` : `${da} m against ${db} m: the nearer one first saves battery` }
       later(g.ms, () =>
-        addEvent(rover.id, 'info', `Second opinion: sample the ${KIND_LABEL[a.kind]} ${a.id} (${da} m) before the ${KIND_LABEL[b.kind]} ${b.id} (${db} m). ${free} free tube${free === 1 ? '' : 's'}, battery ${Math.round(rover.battery * 100)}%.`, null, 'gemma'),
+        addEvent(rover.id, 'info', `Second opinion: sample the ${KIND_LABEL[a.kind]} ${a.id} (${da} m) before the ${KIND_LABEL[b.kind]} ${b.id} (${db} m). ${free} free tube${free === 1 ? '' : 's'}, battery ${Math.round(rover.battery * 100)}%.`, null, 'gemma', decision),
       )
     }
   }
@@ -1245,6 +1285,22 @@ function chooseExplorationGoal(rover) {
   const avoid = knownObstacles(rover)
   // v7: while focused, frontiers inside the circle win (the closest, bigger ones a little
   // more); none left means nothing unknown nearby, and the focus ends.
+  if (rover.focus?.mode === 'resurvey') {
+    // v8: a loop through the circle for the whole time, rescanning (never "done" early).
+    const f = rover.focus
+    for (let k = 0; k < 6; k++) {
+      f.loopK = (f.loopK + 1) % 6
+      const a = (f.loopK / 6) * Math.PI * 2
+      const gx = f.x + Math.cos(a) * f.r * 0.55
+      const gy = f.y + Math.sin(a) * f.r * 0.55
+      if (Math.hypot(gx - rover.x, gy - rover.y) < 2.5 || !placeOk(gx, gy)) continue
+      if (setGoal(rover, gx, gy, 'exploring', `Re-surveying ${f.label}: loop point ${(f.loopK % 6) + 1} of 6.`, 'operator')) {
+        rover.targetId = null
+        return true
+      }
+    }
+    endFocus(rover, 'blocked')
+  }
   if (rover.focus) {
     const f = rover.focus
     const inside = focusFrontiers(f)
@@ -1261,20 +1317,22 @@ function chooseExplorationGoal(rover) {
   }
   let best = null
   let bestScore = -Infinity
+  const runnerUp = [] // v8: the other candidates, for the decision record
   for (const f of sim.frontiers) {
     const d = Math.hypot(f[0] - rover.x, f[1] - rover.y)
     if (d < 4) continue
     if (avoid.some((o) => Math.hypot(f[0] - o[0], f[1] - o[1]) < o[2] + 0.5)) continue
-    let score = Math.pow(f[2], 0.6) / (d + 6)
+    let score = (Math.pow(f[2], 0.6) / (d + 6)) * (PROTOCOL >= 8 ? priorityWeight(f[0], f[1]) : 1)
     for (const o of others) {
       const od = Math.hypot(o.goal[0] - f[0], o.goal[1] - f[1])
       if (od < 14) score *= 0.25 + (od / 14) * 0.5
     }
     score *= 0.85 + sim.rand() * 0.3
     if (score > bestScore) {
+      if (best) runnerUp.unshift(best)
       bestScore = score
       best = f
-    }
+    } else if (runnerUp.length < 2) runnerUp.push(f)
   }
   if (!best) return false
   rover.targetId = null
@@ -1286,6 +1344,9 @@ function chooseExplorationGoal(rover) {
     if (g.ok && setGoal(rover, best[0], best[1], 'exploring')) {
       const d = Math.round(Math.hypot(best[0] - rover.x, best[1] - rover.y))
       const slope = routeMaxSlope(rover)
+      const word = (f) => `Frontier ${at(f[0], f[1])}, ${f[2]} cells`
+      const prio = sim.priority && priorityWeight(best[0], best[1]) > 1 ? `, inside the priority (${sim.priority.label})` : ''
+      const decision = { question: 'Which frontier next?', options: [best, ...runnerUp.slice(0, 2)].map(word), choice: word(best), by: 'gemma', confidence: r2(0.62 + Math.random() * 0.3), why: `${best[2]} unknown cells ${d} m away, max slope ${slope} deg on the way, battery ${Math.round(rover.battery * 100)}%${prio}` }
       later(g.ms, () =>
         addEvent(
           rover.id,
@@ -1293,6 +1354,7 @@ function chooseExplorationGoal(rover) {
           `Chose the frontier at (${best[0].toFixed(0)}, ${best[1].toFixed(0)}): ${best[2]} unknown cells ${d} m away, max slope ${slope} deg on the way, battery ${Math.round(rover.battery * 100)}%.`,
           null,
           'gemma',
+          decision,
         ),
       )
       rover.lastGoalEventT = sim.t
@@ -2781,6 +2843,7 @@ const SAFE_DEFAULT = { rockfall: 'reroute', unknown: 'reroute', sand: 'back_out'
 // (or holds, on soft ground) and asks. Returns false when it already has a question open.
 function askAbout(rover, kind, info) {
   if (PROTOCOL < 3 || rover.request || rover.state === 'fault') return false
+  if (PROTOCOL >= 8 && autonomous()) return decideNow(rover, kind, info) // v8: Gemma decides, no question
   // v6: with no timeout the rover holds position until the operator answers.
   // v7: a herd sighting is asked about while the rover keeps following it.
   const follow = PROTOCOL >= 7 && kind === 'life'
@@ -2814,12 +2877,23 @@ function askAbout(rover, kind, info) {
       question = `Something I can't identify ${info.dist} m ahead: LiDAR says ${info.tall} m tall${g.ok ? `, but the camera is only ${conf}% sure it is a rock` : ', and my rules have no class for it'}. What should I do?`
       note = `Unidentified object ${info.dist} m ahead, ${info.tall} m tall${g.ok ? `, camera ${conf}% confident` : ''}. ${caution} and asking the operator.`
     }
+    // v8 supervised: Gemma's pick is shown as a suggestion (not when it is offline).
+    let options = OPTION_SETS[kind]
+    let pick = null
+    if (PROTOCOL >= 8 && g.ok) {
+      pick = gemmaPick(kind, info, rover)
+      const label = options.find((o) => o.id === pick.choice)?.label || pick.choice
+      options = options.map((o) => (o.id === pick.choice ? { ...o, suggested: true } : o))
+      question += ` Gemma suggests: ${label.toLowerCase()} (${pick.conf.toFixed(2)}).`
+    }
     const q = {
       id: `q${sim.nextRequest++}`,
       rover: rover.id,
       t: sim.t,
       question,
-      options: OPTION_SETS[kind],
+      options,
+      pick,
+      info,
       default: SAFE_DEFAULT[kind],
       deadline: requestDeadline(),
       kind,
@@ -2941,6 +3015,108 @@ function askUnknown(rover) {
   return askAbout(rover, 'unknown', { dist, tall: r1(0.6 + sim.rand() * 0.5), at: pointAhead(rover, dist) })
 }
 
+// ---------------------------------------------------------------------------
+// Version 8: autonomy mode. Where a rover would ask, Gemma decides (autonomous) or the
+// question carries Gemma's suggestion (supervised).
+
+// Gemma's pick for a question a rover would ask: { choice (option id), conf, why }. The
+// reason quotes the readings, like the real model has to.
+function gemmaPick(kind, info, rover) {
+  const conf = r2(0.42 + Math.random() * 0.5) // now and then under 0.5: the safe option wins
+  const pct = pctOf(rover.battery)
+  if (kind === 'rockfall' || kind === 'unknown') {
+    const low = info.tall < 0.75
+    const choice = low && Math.random() < 0.4 ? 'proceed_slowly' : 'reroute'
+    const what = low ? 'rock' : 'boulder'
+    const lead = kind === 'rockfall' ? `LiDAR ${info.n} new objects up to ${info.tall} m tall ${info.dist} m ahead, camera: ${what} ${r2(0.55 + Math.random() * 0.3)}` : `LiDAR ${info.tall} m tall ${info.dist} m ahead, camera: ${what} ${r2(0.5 + Math.random() * 0.3)}`
+    return { choice, conf, why: `${lead}: ${choice === 'reroute' ? 'cheaper to go around' : 'low enough to approach slowly and look again'}` }
+  }
+  if (kind === 'sand') return { choice: 'back_out', conf, why: `slip ${info.slip}% while LiDAR shows flat ground (under ${info.flat} m): soft sand, back out the way I came` }
+  if (kind === 'life') {
+    const follow = rover.battery > 0.5
+    return { choice: follow ? 'follow' : 'observe_here', conf, why: follow ? `camera: creature ${r2(0.7 + Math.random() * 0.2)}, ${info.dist} m ${info.dir}, battery ${pct}: follow at ${OBSERVE_DIST} m before it wanders off` : `battery ${pct}: watch from here instead of following` }
+  }
+  return { choice: SAFE_DEFAULT[kind] || 'reroute', conf, why: 'no better option' }
+}
+
+// The situation in a few words, for the decision record: "3 new objects 5 m ahead, up to 0.8 m tall".
+function situation(kind, info) {
+  if (kind === 'rockfall') return `${info.n} new objects ${info.dist} m ahead, up to ${info.tall} m tall`
+  if (kind === 'unknown') return `Unidentified object ${info.dist} m ahead, ${info.tall} m tall`
+  if (kind === 'sand') return `Wheel slip ${info.slip}% on ground that looks flat`
+  if (kind === 'life') return `Possible lifeform ${info.dist} m ${info.dir}`
+  return 'Something needs a decision'
+}
+
+// Carries out a decision the rover made itself and logs it: an event with `decision` and a
+// chat `info`. `options` are the request's options; `words` what the record lists for them.
+function logDecision(rover, q, question, choice, by, conf, why, words = null) {
+  const label = q.options.find((o) => o.id === choice)?.label || choice
+  const res = applyOption(rover, q, choice)
+  const did = Array.isArray(res) ? res[1] : res
+  const who = by === 'gemma' ? `Gemma, ${conf.toFixed(2)}` : 'rules, Gemma offline'
+  const opts = words || q.options.map((o) => o.id)
+  const chosen = words ? words[q.options.findIndex((o) => o.id === choice)] ?? label : choice
+  const lead = /[.?!]$/.test(question) ? question : `${question}.`
+  addChat(rover.id, 'operator', `${lead} Decided: ${label.toLowerCase()} (${who}). ${did}`.trim(), 'info', by === 'gemma' ? 'gemma' : 'rules', null)
+  addEvent(rover.id, q.kind === 'life' ? 'discovery' : 'info', `${lead} ${did || `Chose ${label.toLowerCase()}.`}`.trim(), q.at, by === 'gemma' ? 'gemma' : null, { question, options: opts, choice: chosen, by, confidence: conf, why })
+}
+
+// Autonomous mode: decide at once (after Gemma's latency) instead of asking. Returns true.
+function decideNow(rover, kind, info) {
+  const follow = kind === 'life'
+  rover.request = { pending: true, hold: kind === 'sand', follow } // cautious while Gemma looks
+  const g = gemmaCall('vision')
+  later(g.ok ? g.ms : 120, () => {
+    if (!rover.request?.pending) return
+    rover.request = null
+    if (rover.state === 'fault') return
+    const q = { kind, options: OPTION_SETS[kind], follow, at: info.at || [rover.x, rover.y] }
+    let by = 'rules'
+    let conf = null
+    let choice = SAFE_DEFAULT[kind]
+    let why = kind === 'life' ? 'Gemma is offline: watch from here, the safe option' : 'Gemma is offline: the rules take the safe option'
+    if (g.ok) {
+      const p = gemmaPick(kind, info, rover)
+      by = 'gemma'
+      conf = p.conf
+      choice = p.conf < 0.5 ? SAFE_DEFAULT[kind] : p.choice
+      why = p.conf < 0.5 ? `${p.why}. Only ${p.conf.toFixed(2)} sure, so the safest option` : p.why
+    }
+    logDecision(rover, q, situation(kind, info), choice, by, conf, why)
+  })
+  return true
+}
+
+// Switching to autonomous with questions open: each rover decides them at once.
+function decideOpen(q) {
+  if (q.pending) return
+  sim.requests = sim.requests.filter((x) => x !== q)
+  sim.closedRequests.set(q.id, 'decided')
+  const rover = sim.rovers.find((r) => r.id === q.rover)
+  if (!rover) return
+  if (rover.request === q) rover.request = null
+  if (q.kind === 'place') {
+    const choice = q.pick?.choice || 'p1'
+    const words = q.options.map((o) => o.label)
+    logDecision(rover, q, q.pick?.question || 'Which place?', choice, q.pick ? 'gemma' : 'rules', q.pick?.conf ?? null, q.pick?.why || 'the closest candidate', words)
+    return
+  }
+  const p = q.pick
+  const choice = p && p.conf >= 0.5 ? p.choice : q.default || SAFE_DEFAULT[q.kind]
+  const why = p ? (p.conf >= 0.5 ? p.why : `${p.why}. Only ${p.conf.toFixed(2)} sure, so the safest option`) : 'No suggestion on record: the safe option'
+  logDecision(rover, q, situation(q.kind, q.info || {}), choice, p ? 'gemma' : 'rules', p ? p.conf : null, why)
+}
+
+function setMode(mode) {
+  if (mode !== 'autonomous' && mode !== 'supervised') throw new HttpError(400, 'mode must be "autonomous" or "supervised".')
+  const was = autonomy
+  autonomy = mode
+  if (mode === 'autonomous') for (const q of [...sim.requests]) decideOpen(q)
+  if (was !== mode) addEvent(null, 'info', mode === 'autonomous' ? 'Autonomous mode: Gemma decides from now on and logs every choice.' : 'Supervised mode: the rovers ask the operator before every decision.', null, 'operator')
+  return mode
+}
+
 class HttpError extends Error {
   constructor(status, message) {
     super(message)
@@ -2955,6 +3131,7 @@ function answerRequest(id, option) {
     const how = sim.closedRequests.get(key)
     if (how === 'expired') throw new HttpError(409, 'Too late: that question already expired and the rover took the safe default.')
     if (how === 'cancelled') throw new HttpError(409, 'That question was withdrawn: the rover had to move (low battery or danger).')
+    if (how === 'decided') throw new HttpError(409, 'That question was already decided: the fleet switched to autonomous mode and the rover chose itself.')
     if (how) throw new HttpError(409, 'That question was already answered.')
     throw new HttpError(404, `No open question with id "${key}".`)
   }
@@ -3101,6 +3278,23 @@ function handleChat(text, roverParam) {
   const g = gemmaCall('command')
   const source = g.ok ? 'gemma' : 'rules'
   const lower = raw.toLowerCase()
+  if (PROTOCOL >= 8 && !isQuestion(lower)) {
+    // v8: autonomy mode and fleet priorities by chat.
+    const mode = /\b(mode|from now on|decide|ask me|controlled|autonomous|supervised)\b/.test(lower) ? parseMode(lower) : null
+    if (mode) {
+      later(g.ok ? g.ms : 120, () => {
+        const was = autonomy
+        setMode(mode)
+        addChat('fleet', 'operator', mode === 'supervised' ? (was === mode ? 'Already in supervised mode: I ask you before every decision.' : "Supervised mode: I'll ask you before every decision, with Gemma's suggestion marked.") : was === mode ? 'Already autonomous: Gemma decides and logs every choice.' : 'Autonomous mode: Gemma decides from now on and logs every choice. Your orders still win.', 'ack', source, null, msg.id)
+      })
+      return msg.id
+    }
+    const pr = parsePriority(lower)
+    if (pr) {
+      later(g.ok ? g.ms : 120, () => respondPriority(pr, source, msg.id))
+      return msg.id
+    }
+  }
   if (PROTOCOL >= 6) {
     // v6: text that picks an option of an open place question answers it.
     const open = openPlaceRequest(targets, to)
@@ -3286,6 +3480,7 @@ function whyText(r) {
   }
   if (r.focus) {
     const left = Math.max(0, Math.round(r.focus.until - sim.t))
+    if (r.focus.mode === 'resurvey') return `You asked me to look at ${r.focus.label} again. It was already mapped, so I'm driving a loop through it, rescanning for anything that changed or that the spectrometer missed, ${left} s to go.`
     return r.focus.reason === 'operator'
       ? `You asked me to explore ${r.focus.label}: I'm mapping the unknown ground within ${Math.round(r.focus.r)} m of it first, ${left} s to go, then back to normal exploration.`
       : `I found something around ${r.focus.label}, so I'm sticking around for another ${left} s to look for more: unknown ground within ${Math.round(r.focus.r)} m first.`
@@ -3456,9 +3651,12 @@ const PLACE_NOUN = {
   lifeform: ['herd', 'herds'],
   lander: ['lander', 'landers'],
   id: ['target', 'targets'],
+  gap: ['unexplored gap', 'unexplored gaps'], // v8
 }
 // Checked in order: "ice deposit" is ice, not a mineral.
+const GAP_RE = /\b(holes?|gaps?|blank (?:spots?|areas?|patches)|dark (?:patches|spots?|areas?)|unexplored (?:areas?|pockets?|patches|spots?|holes?|gaps?|bits?)|unmapped (?:pockets?|areas?|patches|spots?|holes?|gaps?|bits?))\b/
 const PLACE_WORDS = [
+  ...(PROTOCOL >= 8 ? [['gap', GAP_RE]] : []),
   ['water', /\b(water(?:\s+source)?|lakes?|ponds?|streams?|rivers?|creeks?|liquid|shore(?:line)?)\b/],
   ['ice', /\b(ice|icy|frost)\b/],
   ['vent', /\b(vents?|geysers?|thermal)\b/],
@@ -3608,6 +3806,7 @@ function herdCandidates() {
 }
 
 function placeCandidates(place) {
+  if (place.kind === 'gap') return gapCandidates()
   if (place.kind === 'water') return waterCandidates()
   if (place.kind === 'spire') return spireCandidates()
   if (place.kind === 'lifeform') return herdCandidates()
@@ -3741,7 +3940,8 @@ function cmdGoPlace(rover, c, survey, replyTo, life = false, focus = false) {
   let mapped = false
   if (focus && !survey) {
     const fa = focusAround(c)
-    if (focusFrontiers(fa).length) return cmdFocus(rover, fa, replyTo)
+    // v8: mapped ground gets a re-survey instead of just a look.
+    if (focusFrontiers(fa).length || PROTOCOL >= 8) return cmdFocus(rover, fa, replyTo)
     mapped = fa
   }
   const goal = c.kind === 'water' ? shorePoint(c, rover) : standoffPoint(c.x, c.y, c.standoff ?? 3, rover)
@@ -3761,13 +3961,25 @@ function cmdGoPlace(rover, c, survey, replyTo, life = false, focus = false) {
 
 // More than one candidate and nothing to choose between them: ask (choose_place).
 function askPlace(rover, cands, place, replyTo, source) {
-  const top = [...cands].sort((a, b) => distTo(rover, a) - distTo(rover, b)).slice(0, 3)
+  // v8: every gap is marked (up to 6); other places the 3 closest. Best first.
+  const max = place.kind === 'gap' ? 6 : 3
+  const top = (PROTOCOL >= 8 ? rankPlaces(cands, rover, place.kind) : [...cands].sort((a, b) => distTo(rover, a) - distTo(rover, b))).slice(0, max)
   const options = top.map((c, i) => ({ id: `p${i + 1}`, label: placeLabel(c, rover), x: r1(c.x), y: r1(c.y) }))
   options.push({ id: 'cancel', label: 'Never mind' })
   const noun = PLACE_NOUN[place.kind] || ['place', 'places']
-  const question = `I know ${plural(cands.length, noun[0], noun[1])}${cands.length > 3 ? ' (the 3 closest are on the map)' : ''}. Which one${place.survey ? ' should I survey' : ''}?`
+  let question = `I know ${plural(cands.length, noun[0], noun[1])}${cands.length > max ? ` (the ${max} ${place.kind === 'gap' ? 'best' : 'closest'} are on the map)` : ''}. Which one${place.survey ? ' should I survey' : ''}?`
+  // v8 supervised: Gemma's pick is marked.
+  let pick = null
+  if (PROTOCOL >= 8) {
+    const g = gemmaCall('choice')
+    if (g.ok) {
+      pick = { choice: 'p1', conf: r2(0.6 + Math.random() * 0.32), why: placeWhy(top[0], rover, place.kind, cands.length), question: `Which ${noun[0]}?` }
+      options[0] = { ...options[0], suggested: true }
+      question += ` Gemma suggests: ${top[0].name} (${pick.conf.toFixed(2)}).`
+    }
+  }
   const deadline = requestDeadline()
-  const q = { id: `q${sim.nextRequest++}`, rover: rover.id, t: sim.t, question, options, default: deadline === null ? null : 'cancel', deadline, kind: 'place', hold: true, at: [rover.x, rover.y], place: { cands: top, survey: place.survey, life: place.life, focus: place.focus, replyTo } }
+  const q = { id: `q${sim.nextRequest++}`, rover: rover.id, t: sim.t, question, options, pick, default: deadline === null ? null : 'cancel', deadline, kind: 'place', hold: true, at: [rover.x, rover.y], place: { cands: top, survey: place.survey, life: place.life, focus: place.focus, replyTo } }
   rover.request = q
   sim.requests.push(q)
   planner.asked++
@@ -3851,7 +4063,38 @@ function respondPlace(place, targets, to, source, replyTo) {
     say(rover, cmdGoPlace(rover, c, place.survey, replyTo, place.life, place.focus))
     return
   }
+  if (PROTOCOL >= 8 && autonomous()) return decidePlace(rover, cands, place, replyTo, source)
   askPlace(rover, cands, place, replyTo, source)
+}
+
+// v8: best first. Gaps by size for the distance, everything else by distance.
+function rankPlaces(cands, rover, kind) {
+  const score = kind === 'gap' ? (c) => -(c.size / (distTo(rover, c) + 12)) : (c) => distTo(rover, c)
+  return [...cands].sort((a, b) => score(a) - score(b))
+}
+
+function placeWhy(c, rover, kind, n) {
+  const d = Math.round(distTo(rover, c))
+  return kind === 'gap' ? `the biggest for the distance: about ${c.size} m2 unmapped, ${d} m away` : `the closest of ${n} (${d} m away)`
+}
+
+// v8 autonomous: several places match and nothing chooses between them: Gemma picks.
+function decidePlace(rover, cands, place, replyTo, source) {
+  const top = rankPlaces(cands, rover, place.kind).slice(0, place.kind === 'gap' ? 6 : 4)
+  const c = top[0]
+  const g = gemmaCall('choice')
+  const by = g.ok ? 'gemma' : 'rules'
+  const conf = g.ok ? r2(0.6 + Math.random() * 0.32) : null
+  const noun = PLACE_NOUN[place.kind] || ['place', 'places']
+  const why = placeWhy(c, rover, place.kind, cands.length)
+  const words = top.map((x) => placeLabel(x, rover))
+  const lead = `${capital(plural(cands.length, noun[0], noun[1]))} match`
+  later(g.ok ? g.ms : 0, () => {
+    addChat(rover.id, 'operator', `${lead}. Decided: ${c.name} (${by === 'gemma' ? `Gemma, ${conf.toFixed(2)}` : 'rules, Gemma offline'}), ${why}.`, 'info', by, null, replyTo)
+    addEvent(rover.id, 'info', `${lead} the order: going to ${c.name}.`, [c.x, c.y], g.ok ? 'gemma' : null, { question: `Which ${noun[0]}?`, options: words, choice: words[0], by, confidence: conf, why })
+    const [kind, text] = cmdGoPlace(rover, c, place.survey, replyTo, place.life, place.focus)
+    addChat(rover.id, 'operator', text, kind, source, null, replyTo)
+  })
 }
 
 // Arrived where a place order sent it: survey, or stay a little and say so.
@@ -3989,6 +4232,7 @@ function focusAround(c) {
     return { x: c.x, y: c.y, r: clamp(Math.round((c.size || 10) / 2 + 8), 10, 22), label: stream ? "the stream's banks" : `the ${(c.size || 10) < 11 ? 'pond' : 'lake'}'s shore` }
   }
   if (c.kind === 'lander') return { x: c.x, y: c.y, r: 16, label: 'around the lander' }
+  if (c.kind === 'gap') return { x: c.x, y: c.y, r: clamp(Math.round(c.r + 4), 6, 16), label: c.name }
   return { x: c.x, y: c.y, r: c.kind === 'spire' || c.kind === 'herd' ? 12 : 10, label: `around ${c.name}` }
 }
 
@@ -3997,7 +4241,7 @@ function rememberPlace(rover, x, y, name) {
   sim.lastPlace = { x, y, name, rover: rover.id }
 }
 
-function startFocus(rover, { x, y, r, reason, label, replyTo = null, seconds }) {
+function startFocus(rover, { x, y, r, reason, label, replyTo = null, seconds, mode = 'explore' }) {
   if (rover.focus) endFocus(rover, 'replaced')
   const [known] = circleCells(x, y, r)
   rover.focus = {
@@ -4006,6 +4250,8 @@ function startFocus(rover, { x, y, r, reason, label, replyTo = null, seconds }) 
     r,
     reason,
     label,
+    mode, // v8: 'explore' | 'resurvey'
+    loopK: Math.floor(sim.rand() * 6),
     replyTo,
     start: sim.t,
     until: sim.t + seconds,
@@ -4046,16 +4292,17 @@ function endFocus(rover, why) {
     if (world.cover[wi].some((c) => c.seen && inside(c.x, c.y))) finds.push(w.kind === 'river' ? 'a stream' : 'a body of water')
   }
   if (rover.st.sightings.slice(f.sightings0).some((q) => inside(q.x, q.y))) finds.push('a herd of grazers')
-  const verb = f.reason === 'operator' ? 'exploring' : 'looking around'
+  const verb = f.mode === 'resurvey' ? 're-surveying' : f.reason === 'operator' ? 'exploring' : 'looking around'
   const lead = {
     time: `Done ${verb} ${f.label}`,
     done: `Nothing unknown left around ${f.label.replace(/^around /, '')}, so I'm done ${verb}`,
     blocked: `I can't reach the rest of the unknown ground around ${f.label.replace(/^around /, '')} on what I know, so I'm done ${verb}`,
     return: `Stopped ${verb} ${f.label} to head back to the lander (${rover.samples.length >= TUBES ? 'tubes full' : `battery ${pctOf(rover.battery)}`})`,
   }[why] || `Done ${verb} ${f.label}`
-  const found = finds.length ? ` Found ${finds.length > 1 ? `${finds.slice(0, -1).join(', ')} and ${finds[finds.length - 1]}` : finds[0]} there.` : ' Nothing new turned up there.'
+  const found = finds.length ? ` Found ${finds.length > 1 ? `${finds.slice(0, -1).join(', ')} and ${finds[finds.length - 1]}` : finds[0]} there.` : f.mode === 'resurvey' ? ' No changes since it was mapped.' : ' Nothing new turned up there.'
   const tail = why === 'return' ? '' : ' Back to normal exploration.'
-  addChat(rover.id, 'operator', `${lead}: mapped ${fmtInt(m2)} m2 more in ${secs} s.${found}${tail}`, 'info', gemmaReady() ? 'gemma' : 'rules', null, f.replyTo)
+  const mappedText = f.mode === 'resurvey' ? `rescanned ${fmtInt(Math.PI * f.r * f.r)} m2 in ${secs} s` : `mapped ${fmtInt(m2)} m2 more in ${secs} s`
+  addChat(rover.id, 'operator', `${lead}: ${mappedText}.${found}${tail}`, 'info', gemmaReady() ? 'gemma' : 'rules', null, f.replyTo)
   addEvent(rover.id, finds.length ? 'discovery' : 'info', `Finished ${verb} ${f.label}: ${fmtInt(m2)} m2 mapped${finds.length ? `, ${plural(finds.length, 'find')}` : ''}.`, [f.x, f.y], f.reason === 'operator' ? 'operator' : null)
 }
 
@@ -4084,10 +4331,17 @@ function cmdFocus(rover, fa, replyTo) {
   const low = lowBatteryRefusal(rover, fa.x, fa.y, fa.label.replace(/^around /, ''))
   if (low) return ['refuse', low]
   const [known, total] = circleCells(fa.x, fa.y, fa.r)
-  if (!focusFrontiers(fa).length) return ['refuse', `Everything within ${fa.r} m of ${fa.label.replace(/^around /, '')} is already mapped (${Math.round((known / Math.max(1, total)) * 100)}%). Nothing unknown to explore there.`]
+  const resurvey = !focusFrontiers(fa).length
+  if (resurvey && PROTOCOL < 8) return ['refuse', `Everything within ${fa.r} m of ${fa.label.replace(/^around /, '')} is already mapped (${Math.round((known / Math.max(1, total)) * 100)}%). Nothing unknown to explore there.`]
   if (rover.request?.kind === 'place') resolveRequest(rover.request, 'cancelled')
   if (rover.state === 'observing') endObserve(rover, null)
-  startFocus(rover, { ...fa, reason: 'operator', replyTo, seconds: FOCUS_OPERATOR_S })
+  startFocus(rover, { ...fa, reason: 'operator', replyTo, seconds: FOCUS_OPERATOR_S, mode: resurvey ? 'resurvey' : 'explore' })
+  if (resurvey) {
+    const where = fa.label.replace(/^around /, '')
+    addEvent(rover.id, 'info', `Operator: explore ${fa.label}. It is ${Math.round((known / Math.max(1, total)) * 100)}% mapped, so re-surveying it for about ${FOCUS_OPERATOR_S} s.`, [fa.x, fa.y], 'operator')
+    rover.lastGoalEventT = sim.t
+    return ['ack', `${capital(where)} is already ${Math.round((known / Math.max(1, total)) * 100)}% mapped, so I'll re-survey it: a loop through the ground within ${fa.r} m for about ${FOCUS_OPERATOR_S} s, rescanning with LiDAR, camera and spectrometer and stopping for anything new. Then I'll report what changed.`]
+  }
   addEvent(rover.id, 'info', `Operator: explore ${fa.label}. Unknown ground within ${fa.r} m first, for about ${FOCUS_OPERATOR_S} s.`, [fa.x, fa.y], 'operator')
   rover.lastGoalEventT = sim.t
   const d = Math.round(Math.hypot(fa.x - rover.x, fa.y - rover.y))
@@ -4143,6 +4397,160 @@ function respondFocusSpot(spot, targets, to, source, replyTo) {
   }
   const [kind, text] = cmdFocus(rover, fa, replyTo)
   addChat(rover.id, 'operator', text, kind, source, null, replyTo)
+}
+
+// ---------------------------------------------------------------------------
+// Version 8: unexplored gaps (pockets of unknown ground inside the mapped area) and
+// fleet priorities.
+
+const GAP_MIN_CELLS = 16 // 4 m2 at 0.5 m
+const GAP_EVERY_S = 2 // sim s between recomputations
+let gapMark = null
+let gapStack = null
+
+// Connected unknown ground (identified water counts as known) that does not touch the map
+// edge: known ground all round. Flood fill over the grid, best first, at most 12.
+function computeGaps() {
+  if (sim.gaps && sim.t - sim.gapsT < GAP_EVERY_S) return sim.gaps
+  const n = world.n
+  if (!gapMark || gapMark.length !== n * n) {
+    gapMark = new Uint8Array(n * n)
+    gapStack = new Int32Array(n * n)
+  } else gapMark.fill(0)
+  const out = []
+  const maxCells = n * n * 0.05
+  for (let k0 = 0; k0 < n * n; k0++) {
+    if (gapMark[k0] || sim.known[k0] || sim.waterSeen[k0]) continue
+    let top = 0
+    gapStack[top++] = k0
+    gapMark[k0] = 1
+    let cells = 0
+    let sx = 0
+    let sy = 0
+    let edge = false
+    while (top) {
+      const k = gapStack[--top]
+      const i = k % n
+      const j = (k / n) | 0
+      cells++
+      sx += i
+      sy += j
+      if (i === 0 || j === 0 || i === n - 1 || j === n - 1) edge = true
+      if (i > 0) push(k - 1)
+      if (i < n - 1) push(k + 1)
+      if (j > 0) push(k - n)
+      if (j < n - 1) push(k + n)
+    }
+    if (!edge && cells >= GAP_MIN_CELLS && cells <= maxCells) {
+      const m2 = cells * RES * RES
+      out.push({ x: r1(world.ox + (sx / cells) * RES), y: r1(world.oy + (sy / cells) * RES), m2: Math.round(m2), r: r1(Math.sqrt(m2 / Math.PI)) })
+    }
+    function push(k) {
+      if (gapMark[k] || sim.known[k] || sim.waterSeen[k]) return
+      gapMark[k] = 1
+      gapStack[top++] = k
+    }
+  }
+  out.sort((a, b) => b.m2 - a.m2)
+  sim.gaps = out.slice(0, 12)
+  sim.gapsT = sim.t
+  return sim.gaps
+}
+
+function gapCandidates() {
+  return computeGaps().map((g) => ({ kind: 'gap', x: g.x, y: g.y, size: g.m2, r: g.r, t: 0, standoff: 0, base: `Gap of about ${g.m2} m2`, name: `the unexplored gap at ${at(g.x, g.y)}` }))
+}
+
+const DIR_LABEL = { north: 'the north', south: 'the south', east: 'the east', west: 'the west', 'north-east': 'the north-east', 'north-west': 'the north-west', 'south-east': 'the south-east', 'south-west': 'the south-west' }
+
+// "prioritize the gaps", "focus on the unexplored holes first", "prioritize the north",
+// "prioritize water", "prioritize sampling"; "back to normal", "cancel the priority".
+function parsePriority(t) {
+  if (/\b(back to normal|cancel (?:the )?priorit(?:y|ies)|clear (?:the )?priorit(?:y|ies)|no (?:more )?priorit(?:y|ies)|stop prioriti[sz]ing|drop (?:the )?priority|normal exploration)\b/.test(t)) return { clear: true }
+  const verb = /\b(prioriti[sz]e|priority (?:on|to)|focus on|concentrate on|go for)\b/.test(t)
+  if (!verb) return null
+  if (GAP_RE.test(t) || /\b(unexplored|unmapped)\b/.test(t)) return { kind: 'gaps' }
+  if (!/\bprioriti[sz]e|priority\b/.test(t)) return null // "focus on" is only a priority for gaps
+  const d = DIR_RE.exec(t)
+  if (d) return { kind: d[1].replace(/^(north|south)[- ]?(east|west)$/, '$1-$2') }
+  if (/\b(water|lakes?|ponds?|streams?)\b/.test(t)) return { kind: 'water' }
+  if (/\b(sampl\w*|science|targets?)\b/.test(t)) return { kind: 'sampling' }
+  return null
+}
+
+function respondPriority(pr, source, replyTo) {
+  const say = (kind, text) => addChat('fleet', 'operator', text, kind, source, null, replyTo)
+  if (pr.clear) {
+    if (!sim.priority) return say('ack', 'There is no priority set: the fleet is exploring normally.')
+    const was = sim.priority.label
+    sim.priority = null
+    addEvent(null, 'info', `Operator cleared the priority (${was}). Back to normal exploration.`, null, 'operator')
+    return say('ack', `Priority cleared: back to normal exploration (it was ${was}).`)
+  }
+  if (pr.kind === 'gaps') {
+    const gaps = computeGaps()
+    if (!gaps.length) return say('refuse', 'There are no unexplored gaps inside the mapped area right now (pockets of unknown ground of at least 4 m2 with mapped ground around them).')
+    sim.priority = { kind: 'gaps', label: 'the unexplored gaps inside the map', since: r1(sim.t) }
+    const taken = new Set()
+    const plan = []
+    for (const r of sim.rovers.filter((q) => !unavailable(q))) {
+      const g = gaps.filter((q) => !taken.has(q)).sort((a, b) => Math.hypot(a.x - r.x, a.y - r.y) - Math.hypot(b.x - r.x, b.y - r.y))[0]
+      if (!g) break
+      taken.add(g)
+      plan.push(`${r.id} takes the one at ${at(g.x, g.y)}`)
+      r.timer = Math.min(r.timer, 0.5)
+      if (r.state === 'exploring' && !r.focus && !r.placeTask) Object.assign(r, { state: 'idle', timer: 0.4, goal: null, path: [] })
+    }
+    addEvent(null, 'info', `Operator: prioritize the unexplored gaps (${gaps.length}).`, null, 'operator')
+    return say('ack', `Prioritizing ${plural(gaps.length, 'unexplored gap')}${plan.length ? `: ${plan.join(', ')}` : ''}.`)
+  }
+  const label = DIR_LABEL[pr.kind] ? `${DIR_LABEL[pr.kind]} of the map` : pr.kind === 'water' ? 'ground near water' : 'sampling the known targets'
+  sim.priority = { kind: pr.kind, label, since: r1(sim.t) }
+  addEvent(null, 'info', `Operator: prioritize ${label}.`, null, 'operator')
+  return say('ack', `Prioritizing ${label}: every rover weights it strongly until you say "back to normal".`)
+}
+
+// Gaps run out: the priority clears itself and the fleet says so.
+function stepPriority() {
+  const p = sim.priority
+  if (!p || p.kind !== 'gaps') return
+  if (computeGaps().length) return
+  sim.priority = null
+  addChat('fleet', 'operator', 'No unexplored gaps left inside the map. Priority cleared: back to normal exploration.', 'info', 'rules')
+  addEvent(null, 'discovery', 'Every unexplored gap inside the map is filled in. Back to normal exploration.')
+}
+
+// How much a frontier counts under the current priority (1 = no change).
+function priorityWeight(fx, fy) {
+  const p = sim.priority
+  if (!p) return 1
+  if (p.kind === 'gaps') return computeGaps().some((g) => Math.hypot(g.x - fx, g.y - fy) < g.r + 2.5) ? 8 : 1
+  if (DIRS[p.kind]) {
+    const [ux, uy] = DIRS[p.kind]
+    const d = Math.hypot(fx - LANDER.x, fy - LANDER.y) || 1
+    return ((fx - LANDER.x) * ux + (fy - LANDER.y) * uy) / d > 0.4 ? 5 : 0.6
+  }
+  if (p.kind === 'water') return sim.waterZones.some((z) => Math.hypot(z[0] - fx, z[1] - fy) < z[2] + 8) ? 4 : 1
+  return 1
+}
+
+function priorityJson() {
+  const p = sim.priority
+  if (!p) return null
+  const out = { kind: p.kind, label: p.label, since: p.since }
+  if (p.kind === 'gaps') {
+    const gaps = computeGaps()
+    out.count = gaps.length
+    out.places = gaps.map((g) => [g.x, g.y, g.r]) // mock extra, not in the protocol
+  }
+  return out
+}
+
+// v8 chat: "switch to supervised mode", "you decide from now on". Null when it is not about modes.
+function parseMode(t) {
+  if (/\b(supervised|supervise|manual|human[- ]controlled|ask me (?:first|before|every time|about everything)|i(?:'ll| will) decide|let me decide|check with me)\b/.test(t)) return 'supervised'
+  if (/\b(autonomous|autonomy|auto mode|you decide|decide (?:for )?yourselves?|decide on your own|gemma decides?|let gemma decide|don'?t ask me)\b/.test(t)) return 'autonomous'
+  return null
 }
 
 // Mock-only test hook: the fleet learns every lake, target and spire at once.
@@ -4290,41 +4698,360 @@ const ROVER_PARTS = [
 const ROVER_BOUNDS = [-0.62, 0.62, -0.62, 0.62, 0, 1.1]
 const PART_GREY = [52, 52, 58]
 
-function renderCamera(rover, view, w, h) {
-  const raw = Buffer.alloc((w * 3 + 1) * h)
+// The camera model, shared by the renderer and the detector: pose, orientation, field of view.
+function camSetup(rover, view, w, h) {
   const fpv = view !== 'chase'
   const yaw = rover.yaw
   const pitch = fpv ? ((rover.sensors?.pitch ?? 0) * Math.PI) / 180 : (-24 * Math.PI) / 180
   const roll = fpv ? ((rover.sensors?.roll ?? 0) * Math.PI) / 180 : 0
   const vfov = ((fpv ? 48 : 55) * Math.PI) / 180
   const ty = Math.tan(vfov / 2)
-  const tx = (ty * w) / h
-  const g0 = groundAt(rover.x, rover.y)
   const fX = Math.cos(yaw)
   const fY = Math.sin(yaw)
-  const rX = Math.sin(yaw)
-  const rY = -Math.cos(yaw)
-  const camX = fpv ? rover.x + fX * 0.3 : rover.x - fX * 4.4
-  const camY = fpv ? rover.y + fY * 0.3 : rover.y - fY * 4.4
-  const camH = fpv ? MAST_H + 0.25 : 2.5 // above the ground plane at the rover
-  const cr = Math.cos(roll)
-  const sr = Math.sin(roll)
-  const cp = Math.cos(pitch)
-  const sp = Math.sin(pitch)
+  return {
+    fpv,
+    ty,
+    tx: (ty * w) / h,
+    fX,
+    fY,
+    rX: Math.sin(yaw),
+    rY: -Math.cos(yaw),
+    camX: fpv ? rover.x + fX * 0.3 : rover.x - fX * 4.4,
+    camY: fpv ? rover.y + fY * 0.3 : rover.y - fY * 4.4,
+    camH: fpv ? MAST_H + 0.25 : 2.5, // above the ground plane at the rover
+    cr: Math.cos(roll),
+    sr: Math.sin(roll),
+    cp: Math.cos(pitch),
+    sp: Math.sin(pitch),
+    g0: groundAt(rover.x, rover.y),
+  }
+}
+
+// A world point (z above the flat ground plane the mock camera draws) to normalised image
+// coordinates [u, v] (0..1, top left) and its depth along the view, or null behind the camera.
+function projectPoint(c, x, y, z, out) {
+  const dx = x - c.camX
+  const dy = y - c.camY
+  const dz = z - c.camH
+  const fw = dx * c.fX + dy * c.fY
+  const lat = dx * c.rX + dy * c.rY
+  const f1 = fw * c.cp + dz * c.sp
+  const e = -fw * c.sp + dz * c.cp
+  if (f1 < 0.25) return false
+  const cx = (lat * c.cr - e * c.sr) / f1
+  const cy = (lat * c.sr + e * c.cr) / f1
+  out[0] = (cx / c.tx + 1) / 2
+  out[1] = (1 - cy / c.ty) / 2
+  out[2] = f1
+  return true
+}
+
+// Normalised box of a view-aligned block (half width hw across the view, half depth hd
+// along it, height h) standing at (x, y), or null when it is behind the camera.
+const _pp = [0, 0, 0]
+function projectBox(c, x, y, hw, hd, h) {
+  let u0 = Infinity
+  let v0 = Infinity
+  let u1 = -Infinity
+  let v1 = -Infinity
+  for (let k = 0; k < 8; k++) {
+    const a = k & 1 ? hw : -hw
+    const b = k & 2 ? hd : -hd
+    const z = k & 4 ? h : 0
+    if (!projectPoint(c, x + c.rX * a + c.fX * b, y + c.rY * a + c.fY * b, z, _pp)) return null
+    if (_pp[0] < u0) u0 = _pp[0]
+    if (_pp[0] > u1) u1 = _pp[0]
+    if (_pp[1] < v0) v0 = _pp[1]
+    if (_pp[1] > v1) v1 = _pp[1]
+  }
+  return [u0, v0, u1, v1]
+}
+
+// The ray through normalised image point (u, v) meets the ground plane at [gx, gy, dist], or null (sky).
+function groundHit(c, u, v, out) {
+  const cx = (2 * u - 1) * c.tx
+  const cy = (1 - 2 * v) * c.ty
+  const lat = cx * c.cr + cy * c.sr
+  const e = -cx * c.sr + cy * c.cr
+  const up = e * c.cp + c.sp
+  const fw = c.cp - e * c.sp
+  if (up > -1e-4) return false
+  const dx = fw * c.fX + lat * c.rX
+  const dy = fw * c.fY + lat * c.rY
+  const t = c.camH / -up
+  out[0] = c.camX + dx * t
+  out[1] = c.camY + dy * t
+  out[2] = t * Math.hypot(dx, dy, up)
+  return true
+}
+
+const DET_BASE = { rock: 0.62, boulder: 0.74, spire: 0.86, creature: 0.82, water: 0.8, mineral: 0.68, ice: 0.72, vent: 0.74, trace: 0.52, rover: 0.93, lander: 0.95 }
+const TARGET_SHAPE = { mineral: [0.42, 0.42, 0.55], ice: [0.85, 0.85, 0.12], vent: [0.6, 0.6, 0.5], trace: [0.5, 0.5, 0.08] }
+
+// Everything the camera can see right now, with its normalised box, distance and bearing
+// (ground truth: what the pixels show; the detector below reports a noisy subset).
+const _gh = [0, 0, 0]
+function sceneObjects(rover, view) {
+  const c = camSetup(rover, view, 4, 3)
+  const dust = dustActive()
+  const range = dust ? 11 : 30
+  const out = []
+  const add = (id, label, x, y, hw, hd, h, maxD = range, extra = null) => {
+    const dx = x - c.camX
+    const dy = y - c.camY
+    const d = Math.hypot(dx, dy)
+    if (d > maxD || d < 0.6) return
+    const box = projectBox(c, x, y, hw, hd, h)
+    if (!box || box[2] < 0 || box[0] > 1 || box[3] < 0 || box[1] > 1) return
+    if (box[2] - box[0] < 0.012 || box[3] - box[1] < 0.012) return
+    const fw = dx * c.fX + dy * c.fY
+    const lat = dx * c.rX + dy * c.rY
+    out.push({ id, label, x, y, dist: d, bearing: (-Math.atan2(lat, fw) * 180) / Math.PI, box, extra })
+  }
+  for (const t of world.targets) {
+    const [hw, hd, h] = TARGET_SHAPE[t.kind] || [0.4, 0.4, 0.3]
+    add(`t:${t.id}`, t.kind, t.x, t.y, hw, hd, h, Math.min(range, 22))
+  }
+  if (PROTOCOL >= 4) {
+    for (const l of sim.lifeforms) add(`l:${l.id}`, 'creature', l.x, l.y, 0.32 * l.size, 0.45 * l.size, 0.62 * l.size, range, { yaw: l.yaw })
+    for (const sp of world.spires) if (sp.standing && !(sp.fallT && sim.t < sp.fallT)) add(`s:${sp.id}`, 'spire', sp.x, sp.y, sp.radius * 1.5, sp.radius * 1.5, sp.height)
+  }
+  for (const rk of sim.rocks) if (sim.t >= rk.landT) add(`k:${rk.x.toFixed(1)},${rk.y.toFixed(1)}`, rk.r >= 0.45 ? 'boulder' : 'rock', rk.x, rk.y, rk.r, rk.r, rk.r * 1.6)
+  // Loose rocks: fixed per 3 m cell, so they stay put from frame to frame.
+  const C = 3
+  const ci = Math.floor(c.camX / C)
+  const cj = Math.floor(c.camY / C)
+  for (let dj = -5; dj <= 5; dj++) {
+    for (let di = -5; di <= 5; di++) {
+      const i = ci + di
+      const j = cj + dj
+      const hsh = hash2(i * 7 + 3, j * 13 + 1)
+      if (hsh > 0.13) continue
+      const x = (i + 0.2 + 0.6 * hash2(i, j + 99)) * C
+      const y = (j + 0.2 + 0.6 * hash2(i + 77, j)) * C
+      if ((PROTOCOL >= 4 && waterAt(x, y) >= 0) || Math.hypot(x - LANDER.x, y - LANDER.y) < LANDER.radius + 1) continue
+      const r = 0.16 + 0.26 * hash2(i + 5, j + 5)
+      add(`r:${i},${j}`, r >= 0.38 ? 'boulder' : 'rock', x, y, r, r * 0.9, r * 1.3, 15)
+    }
+  }
+  for (const r of sim.rovers) if (r !== rover) add(`v:${r.id}`, 'rover', r.x, r.y, 0.62, 0.62, 1.1, range, { color: r.color })
+  add('lander', 'lander', LANDER.x, LANDER.y, 2.0, 2.0, 2.4)
+  // Water: the box around every ray of a coarse grid that lands in it.
+  if (PROTOCOL >= 4 && world.water.length) {
+    let u0 = 2
+    let v0 = 2
+    let u1 = -1
+    let v1 = -1
+    let near = Infinity
+    let wx = 0
+    let wy = 0
+    for (let gy = 0; gy < 30; gy++) {
+      for (let gx = 0; gx < 40; gx++) {
+        const u = (gx + 0.5) / 40
+        const v = (gy + 0.5) / 30
+        if (!groundHit(c, u, v, _gh) || _gh[2] > range || waterAt(_gh[0], _gh[1]) < 0) continue
+        if (u - 0.0125 < u0) u0 = u - 0.0125
+        if (u + 0.0125 > u1) u1 = u + 0.0125
+        if (v - 0.0167 < v0) v0 = v - 0.0167
+        if (v + 0.0167 > v1) v1 = v + 0.0167
+        if (_gh[2] < near) {
+          near = _gh[2]
+          wx = _gh[0]
+          wy = _gh[1]
+        }
+      }
+    }
+    if (u1 > u0 && v1 > v0 && (u1 - u0) * (v1 - v0) > 0.002) {
+      const dx = wx - c.camX
+      const dy = wy - c.camY
+      out.push({ id: 'water', label: 'water', x: wx, y: wy, dist: Math.hypot(dx, dy), bearing: (-Math.atan2(dx * c.rX + dy * c.rY, dx * c.fX + dy * c.fY) * 180) / Math.PI, box: [u0, v0, u1, v1], extra: null })
+    }
+  }
+  return out
+}
+
+// The onboard detector's view of a frame: confident objects only, a little noise, best first.
+function detect(objs) {
+  const dust = dustActive()
+  const out = []
+  for (const o of objs) {
+    let id = 0
+    for (let k = 0; k < o.id.length; k++) id = (id * 31 + o.id.charCodeAt(k)) | 0
+    const base = (DET_BASE[o.label] ?? 0.6) + (hash2(id, 17) - 0.5) * 0.16
+    let conf = base - o.dist * 0.011 + (Math.random() - 0.5) * 0.04
+    if (dust) conf *= 0.78
+    if (conf < 0.32) continue
+    out.push({ label: o.label, conf: r2(clamp(conf, 0, 0.99)), box: o.box.map((v) => Math.round(clamp(v, 0, 1) * 1000) / 1000), dist: r1(o.dist), bearing: r1(o.bearing) })
+  }
+  out.sort((a, b) => b.conf - a.conf)
+  return out.slice(0, 10)
+}
+
+// ---- simple shapes drawn into the PNG rows (filter byte first, then RGB)
+
+function blendPx(raw, stride, u, v, r, g, b, a) {
+  const o = v * stride + 1 + u * 3
+  raw[o] = clamp(raw[o] + (r - raw[o]) * a, 0, 255)
+  raw[o + 1] = clamp(raw[o + 1] + (g - raw[o + 1]) * a, 0, 255)
+  raw[o + 2] = clamp(raw[o + 2] + (b - raw[o + 2]) * a, 0, 255)
+}
+
+function fillEllipse(raw, w, h, stride, cx, cy, rx, ry, col, shade = 0, alpha = 1) {
+  if (rx < 0.5 || ry < 0.5) return
+  const v0 = Math.max(0, Math.floor(cy - ry))
+  const v1 = Math.min(h - 1, Math.ceil(cy + ry))
+  const u0 = Math.max(0, Math.floor(cx - rx))
+  const u1 = Math.min(w - 1, Math.ceil(cx + rx))
+  for (let v = v0; v <= v1; v++) {
+    const ny = (v + 0.5 - cy) / ry
+    for (let u = u0; u <= u1; u++) {
+      const nx = (u + 0.5 - cx) / rx
+      const d = nx * nx + ny * ny
+      if (d > 1) continue
+      const k = 1 + shade * (-0.45 * nx - 0.6 * ny)
+      const edge = d > 0.86 ? (1 - d) / 0.14 : 1
+      blendPx(raw, stride, u, v, col[0] * k, col[1] * k, col[2] * k, alpha * edge)
+    }
+  }
+}
+
+function fillTri(raw, w, h, stride, ax, ay, bx, by, cx, cy, col, alpha = 1) {
+  const v0 = Math.max(0, Math.floor(Math.min(ay, by, cy)))
+  const v1 = Math.min(h - 1, Math.ceil(Math.max(ay, by, cy)))
+  const u0 = Math.max(0, Math.floor(Math.min(ax, bx, cx)))
+  const u1 = Math.min(w - 1, Math.ceil(Math.max(ax, bx, cx)))
+  const area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+  if (Math.abs(area) < 0.5) return
+  for (let v = v0; v <= v1; v++) {
+    for (let u = u0; u <= u1; u++) {
+      const px = u + 0.5
+      const py = v + 0.5
+      const w0 = ((bx - px) * (cy - py) - (by - py) * (cx - px)) / area
+      const w1 = ((cx - px) * (ay - py) - (cy - py) * (ax - px)) / area
+      if (w0 < 0 || w1 < 0 || w0 + w1 > 1) continue
+      blendPx(raw, stride, u, v, col[0], col[1], col[2], alpha)
+    }
+  }
+}
+
+function fillRect(raw, w, h, stride, x0, y0, x1, y1, col, alpha = 1) {
+  const u0 = Math.max(0, Math.round(x0))
+  const u1 = Math.min(w - 1, Math.round(x1))
+  const v0 = Math.max(0, Math.round(y0))
+  const v1 = Math.min(h - 1, Math.round(y1))
+  for (let v = v0; v <= v1; v++) for (let u = u0; u <= u1; u++) blendPx(raw, stride, u, v, col[0], col[1], col[2], alpha)
+}
+
+function thickLine(raw, w, h, stride, x0, y0, x1, y1, t, col) {
+  const n = Math.max(2, Math.ceil(Math.hypot(x1 - x0, y1 - y0)))
+  for (let k = 0; k <= n; k++) {
+    const x = x0 + ((x1 - x0) * k) / n
+    const y = y0 + ((y1 - y0) * k) / n
+    fillRect(raw, w, h, stride, x - t / 2, y - t / 2, x + t / 2, y + t / 2, col)
+  }
+}
+
+const fogged = (col, dist, fogK) => {
+  const f = 1 - Math.exp(-dist * fogK)
+  return [col[0] + (SKY_HORIZON[0] - col[0]) * f, col[1] + (SKY_HORIZON[1] - col[1]) * f, col[2] + (SKY_HORIZON[2] - col[2]) * f]
+}
+const hexRgb = (hx) => [parseInt(hx.slice(1, 3), 16), parseInt(hx.slice(3, 5), 16), parseInt(hx.slice(5, 7), 16)]
+
+// One object as a simple shape filling its box: what the detector's box will frame.
+function drawObject(raw, w, h, stride, o, fogK) {
+  if (o.label === 'water') return // drawn per pixel with the ground
+  const x0 = o.box[0] * w
+  const y0 = o.box[1] * h
+  const x1 = o.box[2] * w
+  const y1 = o.box[3] * h
+  const bw = x1 - x0
+  const bh = y1 - y0
+  const cx = (x0 + x1) / 2
+  const d = o.dist
+  const F = (col) => fogged(col, d, fogK)
+  switch (o.label) {
+    case 'rock':
+    case 'boulder': {
+      fillEllipse(raw, w, h, stride, cx + bw * 0.06, y1 - bh * 0.08, bw * 0.55, bh * 0.16, F([30, 24, 22]), 0, 0.45)
+      fillEllipse(raw, w, h, stride, cx, y1 - bh * 0.47, bw * 0.5, bh * 0.5, F(o.label === 'boulder' ? [104, 94, 86] : [92, 84, 78]), 0.9)
+      break
+    }
+    case 'mineral': {
+      const c1 = F([150, 108, 222])
+      const c2 = F([196, 164, 255])
+      fillTri(raw, w, h, stride, x0, y1, x0 + bw * 0.42, y1, x0 + bw * 0.2, y0 + bh * 0.25, c1)
+      fillTri(raw, w, h, stride, x0 + bw * 0.25, y1, x0 + bw * 0.78, y1, x0 + bw * 0.52, y0, c2)
+      fillTri(raw, w, h, stride, x0 + bw * 0.58, y1, x1, y1, x0 + bw * 0.84, y0 + bh * 0.38, c1)
+      break
+    }
+    case 'ice':
+      fillEllipse(raw, w, h, stride, cx, (y0 + y1) / 2, bw / 2, bh / 2, F([196, 222, 244]), 0.5)
+      fillEllipse(raw, w, h, stride, cx - bw * 0.12, (y0 + y1) / 2 - bh * 0.1, bw * 0.22, bh * 0.2, F([240, 250, 255]), 0, 0.7)
+      break
+    case 'vent':
+      fillEllipse(raw, w, h, stride, cx, y1, bw / 2, bh * 0.9, F([62, 46, 40]), 0.6)
+      fillEllipse(raw, w, h, stride, cx, y1 - bh * 0.62, bw * 0.16, bh * 0.14, F([255, 150, 70]), 0, 0.95)
+      fillEllipse(raw, w, h, stride, cx, y1 - bh * 0.62, bw * 0.3, bh * 0.26, F([255, 120, 50]), 0, 0.3)
+      break
+    case 'trace':
+      fillEllipse(raw, w, h, stride, cx, (y0 + y1) / 2, bw / 2, bh / 2, F([196, 112, 146]), 0.3, 0.85)
+      break
+    case 'creature': {
+      const body = F([146, 168, 70])
+      const leg = F([58, 64, 34])
+      const by = y0 + bh * 0.38
+      for (let k = 0; k < 3; k++) {
+        const lx = x0 + bw * (0.22 + k * 0.28)
+        thickLine(raw, w, h, stride, lx, by, lx - bw * 0.08, y1, Math.max(1, bw * 0.05), leg)
+        thickLine(raw, w, h, stride, lx + bw * 0.06, by, lx + bw * 0.12, y1, Math.max(1, bw * 0.05), leg)
+      }
+      fillEllipse(raw, w, h, stride, cx, by, bw * 0.5, bh * 0.3, body, 0.8)
+      fillEllipse(raw, w, h, stride, x0 + bw * 0.12, y0 + bh * 0.22, bw * 0.16, bh * 0.18, F([168, 190, 84]), 0.6)
+      break
+    }
+    case 'spire': {
+      fillTri(raw, w, h, stride, x0, y1, x1, y1, cx, y0, F([150, 124, 236]))
+      fillTri(raw, w, h, stride, x0 + bw * 0.12, y1, cx, y1, cx, y0 + bh * 0.04, F([206, 190, 255]), 0.7)
+      break
+    }
+    case 'rover': {
+      const col = F(o.extra?.color ? hexRgb(o.extra.color) : [220, 220, 220])
+      const grey = F([46, 46, 52])
+      fillRect(raw, w, h, stride, x0 + bw * 0.08, y0 + bh * 0.42, x1 - bw * 0.08, y0 + bh * 0.72, col)
+      fillRect(raw, w, h, stride, cx - bw * 0.03, y0 + bh * 0.05, cx + bw * 0.03, y0 + bh * 0.42, grey)
+      fillRect(raw, w, h, stride, cx - bw * 0.1, y0, cx + bw * 0.1, y0 + bh * 0.12, grey)
+      fillEllipse(raw, w, h, stride, x0 + bw * 0.2, y1 - bh * 0.14, bw * 0.16, bh * 0.14, grey)
+      fillEllipse(raw, w, h, stride, x1 - bw * 0.2, y1 - bh * 0.14, bw * 0.16, bh * 0.14, grey)
+      break
+    }
+    case 'lander': {
+      const body = F([164, 164, 172])
+      const dark = F([80, 80, 88])
+      for (const fx of [0.08, 0.92]) thickLine(raw, w, h, stride, x0 + bw * (fx < 0.5 ? 0.3 : 0.7), y0 + bh * 0.6, x0 + bw * fx, y1, Math.max(1, bw * 0.025), dark)
+      fillTri(raw, w, h, stride, x0 + bw * 0.22, y0 + bh * 0.72, x1 - bw * 0.22, y0 + bh * 0.72, cx, y0 + bh * 0.18, body)
+      fillRect(raw, w, h, stride, x0 + bw * 0.22, y0 + bh * 0.45, x1 - bw * 0.22, y0 + bh * 0.72, body)
+      fillEllipse(raw, w, h, stride, cx, y0 + bh * 0.12, bw * 0.14, bh * 0.1, F([210, 210, 220]), 0.5)
+      break
+    }
+  }
+}
+
+// Sky and ground for a w x h image into `raw` (PNG rows). `step` 2 renders every other
+// pixel and copies it into a 2 x 2 block (large frames: a quarter of the work).
+function renderBackground(rover, c, w, h, raw, stride, step) {
   const sunX = Math.cos(SUN_AZ) * Math.cos(SUN_EL)
   const sunY = Math.sin(SUN_AZ) * Math.cos(SUN_EL)
   const sunZ = Math.sin(SUN_EL)
   const dust = dustActive()
   const fogK = dust ? 1 / 9 : 1 / 46
-  const color = rover.color || '#ff7a45'
-  const rc = [parseInt(color.slice(1, 3), 16), parseInt(color.slice(3, 5), 16), parseInt(color.slice(5, 7), 16)]
-  let o = 0
-  for (let v = 0; v < h; v++) {
-    raw[o++] = 0
-    const cy = (1 - (2 * (v + 0.5)) / h) * ty
-    for (let u = 0; u < w; u++) {
-      const cx = ((2 * (u + 0.5)) / w - 1) * tx
-      // camera ray: roll about forward, pitch about right, then yaw
+  const rc = hexRgb(rover.color || '#ff7a45')
+  const { fpv, ty, tx, fX, fY, rX, rY, camX, camY, camH, cr, sr, cp, sp, g0 } = c
+  for (let v = 0; v < h; v += step) {
+    raw[v * stride] = 0
+    if (step === 2 && v + 1 < h) raw[(v + 1) * stride] = 0
+    const cy = (1 - (2 * (v + step / 2)) / h) * ty
+    for (let u = 0; u < w; u += step) {
+      const cx = ((2 * (u + step / 2)) / w - 1) * tx
       const lat = cx * cr + cy * sr
       const e = -cx * sr + cy * cr
       const up = e * cp + sp
@@ -4338,7 +5065,6 @@ function renderCamera(rover, view, w, h) {
       let b
       let hit = false
       if (!fpv) {
-        // ray against the rover's body (slab test in its frame)
         const ox = (camX - rover.x) * fX + (camY - rover.y) * fY
         const oy = -(camX - rover.x) * fY + (camY - rover.y) * fX
         const lx = dx * fX + dy * fY
@@ -4371,14 +5097,21 @@ function renderCamera(rover, view, w, h) {
         const gx = camX + dx * t
         const gy = camY + dy * t
         const dist = t * len
-        const fine = Math.exp(-dist / 14)
-        let n = 0.55 * vnoise(gx * 0.32, gy * 0.32) + 0.3 * vnoise(gx * 1.4 + 7.1, gy * 1.4 - 3.3) * (0.4 + 0.6 * fine) + 0.15 * vnoise(gx * 5.2, gy * 5.2) * fine
-        const rock = vnoise(gx * 2.6 + 11, gy * 2.6 + 5) > 0.83 ? 0.55 : 1
-        const hgt = (groundAt(gx, gy) - g0) * 0.06
-        n = Math.max(0, Math.min(1, n + hgt)) * rock
-        r = GROUND_A[0] + (GROUND_B[0] - GROUND_A[0]) * n
-        g = GROUND_A[1] + (GROUND_B[1] - GROUND_A[1]) * n
-        b = GROUND_A[2] + (GROUND_B[2] - GROUND_A[2]) * n
+        if (PROTOCOL >= 4 && waterAt(gx, gy) >= 0) {
+          // Liquid: dark blue with a soft ripple and the sky in it.
+          const rip = 0.85 + 0.15 * vnoise(gx * 1.7 + sim.t * 0.4, gy * 1.7)
+          r = 34 * rip + 30
+          g = 78 * rip + 26
+          b = 132 * rip + 20
+        } else {
+          const fine = Math.exp(-dist / 14)
+          let n = 0.55 * vnoise(gx * 0.32, gy * 0.32) + 0.3 * vnoise(gx * 1.4 + 7.1, gy * 1.4 - 3.3) * (0.4 + 0.6 * fine) + 0.15 * vnoise(gx * 5.2, gy * 5.2) * fine
+          const hgt = (groundAt(gx, gy) - g0) * 0.06
+          n = Math.max(0, Math.min(1, n + hgt))
+          r = GROUND_A[0] + (GROUND_B[0] - GROUND_A[0]) * n
+          g = GROUND_A[1] + (GROUND_B[1] - GROUND_A[1]) * n
+          b = GROUND_A[2] + (GROUND_B[2] - GROUND_A[2]) * n
+        }
         const fog = 1 - Math.exp(-dist * fogK)
         r += (SKY_HORIZON[0] - r) * fog
         g += (SKY_HORIZON[1] - g) * fog
@@ -4402,14 +5135,84 @@ function renderCamera(rover, view, w, h) {
         g = g * 0.55 + 110 * 0.45
         b = b * 0.55 + 80 * 0.45
       }
-      // a soft lens vignette
-      const vg = 1 - 0.28 * (cx * cx / (tx * tx) + cy * cy / (ty * ty)) * 0.5
-      raw[o++] = Math.max(0, Math.min(255, r * vg)) | 0
-      raw[o++] = Math.max(0, Math.min(255, g * vg)) | 0
-      raw[o++] = Math.max(0, Math.min(255, b * vg)) | 0
+      const vg = 1 - 0.28 * ((cx * cx) / (tx * tx) + (cy * cy) / (ty * ty)) * 0.5
+      const R = Math.max(0, Math.min(255, r * vg)) | 0
+      const G = Math.max(0, Math.min(255, g * vg)) | 0
+      const Bc = Math.max(0, Math.min(255, b * vg)) | 0
+      for (let dv = 0; dv < step && v + dv < h; dv++) {
+        for (let du = 0; du < step && u + du < w; du++) {
+          const o = (v + dv) * stride + 1 + (u + du) * 3
+          raw[o] = R
+          raw[o + 1] = G
+          raw[o + 2] = Bc
+        }
+      }
     }
   }
+  return fogK
+}
+
+// The camera picture: sky and ground, then every visible object as a simple shape (far
+// first), so the detector's boxes frame exactly what is drawn. Returns the PNG.
+function renderCamera(rover, view, w, h, objs) {
+  const stride = w * 3 + 1
+  const raw = Buffer.alloc(stride * h)
+  const c = camSetup(rover, view, w, h)
+  const fogK = renderBackground(rover, c, w, h, raw, stride, w * h > 360000 ? 2 : 1)
+  if (objs) {
+    const order = [...objs].sort((a, b) => b.dist - a.dist)
+    for (const o of order) drawObject(raw, w, h, stride, o, fogK)
+  }
   return encodePng(w, h, raw)
+}
+
+// The newest frame per rover, view and size, kept and served at once while fresh (the
+// protocol's faster camera). A view nobody asked for in 5 s is dropped.
+const camCache = new Map()
+function cameraFrame(rover, view, w, h) {
+  const key = `${rover.id}|${view}|${w}x${h}`
+  const now = performance.now()
+  let e = camCache.get(key)
+  if (e && e.sim === sim && now - e.at < Math.max(66, e.cost * 2)) {
+    e.used = now
+    return e
+  }
+  const t0 = performance.now()
+  const objs = sceneObjects(rover, view)
+  const fpv = view !== 'chase'
+  const dets = PROTOCOL >= 8 && fpv ? detect(objs) : null
+  const png = renderCamera(rover, view, w, h, objs)
+  const frame = fpv ? ++rover.frameNo : (e?.frame ?? 0) + 1
+  e = { png, frame, at: performance.now(), cost: performance.now() - t0, dets, used: now, sim }
+  camCache.set(key, e)
+  if (dets) {
+    rover.vision = { frame, t: r1(sim.t), view: 'fpv', ms: r1(6 + dets.length * 0.9 + Math.random() * 4), objects: dets }
+    rover.visionAt = now
+  }
+  for (const [k, v] of camCache) if (now - v.used > 5000 || v.sim !== sim) camCache.delete(k)
+  return e
+}
+
+// Every tick: each rover's detector result (from its newest FPV frame when the camera is
+// being watched, otherwise from a fresh detection pass without a picture), and the
+// camera's own leads ("Camera: possible vent 12 m ahead (0.71)").
+function updateVision() {
+  const now = performance.now()
+  for (const r of sim.rovers) {
+    if (!r.vision || now - (r.visionAt ?? 0) > 250) {
+      const dets = detect(sceneObjects(r, 'fpv'))
+      r.frameNo++
+      r.vision = { frame: r.frameNo, t: r1(sim.t), view: 'fpv', ms: r1(6 + dets.length * 0.9 + Math.random() * 4), objects: dets }
+      r.visionAt = now
+    }
+    for (const o of r.vision.objects) {
+      if (!['mineral', 'ice', 'vent', 'trace'].includes(o.label) || o.conf < 0.6 || o.dist < SPECTRO_RANGE) continue
+      const t = world.targets.find((q) => q.kind === o.label && !sim.discovered.has(q.id) && Math.hypot(q.x - r.x, q.y - r.y) < o.dist + 3 && Math.hypot(q.x - r.x, q.y - r.y) > o.dist - 3)
+      if (!t || sim.t - (sim.camSeen.get(t.id) ?? -1e9) < 120) continue
+      sim.camSeen.set(t.id, sim.t)
+      addEvent(r.id, 'info', `Camera: possible ${KIND_LABEL[o.label]} ${Math.round(o.dist)} m ${o.bearing > 8 ? 'ahead to the left' : o.bearing < -8 ? 'ahead to the right' : 'ahead'} (${o.conf.toFixed(2)}). The spectrometer will confirm it from ${SPECTRO_RANGE} m.`, [t.x, t.y], gemmaReady() ? 'gemma' : null)
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4426,6 +5229,8 @@ function fleetSummary() {
     budget_ms: BUDGET_MS,
     cycle_ms: CYCLE_MS,
     soft_zones: sim.softZones.map((z) => [r1(z[0]), r1(z[1]), r1(z[2])]),
+    ...(PROTOCOL >= 8 && { mode: autonomy }),
+    ...(PROTOCOL >= 8 && sim.priority && { priority: priorityJson() }),
     ...(PROTOCOL >= 4 && {
       explored_pct: r1(((sim.knownCount + sim.waterSeenCount) / sim.known.length) * 100),
       water_zones: sim.waterZones,
@@ -4499,8 +5304,9 @@ function roverStates() {
       },
     }),
     ...(PROTOCOL >= 7 && r.focus && {
-      focus: { x: r1(r.focus.x), y: r1(r.focus.y), r: r1(r.focus.r), reason: r.focus.reason, label: r.focus.label, ends_in: r1(Math.max(0, r.focus.until - sim.t)) },
+      focus: { x: r1(r.focus.x), y: r1(r.focus.y), r: r1(r.focus.r), reason: r.focus.reason, label: r.focus.label, ends_in: r1(Math.max(0, r.focus.until - sim.t)), ...(PROTOCOL >= 8 && { mode: r.focus.mode || 'explore' }) },
     }),
+    ...(PROTOCOL >= 8 && r.vision && { vision: r.vision }),
     ...(PROTOCOL >= 4 && {
       track_id: r.trackId,
       samples: [...r.samples],
@@ -4574,6 +5380,10 @@ function tick() {
   computeFrontiers()
   fleetEvents()
   stepRequests()
+  if (PROTOCOL >= 8) {
+    updateVision()
+    stepPriority()
+  }
   const msg = {
     type: 'tick',
     t: r1(sim.t),
@@ -4719,6 +5529,7 @@ const server = http.createServer((req, res) => {
       return { ok: true, armed: !sim.firstLifeAsked }
     },
     '/api/_mock/reveal': (b) => revealAll(b),
+    '/api/_mock/gaps': () => ({ ok: true, gaps: PROTOCOL >= 8 ? computeGaps() : [] }),
     '/api/_mock/battery': (b) => {
       const rover = sim.rovers.find((r) => r.id === b?.rover)
       if (!rover || !Number.isFinite(b?.battery)) throw new HttpError(400, 'Body: {"rover": "r1", "battery": 0.3}')
@@ -4726,6 +5537,7 @@ const server = http.createServer((req, res) => {
       return { ok: true }
     },
   }
+  if (PROTOCOL >= 8) v3['/api/mode'] = (b) => ({ ok: true, mode: setMode(b?.mode) })
   if (req.method === 'POST' && v3[url.pathname] && (PROTOCOL >= 3 || url.pathname.startsWith('/api/_mock/'))) {
     let body = ''
     req.on('data', (chunk) => {
@@ -4758,13 +5570,21 @@ const server = http.createServer((req, res) => {
     const size = (v, def, max) => (Number.isFinite(Number(v)) && Number(v) > 0 ? clamp(Math.round(Number(v)), 16, max) : def)
     const w = size(url.searchParams.get('w'), 320, CAM_MAX_W)
     const h = size(url.searchParams.get('h'), 240, CAM_MAX_H)
-    const png = renderCamera(rover, url.searchParams.get('view') === 'chase' ? 'chase' : 'fpv', w, h)
-    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length, 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' })
-    return res.end(png)
+    const f = cameraFrame(rover, url.searchParams.get('view') === 'chase' ? 'chase' : 'fpv', w, h)
+    const headers = { 'Content-Type': 'image/png', 'Content-Length': f.png.length, 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }
+    if (PROTOCOL >= 8) {
+      // v8: which frame, how old, and what the detector found in exactly this frame.
+      headers['X-Frame'] = String(f.frame)
+      headers['X-Frame-Age-Ms'] = String(Math.round(performance.now() - f.at))
+      if (f.dets) headers['X-Detections'] = JSON.stringify(f.dets)
+      headers['Access-Control-Expose-Headers'] = 'X-Frame, X-Frame-Age-Ms, X-Detections'
+    }
+    res.writeHead(200, headers)
+    return res.end(f.png)
   }
   if (req.method === 'GET' && url.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' })
-    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, /api/hazard, /api/chat, /api/answer, /api/camera/{id}.jpg.\n')
+    return res.end('Redshift mock sim. WebSocket on /ws, HTTP on /api/health, /api/truth, /api/reset, /api/hazard, /api/chat, /api/answer, /api/mode, /api/camera/{id}.jpg.\n')
   }
   sendJson(res, 404, { ok: false, error: 'Not found' })
 })

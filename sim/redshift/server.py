@@ -121,6 +121,11 @@ class SimRunner:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="redshift-sim", daemon=True)
         self._thread.start()
+        try:                            # protocol v8: the rovers' onboard detectors (camera thread)
+            from . import camera
+            camera.start_vision(self)
+        except Exception as e:          # noqa: BLE001 (no camera here: the rovers run without detections)
+            _log(f"onboard object detection unavailable: {e}")
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -351,6 +356,12 @@ try:   # onboard camera renders (camera.py); the server runs without them if the
     app.include_router(camera_router)
 except Exception as _e:  # noqa: BLE001
     _log(f"camera endpoint unavailable: {_e}")
+try:   # protocol v8: GET /api/vision/stats (detector precision and recall against the sim's truth)
+    from .vision import router as vision_router
+    if vision_router is not None:
+        app.include_router(vision_router)
+except Exception as _e:  # noqa: BLE001
+    _log(f"vision stats endpoint unavailable: {_e}")
 
 
 @app.get("/")
@@ -495,6 +506,25 @@ async def answer(request: Request):
                             status_code=409)
     return JSONResponse({"ok": False, "error": f"option {data['option']!r} is not one of this request's options"},
                         status_code=400)
+
+
+@app.post("/api/mode")
+async def mode(request: Request):
+    """Protocol v8: {"mode": "autonomous" | "supervised"}: who decides when a rover would ask."""
+    runner = state.runner
+    if runner is None:
+        return JSONResponse({"ok": False, "error": "simulation not running"}, status_code=503)
+    data = await _json_body(request)
+    if data is None or data.get("mode") not in ("autonomous", "supervised"):
+        return JSONResponse({"ok": False, "error": 'Body must be JSON like {"mode": "supervised"} (autonomous or '
+                                                   'supervised)'}, status_code=400)
+
+    def switch():
+        with runner.locked() as sim:
+            sim.advisor.set_mode(data["mode"])
+            return sim.fleet.mode
+
+    return {"ok": True, "mode": await asyncio.to_thread(switch)}
 
 
 @app.websocket("/ws")

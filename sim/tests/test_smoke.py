@@ -37,7 +37,7 @@ TARGET_KEYS = {"id", "x", "y", "kind", "status", "found_by", "found_t", "instrum
 EVENT_KEYS = {"t", "rover", "level", "msg"}           # plus optional "at": [x, y] and "source" (v3)
 FLEET_KEYS = {"explored_pct", "slope_limit_deg", "slope_limit_initial_deg", "targets_found", "targets_total",
               "sim_speed", "budget_ms", "cycle_ms", "soft_zones", "water_zones", "lifeforms_seen", "samples_cached",
-              "samples_carried", "science_score"}
+              "samples_carried", "science_score", "mode"}           # mode: protocol v8 ("priority" only while set)
 STATES = {"exploring", "investigating", "returning", "charging", "recovering", "idle", "fault", "observing"}
 LEVELS = {"info", "warn", "discovery", "hazard"}
 EM_DASH = chr(0x2014)   # banned everywhere in this project
@@ -199,7 +199,7 @@ def test_messages_match_protocol():
             # stats: v5; focus: v7 (only while a rover concentrates on an area)
             assert ROVER_KEYS <= set(r) <= ROVER_KEYS | {"sampling", "stats", "focus"}, set(r) ^ ROVER_KEYS
             if "focus" in r:
-                assert set(r["focus"]) == {"x", "y", "r", "reason", "label", "ends_in"}, r["focus"]
+                assert set(r["focus"]) == {"x", "y", "r", "reason", "label", "ends_in", "mode"}, r["focus"]   # mode: v8
                 assert r["focus"]["reason"] in ("operator", "interest") and r["focus"]["ends_in"] >= 0.0
             assert r["state"] in STATES, r["state"]
             assert 0.0 <= r["battery"] <= 1.0

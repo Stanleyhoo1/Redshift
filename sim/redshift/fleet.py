@@ -42,6 +42,16 @@ CLAIMED = 200.0             # ... and a frontier another rover is already headin
 FOCUS_CLAIM_PENALTY = 15.0  # other rovers leave the unknown ground inside someone's focus circle to that rover
 HERD_DISMISSED_M = 15.0     # tracks this close to a herd the operator said to leave alone are not observed again ...
 HERD_DISMISSED_S = 600.0    # ... for this long (sim s)
+# protocol v8: a fleet priority ("prioritize the gaps", "the north", "water") weighs every rover's frontier choice
+PRIORITY_IN = 80.0          # utility bonus for a frontier the priority covers (more than 80 m of extra distance)
+PRIORITY_MINE = 40.0        # ... plus this for a frontier on the gap assigned to this rover
+PRIORITY_WATER_M = 12.0     # "prioritize water": frontiers this close to known water
+PRIORITY_DIR_COS = 0.64     # "prioritize the north": frontiers within about 50 deg of that bearing from the lander
+GAP_REFRESH_S = 3.0         # the unexplored gaps are found again at most this often (sim s), only while needed
+MODES = ("autonomous", "supervised")
+DIR_VEC = {"north": (0.0, 1.0), "south": (0.0, -1.0), "east": (1.0, 0.0), "west": (-1.0, 0.0),
+           "north-east": (0.7071, 0.7071), "north-west": (-0.7071, 0.7071),
+           "south-east": (0.7071, -0.7071), "south-west": (-0.7071, -0.7071)}
 
 
 def compass(dx: float, dy: float) -> str:
@@ -119,17 +129,26 @@ class Fleet:
         self.interest_spots: list = []     # [(x, y, t)] places a rover already stuck around out of curiosity (v7)
         self.spires_seen: dict = {}        # spire id -> (t, rover id, x, y) when the fleet's LiDAR first saw it
         self.dismissed_herds: list = []    # [(x, y, t)] herds the operator said to leave alone (keep exploring)
+        self.mode = cfg.autonomy_mode if cfg.autonomy_mode in MODES else "autonomous"   # protocol v8
+        self.priority = None               # protocol v8: the fleet priority (dict, see priority_msg), or None
+        self.gaps: list = []               # protocol v8: unexplored gaps (gaps.find_gaps), cached ...
+        self.gap_grid = None               # ... their label grid (frontier lookups) ...
+        self.gaps_t = -1e9                 # ... and when they were found
 
     # ------------------------------------------------------------------ events
-    def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None) -> None:
+    def log(self, t: float, level: str, msg: str, rover: str | None = None, at=None, source: str | None = None,
+            decision: dict | None = None) -> None:
         """source: "gemma" or "operator" when the decision came from tier 2 or a typed command
-        (protocol v3); None means the rules (the field is then left out)."""
+        (protocol v3); None means the rules (the field is then left out). decision (protocol v8): what a
+        rover decided on its own instead of asking the operator."""
         self.event_seq += 1
         e = {"t": round(float(t), 1), "rover": rover, "level": level, "msg": msg, "_seq": self.event_seq}
         if at is not None:
             e["at"] = [round(float(at[0]), 1), round(float(at[1]), 1)]
         if source is not None and source != "rules":
             e["source"] = source
+        if decision is not None:
+            e["decision"] = decision
         self.events.append(e)
         if len(self.events) > 400:
             del self.events[:100]
@@ -146,6 +165,8 @@ class Fleet:
             out["at"] = e["at"]
         if "source" in e:
             out["source"] = e["source"]
+        if "decision" in e:
+            out["decision"] = e["decision"]
         return out
 
     # ------------------------------------------------------------------ periodic
@@ -163,6 +184,59 @@ class Fleet:
             for k in [k for k, exp in self.blacklist.items() if exp < t]:
                 del self.blacklist[k]
             self._check_complete(t)
+        if self.priority is not None and self.priority["kind"] == "gaps":
+            self.refresh_gaps(t)                      # protocol v8: only while the gaps are the priority
+
+    # ------------------------------------------------------------------ unexplored gaps and priorities (v8)
+    def refresh_gaps(self, t: float, max_age: float = GAP_REFRESH_S) -> list:
+        """The unexplored gaps inside the map (gaps.find_gaps, a few ms), cached for max_age sim seconds."""
+        if t - self.gaps_t >= max_age or t < self.gaps_t:
+            from .gaps import find_gaps
+            self.gaps, self.gap_grid = find_gaps(self.map, self.usable_frontiers(t))
+            self.gaps_t = t
+        return self.gaps
+
+    def explorable_gaps(self, t: float, max_age: float = GAP_REFRESH_S) -> list:
+        """Gaps with a reachable frontier on their edge (the others sit in steep ground nobody can drive to)."""
+        return [g for g in self.refresh_gaps(t, max_age) if g["frontiers"]]
+
+    def in_direction(self, x: float, y: float, direction: str) -> bool:
+        """Is (x, y) in that part of the map ("the north": within about 50 deg of north, seen from the lander)?"""
+        d = math.hypot(x, y)
+        ux, uy = DIR_VEC[direction]
+        return d >= 5.0 and (x * ux + y * uy) / d >= PRIORITY_DIR_COS
+
+    def priority_bonus(self, rover, x: float, y: float, idx: int) -> float:
+        """Utility bonus of a frontier under the fleet priority (protocol v8). Sampling works on the target
+        choice instead (rover._explore fetches found targets from further away)."""
+        p = self.priority
+        kind = p["kind"]
+        if kind == "gaps":
+            if self.gap_grid is None:
+                return 0.0
+            lab = int(self.gap_grid.ravel()[idx])
+            if not lab:
+                return 0.0
+            return PRIORITY_IN + (PRIORITY_MINE if lab == p.get("labs", {}).get(rover.id) else 0.0)
+        if kind == "direction":
+            return PRIORITY_IN if self.in_direction(x, y, p["direction"]) else 0.0
+        if kind == "water":
+            if self.water_zones:
+                return PRIORITY_IN if self.water_zone_gap(x, y) < PRIORITY_WATER_M else 0.0
+            lo = p.get("low_h")                       # no water known yet: low ground, where liquid collects
+            return 0.5 * PRIORITY_IN if lo is not None and float(self.map.h.ravel()[idx]) <= lo else 0.0
+        return 0.0
+
+    def priority_msg(self) -> dict | None:
+        p = self.priority
+        if p is None:
+            return None
+        out = {"kind": p["kind"], "label": p["label"], "count": int(p.get("count", 0)), "since": round(p["since"], 1)}
+        if p.get("direction"):
+            out["direction"] = p["direction"]
+        if p.get("places"):
+            out["places"] = p["places"]
+        return out
 
     def _update_reach(self, t: float, max_iters: int | None = 80) -> None:
         """Flood fill from the lander over every sample the planner may cross (known and gentle
@@ -542,6 +616,8 @@ class Fleet:
         circles = [(o.focus["x"], o.focus["y"], o.focus["r"]) for o in self.rovers
                    if o is not rover and getattr(o, "focus", None) is not None]
         reach = self.reach.ravel() if (self.reach is not None and self.in_reach(rover.x, rover.y)) else None
+        # protocol v8: the fleet priority, unless the operator gave this rover its own area or direction
+        pri = self.priority is not None and fc is None and bias is None
         skipped_battery = 0
         claimed_keys: set = set()
         for (x, y, size, idx) in self.frontiers:
@@ -578,6 +654,8 @@ class Fleet:
                 u += SAMPLE_BONUS
             if bias is not None:
                 u += DIR_BIAS * ((x - rover.x) * bias[0] + (y - rover.y) * bias[1]) / max(d, 1e-6)
+            if pri:
+                u += self.priority_bonus(rover, x, y, idx)
             if fc is not None:
                 dc = math.hypot(x - fc["x"], y - fc["y"])
                 if claimed:
@@ -783,6 +861,8 @@ class Fleet:
             "samples_cached": int(self.samples_cached),
             "samples_carried": int(sum(len(r.samples) for r in self.rovers)),
             "science_score": int(self.science_score),
+            "mode": self.mode,                              # protocol v8
+            **({"priority": self.priority_msg()} if self.priority is not None else {}),
         }
 
     def discovered_targets(self) -> list:

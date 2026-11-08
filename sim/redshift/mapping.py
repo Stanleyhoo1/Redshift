@@ -483,6 +483,18 @@ class FleetMap:
         unk = inside & ~self.known[win] & ~self.water[win] & (self.noret[win] < NORET_HOLE) & ~self.blocked[win]
         return int(kn.sum()), int(unk.sum())
 
+    def changes_in(self, x: float, y: float, r: float, since) -> int:
+        """Samples within r of (x, y) that change detection overwrote after `since` (protocol v8 re-survey)."""
+        if since is None:
+            return 0
+        i, j = self.ij(x, y)
+        k = int(math.ceil(r / self.res))
+        j0, j1 = max(0, j - k), min(self.ny - 1, j + k)
+        i0, i1 = max(0, i - k), min(self.nx - 1, i + k)
+        win = (slice(j0, j1 + 1), slice(i0, i1 + 1))
+        inside = (self.xs[i0:i1 + 1][None, :] - x) ** 2 + (self.ys[j0:j1 + 1][:, None] - y) ** 2 <= r * r
+        return int(((self.changed_t[win] >= since) & inside).sum())
+
     def traversable(self, limit_deg: float) -> np.ndarray:
         return self.known & (self.slope <= limit_deg) & ~self.blocked & ~self.soft & ~self.avoid & ~self.water
 

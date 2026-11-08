@@ -20,6 +20,7 @@ import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
 import { PlaceCandidates } from './PlaceCandidates.jsx'
 import { FocusAreas } from './FocusAreas.jsx'
+import { PriorityPlaces } from './PriorityPlaces.jsx'
 import { CameraRig } from './CameraRig.jsx'
 import { Atmosphere } from './Atmosphere.jsx'
 import { Gravel } from './Gravel.jsx'
@@ -73,6 +74,8 @@ function DebugHook() {
           hazards: s.hazards,
           requests: s.requests,
           lander: s.lander,
+          events: s.events.slice(0, 80),
+          priority: s.priority,
         }
       },
     }
@@ -98,6 +101,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <Lander />
       {view.frontiers && <Frontiers />}
       <FocusAreas />
+      <PriorityPlaces />
       <Targets />
       <Rovers showPaths={view.paths} selected={selected} onSelect={onSelect} />
       {view.lidar && <Lidar />}

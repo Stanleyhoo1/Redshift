@@ -11,7 +11,7 @@ Vite + React + three.js (@react-three/fiber, drei). Node 22.
 ```sh
 npm install
 npm run mock      # fake sim on port 8000 (env: SEED, NUM_ROVERS, SIM_SPEED, MAP_SIZE, GRAVITY_G, BRAIN_BUDGET_MS,
-                  #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, MOCK_GEMMA=offline, MOCK_PROTOCOL=2|3,
+                  #   GEMMA_ENABLED, GEMMA_BUDGET_MS, OPERATOR_TIMEOUT_S, AUTONOMY_MODE, MOCK_GEMMA=offline, MOCK_PROTOCOL=2..7,
                   #   MOCK_FIRST_QUESTION_S, MOCK_SAMPLE_SCALE, MOCK_ANSWER_DELAY_MS, MOCK_CAMERA=off)
 npm run dev       # in a second terminal, then open http://localhost:5173
 ```
@@ -38,7 +38,7 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   rover's latest sweep as points in its colour), Life (version 4 sims).
 - Select a rover (its card, its 3D model or name tag, a Follow button, or `1` to `9`): the
   camera follows it and its live sensor panel opens over the lower left of the view:
-  camera (FPV or Chase, about 4 frames a second), a LiDAR scope (rover at the centre facing
+  camera (FPV or Chase, as fast as the sim serves new frames), a LiDAR scope (rover at the centre facing
   up, returns coloured by height, the dashed ring is the current range), IMU attitude,
   wheel speed against ground speed with slip and motor load (slip holds its peak for a few
   seconds), spectrometer, battery, and brain time against the stated budget. `Esc` or the
@@ -83,9 +83,9 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   to glide back. While paused, `F` resumes instead of toggling Frontiers.
 - Camera viewer: click the camera picture (or its expand icon) for a large view, about 80%
   of the screen. It asks for frames sized to the viewer and the screen's pixel density (up
-  to 1280 x 720), about 3 a second, one at a time, and the panel's small feed pauses
+  to 1280 x 720), one at a time and as fast as the sim has new ones, and the panel's small feed pauses
   meanwhile. FPV or Chase, rover buttons (`1` to `9`), scroll to zoom around the cursor,
-  drag to pan, double-click to reset, `V` switches view, `Esc` or a click outside closes.
+  drag to pan, double-click to reset, `V` switches view, `D` hides the detection boxes, `Esc` or a click outside closes.
   A camera HUD shows rover, heading tape, pitch ladder (FPV), speed, position, state,
   pitch and roll, battery, sim time, and whether the picture is live or how stale it is.
 - Sensor detail: the expand buttons on the LiDAR scope, the IMU section and the compute
@@ -139,6 +139,28 @@ npm run preview   # serves dist/ on port 4173 with the same proxy
   A rover that sights a herd follows it while its lifeform question waits for you.
 - Lost tracks (version 4): a faded, frozen copy of the creature stays where the fleet last
   saw it, and the tag says "last seen 12 s ago", until the sim forgets the track.
+- Autonomy (version 8): under the wordmark, Autonomous / Supervised (hover for what each
+  means) shows `fleet.mode` and posts `/api/mode`; the choice blinks until the sim confirms
+  it. Autonomous: Gemma decides and every decision lands in the event log with a compact
+  line (Gemma or Rules, confidence, the choice, "of 3"); click it for the question, every
+  option considered (the chosen one ticked) and why. Supervised: request cards and the chat
+  chips mark Gemma's pick ("Gemma suggests"). A fleet `priority` shows as an amber chip
+  ("Priority: the unexplored gaps (4 left)") whose cross sends "back to normal" over chat;
+  if a sim also lists the places (`places`, `gaps` or `areas`, not in the protocol) the map
+  marks them. A re-survey focus reads "Re-surveying the lake's shore · 64 s".
+- Event log filters: All, one chip per rover (its colour), Fleet (events without a rover)
+  and Decisions, each with its count. The browser keeps the last 1000 events; the log
+  renders 120 rows and "Show older" adds more.
+- Object detection (version 8): both camera views stream with `fetch` (one request in
+  flight, the next as soon as a frame has decoded, a short pause when the sim had nothing
+  newer), decode with `createImageBitmap`, and draw on a canvas, so frames swap without
+  flicker. The `X-Detections` boxes of exactly that frame are drawn on top in class colours
+  (mineral, ice, vent and trace as on the map, creatures lime, spires violet, water blue,
+  rocks neutral) with label and confidence (and distance in the large view, where they
+  follow zoom and pan at a constant size). The box button (or `D` in the viewer) hides them,
+  remembered across reloads. A small readout gives fps and frame age; polling stops while
+  the tab is hidden or the viewer covers the panel. The sensor panel adds "Sees: creature
+  0.83 at 6 m, rock 0.64 at 4 m" from the rover's `vision` and the detector's time.
 - Every version 2, 3 and 4 field is optional: with an older sim the panel shows dashes, the
   camera says it is unavailable, the hazard buttons say the sim does not support them, the
   Gemma pill and bar stay hidden, Comms says the sim has no operator chat, and the version 4
@@ -193,6 +215,24 @@ Version 7 in the mock (the default; `MOCK_PROTOCOL=6` for the previous behaviour
 north of the lander", "explore here/there" and "investigate ..." (survey, then focus), about
 120 sim s; curiosity focuses (about 60 s) now and then after a find; a chat report when a focus
 ends; and every new herd is followed at once while the rover asks about it.
+
+Version 8 in the mock (the default; `MOCK_PROTOCOL=7` for the previous behaviour; mode from
+`AUTONOMY_MODE`, kept across resets): `POST /api/mode` and chat ("switch to supervised mode",
+"you decide from now on"). Autonomous rovers decide anomalies, herds and ambiguous places
+after a fake Gemma call (rules when it is offline, the safe option under 0.5) and log each
+decision; frontier and sampling choices carry a `decision` too. Supervised rovers ask with
+the suggestion marked; switching back decides open questions. LiDAR shadows leave pockets of
+unknown ground, so "explore one of those holes" and "prioritize the gaps" have targets (the
+gaps priority also lists `places`, a mock extra) until "back to normal". An operator focus on
+mapped ground becomes a re-survey. Every tick carries each rover's `vision`; the camera
+draws rocks, boulders, targets, creatures, spires, water, rovers and the lander as simple
+shapes exactly where its `X-Detections` boxes them, keeps the newest frame per view and size
+(served at once while fresh) and renders large frames at half resolution. Test hook:
+`POST /api/_mock/gaps` lists the current gaps. `node scripts/v8-check.mjs` (mock started
+with `MOCK_FIRST_QUESTION_S=99999`, preview running) checks the log filter, both modes, a
+suggested option, the camera boxes and the priority chip, and saves screenshots (low
+graphics by default, `GRAPHICS=high` to override). `node scripts/cam-rate.mjs [url] [w] [h]`
+measures the camera stream on its own (new frames a second, repeats skipped).
 
 Version 4 and 4b in the mock: a 120 m map with two lakes and a stream (LiDAR holes until a
 rover comes within 4.5 m, then `water_zones` grows as it sees more), groves of spires

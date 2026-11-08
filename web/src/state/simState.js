@@ -4,7 +4,7 @@
 // The terrain arrays are mutated in place for speed. Everything else is replaced
 // immutably, so React selectors see a new object when (and only when) it changed.
 
-export const MAX_EVENTS = 200
+export const MAX_EVENTS = 1000 // v8: per-rover log filters need some depth; the list renders a capped window
 export const MAX_CHAT = 200
 export const TRAIL_POINTS = 200
 export const FAR_PAST = -1e6
@@ -39,6 +39,8 @@ export function emptyState() {
     tracks: [], // what the fleet believes it is tracking
     fallen: {}, // spire id -> { x0, y0, x1, y1, t, hazard }: every spire seen falling since the last init
     limit: { current: null, initial: null, prev: null, changedAt: null },
+    // v8 (null with older sims): fleet.priority, sanitized, same object while unchanged
+    priority: null,
     t: 0,
     terrain: null,
     eventSeq: 0,
@@ -248,12 +250,89 @@ function keyEvents(list, seq) {
       msg: e.msg == null ? '' : String(e.msg),
       at: isXY(e.at) ? [e.at[0], e.at[1]] : null,
       source: EVENT_SOURCES.has(e.source) ? e.source : 'rules', // v3: missing means rules
+      decision: sanitizeDecision(e.decision), // v8: null when the event records no decision
     })
   }
   return { events: out, seq }
 }
 
 const EVENT_SOURCES = new Set(['rules', 'gemma', 'operator'])
+
+// v8 event `decision`: { question, options: [string], choice, by, confidence, why }. Options
+// may be ids ("proceed_slowly") or labels; objects with an id or label are accepted too.
+export function sanitizeDecision(d) {
+  if (!isObj(d)) return null
+  const word = (v) => (v == null ? null : isObj(v) ? String(v.label ?? v.id ?? '') || null : String(v) || null)
+  const options = (Array.isArray(d.options) ? d.options : []).map(word).filter(Boolean).slice(0, 12)
+  const choice = word(d.choice)
+  if (!choice && !options.length) return null
+  const conf = num(d.confidence, null)
+  return {
+    question: typeof d.question === 'string' && d.question.trim() ? d.question.trim() : null,
+    options,
+    choice,
+    by: typeof d.by === 'string' && d.by ? d.by.toLowerCase() : null,
+    confidence: conf === null ? null : Math.max(0, Math.min(1, conf > 1 ? conf / 100 : conf)),
+    why: typeof d.why === 'string' && d.why.trim() ? d.why.trim() : null,
+  }
+}
+
+// v8 fleet `priority`: { kind, label, count, since } while set, else null. Positions are not
+// in the protocol; if a sim sends them (`places`, `gaps` or `areas`: [x, y, r] or {x, y, r,
+// label}) the map draws them. Same object while unchanged.
+export function sanitizePriority(p, prev) {
+  if (!isObj(p)) return null
+  const raw = [p.places, p.gaps, p.areas].find(Array.isArray) || []
+  const places = []
+  for (const q of raw) {
+    const x = Array.isArray(q) ? q[0] : q?.x
+    const y = Array.isArray(q) ? q[1] : q?.y
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+    const r = Array.isArray(q) ? q[2] : (q.r ?? q.radius)
+    places.push({ x, y, r: Number.isFinite(r) && r > 0.2 ? r : 3, label: !Array.isArray(q) && typeof q.label === 'string' ? q.label : null })
+    if (places.length >= 24) break
+  }
+  const next = {
+    kind: typeof p.kind === 'string' && p.kind ? p.kind : null,
+    label: typeof p.label === 'string' && p.label.trim() ? p.label.trim() : null,
+    count: Number.isFinite(p.count) ? Math.max(0, Math.round(p.count)) : null,
+    since: num(p.since, null),
+    places,
+  }
+  return prev && JSON.stringify(prev) === JSON.stringify(next) ? prev : next
+}
+
+// v8 detections (rover `vision.objects`, camera header X-Detections): label, conf 0..1,
+// box [x0, y0, x1, y1] normalised (top left origin), dist m, bearing deg (left positive).
+export function sanitizeDetections(list) {
+  if (!Array.isArray(list)) return null
+  const out = []
+  for (const o of list) {
+    if (!isObj(o) || !Array.isArray(o.box) || o.box.length < 4) continue
+    let [x0, y0, x1, y1] = o.box
+    if (![x0, y0, x1, y1].every(Number.isFinite)) continue
+    if (x1 < x0) [x0, x1] = [x1, x0]
+    if (y1 < y0) [y0, y1] = [y1, y0]
+    const c = num(o.conf, null)
+    out.push({
+      label: typeof o.label === 'string' && o.label ? o.label.toLowerCase() : 'object',
+      conf: c === null ? null : Math.max(0, Math.min(1, c > 1 ? c / 100 : c)),
+      box: [Math.max(0, Math.min(1, x0)), Math.max(0, Math.min(1, y0)), Math.max(0, Math.min(1, x1)), Math.max(0, Math.min(1, y1))],
+      dist: num(o.dist, null),
+      bearing: num(o.bearing, null),
+    })
+    if (out.length >= 48) break
+  }
+  return out
+}
+
+function sanitizeVision(v, prev) {
+  if (!isObj(v)) return null
+  const objects = sanitizeDetections(v.objects) || []
+  const next = { frame: num(v.frame, null), t: num(v.t, null), view: typeof v.view === 'string' ? v.view : null, ms: num(v.ms, null), objects }
+  if (prev && prev.frame === next.frame && prev.t === next.t && next.frame !== null) return prev
+  return next
+}
 const CHAT_KINDS = new Set(['command', 'ack', 'refuse', 'question', 'answer', 'info', 'reply'])
 
 // v3 chat messages, keyed like events. Unknown kinds read as info.
@@ -322,6 +401,7 @@ export function sanitizeRequests(list, prev, now, simT, speed) {
       .map((o) => {
         if (typeof o === 'string') return { id: o, label: o }
         const out = { id: String(o.id), label: o.label == null ? String(o.id) : String(o.label) }
+        if (o.suggested === true) out.suggested = true // v8: Gemma's pick in supervised mode
         if (Number.isFinite(o.x) && Number.isFinite(o.y)) {
           out.x = o.x
           out.y = o.y
@@ -432,6 +512,8 @@ function sanitizeRover(r, prev) {
     stats: sanitizeStats(r.stats, prev?.stats),
     // v7: the area the rover concentrates on (present only while it does), else null
     focus: sanitizeFocus(r.focus),
+    // v8: the onboard detector's latest result, else null
+    vision: sanitizeVision(r.vision, prev?.vision),
   }
 }
 
@@ -447,6 +529,8 @@ function sanitizeFocus(f) {
     reason: f.reason === 'interest' ? 'interest' : 'operator',
     label: typeof f.label === 'string' && f.label.trim() ? f.label.trim() : null,
     ends_in: Number.isFinite(f.ends_in) ? Math.max(0, f.ends_in) : null,
+    // v8: "explore" (unknown ground first) or "resurvey" (a loop through mapped ground)
+    mode: f.mode === 'resurvey' ? 'resurvey' : f.mode === 'explore' ? 'explore' : null,
   }
 }
 
@@ -561,6 +645,7 @@ export function applyInit(prev, msg, now) {
   s.initSeq = keyed.seq
   s.fleet = msg.fleet && typeof msg.fleet === 'object' ? { ...msg.fleet } : {}
   s.limit = limitFromFleet(s.fleet, s.limit, now, false)
+  s.priority = sanitizePriority(s.fleet.priority, null)
   s.hazards = sanitizeHazards(msg.hazards)
   s.t = num(msg.t, s.events[0]?.t ?? 0)
   s.chatSeq = prev?.chatSeq ?? 0 // keys keep growing across inits
@@ -638,6 +723,9 @@ export function applyTick(prev, msg, now) {
 
   if (msg.fleet && typeof msg.fleet === 'object') {
     s.fleet = { ...prev.fleet, ...msg.fleet }
+    // v8: `priority` is present only while set, so a tick without it clears it.
+    if (!('priority' in msg.fleet)) delete s.fleet.priority
+    s.priority = sanitizePriority(s.fleet.priority, prev.priority)
     s.limit = limitFromFleet(s.fleet, prev.limit, now, true)
     // v4: the identified water is resent every tick; keep the old array while it is the
     // same, so the water mask is only redrawn when the fleet identifies more.

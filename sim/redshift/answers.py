@@ -64,7 +64,7 @@ def _shorten(p: str, limit: int) -> str:
     """Cut one over-long sentence at a clause boundary ('; ' or ', ') and mark it with '...'."""
     if len(p) <= limit:
         return p
-    cut = p[:limit]
+    cut = p[:max(limit - 3, 1)]               # room for the "..."
     for sep in ("; ", ", "):
         k = cut.rfind(sep)
         if k > limit // 3:
@@ -686,3 +686,94 @@ def _fleet_answer(s: dict, topic: str) -> str:
     return _sentences("I can't answer that from what the fleet has sensed",
                       "Ask about status, exploration, finds, samples, battery, hazards, lifeforms, water, positions "
                       "or why a rover is going somewhere")
+
+
+# ====================================================================== area questions (protocol v8)
+AREA_R = 15.0          # "what did we find there?": what the fleet knows within about this far of the place
+
+
+def area_facts(sim, x: float, y: float, label: str, r: float | None = None, kind: str | None = None) -> list:
+    """Fact lines about one place only ("what did we find there?", "anything near the lake?", "what's at the
+    vent?"): targets and samples, water, spires, herds and hazards within about r of it, and what a rover explored
+    or re-surveyed there, from fleet knowledge. Neutral wording, so a rover and the fleet can both use them.
+    kind: the place's kind (for the caller's records; water at the place itself is described as "there")."""
+    from .places import water_bodies
+    f = sim.fleet
+    rad = float(max(AREA_R, r or 0.0))
+    where = label if "(" in label else f"{label} at {_xy(x, y)}"
+    near = [ts for ts in f.targets if ts.status is not None and math.hypot(ts.spec.x - x, ts.spec.y - y) <= rad]
+    near.sort(key=lambda ts: math.hypot(ts.spec.x - x, ts.spec.y - y))
+    bits = []
+    for ts in near[:5]:
+        if ts.status == "sampled":
+            st = f"sampled by {ts.carried_by or 'the fleet'}" if not ts.cached else "sampled and cached"
+            st += f", value {ts.value}/10" if ts.value is not None else ""
+        elif ts.status == "investigating":
+            st = f"{ts.investigator} is sampling it"
+        else:
+            st = f"found by {ts.found_by}, not sampled yet"
+        bits.append(f"{ts.spec.id} {KIND_SHORT.get(ts.spec.kind, ts.spec.kind)} ({st})")
+    lines = [(f"targets known within {rad:.0f} m of {where}: " + _list(bits, 5)) if bits else
+             f"no science targets known within {rad:.0f} m of {where}"]
+    for wb in water_bodies(f.water_zones):
+        dd = math.hypot(wb.x - x, wb.y - y)
+        if dd <= rad + 0.5 * (wb.size or 0.0):
+            if dd < 0.5 * (wb.size or 0.0) + 4.0:
+                lines.append(f"the {wb.sub} there is about {wb.size:.0f} m across")
+            else:
+                lines.append(f"a {wb.sub} about {wb.size:.0f} m across, its middle {dd:.0f} m from it")
+            break
+    spires = [k for k, v in f.spires_seen.items() if math.hypot(v[2] - x, v[3] - y) <= rad]
+    if spires:
+        lines.append(f"{len(spires)} spire{'s' if len(spires) != 1 else ''} stand{'s' if len(spires) == 1 else ''} "
+                     f"within {rad:.0f} m of it")
+    herd = None
+    for r_ in sim.rovers:
+        for e in r_.mem.life:
+            if e.get("at") and math.hypot(e["at"][0] - x, e["at"][1] - y) <= rad + 5.0:
+                herd = (r_.id, e)
+    if herd is not None:
+        rid, e = herd
+        what = f"a herd of {e['n']}" if e["n"] > 1 else "a creature"
+        lines.append(f"{rid} watched {what} {math.hypot(e['at'][0] - x, e['at'][1] - y):.0f} m from it for "
+                     f"{e['dur']:.0f} s")
+    else:
+        for hx, hy, n in f.lifeform_herds:
+            dd = math.hypot(hx - x, hy - y)
+            if dd <= rad + 5.0:
+                lines.append(f"{'a herd of ' + str(n) if n > 1 else 'a creature'} was seen about {dd:.0f} m from it")
+                break
+    hz = []
+    for z in f.soft_zones:
+        dd = math.hypot(z[0] - x, z[1] - y)
+        if dd <= rad:
+            hz.append(f"soft ground found by {z[3]} {dd:.0f} m from it")
+    for r_ in sim.rovers:
+        for h in r_.mem.hazards:
+            if h["kind"] in ("rocks", "spire", "dropoff") and h.get("at") and \
+                    math.hypot(h["at"][0] - x, h["at"][1] - y) <= rad:
+                what = {"rocks": "new rocks", "spire": "a fallen spire", "dropoff": "a drop-off"}[h["kind"]]
+                hz.append(f"{what} met by {r_.id} {math.hypot(h['at'][0] - x, h['at'][1] - y):.0f} m from it")
+    if hz:
+        lines.append("hazards there: " + _list(list(dict.fromkeys(hz)), 3))
+    for r_ in sim.rovers:
+        s = r_.mem.focus_near(x, y, max(12.0, rad - 3.0))
+        if s is None or not s.get("there"):
+            continue
+        if s.get("mode") == "resurvey":
+            ch = s.get("changes", 0)
+            new = s.get("new_found") or []
+            what = (f"{ch} map samples changed" if ch else "no changes since it was mapped") + (
+                f", newly found {_list(new)}" if new else "")
+            lines.append(f"{r_.id} re-surveyed it for {s['dur']:.0f} s ({s.get('driven', 0)} m driven): {what}")
+        else:
+            lines.append(f"{r_.id} explored around it for {s['dur']:.0f} s and mapped {s['mapped']} m2 of new ground")
+        break
+    kn, unk = f.map.area_cells(x, y, rad)
+    lines.append(f"the ground within {rad:.0f} m of it is {round(100.0 * kn / max(kn + unk, 1))}% mapped")
+    return lines[:7]
+
+
+def area_answer(lines: list) -> str:
+    """The rule-based answer from area_facts lines."""
+    return _sentences(*lines)
