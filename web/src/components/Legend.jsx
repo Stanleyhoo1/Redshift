@@ -2,6 +2,7 @@ import { useSim } from '../state/store.js'
 import { degrees, fixed } from '../lib/format.js'
 import { KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
 import '../styles/scene.css'
+import { TerrainLegend } from './TerrainLegend.jsx'
 
 export function Legend({ slopeColors, frontiers, life = true }) {
   const limit = useSim((s) => s.limit)
@@ -87,6 +88,7 @@ export function Legend({ slopeColors, frontiers, life = true }) {
           )}
         </ul>
       )}
+      <TerrainLegend />
       <ul className="legend-list legend-row">
         {Object.entries(KIND_STYLE)
           .filter(([k]) => k !== 'trace' || hasTrace)
