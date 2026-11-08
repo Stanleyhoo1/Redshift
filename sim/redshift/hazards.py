@@ -850,12 +850,18 @@ class HazardManager:
             # v7: which kind wanders in follows the biome weights at the spot (among the kinds this world has)
             from . import v7_life
             w = v7_life.weights_at(sim.terrain, spot[0], spot[1])
-            have = {hd.kind for hd in fresh}
+            have = {hd.kind for hd in free}
             w = {k: (v if k in have else 0.0) for k, v in w.items()}
             if not any(w.values()):
                 w = {k: 1.0 for k in have}
             kind = v7_life.pick_kind(lf.rng, w)
-            fresh = [hd for hd in fresh if hd.kind == kind] or fresh
+            pool = [hd for hd in free if hd.kind == kind]
+            fresh = [hd for hd in pool if counted(hd) is None] or pool
+            if kind == "crawler":           # a big one arrives a little further out (it keeps 6 m)
+                a = math.atan2(spot[1] - rover.y, spot[0] - rover.x)
+                far = (spot[0] + 1.5 * math.cos(a), spot[1] + 1.5 * math.sin(a))
+                if lf.spot_ok(*far):
+                    spot = far
         herd = min(fresh, key=lambda hd: math.hypot(hd.centre()[0] - spot[0], hd.centre()[1] - spot[1]))
         k = counted(herd)
         lf.move_herd(herd, spot[0], spot[1], face)
