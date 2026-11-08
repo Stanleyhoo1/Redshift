@@ -20,7 +20,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 
 | File | What it does |
 |---|---|
-| `redshift/config.py` | All settings in one place. Reads the env vars below. |
+| `redshift/config.py` | All settings in one place. Reads the env vars below. `SETTINGS` is the table of launch settings (key, range, label, help) behind the setup screen, `GET /api/config` and `POST /api/launch`; the slope thresholds tuned for 2 g follow the launch gravity (see "Learning the slope limit"). |
 | `redshift/terrain.py` | Makes the ground: plains, hills, ridges, craters (each with a gentle way in), rocks, science targets in clusters, one or two lakes (often with a short river), alien spires, the home areas of the grazer herds, organic "trace" targets near them, and each target's science value and analysis. Feature counts grow with the map area. Same seed, same world. |
 | `redshift/world.py` | Builds the MuJoCo physics model: the ground as height-map tiles, rocks, the lander pad, target markers, liquid surfaces, spires, creatures, hidden rockfall boulders and spare spires, and the rovers (4 wheels, skid steering, front axle that rocks so all wheels touch, an IMU). |
 | `redshift/mapping.py` | The shared fleet map. Turns LiDAR hits into heights and slopes for each grid cell, notices when mapped ground changes, keeps layers for soft ground, identified water and "no echo here" evidence, and finds frontiers (edges of the known area). |
@@ -38,7 +38,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `redshift/places.py` | Commands that name a place (protocol v6): finds the known places of a kind from fleet knowledge only (water bodies, found targets, mapped spires, herds, hazard sites, the lander), applies qualifiers (nearest, biggest, north, the second one, near rover 2), finds a safe goal next to a place, writes short labels and reads which option a chat answer picks. |
 | `redshift/gemma.py` | Talks to the local Gemma model (Ollama), or a fake model for demos and tests: prompts, answer checks, timeouts, a keyword parser for typed commands. |
 | `redshift/advisor.py` | Tier 2: asks Gemma at the right moments, applies its advice when it is safe, runs the operator chat (commands and questions) and the questions to the operator. |
-| `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
+| `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `GET /api/config`, `POST /api/launch`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma and builds the world; with `AUTO_LAUNCH=0` (the default) it waits in the setup phase until `POST /api/launch`, then runs the sim in the background at `SIM_SPEED` times real time. A reset or launch builds the new world before it stops the old one. |
 | `scripts/climb_test.py` | Drives a rover up ramps of known angle to check how steep it can climb. |
 | `scripts/gemma_bench.py` | Measures Gemma's speed and answers against a real Ollama. |
 | `scripts/camera_bench.py` | Camera render time per frame (320 x 240 and 1280 x 720 by default). |
@@ -50,6 +50,7 @@ The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`
 | `tests/test_v4.py` | Water (a hole in the map, identified, avoided, the water sensor failsafe), spire fall and replan, motion tracks, observing a lifeform at a safe distance, the first-sighting question, point-and-click hazards and every 400, sampling, tubes and the cache, and the v4 message fields. |
 | `tests/test_v5.py` | Questions: intent (questions vs commands), Gemma's answer checks (a bad number or id falls back to the rules), grounded rule answers for every topic, fleet vs per-rover replies, `reply_to`, `stats`, camera sizes up to 1280 x 720. |
 | `tests/test_v6.py` | Place commands: polite orders vs questions, place parsing (keyword parser and checked Gemma answers), the resolver and its qualifiers, "nothing known", the closest free rover, `choose_place` answered by `POST /api/answer` and by chat, the survey and its report, requests that never expire by default (and the countdown when `OPERATOR_TIMEOUT_S` is above 0). |
+| `tests/test_v7_settings.py` | Launch settings (protocol v7): the settings table and its parser (every bad value and its message), the round trip, `from_env` clamps and feature switches, the slope thresholds derived from gravity (identical at 2 g), Gemma's gravity text, the setup phase, `GET /api/config`, `POST /api/launch`, settings in `POST /api/reset`, the 409s, and no em dash in the files this step touched. |
 
 `test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
 numbers) written for the old 80 m world, so they run with `MAP_SIZE` 80 and the v4 features (water,
@@ -142,11 +143,11 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SEED` | 42 | terrain and target layout |
+| `SEED` | 42 | terrain and target layout (0 to 2147483647) |
 | `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
-| `SIM_SPEED` | 3.0 | sim seconds per wall second |
-| `MAP_SIZE` | 120 | map width in metres (feature counts grow with the area; 80 gives the old layout) |
-| `GRAVITY_G` | 2.0 | gravity in Earth g |
+| `SIM_SPEED` | 3.0 | sim seconds per wall second (0.5 to 10) |
+| `MAP_SIZE` | 120 | map width in metres, 60 to 200 (feature counts grow with the area; 80 gives the old layout) |
+| `GRAVITY_G` | 2.0 | gravity in Earth g (0.5 to 3); out of range values are clamped |
 | `VIEWER` | 0 | 1 = open the native MuJoCo viewer |
 | `BRAIN_BUDGET_MS` | 40 | compute budget per rover per decision cycle (ms) |
 | `AUTO_RESET_S` | 0 | off by default. If set, once exploration is complete and every rover is parked, wait this many seconds, then start a new random planet (server only) |
@@ -160,6 +161,9 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `OPERATOR_ASK_BELOW` | 0.75 | Gemma confidence below this makes the rover ask the operator |
 | `OPERATOR_ASK_FIRST` | 1 | the first anomaly after start or reset always asks the operator (reliable demo trigger) |
 | `CAMERA_SHADOWS` | 1 | 0 = camera renders without the sun's shadows (about 3 times faster with software OpenGL) |
+| `AUTO_LAUNCH` | 0 | 0 = build the world and wait in the setup phase until `POST /api/launch` (the setup screen); 1 = start at once. `AUTO_RESET_S` above 0 also starts at once |
+| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | version 7 world features (0 leaves one out). Off in a bare `Config()`, on in `Config.from_env()`; each is built in its own v7 step |
+| `WEAR` | normal | `off`, `normal` or `harsh` (parts wear out about 4 times sooner) |
 
 More Gemma settings (timeouts, tokens, model loading) are in `GEMMA.md`.
 
@@ -422,6 +426,10 @@ expansions instead (3 us each, measured here), which makes runs repeat exactly; 
   96%"). Every rover replans with the new limit straight away. The limit never drops below the
   steepest climb a rover has already managed. A stall caused by a rock or by losing grip does not
   count. The real limit at 2 g is about 20.5 deg (see `scripts/climb_test.py`).
+  At another launch gravity the predicted limit is `asin(4 T / r / (m g))`, capped at 30 deg where grip
+  takes over (about 14 deg at 3 g), and the thresholds tuned for 2 g follow it: target paths 15 deg, the
+  no-trap flood 18 deg, hazard placement 20 deg, the slope floor 12 deg and the sand wheel load 0.2 (see
+  PROTOCOL.md, "Version 7 additions", Sim notes). At 2 g they are unchanged.
 - **Science.** If a LiDAR ray hits a target within 8 m, the rover reports it with the
   spectrometer's value estimate. If it is free, has the battery and a tube to spare, it drives over,
   runs the instrument, analyses the sample and keeps it in a tube (see "Samples"). Busy rovers log

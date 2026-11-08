@@ -24,6 +24,8 @@ docker compose up --build
 
 Open http://localhost:8080. The web container talks to the sim over Docker's private network, so only port 8080 is used on your machine.
 
+The dashboard opens on the setup screen: pick gravity, fleet size, sector, features and wear, then press Launch (set `AUTO_LAUNCH=1` to skip it).
+
 If the page stays on "Waiting for the simulation", check the sim container with `docker compose ps -a` and `docker compose logs --tail=60 sim`.
 
 Change the planet or speed:
@@ -36,11 +38,14 @@ Stop with Ctrl+C, then `docker compose down`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SEED` | 42 | terrain and target layout |
-| `NUM_ROVERS` | 3 | rovers in the fleet |
-| `SIM_SPEED` | 3.0 | sim seconds per real second |
-| `MAP_SIZE` | 120 | map width in metres |
-| `GRAVITY_G` | 2.0 | gravity in Earth g |
+| `SEED` | 42 | terrain and target layout (0 to 2147483647) |
+| `NUM_ROVERS` | 3 | rovers in the fleet (1 to 8) |
+| `SIM_SPEED` | 3.0 | sim seconds per real second (0.5 to 10) |
+| `MAP_SIZE` | 120 | map width in metres (60 to 200) |
+| `GRAVITY_G` | 2.0 | gravity in Earth g (0.5 to 3) |
+| `AUTO_LAUNCH` | 0 | 0: the fleet waits on the setup screen until you press Launch. 1: start at once with these values |
+| `MESAS`, `CANYON`, `DUNES`, `BOULDER_FIELDS`, `PITS`, `GEYSERS`, `ICE_SHEETS`, `FLORA`, `GROUND_DETAIL` | 1 | new world features, each on by default (0 leaves it out; each arrives in its own v7 step) |
+| `WEAR` | normal | how fast parts wear out: off, normal or harsh |
 | `AUTO_RESET_S` | 0 | off: the planet only changes when you press Reset sim. Set it (e.g. 60) to land on a new random planet that many seconds after exploration finishes |
 | `GEMMA_ENABLED` | 1 | 0 = rules only |
 | `GEMMA_MODEL` | gemma4:e2b | falls back to gemma4:e4b, then gemma3:4b if not installed |
@@ -65,6 +70,7 @@ The rules always keep control of safety: Gemma's picks are only taken from optio
 - **Samples tab:** every sample collected so far, sorted by science value, with the instrument used (drill, scoop, gas sniffer, swab), the lab result, and whether it is still on a rover or cached at the lander. Rover cards show their 3 tube slots and a progress bar while sampling.
 - **Comms tab:** type instructions ("rover 2, explore north", "everyone come home", "orange one, sample the vent"). Gemma turns them into commands, the rules check they are safe, and the rover replies or refuses with its reasons. Rover questions appear here and as a card at the top, with the rover's camera view and a countdown.
 - **Reality:** overlays the true terrain and every real target, so you can compare it with what the fleet knows.
+- **Reset sim and New mission:** Reset sim lands the fleet on a new random planet with the same settings. New mission opens the setup screen first, to change gravity, fleet size, sector size, features, wear or speed; the gravity readout and the slope figure show how steep the rovers can climb and tow at that gravity.
 
 ## Run natively with the MuJoCo viewer
 
