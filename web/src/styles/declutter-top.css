@@ -192,3 +192,9 @@
   font-size: 14px;
   line-height: 1.4;
 }
+
+/* The placement hint and the banners stay centred over the map. */
+.hud-top > .banner-place,
+.hud-top > .banners {
+  align-self: center;
+}
