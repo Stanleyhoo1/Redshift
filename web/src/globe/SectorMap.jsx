@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import { simStore, useSim } from '../state/store.js'
-import { paintSectorMap, patchGeometry } from './sectorMap.js'
+import { paintSectorMap, patchGeometry, sectorLook } from './sectorMap.js'
 import { makeSectorMapMaterial, makeSectorTexture } from './sectorMapMaterial.js'
 import { viewMode } from './viewMode.js'
 import { globeRefs } from './globeDebug.js'
@@ -66,7 +66,12 @@ export function SectorMap({ look, high }) {
     s.T = T
     s.version = T.version
     s.zones = zones
-    const data = paintSectorMap(T, sim.fleet, s.data)
+    if (s.lookWorld !== sim.world || s.lookFeatures !== sim.features) {
+      s.look = sectorLook(sim.world, sim.features)
+      s.lookWorld = sim.world
+      s.lookFeatures = sim.features
+    }
+    const data = paintSectorMap(T, sim.fleet, s.data, s.look)
     if (!s.tex || s.tex.image.width !== T.nx || s.tex.image.height !== T.ny || data !== s.data) {
       s.tex?.dispose()
       s.tex = makeSectorTexture(data, T.nx, T.ny)

@@ -3,6 +3,7 @@ import { useSim } from '../state/store.js'
 import { fixed } from '../lib/format.js'
 import { SIGNAL } from '../lib/theme.js'
 import { GLOBE } from './globePalette.js'
+import { groundSwatch } from '../lib/biomes.js'
 import { formatKm, formatLatLon, planetLook } from './globeMath.js'
 import '../styles/scene.css'
 import '../styles/globe.css'
@@ -27,19 +28,25 @@ export function GlobeLegend({ reality = false }) {
         </li>
         {reality ? (
           <>
+            {p.palette.biome && (
+              <li title="The planet's ground at the landing site">
+                <i className="sw" style={{ background: p.palette.ground.dust }} />
+                {p.palette.biome.name}
+              </li>
+            )}
             <li>
               <i className="sw" style={{ background: GLOBE.ice }} />
               Polar ice
             </li>
             <li>
-              <i className="sw" style={{ background: GLOBE.mare }} />
+              <i className="sw" style={{ background: p.palette.biome ? p.palette.ground.soil : GLOBE.mare }} />
               Dark plains
             </li>
           </>
         ) : (
           <>
             <li title="The ground the rovers have mapped, live">
-              <i className="sw sw-ground" />
+              <i className="sw sw-ground" style={p.palette.biome ? { background: groundSwatch(world) } : undefined} />
               Mapped ground
             </li>
             <li title="Not surveyed yet">

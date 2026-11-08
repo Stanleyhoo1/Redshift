@@ -486,8 +486,9 @@ export function sanitizeFeatures(f, prev) {
   }
   return out
 }
-// v7: geysers (vents and eruption state), dunes, mesas, pits, canyon, boulder_fields.
-const EXTRA_FEATURE_KEYS = ['geysers', 'dunes', 'mesas', 'pits', 'canyon', 'boulder_fields']
+// v7: geysers (vents and eruption state), dunes, mesas, pits, canyon, boulder_fields, and the biome
+// blend grid (biome_map, see lib/biomes.js).
+const EXTRA_FEATURE_KEYS = ['geysers', 'dunes', 'mesas', 'pits', 'canyon', 'boulder_fields', 'biome_map']
 
 const LIFE_KINDS = new Set(['grazer'])
 function sanitizeLifeforms(list) {

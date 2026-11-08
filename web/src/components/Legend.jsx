@@ -3,10 +3,13 @@ import { degrees, fixed } from '../lib/format.js'
 import { KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
 import '../styles/scene.css'
 import { TerrainLegend } from './TerrainLegend.jsx'
+import { biomeOf, groundSwatch } from '../lib/biomes.js'
 
 export function Legend({ slopeColors, frontiers, life = true }) {
   const limit = useSim((s) => s.limit)
   const map = useSim((s) => s.map)
+  const world = useSim((s) => s.world)
+  const biome = biomeOf(world)
   const v4 = useSim((s) => s.v4)
   const hasTrace = useSim((s) => s.v4 || s.targets.some((t) => t.kind === 'trace'))
   const lim = Number.isFinite(limit.current) ? limit.current : 30
@@ -42,8 +45,8 @@ export function Legend({ slopeColors, frontiers, life = true }) {
             Slope limit {degrees(lim)} deg
           </div>
           <ul className="legend-list">
-            <li title="The ground as the rovers mapped it: dust on the flats, rock on steep ground">
-              <i className="sw sw-ground" />
+            <li title={biome ? `The ground as the rovers mapped it: ${biome.name.toLowerCase()}, rock on steep ground` : 'The ground as the rovers mapped it: dust on the flats, rock on steep ground'}>
+              <i className="sw sw-ground" style={biome ? { background: groundSwatch(world) } : undefined} />
               Mapped ground <span>{map ? `${fixed(map.minH, 1)} to ${fixed(map.maxH, 1)} m` : '--'}</span>
             </li>
           </ul>

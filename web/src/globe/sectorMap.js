@@ -2,6 +2,7 @@ import { REGOLITH, SAND, WATER } from '../lib/theme.js'
 import { FLORA, ICE } from '../lib/terrainTheme.js'
 import { SUN_DIR } from '../scene/sceneConstants.js'
 import { MARKER_R } from './globeMath.js'
+import { biomeMapOf, biomeWeightAt, worldPalette } from '../lib/biomes.js'
 
 // The fleet's map on the planet (SectorMap.jsx), as plain numbers so Node can test it: the
 // patch it is drawn on and the RGBA pixels it shows. The real sector (a few hundred metres)
@@ -120,7 +121,16 @@ const zoneOk = (z) => Array.isArray(z) && z.length >= 3 && Number.isFinite(z[0])
 // ny, row j = grid row j (south first). Unknown ground is fully transparent black; known
 // ground and the zones are opaque (so filtered texels come out premultiplied). Reuses `out` when it has the right size (a reset may change nx, ny). Pure: the
 // same map gives the same bytes.
-export function paintSectorMap(T, fleet, out) {
+//
+// v7 biomes: `look` (sectorLook below) paints the ground in the world's own ramp, blending in the
+// secondary biome's ramp where features.biome_map says so. Without it: today's ramp, byte for byte.
+export function sectorLook(world, features) {
+  const pal = worldPalette(world)
+  if (!pal.biome) return null
+  return { ramp: pal.map.map(rgb), ramp2: pal.map2.map(rgb), rock: rgb(pal.ground.rock), rock2: rgb(pal.ground2.rock), bmap: biomeMapOf(features) }
+}
+
+export function paintSectorMap(T, fleet, out, look = null) {
   const nx = T?.nx | 0
   const ny = T?.ny | 0
   const n = nx * ny * 4
@@ -146,16 +156,25 @@ export function paintSectorMap(T, fleet, out) {
         const gy = ((hn - hs) / (2 * step)) * RELIEF
         const shade = clamp((-gx * LIGHT[0] - gy * LIGHT[1] + LIGHT[2]) / Math.sqrt(gx * gx + gy * gy + 1) / LIGHT[2], 0.55, 1.3)
         // Ramp by height, rock on steep ground.
-        const t = clamp((h0 - lo) / span, 0, 1) * (MAP_RAMP.length - 1)
-        const r0 = Math.min(MAP_RAMP.length - 2, Math.floor(t))
+        const ramp = look ? look.ramp : MAP_RAMP
+        const t = clamp((h0 - lo) / span, 0, 1) * (ramp.length - 1)
+        const r0 = Math.min(ramp.length - 2, Math.floor(t))
         const f = t - r0
-        const A = MAP_RAMP[r0]
-        const B = MAP_RAMP[r0 + 1]
+        const A = ramp[r0]
+        const B = ramp[r0 + 1]
         const rock = smooth(20, 40, Number.isFinite(slope[k]) ? slope[k] : 0) * 0.6
         const o = k * 4
+        const bw = look && look.bmap ? biomeWeightAt(look.bmap, T.ox + i * step, T.oy + j * step) : 0
         for (let c = 0; c < 3; c++) {
-          const base = A[c] + (B[c] - A[c]) * f
-          out[o + c] = clamp(Math.round((base + (ROCK[c] - base) * rock) * shade), 0, 255)
+          let base = A[c] + (B[c] - A[c]) * f
+          let rk = look ? look.rock[c] : ROCK[c]
+          if (bw > 0) {
+            const A2 = look.ramp2[r0]
+            const B2 = look.ramp2[r0 + 1]
+            base += (A2[c] + (B2[c] - A2[c]) * f - base) * bw
+            rk += (look.rock2[c] - rk) * bw
+          }
+          out[o + c] = clamp(Math.round((base + (rk - base) * rock) * shade), 0, 255)
         }
         out[o + 3] = 255
       }
