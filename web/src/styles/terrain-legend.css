@@ -90,3 +90,33 @@
     radial-gradient(circle at 70% 30%, var(--c) 0 17%, transparent 20%),
     radial-gradient(circle at 52% 74%, var(--c) 0 25%, transparent 28%);
 }
+
+/* On short screens a stacked terrain list would push the legend up into the controls panel,
+   so the terrain entries move into a second column beside the rest of the legend. */
+@media (max-height: 860px) {
+  .hud-legend:has(.legend-terrain) {
+    display: grid;
+    grid-template-columns: auto auto;
+    align-content: start;
+  }
+
+  .hud-legend:has(.legend-terrain) > * {
+    grid-column: 1;
+  }
+
+  .hud-legend > .legend-terrain {
+    grid-column: 2;
+    grid-row: 1 / span 8;
+    margin: 0 0 0 14px;
+    padding: 0 0 0 14px;
+    border-top: 0;
+    border-left: 1px solid var(--line);
+  }
+
+  .legend-terrain .legend-row {
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 6px 12px;
+    margin-top: 7px;
+  }
+}
