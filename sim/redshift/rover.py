@@ -408,6 +408,9 @@ class Rover:
             hit &= (dist > 0.05) & (dist <= rng_max)
         self.lidar_hits = int(hit.sum())
         returned = hit.copy()              # anything that echoed back (ground, rocks, markers, creatures)
+        fl = getattr(self.sim, "flora", None)
+        if fl is not None:                 # v7 flora: stalks stay map obstacles; the camera may classify them
+            fl.on_scan(self, pnt, vec, gid, dist, hit, t)
         tmap = self.sim.world.target_geom_ids
         self.spectro = None
         if tmap:

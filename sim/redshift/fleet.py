@@ -725,7 +725,7 @@ class Fleet:
     # ------------------------------------------------------------------ stats
     def stats(self) -> dict:
         found = sum(1 for ts in self.targets if ts.status is not None)
-        return {
+        out = {
             "explored_pct": round(self.map.explored_pct(), 1),
             "slope_limit_deg": round(self.slope_limit, 1),
             "slope_limit_initial_deg": round(float(self.cfg.slope_limit_initial_deg), 1),
@@ -741,6 +741,9 @@ class Fleet:
             "samples_carried": int(sum(len(r.samples) for r in self.rovers)),
             "science_score": int(self.science_score),
         }
+        if getattr(self, "flora", None) is not None:
+            out.update(self.flora.stats())     # v7: only when flora is on and some is known
+        return out
 
     def discovered_targets(self) -> list:
         return [ts.to_msg() for ts in self.targets if ts.status is not None]
