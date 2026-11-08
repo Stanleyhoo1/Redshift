@@ -6,6 +6,7 @@ import { appStore, simStore, useSim, roverPoses, hudLayout } from '../state/stor
 import { sampleGroundNear } from '../state/simState.js'
 import { hasPlaces } from '../lib/answers.js'
 import { groundAt } from './ground.js'
+import { viewMode } from '../globe/viewMode.js'
 
 const _d = new THREE.Vector3()
 const _o = new THREE.Vector3()
@@ -18,7 +19,7 @@ const ELEVATION = 0.98 // overview camera angle above the horizon, radians
 // The control panel covers the left edge and the hazard bar the top, so the picture is
 // shifted to be centred in what is left. With the sensor panel open (a rover selected)
 // the free space is the band above it, where the followed rover then sits.
-function freeRect(size) {
+export function freeRect(size) {
   const { width: W, height: H } = size
   if (W <= 640) return { x0: 0, x1: W, y0: H * 0.06, y1: H * 0.94 }
   const c = hudLayout.controls
@@ -220,7 +221,7 @@ function fitPose(camera, target0, size, pts, rect, maxDist) {
 
 // Keeps the free part of the view centred on screen with a view offset, easing when a
 // panel opens or closes so the picture glides instead of jumping.
-function applyShift(s, camera, size, free, dt) {
+export function applyShift(s, camera, size, free, dt) {
   const W = size.width
   const H = size.height
   const wx = (free.x0 + free.x1) / 2 - W / 2
@@ -299,6 +300,14 @@ export function CameraRig({ follow, overview = 0, focus = null }) {
     const c = controls.current
     if (!c || !map) return
     const s = st.current
+    // v7 planet view (src/globe): the sector camera only moves while the sector is wanted
+    // and drawn; meanwhile its controls ignore the mouse.
+    const v = viewMode.get()
+    c.enabled = v.view === 'plane' && v.render === 'plane'
+    if (v.view === 'globe' || v.render === 'globe') {
+      s.hasLast = false
+      return
+    }
     // Anything that moved the orbit target since our last frame was the user panning
     // (OrbitControls updates before this frame; rotate and zoom leave the target alone).
     const moved = s.hasLast ? c.target.distanceTo(s.last) : 0

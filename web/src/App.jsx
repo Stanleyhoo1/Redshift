@@ -13,6 +13,8 @@ import { SensorDetail } from './components/SensorDetail.jsx'
 import { startConnection, wsUrl } from './net/connection.js'
 import { appStore, simStore, useApp, useSim } from './state/store.js'
 import { stopPlacing } from './lib/placement.js'
+// v7 planet view (src/globe)
+import { GlobeFade } from './globe/GlobeFade.jsx'
 
 function Waiting() {
   const ready = useSim((s) => s.ready)
@@ -158,6 +160,8 @@ export default function App() {
         <Canvas flat linear dpr={[1, 1.5]} camera={{ position: [0, 68, 46], fov: 42, near: 0.5, far: 2000 }} gl={{ antialias: true, powerPreference: 'high-performance' }}>
           <Scene view={view} follow={follow} overview={overview} selected={selected} onSelect={show} focus={focus} />
         </Canvas>
+        {/* v7: the fade between the sector and the planet */}
+        <GlobeFade />
         <DustHaze />
         <div className="vignette" aria-hidden="true" />
         <ViewControls view={view} setView={setView} follow={follow} onSelect={show} onOverview={goOverview} />

@@ -23,6 +23,9 @@ import { CameraRig } from './CameraRig.jsx'
 import { Atmosphere } from './Atmosphere.jsx'
 import { Gravel } from './Gravel.jsx'
 import { cameraDebug } from './debugCamera.js'
+import { GlobeLayer } from '../globe/GlobeLayer.jsx'
+import { globeDebug } from '../globe/globeDebug.js'
+import { viewMode } from '../globe/viewMode.js'
 
 // Test aid, only with ?debug in the URL: lets scripts find where a world point is on
 // screen and read a slim copy of the sim state (see scripts/v4-shots.mjs).
@@ -35,6 +38,7 @@ function DebugHook() {
   useEffect(() => {
     window.__redshift = {
       ...cameraDebug(camera, () => get().controls),
+      ...globeDebug(),
       screenOf(x, y, lift = 0) {
         const v = new THREE.Vector3(x, groundAt(x, y) + lift, -y).project(camera)
         const r = gl.domElement.getBoundingClientRect()
@@ -72,6 +76,9 @@ function DebugHook() {
           hazards: s.hazards,
           requests: s.requests,
           lander: s.lander,
+          view: viewMode.get().view,
+          viewRender: viewMode.get().render,
+          viewPhase: viewMode.get().phase,
         }
       },
     }
@@ -105,6 +112,7 @@ export function Scene({ view, follow, overview, selected, onSelect, focus }) {
       <PlaceCandidates />
       <Placement reality={view.reality} />
       <CameraRig follow={follow} overview={overview} focus={focus} />
+      <GlobeLayer onSelect={onSelect} />
       {DEBUG && <DebugHook />}
     </>
   )
