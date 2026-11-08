@@ -59,8 +59,11 @@ console.log(`lifeforms: ${Object.entries(kinds).map(([k, v]) => `${k} ${v.length
 const view = async (name, id, dist, el, az = 25) => {
   const l = await page.evaluate((id) => window.__redshift.state().lifeforms.find((q) => q.id === id), id)
   if (!l) return
-  await page.evaluate(([x, y, az, el, d]) => window.__redshift.view(x, y, az, el, d), [l.x, l.y, az, el, dist])
-  await page.waitForTimeout(1500)
+  // twice: the first call can land while the camera is still easing to its start view
+  for (let k = 0; k < 2; k++) {
+    await page.evaluate(([x, y, az, el, d]) => window.__redshift.view(x, y, az, el, d), [l.x, l.y, az, el, dist])
+    await page.waitForTimeout(800)
+  }
   await shot(name)
 }
 // close-ups: hide the panels so the creature is not behind them
