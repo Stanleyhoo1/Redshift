@@ -291,6 +291,37 @@ Rover additions:
 
 Fleet additions: `"samples_cached"`, `"samples_carried"` (counts) and `"science_score"` (sum of `value` of cached samples).
 
+## Version 5 additions (asking rovers questions, rover stats, large camera frames)
+
+All optional for clients.
+
+### Questions in chat
+
+`POST /api/chat` is unchanged. The sim decides whether operator text is a command or a question (Gemma's interpretation, or the rule-based parser: question words, a trailing "?", "tell me", "report", "status"). A question gets an answer instead of an action:
+
+```json
+{"id": "c40", "t": 512.0, "from": "r2", "to": "operator", "kind": "reply", "source": "gemma", "reply_to": "c39",
+ "text": "I've mapped about 1,900 m2 (14% of the region), mostly north-east of the lander, and driven 410 m. Found 3 targets: t4 ice, t7 mineral, t9 ice. Sampled 2 of them."}
+```
+
+- New `kind`: `"reply"` (an answer to an operator question). New optional field `reply_to`: the id of the operator message it answers (also allowed on `ack` and `refuse`).
+- Addressed to one rover ("rover 2, what have you found?", or `rover` in the POST body): that rover replies. Addressed to everyone or nobody ("what has the fleet explored?"): one reply `from: "fleet"`, unless the question is clearly per rover ("everyone, report battery"), then each rover replies.
+- Answers are grounded: the sim builds a fact sheet from the rover's own state and memory (what it mapped, where, what it found and sampled, hazards met, lifeforms seen, current goal and why, battery). Gemma writes the reply from the fact sheet only; any number in the reply that is not in the fact sheet makes the sim use its rule-based answer instead. Without Gemma the rule-based answers cover status, exploration, finds, samples, battery, hazards, lifeforms, water, location and "why".
+- A rover never makes up what it has not sensed: if asked about something outside its knowledge, it says so.
+- Clarification (sim implementation): every chat message carries `reply_to` (null when it answers nothing, e.g. operator messages). Besides `reply`, `ack` and `refuse`, it is also set on the `question` sent back when a command was unclear and on the `info` line when a pending trip is dropped. The reply arrives within about 3 s (Gemma's latency budget), otherwise the rule-based answer is posted.
+
+### Rover addition: `stats` (in every `tick.rovers[]` entry, optional)
+
+```json
+"stats": {"distance_m": 410.2, "mapped_m2": 1904.0, "targets_found": 3, "samples_taken": 2, "hazards_met": 4, "lifeforms_seen": 1, "replans": 17}
+```
+
+Running totals for this rover since the sim started: `distance_m` driven, `mapped_m2` of ground first mapped by this rover, targets it found, samples it collected, hazards it detected (rocks, sand, dust, spire), herds it observed, and replans.
+
+### Camera size
+
+`GET /api/camera/{rover_id}.jpg` now accepts `w` and `h` up to 1280 x 720 (for an enlarged view in the UI). Larger values are clamped. Default stays 320 x 240.
+
 ### `GET /api/camera/{rover_id}.jpg`
 
 Live image rendered by MuJoCo from the rover's point of view, at the current sim state.

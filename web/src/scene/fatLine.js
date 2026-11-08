@@ -43,6 +43,9 @@ export class FatPolyline {
       vertexColors,
       worldUnits: false,
     })
+    // HUD layer: exact theme colours, no tone mapping or haze.
+    this.material.toneMapped = false
+    this.material.fog = false
     this.object = new LineSegments2(geo, this.material)
     this.object.frustumCulled = false
     this.object.visible = false

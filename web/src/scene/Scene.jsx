@@ -1,6 +1,5 @@
 import { useEffect } from 'react'
 import { useThree } from '@react-three/fiber'
-import { Stars } from '@react-three/drei'
 import * as THREE from 'three'
 import { simStore } from '../state/store.js'
 import { groundAt } from './ground.js'
@@ -20,8 +19,9 @@ import { Spires, fallDebug } from './Spires.jsx'
 import { Life } from './Life.jsx'
 import { Placement } from './Placement.jsx'
 import { CameraRig } from './CameraRig.jsx'
-import { SUN_DIR, reducedMotion } from './sceneConstants.js'
-import { VOID } from '../lib/theme.js'
+import { Atmosphere } from './Atmosphere.jsx'
+import { Gravel } from './Gravel.jsx'
+import { cameraDebug } from './debugCamera.js'
 
 // Test aid, only with ?debug in the URL: lets scripts find where a world point is on
 // screen and read a slim copy of the sim state (see scripts/v4-shots.mjs).
@@ -30,8 +30,10 @@ const DEBUG = typeof location !== 'undefined' && /[?&]debug\b/.test(location.sea
 function DebugHook() {
   const camera = useThree((s) => s.camera)
   const gl = useThree((s) => s.gl)
+  const get = useThree((s) => s.get)
   useEffect(() => {
     window.__redshift = {
+      ...cameraDebug(camera, () => get().controls),
       screenOf(x, y, lift = 0) {
         const v = new THREE.Vector3(x, groundAt(x, y) + lift, -y).project(camera)
         const r = gl.domElement.getBoundingClientRect()
@@ -76,21 +78,18 @@ function DebugHook() {
       fallDebug.hold = null
       delete window.__redshift
     }
-  }, [camera, gl])
+  }, [camera, gl, get])
   return null
 }
 
 export function Scene({ view, follow, overview, selected, onSelect, focus }) {
   return (
     <>
-      <color attach="background" args={[VOID]} />
-      <ambientLight intensity={0.55} />
-      <hemisphereLight args={['#c9dcff', '#3a2620', 0.35]} />
-      <directionalLight position={SUN_DIR.map((v) => v * 100)} intensity={1.35} />
-      <Stars radius={300} depth={90} count={2600} factor={4} saturation={0} fade speed={reducedMotion ? 0 : 0.35} />
+      <Atmosphere />
       <DustStorm />
       <Ground />
       <Terrain slopeColors={view.slope} />
+      <Gravel />
       <Water reality={view.reality} />
       <HazardVisuals reality={view.reality} />
       <Spires reality={view.reality} />

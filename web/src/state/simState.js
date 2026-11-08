@@ -254,7 +254,7 @@ function keyEvents(list, seq) {
 }
 
 const EVENT_SOURCES = new Set(['rules', 'gemma', 'operator'])
-const CHAT_KINDS = new Set(['command', 'ack', 'refuse', 'question', 'answer', 'info'])
+const CHAT_KINDS = new Set(['command', 'ack', 'refuse', 'question', 'answer', 'info', 'reply'])
 
 // v3 chat messages, keyed like events. Unknown kinds read as info.
 function keyChat(list, seq) {
@@ -272,6 +272,8 @@ function keyChat(list, seq) {
       kind: CHAT_KINDS.has(m.kind) ? m.kind : 'info',
       source: m.source === 'gemma' || m.source === 'rules' ? m.source : null,
       request_id: m.request_id == null ? null : String(m.request_id),
+      // v5: the operator message this answers (on reply, ack and refuse). Missing: null.
+      reply_to: m.reply_to == null || m.reply_to === '' ? null : String(m.reply_to),
     })
   }
   return { chat: out, seq }
@@ -415,7 +417,20 @@ function sanitizeRover(r, prev) {
     samples: Array.isArray(r.samples) ? r.samples.filter((id) => id != null).map(String) : null,
     capacity: Number.isFinite(r.capacity) && r.capacity > 0 ? Math.round(r.capacity) : null,
     sampling: isObj(r.sampling) && r.sampling.target != null ? { target: String(r.sampling.target), instrument: r.sampling.instrument == null ? null : String(r.sampling.instrument), progress: Math.max(0, Math.min(1, num(r.sampling.progress, 0))) } : null,
+    // v5 running totals (null when the sim does not send them)
+    stats: sanitizeStats(r.stats, prev?.stats),
   }
+}
+
+const STAT_KEYS = ['distance_m', 'mapped_m2', 'targets_found', 'samples_taken', 'hazards_met', 'lifeforms_seen', 'replans']
+
+// v5 rover stats: numbers or null per field. Same object while unchanged.
+function sanitizeStats(st, prev) {
+  if (!isObj(st)) return null
+  const next = {}
+  for (const k of STAT_KEYS) next[k] = num(st[k], null)
+  if (prev && STAT_KEYS.every((k) => prev[k] === next[k])) return prev
+  return next
 }
 
 // v4 static features (init, or a tick that resends them). Same object when unchanged.

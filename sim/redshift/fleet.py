@@ -123,6 +123,11 @@ class Fleet:
         self.events.append(e)
         if len(self.events) > 400:
             del self.events[:100]
+        if rover is not None:
+            for r in self.rovers:              # the rover's own mission memory (answers.py)
+                if r.id == rover:
+                    r.mem.on_event(e)
+                    break
 
     @staticmethod
     def public_event(e: dict) -> dict:
@@ -584,6 +589,7 @@ class Fleet:
         ts.status = "found"
         ts.found_by = rover.id
         ts.found_t = t
+        rover.mem.on_target(ts, t)
         label = KIND_LABEL[ts.spec.kind]
         dirn = compass(ts.spec.x - rover.x, ts.spec.y - rover.y)
         at = (ts.spec.x, ts.spec.y)
@@ -650,6 +656,7 @@ class Fleet:
         ts.carried_by = rover.id
         if tidx not in rover.samples:
             rover.samples.append(tidx)
+        rover.mem.on_sample(ts, t)
         self.sampled_points.append((ts.spec.x, ts.spec.y))
         used = len(rover.samples)
         verb = VERB.get(ts.spec.instrument, "sampled")
@@ -673,6 +680,7 @@ class Fleet:
             self.samples_cached += 1
             self.science_score += int(ts.value or 0)
         rover.samples = []
+        rover.mem.on_cache(n, t)
         self.log(t, "discovery", f"{rover.id} cached {n} sample{'s' if n != 1 else ''} at the lander (fleet total "
                                  f"{self.samples_cached}, science score {self.science_score}).", rover.id, at=rover.dock)
         return n

@@ -62,5 +62,34 @@ export const KIND_STYLE = {
   trace: { label: 'Trace', long: 'organic trace', color: '#ff9ec7' },
 }
 
+// The realistic 3D world (sRGB hex). A dense, hazy super-Earth atmosphere lit by a low,
+// warm red-dwarf sun: peach haze at the horizon, dusky mauve at the zenith.
+export const ATMOSPHERE = {
+  zenith: '#3d3747',
+  sky: '#8a6863',
+  horizon: '#d6a586',
+  haze: '#b48a75', // distance haze, matched to the sky low over the horizon
+  groundHaze: '#5a4639', // the sky dome below the horizon
+  sun: '#fff1d6', // sun disk
+  sunGlow: '#ffb27a',
+  sunLight: '#ffdab4', // key light
+  fillSky: '#b9a3a4', // hemisphere fill from the sky
+  fillGround: '#4a372b', // and bounced from the ground
+  dust: '#7d5a40', // dust storm haze
+  dustSky: '#5a4030',
+}
+
+// Ground materials: fine ochre dust on flats, darker basalt on steep ground and ridges.
+export const REGOLITH = {
+  dustLight: '#ad9a88',
+  dust: '#86735f',
+  soil: '#4f4741',
+  rock: '#4a4440',
+  rockLight: '#7a6f67',
+  strataA: '#83695a',
+  strataB: '#3b3431',
+  pebble: '#a09385',
+}
+
 export const stateStyle = (s) => STATE_STYLE[s] || { label: s ? s[0].toUpperCase() + s.slice(1) : 'Unknown', color: '#8d99aa' }
 export const kindStyle = (k) => KIND_STYLE[k] || { label: k || 'Target', long: k || 'target', color: '#e6edf5' }

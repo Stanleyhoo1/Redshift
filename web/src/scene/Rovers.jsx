@@ -9,17 +9,15 @@ import { FatPolyline } from './fatLine.js'
 import { glowTexture, warningTexture } from './textures.js'
 import { reducedMotion } from './sceneConstants.js'
 import { HAZARD } from '../lib/theme.js'
+import { hardwareMaterials } from './hardware.js'
+import { MAST_TOP, WHEELS, WHEEL_R, roverParts } from './roverModel.js'
+import { RoverDust, dustSources } from './RoverDust.jsx'
 
 const MODEL_SCALE = 1.5 // a little larger than life so rovers read on a projector
 
 const geo = {
-  body: new THREE.BoxGeometry(1.15, 0.3, 0.78),
-  wheel: new THREE.CylinderGeometry(0.21, 0.21, 0.16, 14).rotateX(Math.PI / 2),
-  panel: new THREE.BoxGeometry(0.56, 0.04, 0.86), // rear half only, so the colour shows from above
-  mast: new THREE.BoxGeometry(0.06, 0.42, 0.06),
-  head: new THREE.BoxGeometry(0.16, 0.13, 0.32),
-  light: new THREE.BoxGeometry(0.04, 0.07, 0.56),
   halo: new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
+  idRing: new THREE.RingGeometry(1.22, 1.32, 64).rotateX(-Math.PI / 2),
   goalRing: new THREE.RingGeometry(0.72, 0.92, 48).rotateX(-Math.PI / 2),
   goalDot: new THREE.CircleGeometry(0.2, 20).rotateX(-Math.PI / 2),
   selRing: new THREE.RingGeometry(1.85, 1.98, 64).rotateX(-Math.PI / 2),
@@ -31,34 +29,41 @@ const faultMats = {
   glow: new THREE.MeshBasicMaterial({ color: HAZARD, map: glowTexture(), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }),
   sign: new THREE.SpriteMaterial({ map: warningTexture(), transparent: true, depthWrite: false, depthTest: false }),
 }
-const shared = {
-  wheel: new THREE.MeshStandardMaterial({ color: '#1a1e26', roughness: 0.9, metalness: 0.1 }),
-  panel: new THREE.MeshStandardMaterial({ color: '#1c2a45', roughness: 0.35, metalness: 0.6 }),
-  metal: new THREE.MeshStandardMaterial({ color: '#9aa4b2', roughness: 0.5, metalness: 0.5 }),
-  head: new THREE.MeshBasicMaterial({ color: '#e8f6ff' }),
-  light: new THREE.MeshBasicMaterial({ color: '#ffffff' }),
-}
-const WHEELS = [
-  [0.4, 0.21, 0.47],
-  [-0.4, 0.21, 0.47],
-  [0.4, 0.21, -0.47],
-  [-0.4, 0.21, -0.47],
-]
 
-function RoverModel({ color }) {
-  // A touch of emissive keeps the fleet colours readable on a washed-out projector.
-  const body = useMemo(() => new THREE.MeshStandardMaterial({ color, roughness: 0.45, metalness: 0.15, emissive: color, emissiveIntensity: 0.22 }), [color])
-  useEffect(() => () => body.dispose(), [body])
+// Wheels, LiDAR head and beacon move; everything else is merged per material (roverModel.js).
+function RoverModel({ color, wheels, lidar, beacon }) {
+  const P = roverParts()
+  const M = hardwareMaterials()
+  // The identity colour as an accent (stripes, mast band, nose), a little self-lit so it
+  // reads on a washed-out projector.
+  const accent = useMemo(() => {
+    const m = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55, roughness: 0.4, metalness: 0.1 })
+    m.userData.realistic = true
+    return m
+  }, [color])
+  const laserMat = useMemo(() => new THREE.MeshBasicMaterial({ color }), [color])
+  const beaconMat = useMemo(() => new THREE.SpriteMaterial({ map: glowTexture(), color, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: false }), [color])
+  useEffect(() => () => (accent.dispose(), laserMat.dispose(), beaconMat.dispose()), [accent, laserMat, beaconMat])
   return (
     <group scale={MODEL_SCALE}>
-      <mesh geometry={geo.body} material={body} position={[0, 0.43, 0]} />
-      {WHEELS.map((p, i) => (
-        <mesh key={i} geometry={geo.wheel} material={shared.wheel} position={p} />
+      <mesh geometry={P.paint} material={M.paint} castShadow receiveShadow />
+      <mesh geometry={P.gold} material={M.gold} castShadow />
+      <mesh geometry={P.solar} material={M.solar} castShadow receiveShadow />
+      <mesh geometry={P.dark} material={M.dark} castShadow />
+      <mesh geometry={P.metal} material={M.metal} />
+      <mesh geometry={P.glass} material={M.glass} />
+      <mesh geometry={P.lamp} material={M.lamp} />
+      <mesh geometry={P.accent} material={accent} />
+      <group ref={lidar} position={P.lidarAt}>
+        <mesh geometry={P.laser} material={laserMat} />
+      </group>
+      {WHEELS.map((w, i) => (
+        <group key={i} position={w} ref={(el) => (wheels.current[i] = el)}>
+          <mesh geometry={P.tyre} material={M.tyre} castShadow />
+          <mesh geometry={P.hub} material={M.metal} />
+        </group>
       ))}
-      <mesh geometry={geo.panel} material={shared.panel} position={[-0.26, 0.6, 0]} />
-      <mesh geometry={geo.mast} material={shared.metal} position={[0.38, 0.8, 0]} />
-      <mesh geometry={geo.head} material={shared.head} position={[0.42, 1.04, 0]} />
-      <mesh geometry={geo.light} material={shared.light} position={[0.585, 0.45, 0]} />
+      <sprite ref={beacon} material={beaconMat} position={[0.205, MAST_TOP, 0]} scale={0.011} renderOrder={5} />
     </group>
   )
 }
@@ -68,6 +73,10 @@ const _fwd = new THREE.Vector3()
 const _side = new THREE.Vector3()
 const _basis = new THREE.Matrix4()
 const _q = new THREE.Quaternion()
+const _qa = new THREE.Quaternion()
+const _e = new THREE.Euler()
+const Y = new THREE.Vector3(0, 1, 0)
+const D2R = Math.PI / 180
 
 function groundNormal(T, x, y, out) {
   const d = 0.6
@@ -89,18 +98,24 @@ function Rover({ meta, selected, onSelect }) {
   const fault = useRef()
   const sign = useRef()
   const sel = useRef()
+  const wheels = useRef([])
+  const lidar = useRef()
+  const beacon = useRef()
   const state = useSim((s) => s.rovers[meta.id]?.state)
   const faulted = state === 'fault'
   const asking = useSim((s) => s.requests.some((q) => q.rover === meta.id)) // v3: waiting for the operator
   // drei <Html> picks its DOM container once R3F has connected its events; mounting it
   // earlier makes it unmount and remount its own React root (a React error in dev).
   const labelsReady = useThree((s) => !!s.events.connected)
-  const haloMat = useMemo(
-    () => new THREE.MeshBasicMaterial({ color: meta.color, map: glowTexture(), transparent: true, opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending }),
+  const markMats = useMemo(
+    () => ({
+      halo: new THREE.MeshBasicMaterial({ color: meta.color, map: glowTexture(), transparent: true, opacity: 0.2, depthWrite: false, blending: THREE.AdditiveBlending }),
+      ring: new THREE.MeshBasicMaterial({ color: meta.color, transparent: true, opacity: 0.8, depthWrite: false }),
+    }),
     [meta.color],
   )
-  useEffect(() => () => haloMat.dispose(), [haloMat])
-  useEffect(() => () => roverPoses.delete(meta.id), [meta.id])
+  useEffect(() => () => (markMats.halo.dispose(), markMats.ring.dispose()), [markMats])
+  useEffect(() => () => (roverPoses.delete(meta.id), dustSources.delete(meta.id)), [meta.id])
   useEffect(() => () => (document.body.style.cursor = ''), [])
 
   // Click (not drag) on the rover or its label selects it: sensor panel and follow.
@@ -125,14 +140,19 @@ function Rover({ meta, selected, onSelect }) {
     if (!r) {
       o.visible = false
       roverPoses.delete(meta.id)
+      dustSources.delete(meta.id)
       return
     }
     let p = pose.current
     if (!p || Math.hypot(r.x - p.x, r.y - p.y) > 8) {
-      p = pose.current = { x: r.x, y: r.y, yaw: r.yaw, gz: null }
+      p = pose.current = { x: r.x, y: r.y, yaw: r.yaw, gz: null, spin: 0, v: 0, lidar: 0 }
     }
     // Ticks arrive at ~5 Hz; ease towards the latest one so motion stays smooth.
-    const a = 1 - Math.exp(-Math.min(dt, 0.1) * 8)
+    const step = Math.min(dt, 0.1)
+    const a = 1 - Math.exp(-step * 8)
+    const ox = p.x
+    const oy = p.y
+    const oyaw = p.yaw
     p.x += (r.x - p.x) * a
     p.y += (r.y - p.y) * a
     p.yaw += wrap(r.yaw - p.yaw) * a
@@ -142,19 +162,60 @@ function Rover({ meta, selected, onSelect }) {
     o.visible = true
     o.position.set(p.x, p.gz, -p.y)
 
-    groundNormal(s.terrain, p.x, p.y, _up)
-    _fwd.set(Math.cos(p.yaw), 0, -Math.sin(p.yaw))
-    _fwd.addScaledVector(_up, -_fwd.dot(_up)).normalize()
-    _side.crossVectors(_fwd, _up)
-    _basis.makeBasis(_fwd, _up, _side)
-    _q.setFromRotationMatrix(_basis)
+    // Attitude: the IMU's pitch and roll when the sim sends them (nose up and right side
+    // down positive), else the slope of the known ground.
+    const sn = r.sensors
+    if (sn && Number.isFinite(sn.pitch) && Number.isFinite(sn.roll)) {
+      _q.setFromAxisAngle(Y, p.yaw)
+      _qa.setFromEuler(_e.set(sn.roll * D2R, 0, sn.pitch * D2R, 'ZXY'))
+      _q.multiply(_qa)
+    } else {
+      groundNormal(s.terrain, p.x, p.y, _up)
+      _fwd.set(Math.cos(p.yaw), 0, -Math.sin(p.yaw))
+      _fwd.addScaledVector(_up, -_fwd.dot(_up)).normalize()
+      _side.crossVectors(_fwd, _up)
+      _basis.makeBasis(_fwd, _up, _side)
+      _q.setFromRotationMatrix(_basis)
+    }
     if (inner.current) inner.current.quaternion.slerp(_q, Math.min(1, a * 1.2))
     roverPoses.set(meta.id, o.position)
+
+    // Wheels: surface speed from the encoders when known (they spin faster than the rover
+    // moves when it slips), signed by the direction of travel; skid steer turns spin the
+    // two sides against each other.
+    const moved = Math.hypot(p.x - ox, p.y - oy)
+    const along = (p.x - ox) * Math.cos(p.yaw) + (p.y - oy) * Math.sin(p.yaw)
+    const gs = moved / Math.max(step, 1e-3)
+    const ws = sn && Number.isFinite(sn.wheel_speed) && r.state !== 'fault' ? sn.wheel_speed : gs
+    const dir = along < -1e-4 ? -1 : 1
+    p.v += (ws * dir - p.v) * Math.min(1, step * 6)
+    const turn = wrap(p.yaw - oyaw) / Math.max(step, 1e-3)
+    const R = WHEEL_R * MODEL_SCALE
+    const half = 0.4 * MODEL_SCALE
+    if (!reducedMotion) {
+      for (let i = 0; i < 4; i++) {
+        const w = wheels.current[i]
+        if (!w) continue
+        const right = WHEELS[i][2] > 0
+        const v = p.v + (right ? 1 : -1) * turn * half
+        w.rotation.z -= (v / R) * step
+      }
+      if (lidar.current && r.state !== 'fault') lidar.current.rotation.y += step * 9
+    }
+    // Dust from the rear wheels (RoverDust reads this).
+    let src = dustSources.get(meta.id)
+    if (!src) dustSources.set(meta.id, (src = { x: 0, y: 0, z: 0, yaw: 0, speed: 0, color: meta.color }))
+    src.x = p.x
+    src.y = p.y
+    src.z = p.gz
+    src.yaw = p.yaw
+    src.speed = Math.max(Math.abs(p.v), gs)
 
     // Motor fault: a blinking crimson ring and a warning sign over the parked rover.
     const isFault = r.state === 'fault'
     const t = clock.elapsedTime
     const blink = reducedMotion ? 1 : 0.5 + 0.5 * Math.sign(Math.sin(t * 6.5))
+    if (beacon.current) beacon.current.material.opacity = isFault ? 0.25 + 0.5 * blink : 0.85
     if (fault.current) {
       fault.current.visible = isFault
       if (isFault) {
@@ -193,8 +254,9 @@ function Rover({ meta, selected, onSelect }) {
       onPointerOut={() => (document.body.style.cursor = '')}
     >
       <group ref={inner}>
-        <RoverModel color={meta.color} />
-        <mesh geometry={geo.halo} material={haloMat} scale={4.2} position={[0, 0.06, 0]} renderOrder={3} />
+        <RoverModel color={meta.color} wheels={wheels} lidar={lidar} beacon={beacon} />
+        <mesh geometry={geo.halo} material={markMats.halo} scale={3.4} position={[0, 0.05, 0]} renderOrder={3} />
+        <mesh geometry={geo.idRing} material={markMats.ring} position={[0, 0.07, 0]} renderOrder={3} />
       </group>
       <mesh ref={sel} geometry={geo.selRing} material={selMat} position={[0, 0.1, 0]} visible={!!selected} renderOrder={3} />
       <group ref={fault} visible={false}>
@@ -357,6 +419,7 @@ export function Rovers({ showPaths, selected, onSelect }) {
           <Rover meta={m} selected={selected === m.id} onSelect={onSelect} />
         </group>
       ))}
+      <RoverDust />
     </group>
   )
 }

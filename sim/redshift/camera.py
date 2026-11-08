@@ -11,6 +11,15 @@ reset brings a new model). Requests reach it through a queue and get a Future ba
 handler awaits it. The sim lock is held only while mjv_updateScene copies the state into the
 scene; rendering, reading pixels and JPEG encoding happen outside the lock.
 
+Look (visuals.py): procedural regolith, hazy sky with a low sun, the sun's shadows and distance haze.
+  shadows  the directional light's shadow box (SHADOW_CLIP_M around a point a little ahead of the
+           camera) is moved in front of each camera before rendering, so shadows are crisp where the
+           camera looks (CAMERA_SHADOWS=0 switches them off: they cost the most on software GL).
+  haze     exponential distance fog in the horizon colour, applied to the pixels from the depth buffer
+           (MuJoCo's own fog would also fog the skybox, which then turns into one flat colour).
+The rules' quick colour check and spot_targets() render without shadows or haze (machine vision
+frames, cheaper, and on the sim thread). scripts/camera_bench.py measures the render time per frame.
+
 Backends: MuJoCo picks the GL backend from MUJOCO_GL when it is first imported.
   Docker   MUJOCO_GL=osmesa + PYOPENGL_PLATFORM=osmesa (software rendering, no GPU or display).
   Native   the default (GLFW) on Windows, macOS and Linux with a display. On Linux without a
@@ -49,7 +58,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse, Response
 
 DEFAULT_W, DEFAULT_H = 320, 240
-MAX_W, MAX_H = 640, 480
+MAX_W, MAX_H = 1280, 720      # PROTOCOL.md v5 (the model's offscreen buffer is this size too)
 MIN_SIDE = 16
 JPEG_QUALITY = 80
 VIEWS = ("fpv", "chase")
@@ -71,7 +80,12 @@ CHASE_CLEARANCE = 0.8         # keep the chase camera at least this high above t
 CHASE_SIGHT_CLEARANCE = 0.25  # and keep the ground this far below the line of sight to the rover
 CHASE_SMOOTH_S = 0.3          # chase camera heading follows the rover with this time constant (wall s)
 NEAR_CLIP = 0.05              # the model's znear is relative to its extent (several metres here)
-FAR_CLIP = 300.0
+FAR_CLIP = 600.0              # the skybox is drawn beyond 300 m; terrain is never more than ~170 m away
+SKY_DIST_M = 260.0            # pixels farther than this (along the ray) are sky: no distance haze
+SHADOW_CLIP_M = 14.0          # sun shadows are drawn within this many metres of a point ...
+SHADOW_AHEAD_M = 10.0         # ... this far ahead of the camera (beyond that the haze hides their absence)
+SHADOW_BACK_M = 40.0          # the sun's shadow camera sits this far up-sun of that point
+SHADOWS = os.environ.get("CAMERA_SHADOWS", "1").strip().lower() not in ("0", "off", "false", "no")
 
 _GEOM_GROUPS = (1, 1, 1, 1, 1, 1)   # terrain, rocks and spires, targets and lifeforms, rovers, lander ring
                                     # (the walls in group 4 have alpha 0 and are never drawn), liquid (5)
@@ -195,6 +209,83 @@ def _set_frustum(scn: mujoco.MjvScene, spec: CamSpec) -> None:
         c.frustum_center = 0.0
 
 
+def _place_sun_shadow(scn: mujoco.MjvScene, spec: CamSpec) -> None:
+    """Centre the directional light's shadow box on the ground a little ahead of the camera. MuJoCo
+    draws directional shadows in a box of half width shadowClip around the line through the light's
+    position, for casters in front of that position."""
+    f = spec.forward
+    fh = np.array([f[0], f[1], 0.0])
+    n = np.linalg.norm(fh)
+    fh = fh / n if n > 1e-6 else np.zeros(3)
+    focus = spec.eye + fh * SHADOW_AHEAD_M - np.array([0.0, 0.0, 1.0])
+    for i in range(scn.nlight):
+        lt = scn.lights[i]
+        if lt.castshadow and int(lt.type) == int(mujoco.mjtLightType.mjLIGHT_DIRECTIONAL) and not lt.headlight:
+            d = np.asarray(lt.dir, dtype=np.float64)
+            d /= max(np.linalg.norm(d), 1e-9)
+            lt.pos[:] = focus - d * SHADOW_BACK_M
+
+
+def _drop_markers(scn: mujoco.MjvScene, markers: set) -> None:
+    """Leave the science target marker capsules out of a look frame (their natural decoration is drawn)."""
+    geom_t = int(mujoco.mjtObj.mjOBJ_GEOM)
+    for i in range(scn.ngeom):
+        sg = scn.geoms[i]
+        if sg.objtype == geom_t and sg.objid in markers:
+            sg.size[:] = 1e-5
+            sg.pos[2] -= 1000.0
+
+
+def _vision_lighting(scn: mujoco.MjvScene) -> None:
+    """Machine vision frames (look=False): even, near neutral light from the camera (an on-board
+    illuminator) instead of the low warm sun, and no glow, so colours stay close to the true surface
+    colours without clipping (a clipped channel shifts the hue) or white highlights (violet crystal plus
+    a highlight looks lavender, like a mineral marker)."""
+    for i in range(scn.nlight):
+        lt = scn.lights[i]
+        lt.specular[:] = 0.0
+        if lt.headlight:
+            lt.ambient[:] = (0.32, 0.31, 0.3)
+            lt.diffuse[:] = (0.55, 0.54, 0.53)
+        else:
+            lt.diffuse[:] = np.asarray(lt.diffuse) * 0.35
+            lt.ambient[:] = 0.0
+    for i in range(scn.ngeom):
+        scn.geoms[i].emission = 0.0
+
+
+_RAY_K: dict = {}
+
+
+def _ray_factor(h: int, w: int, fovy: float) -> np.ndarray:
+    """Per pixel: distance along the ray / depth along the view axis (cached per image size and fov)."""
+    key = (h, w, round(fovy, 3))
+    k = _RAY_K.get(key)
+    if k is None:
+        tv = math.tan(math.radians(fovy) / 2.0)
+        u = ((np.arange(w) + 0.5) / w * 2.0 - 1.0) * tv * w / h
+        v = (1.0 - (np.arange(h) + 0.5) / h * 2.0) * tv
+        k = np.sqrt(1.0 + u[None, :] ** 2 + v[:, None] ** 2).astype(np.float32)
+        if len(_RAY_K) > 16:
+            _RAY_K.clear()
+        _RAY_K[key] = k
+    return k
+
+
+def _haze(rgb: np.ndarray, dep: np.ndarray, fovy: float) -> np.ndarray:
+    """Distance haze of a dense atmosphere: blend toward the horizon colour with distance along the ray
+    (exponential, nothing within visuals.FOG_START_M), never on the sky (farther than SKY_DIST_M)."""
+    from .visuals import FOG_END_M, FOG_START_M, HORIZON_RGB, HAZE_MAX
+    dist = dep * _ray_factor(dep.shape[0], dep.shape[1], fovy)
+    d = np.clip(dist - FOG_START_M, 0.0, None)
+    f = (1.0 - np.exp(d * (-3.0 / (FOG_END_M - FOG_START_M)))) * HAZE_MAX
+    f[dist > SKY_DIST_M] = 0.0
+    fog = np.asarray(HORIZON_RGB, np.float32) * 255.0
+    out = rgb.astype(np.float32)
+    out += (fog - out) * f[..., None]
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
 def _linear_depth(raw: np.ndarray, near: float, far: float) -> np.ndarray:
     """Depth buffer (reverse Z, as mujoco.Renderer reads it) to metres along the view axis."""
     zfar, znear = np.float32(far), np.float32(near)
@@ -248,8 +339,17 @@ class _Gfx:
         mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN.value, self.con)
         self.con.readDepthMap = mujoco.mjtDepthMap.mjDEPTH_ZEROFAR
         self.scn = mujoco.MjvScene(model, maxgeom=int(model.ngeom) + 500)
-        self.scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
-        self.scn.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+        flags = self.scn.flags
+        flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 1
+        flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+        flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = 1
+        flags[mujoco.mjtRndFlag.mjRND_HAZE] = 0          # the sky texture has its own horizon haze
+        flags[mujoco.mjtRndFlag.mjRND_FOG] = 0           # distance haze is applied from depth (_haze)
+        self.con.shadowClip = SHADOW_CLIP_M
+        # science target marker capsules: what LiDAR, the spectrometer and machine vision see. Look frames
+        # that draw the visual-only decoration (group 4) show the natural target instead (world.py)
+        self.markers = {g for g in range(model.ngeom)
+                        if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("target_")}
         self.cam = mujoco.MjvCamera()
         self._opts: dict = {}
         self.max_w = int(min(MAX_W, model.vis.global_.offwidth))
@@ -345,19 +445,20 @@ class GLRenderer:
         return h
 
     def frame(self, runner, sim, rover_id: str, view: str, w: int, h: int, *,
-              depth: bool = False, hide_groups: tuple = (), smooth: bool = True) -> Frame:
+              depth: bool = False, hide_groups: tuple = (), smooth: bool = True, look: bool = True) -> Frame:
         """Render one view. runner given: hold runner.locked() for the scene update only.
-        runner None: the caller already holds the sim lock (or nothing else touches sim)."""
+        runner None: the caller already holds the sim lock (or nothing else touches sim).
+        look False: no shadows and no distance haze (machine vision frames: cheaper)."""
         self.ensure()
         try:
-            return self._frame(runner, sim, rover_id, view, w, h, depth, tuple(hide_groups), smooth)
+            return self._frame(runner, sim, rover_id, view, w, h, depth, tuple(hide_groups), smooth, look)
         except (UnknownRover, ValueError):
             raise
         except Exception:
             self.release()           # GL trouble: start from a fresh context next time
             raise
 
-    def _frame(self, runner, sim, rover_id, view, w, h, depth, hide_groups, smooth) -> Frame:
+    def _frame(self, runner, sim, rover_id, view, w, h, depth, hide_groups, smooth, look=True) -> Frame:
         for _attempt in range(3):
             g = self._gfx_for(sim.model)
             hold = runner.locked() if runner is not None else contextlib.nullcontext(sim)
@@ -379,16 +480,25 @@ class GLRenderer:
         w = max(MIN_SIDE, min(int(w), g.max_w))
         h = max(MIN_SIDE, min(int(h), g.max_h))
         _set_frustum(g.scn, spec)
+        g.scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 1 if (look and SHADOWS) else 0
+        if look and 4 not in hide_groups and g.markers:
+            _drop_markers(g.scn, g.markers)
+        if look and SHADOWS:
+            _place_sun_shadow(g.scn, spec)
+        elif not look:
+            _vision_lighting(g.scn)
         rect = mujoco.MjrRect(0, 0, w, h)
         self._ctx.make_current()
         mujoco.mjr_render(rect, g.scn, g.con)
         rgb = np.empty((h, w, 3), dtype=np.uint8)
-        raw = np.empty((h, w), dtype=np.float32) if depth else None
+        raw = np.empty((h, w), dtype=np.float32) if (depth or look) else None
         mujoco.mjr_readPixels(rgb, raw, rect, g.con)
         self.frames += 1
-        rgb = np.ascontiguousarray(rgb[::-1])               # OpenGL rows start at the bottom
+        rgb = rgb[::-1]                                     # OpenGL rows start at the bottom
         dep = _linear_depth(raw[::-1], spec.near, spec.far) if raw is not None else None
-        return Frame(rgb, dep, spec, t, pos, yaw)
+        if look:
+            rgb = _haze(rgb, dep, spec.fovy)
+        return Frame(np.ascontiguousarray(rgb), dep if depth else None, spec, t, pos, yaw)
 
 
 class RenderThread:
@@ -693,7 +803,7 @@ def spot_targets(sim, rover, *, w: int = DETECT_W, h: int = DETECT_H,
     no GL context can be made.
     """
     fr = _local_renderer().frame(None, sim, rover.id, "fpv", w, h, depth=True,
-                                 hide_groups=DETECT_HIDE_GROUPS, smooth=False)
+                                 hide_groups=DETECT_HIDE_GROUPS, smooth=False, look=False)
     return detect_targets(fr, palette, max_range)
 
 

@@ -26,6 +26,11 @@ the rovers safe. Tier 2 only advises, on other threads, and the rules check ever
    numbers go to Gemma, which says whether it is a lifeform, gives a short label and an action. The
    first sighting after start or reset (and later ones only when Gemma is unsure) asks the operator:
    follow it, observe from here (the default: it never gets closer) or keep exploring.
+6. Questions (protocol v5). When the operator's message is a question ("rover 2, what have you
+   found?"), the addressed rover (or the fleet) builds a fact sheet from its own memory
+   (answers.py) and Gemma writes a short reply from it; any number or id not in the fact sheet, a
+   slow answer (over the 3 s budget) or Gemma offline means the rule-based answer is used. Replies
+   are kind "reply" with reply_to = the operator message id (acks and refusals carry reply_to too).
 
 Nothing here ever waits for the model in the 5 Hz loop: submits and polls take microseconds.
 """
@@ -38,8 +43,9 @@ import time
 import traceback
 from collections import OrderedDict
 
+from .answers import PER_ROVER_TOPICS, fact_lines, fleet_sheet, rover_sheet, rule_answer
 from .fleet import OVERLAP_RADIUS, compass
-from .gemma import GemmaConfig, GemmaPlanner, parse_command
+from .gemma import GemmaConfig, GemmaPlanner, parse_command, wants_each
 from .planner import PENDING
 from .terrain import KIND_LABEL
 
@@ -136,6 +142,9 @@ class Advisor:
         self.closed: OrderedDict = OrderedDict()     # id -> "answered" | "expired"
         self.req_seq = 0
         self.commands: list = []                     # operator messages waiting for their parse
+        self.answers: list = []                      # questions waiting for Gemma's reply (or the budget)
+        self._reply_to = None                        # operator message the replies being written answer
+        self.n_answers = {"gemma": 0, "rules": 0}
         self.go_jobs: dict = {}                      # rover id -> operator go_to being planned
         self.after_sand: dict = {}                   # rover id -> wait (s) once it is out of the sand
         self.home_after: set = set()                 # rovers to send home once their recovery ends
@@ -199,8 +208,9 @@ class Advisor:
                 "last_ms": s["last_ms"], "budget_ms": s["budget_ms"], "over_budget": s["over_budget"]}
 
     def say(self, frm: str, t: float, text: str, kind: str = "info", to="operator", source="rules",
-            request_id=None) -> str:
-        """Add a chat message (from "operator", a rover id or "fleet"). Returns its id."""
+            request_id=None, reply_to=None) -> str:
+        """Add a chat message (from "operator", a rover id or "fleet"). Returns its id. reply_to: the
+        operator message this answers (protocol v5)."""
         self.chat_seq += 1
         cid = f"c{self.chat_seq}"
         text = _clean(text)
@@ -212,7 +222,8 @@ class Advisor:
                     text = text[:1].upper() + text[1:]
                     break
         self.chat.append({"id": cid, "t": round(float(t), 1), "from": frm, "to": to, "text": text[:400],
-                          "kind": kind, "source": source, "request_id": request_id, "_seq": self.chat_seq})
+                          "kind": kind, "source": source, "request_id": request_id, "reply_to": reply_to,
+                          "_seq": self.chat_seq})
         if len(self.chat) > MAX_CHAT:
             del self.chat[:100]
         return cid
@@ -253,6 +264,8 @@ class Advisor:
         try:
             if self.commands:
                 self._poll_commands(t)
+            if self.answers:
+                self._poll_answers(t)
             if self._done:
                 self._poll_interpretations(t)
             if self.requests:
@@ -449,6 +462,7 @@ class Advisor:
             rover.plan_t = -1e9            # re-plan from where the rover is now (the rules' A*)
             rover.sticky_goal = (gx, gy)
             rover.next_goal_eval = t + 30.0
+            rover.mem.on_goal(t, "gemma", _clean(res.reason).strip("'\" "))
             self._log(t, "info", f"{rover.id} switching to {c['label']} (Gemma, {lat:.1f} s): {why}", rover.id,
                       at=(gx, gy), source="gemma")
         elif c["kind"] == "target":
@@ -872,7 +886,7 @@ class Advisor:
         preview = parse_command(text, ctx)["command"].get("rover")
         cid = self.say("operator", t, text, "command", to=rover_hint or preview or None, source=None)
         tk = self.planner.submit_command(t, text, ctx)
-        self.commands.append({"ticket": tk, "cid": cid, "hint": rover_hint, "t": t, "wall": self.clock()})
+        self.commands.append({"ticket": tk, "cid": cid, "hint": rover_hint, "t": t, "wall": self.clock(), "text": text})
         if self.wait_for_gemma:
             self._wait(tk)
         return cid
@@ -884,15 +898,22 @@ class Advisor:
                 if self.clock() - c["wall"] < self.planner.cfg.timeout_s + 3.0:
                     continue
                 self.commands.remove(c)
-                self.say("fleet", t, "Sorry, that message got lost. Please send it again.", "info")
+                self.say("fleet", t, "Sorry, that message got lost. Please send it again.", "info", reply_to=c["cid"])
                 continue
             self.commands.remove(c)
             self._execute(res, c, t)
 
     def _reply(self, rid, t, text, kind, src):
-        self.say(rid or "fleet", t, text, kind, source=src)
+        self.say(rid or "fleet", t, text, kind, source=src, reply_to=self._reply_to)
 
     def _execute(self, res, c: dict, t: float) -> None:
+        self._reply_to = c["cid"]
+        try:
+            self._execute_cmd(res, c, t)
+        finally:
+            self._reply_to = None
+
+    def _execute_cmd(self, res, c: dict, t: float) -> None:
         cmd = dict(res.command or {"type": "unclear", "question": res.question or "Sorry?"})
         src = "gemma" if res.ok else "rules"
         typ = cmd["type"]
@@ -914,6 +935,57 @@ class Advisor:
             getattr(self, "_cmd_" + typ)(rid, t, src)
         elif typ == "avoid_area":
             self._cmd_avoid(float(cmd["x"]), float(cmd["y"]), float(cmd.get("radius") or 3.0), t, src)
+        elif typ == "question":
+            self._ask(cmd, c, t, res)
+
+    # ================================================================== 6. questions from the operator
+    def _ask(self, cmd: dict, c: dict, t: float, res) -> None:
+        """Answer an operator question: who answers (one rover, each rover, or the fleet), a fact sheet
+        each, the rule answer at once, Gemma's reply when it comes (within the budget)."""
+        ids = [r.id for r in self.sim.rovers]
+        topic = cmd.get("topic") or "status"
+        named = cmd.get("rover")
+        text = res.text or c.get("text") or ""
+        if named in ids:
+            speakers = [named]
+        elif named == "all":
+            speakers = list(ids) if (wants_each(text) and topic in PER_ROVER_TOPICS) else ["fleet"]
+        elif c.get("hint") in ids:
+            speakers = [c["hint"]]
+        else:
+            speakers = ["fleet"]
+        budget = self.planner.cfg.budget_ms / 1000.0
+        for sp in speakers:
+            r = self._rover(sp)
+            sheet = rover_sheet(r) if r is not None else fleet_sheet(self.sim)
+            rules = rule_answer(sheet, topic)
+            job = {"speaker": sp, "cid": c["cid"], "rules": rules, "topic": topic, "wall": self.clock(),
+                   "ticket": None, "budget": budget}
+            if self.planner.online:
+                job["ticket"] = self.planner.submit_answer(sp, t, text, topic, fact_lines(sheet, topic), rules,
+                                                           timeout_s=budget)
+                self.answers.append(job)
+                if self.wait_for_gemma:
+                    self._wait(job["ticket"])
+            else:
+                self._post_answer(job, None, t)
+        if self.answers and self.wait_for_gemma:
+            self._poll_answers(t)
+
+    def _poll_answers(self, t: float) -> None:
+        for job in list(self.answers):
+            res = self.planner.poll(job["ticket"])
+            if res is None and self.clock() - job["wall"] < job["budget"]:
+                continue                   # still within the latency budget
+            self.answers.remove(job)
+            self._post_answer(job, res, t)
+
+    def _post_answer(self, job: dict, res, t: float) -> None:
+        ok = res is not None and res.ok and bool(res.answer)
+        text = res.answer if ok else job["rules"]
+        src = "gemma" if ok else "rules"
+        self.n_answers[src] += 1
+        self.say(job["speaker"], t, text, "reply", source=src, reply_to=job["cid"])
 
     # ---- helpers for commands
     def _targets_for(self, rid) -> list:
@@ -932,7 +1004,8 @@ class Advisor:
         job = self.go_jobs.pop(rid, None)
         if job is not None:
             x, y = job["goal"]
-            self._reply(rid, t, f"{rid}: dropped the trip to ({x:g}, {y:g}), {why}.", "info", "rules")
+            self.say(rid, t, f"{rid}: dropped the trip to ({x:g}, {y:g}), {why}.", "info", source="rules",
+                     reply_to=job.get("cid"))
 
     def _go_need(self, r, x: float, y: float, dist: float) -> float:
         return r.energy_for_distance(dist + 1.3 * math.hypot(x, y)) + r.battery_margin
@@ -997,10 +1070,17 @@ class Advisor:
                         "refuse", "rules")
             return
         self._cancel_go(rid, t, f"new destination ({x:g}, {y:g})")
-        self.go_jobs[rid] = {"goal": (x, y), "t0": t, "src": src}
+        self.go_jobs[rid] = {"goal": (x, y), "t0": t, "src": src, "cid": self._reply_to}
 
     def _plan_go(self, rover, t: float) -> None:
         job = self.go_jobs[rover.id]
+        prev, self._reply_to = self._reply_to, job.get("cid")
+        try:
+            self._plan_go_job(rover, job, t)
+        finally:
+            self._reply_to = prev
+
+    def _plan_go_job(self, rover, job: dict, t: float) -> None:
         rid, (x, y) = rover.id, job["goal"]
         busy = self._busy_reason(rover)
         if busy:

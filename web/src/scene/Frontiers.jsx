@@ -59,7 +59,7 @@ export function Frontiers() {
       _o.scale.set(k * 2.2, 1, k * 2.2)
       _o.updateMatrix()
       glow.current.setMatrixAt(i, _o.matrix)
-      _c.copy(signal).multiplyScalar(0.45 + 0.2 * wave)
+      _c.copy(signal).multiplyScalar(0.28 + 0.12 * wave)
       glow.current.setColorAt(i, _c)
       _o.scale.set(k, 1, k)
       _o.position.y = p.h + 0.18

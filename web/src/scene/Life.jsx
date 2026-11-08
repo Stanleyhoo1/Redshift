@@ -20,53 +20,126 @@ const TRACK_NEAR = 3 // m: a creature counts as noticed when a live track is thi
 
 // ---------------------------------------------------------------- creatures
 
-// Stylised grazers: three body segments, six legs with a tripod gait, two antennae and
-// glowing spots along the back. Every part of every creature is an instance, so a herd
-// costs four draw calls (eight with the faded Reality-only set).
+// Grazers: a soft, segmented body (abdomen, thorax, neck, head) with darker chitin plates
+// along the back, six jointed legs with a tripod gait, two antennae and bioluminescent
+// spots along the flanks. The skin is countershaded (pale belly, mottled darker back) with
+// a little light bleeding through at the edges. Every part of every creature is an
+// instance, so a herd costs a few draw calls (twice that with the faded Reality-only set).
 const MAXC = 40
 const SEGS = [
   // x, y, half extents (x, y, z), all times the creature's size
-  [-0.33, 0.4, 0.27, 0.17, 0.2],
-  [0.0, 0.43, 0.18, 0.15, 0.17],
-  [0.31, 0.45, 0.13, 0.11, 0.12],
+  [-0.29, 0.42, 0.31, 0.19, 0.22],
+  [0.04, 0.45, 0.22, 0.17, 0.19],
+  [0.25, 0.47, 0.1, 0.1, 0.1],
+  [0.39, 0.5, 0.135, 0.112, 0.118],
 ]
-const HIP_X = [0.12, -0.02, -0.18]
-const FOOT_DX = [0.2, 0.03, -0.17]
+const PLATES = [
+  // x, y, half extents, pitch
+  [-0.37, 0.58, 0.15, 0.045, 0.19, 0.25],
+  [-0.15, 0.6, 0.15, 0.045, 0.2, 0.0],
+  [0.06, 0.6, 0.14, 0.045, 0.17, -0.12],
+]
+const HIP_X = [0.14, 0.02, -0.16]
+const FOOT_DX = [0.2, 0.03, -0.18]
 const LIMBS = 14 // 12 leg parts and 2 antennae
-const DOTS = 4
+const SPOTS = [
+  // x, y, z (one side; mirrored), radius
+  [-0.45, 0.37, 0.16, 0.04],
+  [-0.29, 0.34, 0.2, 0.046],
+  [-0.13, 0.36, 0.19, 0.04],
+  [0.05, 0.38, 0.17, 0.036],
+  [0.47, 0.53, 0.08, 0.026],
+]
+const DOTS = SPOTS.length * 2
 
-const sphereGeo = new THREE.IcosahedronGeometry(1, 1) // flat shaded: a faceted, stylised hide
-const limbGeo = new THREE.CylinderGeometry(1, 0.8, 1, 5)
-const dotGeo = new THREE.IcosahedronGeometry(1, 0)
+const sphereGeo = new THREE.SphereGeometry(1, 20, 14)
+const limbGeo = new THREE.CylinderGeometry(1, 0.75, 1, 7)
+const dotGeo = new THREE.SphereGeometry(1, 10, 8)
 const haloGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2)
+
+const skinV = /* glsl */ `
+varying vec3 vLocalP;
+`
+const skinF = /* glsl */ `
+uniform vec3 uBelly;
+uniform vec3 uBack;
+uniform vec3 uMottle;
+varying vec3 vLocalP;
+`
+const skinAlbedo = /* glsl */ `
+  {
+    vec3 q = vLocalP;
+    float back = smoothstep(-0.3, 0.6, q.y);
+    vec3 sk = mix(uBelly, uBack, back);
+    vec3 m = q * 5.3;
+    float mott = sin(m.x * 1.3 + m.z * 2.1) * sin(m.y * 2.7 + m.x * 1.7) * sin(m.z * 1.9 + m.y * 0.7 + 1.3);
+    sk = mix(sk, uMottle, smoothstep(0.12, 0.5, mott) * back * 0.65);
+    // Soft rings round each segment.
+    sk *= 0.9 + 0.1 * smoothstep(0.6, 0.95, abs(q.x));
+    diffuseColor.rgb = sk;
+  }
+`
+const skinEmit = /* glsl */ `
+  {
+    float nv = clamp(dot(normal, normalize(vViewPosition)), 0.0, 1.0);
+    totalEmissiveRadiance += diffuseColor.rgb * pow(1.0 - nv, 2.5) * 0.35;
+  }
+`
+
+function skinMaterial() {
+  const m = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.52, metalness: 0.0 })
+  m.userData.realistic = true
+  const uniforms = {
+    uBelly: { value: new THREE.Color('#e3d8b8') },
+    uBack: { value: new THREE.Color('#9c9a72') },
+    uMottle: { value: new THREE.Color('#5f6446') },
+  }
+  m.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms)
+    shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>\n${skinV}`).replace('#include <begin_vertex>', '#include <begin_vertex>\n  vLocalP = position;')
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${skinF}`)
+      .replace('#include <map_fragment>', skinAlbedo)
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${skinEmit}`)
+  }
+  m.customProgramCacheKey = () => 'redshift-skin-1'
+  return m
+}
 
 function makeSet(ghost) {
   const o = ghost ? { transparent: true, opacity: 0.3, depthWrite: false } : {}
-  const mats = {
-    // A pale, faceted hide with some self-light (like the rovers), so a herd reads on
-    // every slope colour; dark legs; glowing spots in the life colour.
-    body: new THREE.MeshStandardMaterial({ color: '#e6dcc2', roughness: 0.65, metalness: 0.02, flatShading: true, emissive: '#8c8566', emissiveIntensity: 0.55, ...o }),
-    limb: new THREE.MeshStandardMaterial({ color: '#6e6857', roughness: 0.8, metalness: 0.05, flatShading: true, emissive: '#2a2820', emissiveIntensity: 0.6, ...o }),
-    dot: new THREE.MeshBasicMaterial({ color: LIFE, transparent: ghost, opacity: ghost ? 0.5 : 1, depthWrite: !ghost }),
-    halo: new THREE.MeshBasicMaterial({ color: LIFE, map: glowTexture(), transparent: true, opacity: ghost ? 0.12 : 0.3, depthWrite: false, blending: THREE.AdditiveBlending }),
+  const std = (p) => {
+    const m = new THREE.MeshStandardMaterial(p)
+    m.userData.realistic = true
+    return m
   }
-  const mk = (g, m, n) => {
+  const mats = {
+    body: ghost ? std({ color: '#c9c09e', roughness: 0.6, emissive: '#55513e', emissiveIntensity: 0.5, ...o }) : skinMaterial(),
+    plate: std({ color: '#6a6550', roughness: 0.3, metalness: 0.1, ...o }),
+    limb: std({ color: '#6b6550', roughness: 0.45, metalness: 0.05, ...o }),
+    dot: new THREE.MeshBasicMaterial({ color: LIFE, transparent: ghost, opacity: ghost ? 0.5 : 1, depthWrite: !ghost }),
+    halo: new THREE.MeshBasicMaterial({ color: LIFE, map: glowTexture(), transparent: true, opacity: ghost ? 0.1 : 0.22, depthWrite: false, blending: THREE.AdditiveBlending }),
+  }
+  const mk = (g, m, n, shadow) => {
     const mesh = new THREE.InstancedMesh(g, m, n)
     mesh.count = 0
     mesh.frustumCulled = false
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+    mesh.castShadow = !!shadow && !ghost
+    mesh.receiveShadow = !ghost
     return mesh
   }
   const set = {
-    body: mk(sphereGeo, mats.body, MAXC * SEGS.length),
-    limb: mk(limbGeo, mats.limb, MAXC * LIMBS),
+    body: mk(sphereGeo, mats.body, MAXC * SEGS.length, true),
+    plate: mk(sphereGeo, mats.plate, MAXC * PLATES.length, true),
+    limb: mk(limbGeo, mats.limb, MAXC * LIMBS, true),
     dot: mk(dotGeo, mats.dot, MAXC * DOTS),
     halo: mk(haloGeo, mats.halo, MAXC),
     n: 0,
     mats,
   }
   set.halo.renderOrder = 3
-  if (ghost) for (const k of ['body', 'limb', 'dot']) set[k].renderOrder = 5
+  if (ghost) for (const k of ['body', 'plate', 'limb', 'dot']) set[k].renderOrder = 5
   return set
 }
 
@@ -75,6 +148,7 @@ const _L = new THREE.Matrix4()
 const _M = new THREE.Matrix4()
 const _q = new THREE.Quaternion()
 const _qy = new THREE.Quaternion()
+const _qp = new THREE.Quaternion()
 const _p = new THREE.Vector3()
 const _s = new THREE.Vector3()
 const _a = new THREE.Vector3()
@@ -82,6 +156,7 @@ const _b = new THREE.Vector3()
 const _k = new THREE.Vector3()
 const _d = new THREE.Vector3()
 const UP = new THREE.Vector3(0, 1, 0)
+const ZAX = new THREE.Vector3(0, 0, 1)
 const NOQ = new THREE.Quaternion()
 
 function put(mesh, i, pos, quat, scale) {
@@ -100,7 +175,7 @@ function limb(mesh, i, a, b, w) {
 }
 
 const SIDES = [-1, 1]
-const PARTS = ['body', 'limb', 'dot', 'halo']
+const PARTS = ['body', 'plate', 'limb', 'dot', 'halo']
 
 function writeCreature(set, pose, S, t) {
   const c = set.n++
@@ -108,45 +183,53 @@ function writeCreature(set, pose, S, t) {
   _G.compose(_p.set(pose.x, pose.gz, -pose.y), _qy, _s.set(1, 1, 1))
   const move = Math.min(1, pose.spd / 0.22)
   const bob = Math.sin(pose.phase * 2) * 0.018 * S * move
+  // Body segments sway a little from side to side as it walks.
   for (let k = 0; k < SEGS.length; k++) {
     const [x, y, sx, sy, sz] = SEGS[k]
-    put(set.body, c * SEGS.length + k, _p.set(x * S, y * S + bob, 0), NOQ, _s.set(sx * S, sy * S, sz * S))
+    const sway = Math.sin(pose.phase + k * 0.9) * 0.012 * S * move
+    put(set.body, c * SEGS.length + k, _p.set(x * S, y * S + bob, sway), NOQ, _s.set(sx * S, sy * S, sz * S))
+  }
+  for (let k = 0; k < PLATES.length; k++) {
+    const [x, y, sx, sy, sz, pitch] = PLATES[k]
+    _qp.setFromAxisAngle(ZAX, pitch)
+    put(set.plate, c * PLATES.length + k, _p.set(x * S, y * S + bob, 0), _qp, _s.set(sx * S, sy * S, sz * S))
   }
   let li = c * LIMBS
   for (let i = 0; i < 3; i++) {
     for (const side of SIDES) {
       const ph = pose.phase + ((i + (side > 0 ? 1 : 0)) % 2) * Math.PI
-      _a.set(HIP_X[i] * S, 0.38 * S + bob, side * 0.11 * S)
+      _a.set(HIP_X[i] * S, 0.38 * S + bob, side * 0.13 * S)
       const fx = (HIP_X[i] + FOOT_DX[i]) * S + 0.13 * S * move * Math.sin(ph)
-      _b.set(fx, 0.09 * S * move * Math.max(0, Math.cos(ph)), side * 0.44 * S)
+      _b.set(fx, 0.09 * S * move * Math.max(0, Math.cos(ph)), side * 0.46 * S)
       _k.addVectors(_a, _b).multiplyScalar(0.5)
-      _k.y += 0.21 * S
-      _k.z += side * 0.06 * S
-      limb(set.limb, li++, _a, _k, 0.034 * S)
-      limb(set.limb, li++, _k, _b, 0.026 * S)
+      _k.y += 0.24 * S
+      _k.z += side * 0.07 * S
+      limb(set.limb, li++, _a, _k, 0.03 * S)
+      limb(set.limb, li++, _k, _b, 0.02 * S)
     }
   }
   const wig = reducedMotion ? 0 : Math.sin(t * 3 + pose.seed) * 0.04 * S
   for (const side of SIDES) {
-    _a.set(0.41 * S, 0.5 * S + bob, side * 0.04 * S)
-    _b.set(0.62 * S, 0.7 * S + bob + wig * side, side * 0.14 * S)
-    limb(set.limb, li++, _a, _b, 0.014 * S)
+    _a.set(0.48 * S, 0.56 * S + bob, side * 0.05 * S)
+    _b.set(0.7 * S, 0.76 * S + bob + wig * side, side * 0.16 * S)
+    limb(set.limb, li++, _a, _b, 0.011 * S)
   }
-  // Bioluminescent spots: one on each segment and one at the tail, slowly pulsing.
-  for (let k = 0; k < DOTS; k++) {
+  // Bioluminescent spots along both flanks, slowly pulsing.
+  let di = c * DOTS
+  for (let k = 0; k < SPOTS.length; k++) {
+    const [x, y, z, r0] = SPOTS[k]
     const pulse = reducedMotion ? 1 : 0.8 + 0.35 * Math.sin(t * 2.2 + pose.seed + k * 1.3)
-    if (k < SEGS.length) {
-      const [x, y, , sy] = SEGS[k]
-      _p.set(x * S, (y + sy * 0.92) * S + bob, 0)
-    } else _p.set(-0.58 * S, 0.4 * S + bob, 0)
-    const r = (k === DOTS - 1 ? 0.07 : 0.055) * S * pulse
-    put(set.dot, c * DOTS + k, _p, NOQ, _s.set(r, r, r))
+    for (const side of SIDES) {
+      const r = r0 * S * pulse
+      put(set.dot, di++, _p.set(x * S, y * S + bob, side * z * S), NOQ, _s.set(r, r, r))
+    }
   }
   put(set.halo, c, _p.set(0, 0.04, 0), NOQ, _s.set(2 * S, 1, 2 * S))
 }
 
 function finish(set) {
   set.body.count = set.n * SEGS.length
+  set.plate.count = set.n * PLATES.length
   set.limb.count = set.n * LIMBS
   set.dot.count = set.n * DOTS
   set.halo.count = set.n
@@ -217,6 +300,7 @@ function Creatures({ reality }) {
         <group key={i}>
           <primitive object={set.halo} />
           <primitive object={set.body} />
+          <primitive object={set.plate} />
           <primitive object={set.limb} />
           <primitive object={set.dot} />
         </group>

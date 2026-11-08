@@ -17,7 +17,12 @@ or Gemma 3 4B on older Ollama) on ONE background thread beside the rules. It
       offline or answers something invalid, and
   (d) describes something the LiDAR tracker saw moving (camera image plus track numbers): a
       lifeform or not, a short label ("possible lifeform, six legs, about 1.2 m"), what to do
-      (approach to observe, observe from here, ignore) and a confidence.
+      (approach to observe, observe from here, ignore) and a confidence, and
+  (e) answers the operator's questions ("rover 2, what have you found?"): the command step says
+      the message is a question (with its topic), then Gemma writes a 1 to 3 sentence reply from a
+      fact sheet the sim built from the rover's own memory (answers.py). Every number in the reply
+      must appear in that fact sheet and every id must be one it lists, or the rule-based answer
+      is used instead.
 
 The rules never wait on Gemma. submit_choice(), submit_interpretation(), submit_command() and
 poll() return at once (tens of microseconds). If Gemma is disabled, offline, still loading, slow
@@ -34,6 +39,7 @@ Interface (GEMMA.md shows where the rovers call it)
                                   ["reroute", "back_out", "proceed_slowly", "wait"])
     tk = gp.submit_command(t, "rover 2 go to 10, -5", fleet_context)
     tk = gp.submit_description("r3", t, perception, observation, jpeg_or_None)
+    tk = gp.submit_answer("r2", t, "what have you found?", "finds", fact_lines, default=rule_text)
     res = gp.poll(tk)          # None while pending, then a Result; never blocks
     gp.stats()                 # {"model", "online", "state", "calls", "ok", "fallbacks", "avg_ms", ...}
 
@@ -49,7 +55,10 @@ Validation (every answer, before the caller sees it)
   "ask_operator" (the model's own pick is kept in model_action, and Result.question holds a
   short question for the human). A command below it becomes "unclear" with a question;
 - command coordinates must come from the message or the fleet data (no invented places), rover
-  and target ids must exist.
+  and target ids must exist;
+- an answer (kind "answer") is 1 to 3 sentences, at most 60 words; every number in it must match a
+  number in the fact lines it was given (simple rounding allowed: 7.83 as 7.8, 1904 as 1,900, 0.64
+  as 64%) and every id (r2, t4, k1, ...) must appear in them.
 Rejected answers become fallback results with the reason in Result.error.
 
 Env vars
@@ -91,7 +100,8 @@ __all__ = [
     "ACTIONS", "CANDIDATE_KINDS", "CLASSES", "COMMANDS", "DIRECTIONS", "GemmaConfig", "Result", "Request",
     "GemmaPlanner", "OllamaBackend", "FakeBackend", "GemmaError", "GemmaTimeout", "GemmaOffline",
     "make_choice_request", "make_interpretation_request", "make_command_request", "make_description_request",
-    "build_prompt", "DESCRIBE_CLASSES", "DESCRIBE_ACTIONS",
+    "make_answer_request", "build_prompt", "DESCRIBE_CLASSES", "DESCRIBE_ACTIONS", "TOPICS", "question_intent",
+    "question_topic", "wants_each",
     "build_schema", "validate", "run_request", "parse_command", "cited_numbers", "render_readings",
     "colour_name", "latency_summary", "estimate_tokens", "get_planner", "planner_from_env", "close_planner",
 ]
@@ -108,7 +118,9 @@ DESCRIBE_CLASSES = ("lifeform", "rock", "other_rover", "dust", "unknown")
 DESCRIBE_ACTIONS = ("approach", "observe", "ignore", "ask_operator")
 MAX_LABEL_WORDS = 10
 COMMANDS = ("go_to", "explore_direction", "sample_target", "return_home", "hold", "resume", "avoid_area",
-            "unclear")
+            "question", "unclear")
+TOPICS = ("status", "exploration", "finds", "samples", "battery", "hazards", "lifeforms", "water", "location",
+          "why", "unknown")
 DIRECTIONS = ("north", "south", "east", "west", "north-east", "north-west", "south-east", "south-west")
 
 MAX_REASON_WORDS = 25
@@ -120,6 +132,11 @@ SKIP_KEYS = {"scan", "path", "image", "images", "jpeg"}
 MAX_RESULTS = 512      # results kept for poll(); older tickets are forgotten
 MAX_LATENCIES = 200    # window for avg / p95
 COMMAND_NUM_PREDICT = 128
+ANSWER_NUM_PREDICT = 128
+MAX_ANSWER_WORDS = 60
+MAX_ANSWER_CHARS = 360
+MAX_ANSWER_SENTENCES = 3
+MAX_FACT_LINES = 8
 DEFAULT_AVOID_RADIUS = 3.0
 
 SYSTEM_BASE = (
@@ -148,13 +165,14 @@ SYSTEM_INTERPRET = SYSTEM_BASE + (
 SYSTEM_COMMAND = (
     "You turn a human operator's message into one command for a fleet of rovers exploring a super-Earth. "
     "Commands: go_to (rover, x, y), explore_direction (rover, direction), sample_target (rover, target_id), "
-    "return_home (rover or all), hold (rover or all), resume (rover or all), avoid_area (x, y, radius in m), "
-    "unclear (ask one short question). "
+    "return_home, hold or resume (rover or all), avoid_area (x, y, radius in m), question (rover, topic: the "
+    "operator asks for information: what, where, why, how, any, status, report), unclear (ask one short question). "
     "rover is an id from the rover list, all, or none if the message names no rover; match names, numbers "
     "and colours to ids ('rover 2' is r2, 'the orange one' is the orange rover). "
     "A direction or area without coordinates (north, north of the lander) means explore_direction. "
     "go_to needs coordinates from the message or the lists, never the rover's own position. "
-    "Use only numbers and ids from the message or the lists. Put 0 or none in fields the command does not use. "
+
+    "Use only numbers and ids from the message or the lists. Put 0 or none in unused fields. "
     "If the message is ambiguous, choose unclear and ask in question; otherwise question is empty. "
     "ack is one short sentence confirming the command. Reply with JSON only."
 )
@@ -168,6 +186,15 @@ SYSTEM_DESCRIBE = SYSTEM_BASE + (
     'Example: {"classification": "lifeform", "label": "possible lifeform, six legs, about 1.2 m", '
     '"reason": "speed 0.3 m/s, size 1.2 m, legs in the camera.", '
     '"action": "approach", "confidence": 0.8}'
+)
+
+SYSTEM_ANSWER = (
+    "You are a rover exploring a super-Earth, answering your human operator in a chat. "
+    "Use only the facts listed. Answer the question in 1 to 3 short sentences, in the first person "
+    "(I, my), or we when you speak for the whole fleet. Copy numbers exactly as written in the facts; "
+    "never add numbers, places, ids or events that are not in the facts. "
+    "If the facts do not answer the question, say plainly that you do not know that. "
+    'Reply with JSON only: {"text": "your answer"}'
 )
 
 EM_DASH = chr(0x2014)     # banned in all project text; replaced if the model writes one
@@ -269,12 +296,16 @@ class Request:
     coords: list = field(default_factory=list)   # command: signed numbers a coordinate may use
     parsed: dict | None = None       # command: the regex parser's answer (the fallback)
     num_predict: int | None = None
+    timeout_s: float | None = None   # per request limit (answers: the latency budget); default GEMMA_TIMEOUT_S
+    allowed_ids: tuple = ()          # answer: ids (r2, t4, ...) the reply may mention
     submitted: float = field(default_factory=time.perf_counter)
 
     @property
     def key(self) -> tuple:
         if self.kind == "command":                 # operator commands never replace each other
             return ("operator", "command", self.ticket)
+        if self.kind == "answer":                  # nor do answers to different questions
+            return (self.rover_id, "answer", self.ticket)
         return (self.rover_id, self.kind)
 
 
@@ -295,6 +326,7 @@ class Result:
     model_command: dict | None = None    # Gemma's command before the low-confidence rule made it unclear
     label: str | None = None         # describe: short description ("possible lifeform, six legs, about 1.2 m")
     ack: str | None = None           # command: one short sentence for the operator
+    answer: str | None = None        # answer: the reply text (the caller's rule answer in a fallback)
     text: str | None = None          # command: the operator's message
     confidence: float = 0.0
     reason: str = ""                 # max 25 words, cites at least one input number
@@ -324,6 +356,9 @@ class Result:
             say = self.question if typ == "unclear" else self.ack
             extra = f", Gemma fallback: {self.error}" if not self.ok and self.error else ""
             return f"Operator: {self.text!r} -> {typ} ({who}, conf {self.confidence:.2f}{extra}). {say}"
+        if self.kind == "answer":
+            who = "Gemma" if self.ok else f"rules, Gemma fallback: {self.error}"
+            return f"{self.rover_id} answer ({who}, {ms}): {self.answer}"
         if not self.ok:
             keep = self.choice if self.kind == "choice" else self.action
             return f"{self.rover_id} Gemma fallback ({self.error}); keeping rule choice {keep}."
@@ -695,6 +730,36 @@ def make_command_request(ticket: int, t: float, text: str, fleet_context: dict) 
                    num_predict=COMMAND_NUM_PREDICT)
 
 
+_ID_RE = re.compile(r"\b([rtkqwsh])(\d+)\b")
+
+
+def make_answer_request(ticket: int, speaker: str, t: float, question: str, topic: str, facts: list,
+                        default: str, timeout_s: float | None = None) -> Request:
+    """An operator question to answer from fact lines (answers.fact_lines). speaker: a rover id, or
+    "fleet". default: the rule-based answer, returned in a fallback."""
+    q = " ".join(str(question or "").split())[:MAX_TEXT]
+    if not q:
+        raise ValueError("empty question")
+    lines = [" ".join(str(x).replace(EM_DASH, ",").split())[:2 * MAX_STR] for x in (facts or []) if str(x).strip()]
+    lines = lines[:MAX_FACT_LINES]
+    topic = topic if topic in TOPICS else "unknown"
+    ids = {str(speaker)}
+    for ln in lines:
+        ids.update(m.group(0) for m in _ID_RE.finditer(ln))
+    payload = {"speaker": str(speaker), "question": q, "topic": topic, "facts": lines}
+    return Request(ticket=ticket, kind="answer", rover_id=str(speaker), t=float(t), payload=payload,
+                   inputs=[v for ln in lines for _, v in numbers_in_text(_strip_thousands(ln))], text=q,
+                   default=str(default or ""), num_predict=ANSWER_NUM_PREDICT, timeout_s=timeout_s,
+                   allowed_ids=tuple(sorted(ids)))
+
+
+def _answer_prompt(req: Request) -> str:
+    p = req.payload
+    who = ("You speak for the whole rover fleet." if p["speaker"] == "fleet" else f"You are rover {p['speaker']}.")
+    facts = "\n".join(f"- {ln}" for ln in p["facts"]) or "- (no facts)"
+    return f"{who}\nOperator asks: {json.dumps(p['question'], ensure_ascii=False)}\nFacts:\n{facts}\nAnswer the question."
+
+
 def _command_prompt(req: Request) -> str:
     ctx = req.payload["fleet"]
     lines = [f"Operator message: {json.dumps(req.text, ensure_ascii=False)}"]
@@ -739,6 +804,8 @@ def build_prompt(req: Request) -> tuple:
     """(system prompt, user text). Kept small: under about 400 tokens without the image."""
     if req.kind == "command":
         return SYSTEM_COMMAND, _command_prompt(req)
+    if req.kind == "answer":
+        return SYSTEM_ANSWER, _answer_prompt(req)
     p = req.payload
     head = f"Rover {p['rover']} readings: {render_readings(p['sensors']) or 'none'}"
     if req.kind == "choice":
@@ -775,6 +842,8 @@ def build_schema(req: Request) -> dict:
                  "reason": {"type": "string"},
                  "action": {"type": "string", "enum": list(req.options)},
                  "confidence": {"type": "number"}}
+    elif req.kind == "answer":
+        props = {"text": {"type": "string"}}
     elif req.kind == "describe":
         props = {"classification": {"type": "string", "enum": list(req.classes)},
                  "label": {"type": "string"},
@@ -790,6 +859,7 @@ def build_schema(req: Request) -> dict:
                  "direction": {"type": "string", "enum": list(DIRECTIONS) + ["none"]},
                  "x": {"type": "number"}, "y": {"type": "number"}, "radius": {"type": "number"},
                  "target_id": target,
+                 "topic": {"type": "string", "enum": list(TOPICS) + ["none"]},
                  "question": {"type": "string"},
                  "ack": {"type": "string"},
                  "confidence": {"type": "number"}}
@@ -828,6 +898,92 @@ _GO_RE = re.compile(r"\b(go|goes|drive|move|head|navigate|travel|send|get|to)\b"
 _EXPLORE_RE = re.compile(r"\b(explore|exploring|scout|survey|search|map)\b")
 _HELP = ("Sorry, I did not understand. Try: 'rover 2 go to 10, -5', 'all return', 'r1 explore north', "
          "'hold', 'resume' or 'sample t4'.")
+
+
+# ---- questions ("rover 2, what have you found?", "everyone, report battery", "status")
+_CMD_VERBS_Q = r"go|drive|head|move|return|come|hold|stop|wait|park|resume|continue|sample|explore|avoid|check"
+_SUBJ = r"(?:you|u|we|they|it|anyone|anybody|everyone|the fleet|the rovers?|any|r\d+|rover\s*\w+)"
+_Q_START_RE = re.compile(r"^(?:what|whats|what's|where|wheres|where's|why|how|hows|how's|which|who|when|is|are|am|"
+                         r"was|were|any|anything|seen|seeing|found|got)\b"
+                         rf"|^(?:do|does|did|have|has|had)\s+{_SUBJ}\b"
+                         rf"|^(?:can|could)\s+{_SUBJ}\b(?!\s+(?:please\s+)?(?:{_CMD_VERBS_Q})\b)")
+_Q_TELL_RE = re.compile(r"\b(?:tell me|let me know|give me (?:a |an |your )?(?:update|report|status|summary|rundown)|"
+                        r"report(?!\s+(?:back|to|in)\b)|status|update me|summary|sitrep|what'?s up|"
+                        r"how are (?:you|things)|how is it going|how'?s it going)\b")
+_CMD_VERBS = (r"go|drive|head|move|return|come|hold|stop|halt|freeze|wait|park|resume|continue|carry on|keep|"
+              r"sample|explore|scout|survey|avoid|stay|check|investigate|inspect|send|get|navigate|travel|recall|dock|"
+              r"proceed|turn|back")
+_CMD_PREFIX_RE = re.compile(rf"^(?:please\s+)?(?:can|could|would|will) (?:you|u)\s+(?:please\s+)?(?:{_CMD_VERBS})\b"
+                            r"|^(?:how about|what about|why don'?t you|why not)\b")
+_IMPERATIVE_RE = re.compile(rf"^(?:please\s+)?(?:{_CMD_VERBS}|map)\b")
+_LEAD_RE = re.compile(r"^(?:[\s,.:;!\-]|hey\b|hi\b|ok\b|okay\b|so\b|and\b|also\b|quick question\b|question\b)+")
+_EACH_RE = re.compile(r"\b(?:each|every rover|everyone|everybody|all of you|all rovers|each of you|every one of you)\b")
+_TOPIC_RES = (   # first match wins
+    ("battery", re.compile(r"batter|charg|\bpower|energy|juice|\bfuel")),
+    ("lifeforms", re.compile(r"\blife|alive|creature|animal|organism|grazer|\bherd|alien(?!\s+spire)|living|biolog|"
+                             r"moving thing|something mov|anything mov")),
+    ("water", re.compile(r"water|\blake|river|liquid|\bpond|\bpool|\bsea\b|\bwet\b")),
+    ("samples", re.compile(r"sample|\btube|cache|drill|\bcore|scoop|swab|analys|analyz|science score")),
+    ("why", re.compile(r"\bwhy\b|reason|what are you doing|what're you doing|where are you (?:going|heading|headed)|"
+                       r"where (?:to|next)\b|\bplan\b|\bplans\b|\bgoal|heading|headed|destination|\bnext\b|purpose")),
+    ("location", re.compile(r"where are you|where is|where'?s|wheres|position|location|coordinates|"
+                            r"how far (?:are you |is it )?(?:from|away)|distance (?:to|from) (?:the )?(?:lander|base|home)")),
+    ("hazards", re.compile(r"problem|issue|trouble|hazard|danger|wrong|rock ?fall|\brocks?\b|boulder|\bsand|stuck|"
+                           r"\bdust|storm|fault|obstacle|\brisk|damage|broke|spire|incident|difficult|scary")),
+    ("finds", re.compile(r"\bfind|found|discover|target|interesting|science|\bspot|detect|result")),
+    ("exploration", re.compile(r"explor|mapped|\bmap\b|cover|\barea|region|\bbeen\b|visited|driven|\bdrive|travel|"
+                               r"distance|how far|how much ground|progress|percent")),
+    ("status", re.compile(r"status|how are you|how'?s it going|how is it going|update|report|sitrep|\bok\b|okay|"
+                          r"alright|all right|doing\b|\bstate\b|summary|overview|what'?s up|health|condition")),
+)
+
+
+def question_topic(text: str) -> str:
+    """'how's your battery?' -> 'battery'. One of TOPICS ('unknown' when nothing matches)."""
+    low = " ".join(str(text or "").lower().split())
+    for topic, rx in _TOPIC_RES:
+        if rx.search(low):
+            return topic
+    return "unknown"
+
+
+def _q_core(text: str, rovers: list) -> tuple:
+    """(rover, the message with rover mentions and filler words removed)."""
+    low = " ".join(str(text or "").lower().split())
+    rover, rest, _ = _resolve_rover(low, rovers)
+    return rover, _LEAD_RE.sub("", " ".join(rest.split())).strip()
+
+
+def question_intent(text: str, rovers: list | None = None) -> tuple:
+    """Does the message ask for information? Returns (strength, topic): strength "strong" (starts
+    with a question word, or 'tell me', 'report', 'status'), "weak" (only a trailing '?'), "command"
+    (starts with an order, also when politely asked: 'can you go home?') or None (no sign either way)."""
+    _, core = _q_core(text, list(rovers or []))
+    topic = question_topic(core)
+    if not core:
+        return None, topic
+    if _CMD_PREFIX_RE.match(core) or _IMPERATIVE_RE.match(core):
+        return "command", topic
+    if _Q_START_RE.match(core) or _Q_TELL_RE.search(core):
+        return "strong", topic
+    if core.endswith("?"):
+        return "weak", topic
+    return None, topic
+
+
+def wants_each(text: str) -> bool:
+    """'everyone, report battery': addressed to every rover one by one."""
+    return bool(_EACH_RE.search(" ".join(str(text or "").lower().split())))
+
+
+def _ask(rover, topic: str, conf: float) -> dict:
+    cmd = {"type": "question", "rover": rover, "topic": topic if topic in TOPICS else "unknown"}
+    return {"command": cmd, "ack": "", "question": None, "confidence": conf}
+
+
+def _strip_thousands(text: str) -> str:
+    """'1,904 m2' -> '1904 m2' (a comma between digits followed by exactly three digits)."""
+    return re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text or "")
 
 
 def _norm_direction(m) -> str:
@@ -910,6 +1066,8 @@ def command_ack(cmd: dict) -> str:
         return f"{who} resuming exploration." if who else "Resuming exploration."
     if typ == "avoid_area":
         return f"Avoiding the area around {_fmt_xy(cmd['x'], cmd['y'])}, radius {cmd['radius']:g} m."
+    if typ == "question":
+        return f"Answering a question about {cmd.get('topic', 'status')}."
     return cmd.get("question") or _HELP
 
 
@@ -931,6 +1089,7 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
         {"type": "sample_target", "rover", "target_id"}
         {"type": "return_home" | "hold" | "resume", "rover"}     rover: "r1".."rN", "all" or None
         {"type": "avoid_area", "x", "y", "radius"}    {"type": "unclear", "question"}
+        {"type": "question", "rover", "topic"}        the operator asks for information (TOPICS)
     fleet_context: {"rovers": [{"id", "name", "color", "x", "y"}], "targets": [{"id", ...}], ...}
     (raw or already compacted)."""
     ctx = _fleet_context(fleet_context)       # idempotent: raw or already compacted
@@ -942,6 +1101,9 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
     rover, rest, question = _resolve_rover(low, rovers)
     if question:
         return _unclear(question)
+    q_strength, q_topic = question_intent(low, rovers)
+    if q_strength == "strong":
+        return _ask(rover, q_topic, 0.9)
 
     tm = _TARGET_RE.search(rest)
     target = f"t{tm.group(1)}" if tm else None
@@ -981,6 +1143,8 @@ def parse_command(text: str, fleet_context: dict | None = None) -> dict:
     nums = [v for _, v in numbers_in_text(rest)]
     if len(nums) == 2 and _GO_RE.search(rest):
         return _done({"type": "go_to", "rover": rover, "x": nums[0], "y": nums[1]})
+    if q_strength == "weak" or (q_strength is None and q_topic != "unknown"):    # "battery?", "any water"
+        return _ask(rover, q_topic, 0.7)
     return _unclear(_HELP)
 
 
@@ -992,6 +1156,9 @@ def fallback(req: Request, error: str, latency_ms: float = 0.0, model: str = "")
         r.choice = req.default
     elif req.kind in ("interpretation", "describe"):
         r.action = req.default
+    elif req.kind == "answer":
+        r.answer = req.default
+        r.text = req.text
     else:
         p = req.parsed or _unclear(_HELP)
         r.command = dict(p["command"])
@@ -1093,6 +1260,84 @@ def _fix_go_to(req: Request, cmd: dict, data: dict) -> dict:
     return cmd
 
 
+def _fix_intent(req: Request, cmd: dict) -> dict:
+    """Post-check command vs question with the keyword rules (small models mix them up): a message
+    that starts with a question word ("did you sample t4?") is a question, not an order; one that
+    starts with an order ("go to 10, 5?") is not a question. A question about an unknown topic takes
+    the keyword topic when there is one."""
+    rovers = (req.payload.get("fleet") or {}).get("rovers", [])
+    strength, topic = question_intent(req.text or "", rovers)
+    typ = cmd.get("type")
+    if typ == "question":
+        p = (req.parsed or {}).get("command") or {}
+        if strength == "command" and p.get("type") not in (None, "unclear", "question"):
+            return dict(p)
+        if cmd.get("topic") in (None, "unknown") and topic != "unknown":
+            cmd = dict(cmd, topic=topic)
+        return cmd
+    if strength == "strong" or (typ == "unclear" and (strength == "weak" or (strength is None and topic != "unknown"))):
+        rv = cmd.get("rover")
+        if rv is None:
+            rv, _ = _q_core(req.text or "", rovers)
+        return {"type": "question", "rover": rv, "topic": topic}
+    return cmd
+
+
+def _validate_answer(req: Request, data: dict, model: str) -> Result:
+    """An answer to an operator question: plain text, 1 to 3 sentences, grounded in the fact lines."""
+    def bad(msg: str) -> Result:
+        return fallback(req, f"invalid answer: {msg}", model=model)
+
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return bad("missing text")
+    text = " ".join(text.replace(EM_DASH, ", ").split())
+    text = _strip_label(text)
+    sp = req.payload.get("speaker", "")
+    for prefix in (f"{sp}:", f"{sp} :"):
+        if sp and text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+    if text[:1] in "\"'" and text[-1:] in "\"'":
+        text = text[1:-1].strip()
+    if not text:
+        return bad("empty text")
+    words = text.split()
+    if len(words) < 2:
+        return bad("too short")
+    if len(words) > MAX_ANSWER_WORDS or len(text) > MAX_ANSWER_CHARS:
+        return bad(f"too long ({len(words)} words)")
+    n_sent = len(re.findall(r"[.!?]+(?=\s|$)", text))
+    if n_sent > MAX_ANSWER_SENTENCES:
+        return bad(f"{n_sent} sentences")
+    if "{" in text or "}" in text:
+        return bad("looks like JSON, not a sentence")
+    plain = _strip_thousands(text)
+    for written, value in numbers_in_text(plain):
+        if not any(_matches_rounded(written, value, w) for w in req.inputs):
+            return bad(f"number {written} is not in the fact sheet")
+    for m in _ID_RE.finditer(text.lower()):
+        if m.group(0) not in req.allowed_ids:
+            return bad(f"id {m.group(0)} is not in the fact sheet")
+    if text[-1] not in ".!?":
+        text += "."
+    return Result(ok=True, kind="answer", source="gemma", rover_id=req.rover_id, t=req.t, ticket=req.ticket,
+                  answer=text, text=req.text, confidence=1.0, model=model,
+                  cited=cited_numbers(plain, req.inputs))
+
+
+def _matches_rounded(written: str, r: float, w: float) -> bool:
+    """_matches, plus rounding to tens, hundreds or thousands when written so (1904 as 1,900 or 2,000)."""
+    if _matches(written, r, w):
+        return True
+    if "." in written:
+        return False
+    digits = written.lstrip("+-")
+    zeros = len(digits) - len(digits.rstrip("0"))
+    if zeros and digits.rstrip("0"):
+        return abs(abs(r) - abs(w)) <= 0.5 * 10.0 ** zeros + 1e-9
+    return False
+
+
 def _validate_command(req: Request, data: dict, min_confidence: float, model: str) -> Result:
     def bad(msg: str) -> Result:
         return fallback(req, f"invalid answer: {msg}", model=model)
@@ -1148,12 +1393,16 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
             cmd = {"type": typ, "rover": rv, "target_id": tid}
         elif typ in ("return_home", "hold", "resume"):
             cmd = {"type": typ, "rover": rv}
+        elif typ == "question":
+            topic = str(data.get("topic") or "").strip().lower()
+            cmd = {"type": "question", "rover": rv, "topic": topic if topic in TOPICS else "unknown"}
         else:
             q = _clean_text(data.get("question") or "", 30) or _HELP
             cmd = {"type": "unclear", "question": q}
     except ValueError as e:
         return bad(str(e))
     cmd = _fix_go_to(req, cmd, data)
+    cmd = _fix_intent(req, cmd)
     if cmd["type"] == "unclear":
         cmd["question"] = _strip_label(cmd["question"]) or _HELP
     ack = _strip_label(_clean_text(data.get("ack") or ""))
@@ -1164,7 +1413,7 @@ def _validate_command(req: Request, data: dict, min_confidence: float, model: st
     res = Result(ok=True, kind="command", source="gemma", rover_id="operator", t=req.t, ticket=req.ticket,
                  command=cmd, ack=ack, text=req.text, confidence=round(conf, 3), model=model,
                  question=cmd.get("question"))
-    if cmd["type"] != "unclear" and conf < min_confidence:
+    if cmd["type"] not in ("unclear", "question") and conf < min_confidence:    # asking is always harmless
         q = f"Did you mean: {ack.rstrip('.')}?"
         res.model_command = cmd
         res.command = {"type": "unclear", "question": q}
@@ -1188,6 +1437,8 @@ def validate(req: Request, content: str, min_confidence: float = 0.55, model: st
         return bad("not a JSON object")
     if req.kind == "command":
         return _validate_command(req, data, min_confidence, model)
+    if req.kind == "answer":
+        return _validate_answer(req, data, model)
     reason = data.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         return bad("missing reason")
@@ -1457,6 +1708,8 @@ class FakeBackend(Backend):
             ans = self._interpret(req)
         elif req.kind == "describe":
             ans = self._describe(req)
+        elif req.kind == "answer":
+            ans = self._answer(req)
         else:
             ans = self._command(req)
         return json.dumps(ans), {"prompt_eval_count": estimate_tokens(system + user), "eval_count": 40}
@@ -1554,8 +1807,35 @@ class FakeBackend(Backend):
         c = p["command"]
         return {"command": c["type"], "rover": c.get("rover") or "none", "direction": c.get("direction", "none"),
                 "x": c.get("x", 0), "y": c.get("y", 0), "radius": c.get("radius", 0),
-                "target_id": c.get("target_id", "none"), "question": c.get("question", ""),
-                "ack": p["ack"], "confidence": 0.85}
+                "target_id": c.get("target_id", "none"), "topic": c.get("topic", "none"),
+                "question": c.get("question", ""), "ack": p["ack"], "confidence": 0.85}
+
+    _LEADS = {"status": "Status: ", "exploration": "Mapping so far: ", "finds": "Finds: ", "samples": "Samples: ",
+              "battery": "Power check: ", "hazards": "Hazards: ", "lifeforms": "Lifeforms: ", "water": "Water: ",
+              "location": "Position: ", "why": "Plan: "}
+
+    def _answer(self, req: Request) -> dict:
+        """The fake cannot reason: it rewords the two most relevant fact lines (they come first) into
+        sentences, which keeps every number and id grounded. Unknown topics: it says it does not know."""
+        p = req.payload
+        facts = [f for f in p.get("facts", []) if f]
+        if p.get("topic") == "unknown" or not facts:
+            return {"text": "I don't know that. I can only tell you what my own sensors and memory recorded."}
+        out = []
+        for f in facts[:2]:
+            f = f.strip().rstrip(".")
+            if f.lower().startswith("why: "):
+                f = "that is because " + f[5:]
+            out.append(f if _ID_RE.match(f) else f[:1].upper() + f[1:])
+            out[-1] += "."
+        text = self._LEADS.get(p.get("topic"), "") + " ".join(out)
+        words = text.split()
+        if len(words) > MAX_ANSWER_WORDS or len(text) > MAX_ANSWER_CHARS:
+            text = self._LEADS.get(p.get("topic"), "") + out[0]
+            if len(text.split()) > MAX_ANSWER_WORDS or len(text) > MAX_ANSWER_CHARS:
+                cut = " ".join(text.split()[:MAX_ANSWER_WORDS - 2])[:MAX_ANSWER_CHARS - 4].rsplit(" ", 1)[0]
+                text = cut.rstrip(",;:") + "..."
+        return {"text": text}
 
 
 # ====================================================================== one call
@@ -1566,9 +1846,10 @@ def run_request(backend: Backend, req: Request, cfg: GemmaConfig, meta_out: dict
     system, user = build_prompt(req)
     schema = build_schema(req)
     model = getattr(backend, "model", "")
+    limit = min(cfg.timeout_s, req.timeout_s) if req.timeout_s else cfg.timeout_s
     t0 = time.perf_counter()
     try:
-        content, meta = backend.chat(req, system, user, schema, cfg.timeout_s)
+        content, meta = backend.chat(req, system, user, schema, limit)
         if meta_out is not None:
             meta_out.update(meta or {})
             meta_out["content"] = content
@@ -1585,8 +1866,8 @@ def run_request(backend: Backend, req: Request, cfg: GemmaConfig, meta_out: dict
         ms = (time.perf_counter() - t0) * 1000.0
         return fallback(req, f"error: {type(e).__name__}: {e}"[:200], ms, model), "error"
     ms = (time.perf_counter() - t0) * 1000.0
-    if ms > cfg.timeout_s * 1000.0:
-        return fallback(req, f"late: answered in {ms:.0f} ms, over the {cfg.timeout_s:g} s timeout", ms,
+    if ms > limit * 1000.0:
+        return fallback(req, f"late: answered in {ms:.0f} ms, over the {limit:g} s timeout", ms,
                         model), "timeout"
     res = validate(req, content, cfg.min_confidence, model)
     res.latency_ms = round(ms, 1)
@@ -1623,7 +1904,7 @@ class GemmaPlanner:
     that waited longer than GEMMA_TIMEOUT_S in the queue is dropped (fallback). When the model
     is not ready (disabled, offline, model missing, warming), submits resolve to a fallback at once."""
 
-    _PRIORITY = ("command", "interpretation", "describe", "choice")
+    _PRIORITY = ("command", "answer", "interpretation", "describe", "choice")
 
     def __init__(self, config: GemmaConfig | None = None, backend: Backend | None = None, start: bool = True):
         self.cfg = config or GemmaConfig.from_env()
@@ -1795,6 +2076,21 @@ class GemmaPlanner:
             return self._resolve_now(stub, f"bad input: {type(e).__name__}: {e}")
         if not req.text:
             return self._resolve_now(req, "empty message")
+        return self._enqueue(req)
+
+    def submit_answer(self, speaker: str, t: float, question: str, topic: str, facts: list,
+                      default: str, timeout_s: float | None = None) -> int:
+        """Ask Gemma to answer an operator question from fact lines (answers.fact_lines). speaker: a
+        rover id or "fleet". default: the rule-based answer (Result.answer in a fallback). timeout_s:
+        latency limit for this call (default the budget, GEMMA_BUDGET_MS). Never blocks, never raises."""
+        ticket = next(self._tickets)
+        lim = timeout_s if timeout_s is not None else self.cfg.budget_ms / 1000.0
+        try:
+            req = make_answer_request(ticket, speaker, t, question, topic, facts, default, lim)
+        except Exception as e:                # noqa: BLE001
+            stub = Request(ticket, "answer", str(speaker), float(t or 0.0), {}, [], default=str(default or ""),
+                           text=str(question)[:MAX_TEXT])
+            return self._resolve_now(stub, f"bad input: {e}")
         return self._enqueue(req)
 
     def poll(self, ticket: int) -> Result | None:

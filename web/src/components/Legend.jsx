@@ -1,6 +1,7 @@
 import { useSim } from '../state/store.js'
 import { degrees, fixed } from '../lib/format.js'
-import { GROUND_RAMP, KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
+import { KIND_STYLE, LIFE, SIGNAL, SLOPE, SPIRE, WATER } from '../lib/theme.js'
+import '../styles/scene.css'
 
 export function Legend({ slopeColors, frontiers, life = true }) {
   const limit = useSim((s) => s.limit)
@@ -36,11 +37,17 @@ export function Legend({ slopeColors, frontiers, life = true }) {
         </>
       ) : (
         <>
-          <div className="legend-title">Ground height</div>
-          <div className="ramp" style={{ background: `linear-gradient(90deg, ${GROUND_RAMP.join(', ')})` }} />
-          <div className="ramp-ends">
-            <span>{map ? `${fixed(map.minH, 1)} m` : '--'}</span>
-            <span>{map ? `${fixed(map.maxH, 1)} m` : '--'}</span>
+          <div className="legend-title" key={limit.changedAt ?? 'base'} data-flash={limit.changedAt !== null || undefined}>
+            Slope limit {degrees(lim)} deg
+          </div>
+          <ul className="legend-list">
+            <li title="The ground as the rovers mapped it: dust on the flats, rock on steep ground">
+              <i className="sw sw-ground" />
+              Mapped ground <span>{map ? `${fixed(map.minH, 1)} to ${fixed(map.maxH, 1)} m` : '--'}</span>
+            </li>
+          </ul>
+          <div className="legend-hint">
+            Press <kbd>S</kbd> for slope colours
           </div>
         </>
       )}

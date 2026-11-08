@@ -3,6 +3,34 @@ import { appStore, nowSeconds, simStore, useApp, useSim } from '../state/store.j
 import { resetSim } from '../net/connection.js'
 import { shortName } from '../lib/format.js'
 import { useHudRect } from '../lib/useHudRect.js'
+import { useGraphics, visualPrefs } from '../state/visualPrefs.js'
+import '../styles/scene.css'
+
+// The realistic ground is the first impression: slope colours start off (once per page
+// load; the S key and the toggle still switch them).
+let slopeDefaultApplied = false
+
+// Graphics quality: High (shadows, gravel, particles, detailed materials) or Low.
+function GraphicsControl() {
+  const graphics = useGraphics()
+  return (
+    <div className="hud-group">
+      <div className="gfx-row">
+        <div className="hud-label" id="gfx-label">
+          Graphics
+        </div>
+        <div className="seg gfx-seg" role="group" aria-labelledby="gfx-label">
+          <button type="button" aria-pressed={graphics === 'high'} onClick={() => visualPrefs.setGraphics('high')} title="Shadows, gravel, dust and detailed materials">
+            High
+          </button>
+          <button type="button" aria-pressed={graphics === 'low'} onClick={() => visualPrefs.setGraphics('low')} title="Faster: no shadows, gravel or particles, simpler materials">
+            Low
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 function useStale() {
   const [stale, setStale] = useState(false)
@@ -111,6 +139,11 @@ export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
   const v4 = useSim((s) => s.v4)
   const ref = useHudRect('controls')
   const set = (key) => (value) => setView((v) => ({ ...v, [key]: value }))
+  useEffect(() => {
+    if (slopeDefaultApplied) return
+    slopeDefaultApplied = true
+    setView((v) => (v.slope ? { ...v, slope: false } : v))
+  }, [setView])
   let realityHint = ''
   if (view.reality) {
     if (!truth || truth.gen !== gen) realityHint = 'Loading'
@@ -143,6 +176,7 @@ export function ViewControls({ view, setView, follow, onSelect, onOverview }) {
           ))}
         </div>
       </div>
+      <GraphicsControl />
       <ResetControl />
     </div>
   )

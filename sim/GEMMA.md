@@ -4,7 +4,7 @@
 
 The rovers drive themselves with fast hand-written rules and A* path planning. Gemma adds a
 second opinion that runs **on your own machine** (no cloud, no link to Earth, just like a real
-rover). It does four jobs:
+rover). It does five jobs:
 
 1. **Choose.** When a rover picks a new goal (at most every 20 s, or when it reaches one), the rules
    list a few safe options: two or three frontiers with the A* path length, the steepest slope on
@@ -20,6 +20,10 @@ rover). It does four jobs:
    the camera picture and the track numbers (distance, speed, size) and says whether it is a
    lifeform, gives a short label ("possible lifeform, six legs, about 1.2 m") and what to do:
    approach (to watch from about 6 m), observe from here, or ignore.
+5. **Answer you.** You ask "rover 2, what have you found?" and the rover answers in one to three
+   sentences, written by Gemma from a fact sheet the sim builds from that rover's own memory. Every
+   number and id in the answer is checked against the fact sheet; anything else (or no answer in 3 s)
+   and the rule-based answer is used.
 
 ## The two tiers
 
@@ -54,7 +58,8 @@ back off) on top of what the rules already did.
 | LiDAR range drops (dust) | slow down, then 0.4 m/s on mapped ground only | same | go slowly: agrees. Wait: stands still until the dust clears (at most 30 s) |
 | LiDAR gets no returns ahead, camera sees blue (`no_returns`) | slow down, mark the lake for the fleet, replan around it | camera + numbers (missing rays, distance, share of blue pixels) | "liquid" + reroute: agrees (and marks the water if the rules had not). A hole the camera says is not liquid is a drop-off: the rules just slow down and keep to mapped ground, Gemma is not asked |
 | Something moves (a LiDAR track) | stop and turn to face it | camera + track numbers: lifeform or not, short label, action | approach: follow at about 6 m (never closer than 4 m). Observe: watch from here. Ignore (not a lifeform): back to exploring. Unsure (or the first sighting): question to the operator |
-| Operator types a message | post it in the chat | turn it into a command | the rules check it (A* within the slope limit, battery there and back) and run it, or refuse with numbers |
+| Operator types a message | post it in the chat | turn it into a command (or say it is a question, with its topic) | the rules check it (A* within the slope limit, battery there and back) and run it, or refuse with numbers |
+| Operator asks a question | build the fact sheet and the rule answer | write the reply from the fact sheet only | every number and id must be in the fact sheet, at most 3 sentences: posted as `kind: "reply"`, `source: "gemma"`; otherwise (or after 3 s) the rule answer, `source: "rules"` |
 
 The camera picture is grabbed by a small worker thread through the camera's render thread
 (never from the sim thread, which holds the sim lock). Gemma's anomaly prompt says: soft ground or
@@ -107,6 +112,38 @@ Target options quote the spectrometer's value estimate and the free tubes, so Ge
 `sample t3 (mineral outcrop) 12 m north-east, value 8/10 (estimate), 2 tubes free, path 14 m, slope
 max 9 deg, battery after return 51%`. With full tubes, "return to the lander to cache the samples"
 is an option.
+
+### Questions (protocol v5)
+
+The command step sees the question ("question" with a topic: status, exploration, finds, samples,
+battery, hazards, lifeforms, water, location, why, unknown); small-model mix-ups are corrected by the
+keyword rules (a message starting with a question word is a question even if Gemma made an order of
+it, "go to 10, 5?" is still an order). Who answers: the rover named (or picked in the UI); the fleet
+when nobody or everybody is asked; each rover for per-rover topics addressed to everyone ("everyone,
+report battery").
+
+Each rover keeps a small mission memory (`memory.py`, updated where things happen): mapped area by
+compass sector and distance band around the lander, distance driven, targets found and sampled (with
+the on-board analysis), hazards met and how it handled them, lifeforms observed, notable recent log
+lines, its goal and the reason. `answers.py` turns that into short first person facts, most relevant
+first, and Gemma gets only those (a prompt of about 150 to 250 tokens):
+
+```
+You are rover r2.
+Operator asks: "what have you explored?"
+Facts:
+- I've mapped about 1,904 m2 (13.2% of the 14,400 m2 map), mostly north-east of the lander, out past 35 m
+- I've driven 410 m
+- I'm at (31, 12), 33 m east of the lander
+Answer the question.
+```
+
+Answer: `{"text": "..."}`. Checks: 1 to 3 sentences, at most 60 words; every number must match a fact
+(simple rounding allowed: 1,904 as 1,900, 0.64 as 64%); every id (r2, t4, k1) must be in the facts;
+an em dash is replaced. A failed check, a slow answer (over `GEMMA_BUDGET_MS`, 3 s) or Gemma offline:
+the rule-based answer (`answers.rule_answer`) is posted instead. Asked about something outside its
+memory, the rover says it does not know. The fake model (`GEMMA_FAKE=1`) answers by rewording the two
+most relevant facts, so its answers are grounded too.
 
 ### Typed commands
 
@@ -186,7 +223,7 @@ drops questions still queued about the old world.
 | What | Budget | Measured (RTX 4070, Ollama 0.40.15, gemma4:e2b, gemma.py's prompts) |
 |---|---|---|
 | Rule brain, per rover per 200 ms cycle | 40 ms (`BRAIN_BUDGET_MS`) | about 1.3 ms average, p95 about 3 ms, with the fake Gemma attached (2 shared CPUs) |
-| One Gemma call | 3000 ms (`GEMMA_BUDGET_MS`), dropped after 4 s | goal choice about 0.3 s, anomaly with a 320 x 240 camera JPEG about 0.4 s |
+| One Gemma call | 3000 ms (`GEMMA_BUDGET_MS`), dropped after 4 s | goal choice about 0.3 s, anomaly with a 320 x 240 camera JPEG about 0.4 s; answers to questions have a 3 s limit (prompt about 150 to 250 tokens, up to 128 output tokens; not measured here: Ollama is not reachable from the dev container, expect about 0.3 to 1.5 s warm) |
 | Model load | in the background at server start | about 39 s, once |
 
 - Gemma is **not** in the 40 ms rule budget. It has its own budget, and its stats are in every tick
@@ -195,7 +232,8 @@ drops questions still queued about the old world.
   the 40 ms and is planned in slices like every other plan.
 - Load: 3 rovers ask about every 20 to 30 sim seconds; at `SIM_SPEED=3` that is one choice call
   every 2 to 3 wall seconds at about 0.3 s each, plus the odd anomaly, sighting or command. One call
-  runs at a time; typed commands go first, then anomalies, then lifeform descriptions, then choices.
+  runs at a time; typed commands go first, then answers to questions, then anomalies, then lifeform
+  descriptions, then choices. A question costs two calls (reading it, then writing the answer).
 - Prompts are small (under 400 tokens plus the picture), answers short (JSON only, temperature 0,
   thinking off).
 
@@ -229,7 +267,8 @@ drops questions still queued about the old world.
 | Model still loading | answered at once | rules alone; planner `warming` |
 | No answer within 4 s | call dropped | rules' choice stands; warm-up repeats on the next check |
 | Answer invalid (bad JSON, unknown id or action, no sensor number quoted, made-up coordinates) | answer rejected | rules' choice stands (commands: the keyword parser) |
-| Confidence below 0.55 | answer kept | anomaly: ask_operator; command: a question back |
+| Confidence below 0.55 | answer kept | anomaly: ask_operator; command: a question back (a question is always answered) |
+| Answer to a question invalid or later than 3 s | answer dropped | the rule-based answer is posted |
 
 ## gemma.py interface (for reference)
 
@@ -243,6 +282,7 @@ tk = gp.submit_choice("r1", t, perception, candidates, default="f1")
 tk = gp.submit_interpretation("r1", t, perception, anomaly, jpeg_or_None,
                               ["reroute", "back_out", "proceed_slowly", "wait"], default="back_out")
 tk = gp.submit_command(t, "rover 2 go to 10, -5", fleet_context)   # rovers, targets, lander, bounds
+tk = gp.submit_answer("r2", t, "what have you found?", "finds", facts, default=rule_text)
 res = gp.poll(tk)                      # None while pending, then a Result; never blocks
 gp.stats(); gp.cancel()                # status badge; drop queued questions (on reset)
 ```
@@ -255,14 +295,17 @@ other_rover, crater_edge, clear, unknown), `res.action`, `res.model_action`. Des
 rock, other_rover, dust, unknown), `res.label`, `res.action` (approach, observe, ignore, or
 ask_operator when unsure). Commands:
 `res.command` (`go_to`, `explore_direction`, `sample_target`, `return_home`, `hold`, `resume`,
-`avoid_area`, `unclear` with `question`).
+`avoid_area`, `question` with `topic`, `unclear` with `question`). Answers: `res.answer` (Gemma's
+checked text, or the caller's rule answer in a fallback).
 
 ## Files
 
 | File | What |
 |---|---|
 | `redshift/gemma.py` | planner, Ollama and fake backends, prompts, JSON schemas, answer checks, command parser |
-| `redshift/advisor.py` | tier 2 wiring: goal choice, anomaly checks with the camera, operator questions, chat commands |
+| `redshift/advisor.py` | tier 2 wiring: goal choice, anomaly checks with the camera, operator questions, chat commands and answers |
+| `redshift/memory.py`, `redshift/answers.py` | each rover's mission memory; fact sheets, the facts for Gemma, rule-based answers |
 | `tests/test_gemma.py` | gemma.py against a stub Ollama server on port 8400 |
 | `tests/test_brain.py` | tier 2 in the running sim with the fake model and the keyword parser |
+| `tests/test_v5.py` | questions: intent, answer checks, grounded rule answers, routing, `reply_to` |
 | `scripts/gemma_bench.py` | latency and quality bench against a real Ollama |

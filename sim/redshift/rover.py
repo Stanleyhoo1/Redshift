@@ -46,6 +46,7 @@ import mujoco
 import numpy as np
 
 from .config import Config
+from .memory import RoverMemory
 from .planner import PENDING, downsample, path_length
 from .terrain import KIND_LABEL
 from .world import GROUP_ROCK
@@ -76,7 +77,7 @@ def _camera_frame(sim, rid: str):
     """A small mast camera picture (camera hardware: rendered in this thread with its own GL context)."""
     from . import camera
     return camera._local_renderer().frame(None, sim, rid, "fpv", 160, 120, depth=False, hide_groups=(3, 4),
-                                          smooth=False)
+                                          smooth=False, look=False)
 
 
 class Rover:
@@ -260,6 +261,11 @@ class Rover:
         self.t_now = 0.0
         self.exp_used = 0
 
+        # mission memory: what it mapped, found, sampled and met (answers questions, protocol v5 stats)
+        self.mem = RoverMemory(self)
+        self._count_replan = False
+        self.vis_lost_t = None
+
         self.read_pose()
         self.last_xy = (self.x, self.y)
 
@@ -425,7 +431,11 @@ class Rover:
         if len(idx):
             pts = pnt[None, :] + vec[idx] * dist[idx, None]
             self.scan_pts = pts
-            self.scan_changes = self.fleet.map.integrate(pts, t)
+            fm = self.fleet.map
+            k0 = fm.known_count
+            self.scan_changes = fm.integrate(pts, t)
+            if fm.known_count > k0:
+                self.mem.on_mapped(fm, fm.last_new, fm.known_count - k0)
         else:
             self.scan_pts = np.zeros((0, 3))
             self.scan_changes = 0
@@ -566,12 +576,14 @@ class Rover:
                 msg = (f"{self.id} LiDAR gets no returns {d:.0f} m ahead and the hole has a flat, level edge "
                        f"(spread {spread:.2f} m; no camera here). Probably liquid: marking it and routing around it.")
             f.log(t, "discovery", msg, self.id, at=(zx, zy))
+            self.mem.on_water(t, zx, zy, zr, "camera" if liquid else "flat edge")
             self._replan_now(t)
             self.plan_t = -1e9
         else:                              # a drop-off: just slow down and keep to mapped ground
             self.caution_until = t + CAUTION_S["no_returns"]
             self.caution_v = self.cfg.caution_v
             f.dropoffs.append((at[0], at[1], t))
+            self.mem.on_hazard("dropoff", t, at, f"a drop-off {d:.0f} m ahead where my LiDAR got no returns")
             seen = "no liquid" if pct is not None else "nothing (no camera here)"
             f.log(t, "info", f"{self.id} LiDAR gets no returns {d:.0f} m ahead but the camera shows {seen}. "
                              f"Treating it as a drop-off and keeping to mapped ground.", self.id, at=at)
@@ -598,6 +610,7 @@ class Rover:
         f = self.fleet
         ax, ay = self.x + 1.5 * math.cos(self.yaw), self.y + 1.5 * math.sin(self.yaw)
         f.add_water_zone(t, self, ax, ay, 2.5)
+        self.mem.on_hazard("wet", t, (self.x, self.y))
         f.log(t, "warn", f"{self.id} water sensor wet: chassis {depth:.2f} m under a liquid surface. Stopping, "
                          f"marking it for the fleet and backing out.", self.id, at=(self.x, self.y))
         if self.state != "recovering":
@@ -676,6 +689,9 @@ class Rover:
         elif self.degraded and far_min > 0.75 * nominal:
             self.degraded = False
             self.lidar_eff = nominal
+            if self.vis_lost_t is not None:
+                self.mem.note_outcome("dust", f"visibility came back after {t - self.vis_lost_t:.0f} s", t, 600.0)
+                self.vis_lost_t = None
             self.fleet.log(t, "info", f"{self.id} visibility back to {nominal:.0f} m. Resuming normal speed.",
                            self.id, at=(self.x, self.y))
             self._replan_now(t)
@@ -694,6 +710,7 @@ class Rover:
         a.update({k: v for k, v in details.items() if k != "at"})
         self.anomaly = a
         self.anomaly_log.append(a)
+        self._remember_anomaly(t, kind, details, at)
         self.caution_until = t + CAUTION_S[kind]
         self.caution_v = 0.0 if kind == "slip" else self.cfg.caution_v
         if kind == "new_obstacle" and details.get("shape") == "long":
@@ -717,6 +734,25 @@ class Rover:
             except Exception:              # a broken add-on must never stop the rover
                 pass
         return a
+
+    def _remember_anomaly(self, t: float, kind: str, d: dict, at) -> None:
+        """Mission memory: what the anomaly was, in the rover's own words, with its numbers."""
+        if kind == "new_obstacle" and d.get("shape") == "long":
+            self.mem.on_hazard("spire", t, at, f"a long, low obstacle across my path {d.get('dist', 0.0):.0f} m ahead "
+                                               f"(about {d.get('length', 0.0):.1f} m long, a fallen spire)")
+        elif kind == "new_obstacle":
+            self.mem.on_hazard("rocks", t, at, f"new rocks across my path {d.get('dist', 0.0):.0f} m ahead "
+                                               f"({d.get('cells', 0)} map cells changed)")
+        elif kind == "slip":
+            self.mem.on_hazard("sand", t, at, f"soft ground: wheels spinning at {d.get('slip', 0.0) * 100:.0f}% slip")
+        elif kind == "low_visibility":
+            self.vis_lost_t = t
+            self.mem.on_hazard("dust", t, at, f"dust: LiDAR range down to {d.get('lidar_range', 0.0):.0f} m")
+        elif kind == "no_returns":
+            pct = d.get("camera_liquid_pct")
+            seen = (f"the camera saw liquid ({pct:.0f}% of the lower view blue)" if pct is not None
+                    else "the hole had a flat, level edge")
+            self.mem.on_hazard("water", t, at, f"no LiDAR returns {d.get('dist', 0.0):.0f} m ahead and {seen}")
 
     def _check_new_obstacles(self, t: float) -> None:
         """Our own sweep just changed mapped ground (something new stands there). If it is on or right
@@ -1219,6 +1255,7 @@ class Rover:
             self.sticky_goal = None
             self.next_goal_eval = t + 15.0
             self._set_path(t, path)
+            self.mem.on_goal(t, "rules", f"best frontier for size and distance ({size} cells of unknown ground at its edge)")
             f.takeover_note(t, self, goal)
             if self.advisor is not None:          # tier 2 may suggest another option; we drive this one now
                 self.advisor.on_goal_chosen(self, t, goal, path, size, reached)
@@ -1426,12 +1463,14 @@ class Rover:
             self.hist.clear()
             self.fleet.log(t, "info", f"{self.id} backed out of the soft ground. Planning around it.", self.id,
                            at=(self.x, self.y))
+            self.mem.note_outcome("sand", f"backed out along my tracks in {t - self.sand_t0:.0f} s", t)
             return
         if t - self.sand_t0 > cfg.sand_free_s and not self.sand_freed:
             self.sand_freed = True
             if self.sim.hazards is not None:
                 self.sim.hazards.free_rover(self.id, t)
             self.fleet.log(t, "warn", f"{self.id} dug itself out.", self.id, at=(self.x, self.y))
+            self.mem.note_outcome("sand", f"dug myself out after {t - self.sand_t0:.0f} s", t)
         if t - self.sand_t0 > cfg.sand_free_s + 30.0:
             self.sand_zone = (self.x, self.y, 0.0)     # give up on backing out; carry on from here
             return
@@ -1466,6 +1505,10 @@ class Rover:
         else:
             what = "Brakes on, telling the fleet it is parked here."
         f.log(t, "warn", f"{self.id} motor controller not responding. {what}", self.id, at=(self.x, self.y))
+        self.fault_t0 = t
+        self.mem.on_hazard("fault", t, (self.x, self.y), handled="locked the brakes and " + (
+            f"released {tid} to the fleet" if tid else "handed my frontier to the fleet" if had_frontier
+            else "told the fleet I was parked"))
 
     def _reboot(self, t: float) -> None:
         at_dock = math.hypot(self.x - self.dock[0], self.y - self.dock[1]) < 1.6
@@ -1481,6 +1524,7 @@ class Rover:
         self.stall_cooldown = t + 2.0
         self.hist.clear()
         self.fleet.log(t, "info", f"{self.id} rebooted. Back online.", self.id, at=(self.x, self.y))
+        self.mem.note_outcome("fault", f"rebooted after {t - getattr(self, 'fault_t0', t):.0f} s", t, 600.0)
 
     # ================================================================== lifeforms: observe from a safe distance
     def can_observe(self, t: float, tr) -> bool:
@@ -1509,6 +1553,7 @@ class Rover:
                     "seen": {tr.id}, "speeds": [], "next_plan": t, "goal": None, "life": False, "decided": False,
                     "most": 1, "start": (px, py), "far": 0.0}
         tr.observer = self.id
+        self.mem.on_sighting(t)
         self.fleet.log(t, "discovery", f"{self.id} sees something moving {d:.0f} m {compass(px - self.x, py - self.y)} "
                                        f"(LiDAR track {tr.id}, {tr.speed:.1f} m/s, about {tr.size:.1f} m). Stopping to "
                                        f"look.", self.id, at=(px, py))
@@ -1665,6 +1710,8 @@ class Rover:
         if life:
             f.confirm_herd(px, py, n, t)
         f.observed_areas.append((px, py, t))
+        label = tr.label if (tr is not None and tr.label and tr.label != "moving object") else None
+        self.mem.on_observed(t, n, dur, avg, bool(life), label, (px, py))
         if self.state == "observing":
             self.state = "exploring"
         self.goal, self.path = None, []
@@ -1737,6 +1784,7 @@ class Rover:
         if bump is not None:
             bd, bx, by = bump
             f.map.mark_blocked(bx, by, 0.6)
+            self.mem.on_hazard("rock", t, (bx, by), f"a rock under my bumper ({bd:.1f} m ahead)")
             f.log(t, "info", f"{self.id} blocked by a rock (bumper ray hit at {bd:.1f} m). Marking it as an obstacle "
                              f"and rerouting.", self.id, at=(bx, by))
             self._start_recovery(t, (bx, by))
@@ -1754,7 +1802,12 @@ class Rover:
             # nose up on a steady slope with full power and no progress: the slope beat the motors.
             # The tilt (pitch and roll together) is the slope the planner's map measures.
             tilts = sorted(e[7] for e in h)
-            if not f.report_slope_stall(t, self, max(p_med, tilts[len(tilts) // 2]), load):
+            sl = max(p_med, tilts[len(tilts) // 2])
+            lowered = f.report_slope_stall(t, self, sl, load)
+            self.mem.on_hazard("slope", t, here, f"a {sl:.0f} deg slope I could not climb (motors at {load * 100:.0f}%)",
+                               f"backed off and the fleet lowered its slope limit to {f.slope_limit:.0f} deg" if lowered
+                               else "backed off and replanned")
+            if not lowered:
                 f.map.mark_blocked(ax, ay, 0.5)    # steeper than the map said: avoid this exact spot
             self._start_recovery(t, None)
             return
@@ -1822,6 +1875,7 @@ class Rover:
                 tilt = self.tilt
                 self._hw_call(self.sim.reset_rover_upright, self)
                 self.read_pose()
+                self.mem.on_hazard("tipped", t, (self.x, self.y), f"tipping over (IMU tilt {tilt:.0f} deg)")
                 self.fleet.log(t, "warn", f"{self.id} tipped over (IMU tilt {tilt:.0f} deg). Self-righting and "
                                           f"replanning.", self.id, at=(self.x, self.y))
                 self.path = []
@@ -1895,6 +1949,10 @@ class Rover:
                 msg = f"{self.id} rerouting around soft ground reported by {owner}{tail}."
         if why in ("rocks", "long"):
             self.last_rocks_t = t
+            self.mem.note_outcome(("rocks", "spire"), "found no way past, picked another goal" if path is None else (
+                f"rerouted (+{extra:.0f} m)" if extra >= 1.0 else "rerouted"), t)
+        if path is not None:
+            self._count_replan = True
         self.fleet.log(t, "info", msg, self.id, at=(x, y))
 
     def _hold_if_blocked(self) -> None:
@@ -1903,6 +1961,10 @@ class Rover:
             self.hold_for_plan = True
 
     def _set_path(self, t: float, path: list) -> None:
+        if self._count_replan or self.block_info is not None or (
+                self.path and self.plan_limit_version != self.fleet.limit_version):
+            self.mem.replans += 1          # replanned because of something newly perceived or learned
+        self._count_replan = False
         self.path = list(path)
         self.wp = 1 if len(self.path) > 1 else 0
         self.plan_t = t
@@ -2098,6 +2160,7 @@ class Rover:
             "track_id": None if self.obs is None else self.obs["track"],
             "samples": [self.fleet.targets[k].spec.id for k in self.samples],
             "capacity": self.capacity,
+            "stats": self.mem.stats(self),
         }
         if self.sampling is not None:
             sm = self.sampling

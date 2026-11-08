@@ -12,8 +12,9 @@ shows the world filling in. The message format is in `../PROTOCOL.md`.
 
 The brain has two tiers. Fast hand-written rules decide everything, 5 times a second, and keep the
 rovers safe. A small Gemma model running on your own machine gives advice beside them: which goal
-to pick, what an odd sensor reading means (with the camera picture), and what the operator's typed
-messages mean. The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`.
+to pick, what an odd sensor reading means (with the camera picture), what the operator's typed
+messages mean, and short answers to the operator's questions written from each rover's own memory.
+The rules check every piece of advice. See "Two-tier brain" below and `GEMMA.md`.
 
 ## What each module does
 
@@ -30,18 +31,23 @@ messages mean. The rules check every piece of advice. See "Two-tier brain" below
 | `redshift/lifeforms.py` | The grazers: they wander, graze, keep together, avoid bad ground and shy away from rovers. The rovers never read this. |
 | `redshift/hazards.py` | Changes the world on request: rockfall, sand, dust storm, rover fault, spire fall, and (demo) a herd walking into view. Rockfall, sand, spire fall and lifeform can be put at a clicked point. Only the UI sees this list; the rovers must find out for themselves. |
 | `redshift/sim.py` | Runs it all: steps the physics, runs the rovers' decisions 5 times per sim second, and builds the messages for the UI. Also a command line runner that can script hazards. |
-| `redshift/camera.py` | Live pictures from each rover's mast camera (MuJoCo renders), for the UI and for Gemma. |
+| `redshift/camera.py` | Live pictures from each rover's mast camera (MuJoCo renders, up to 1280 x 720), for the UI and for Gemma: sun shadows placed in front of each camera, distance haze from the depth buffer. |
+| `redshift/visuals.py` | The look (visual only): procedural regolith texture, rock grain, solar cells, a hazy sky cube with a low sun, lights, haze colours and materials. In the camera, science targets look like natural features with the dashboard colours as accents (a vent is a low mound with a dark mouth and an orange rim, a mineral an angular outcrop with violet crystal veins, ice a glossy white-blue patch, a trace a thin film with lime specks), spires are faceted violet crystals and grazers have segmented, softly glowing green bodies. These are massless, non-colliding geoms in group 4: LiDAR, the spectrometer, the tracker and machine vision still use the original marker capsules and bodies (the camera's look frames leave the target capsules out). |
+| `redshift/memory.py` | Each rover's mission memory, updated where things happen: where it mapped (compass sector and distance band around the lander), distance, targets found and sampled, hazards met and how it handled them, lifeforms observed, notable events, its goal and why. Gives the `stats` in every tick. |
+| `redshift/answers.py` | Answers to the operator's questions: a fact sheet per rover (and for the fleet), the facts Gemma may use, and rule-based answers for every topic. |
 | `redshift/gemma.py` | Talks to the local Gemma model (Ollama), or a fake model for demos and tests: prompts, answer checks, timeouts, a keyword parser for typed commands. |
-| `redshift/advisor.py` | Tier 2: asks Gemma at the right moments, applies its advice when it is safe, runs the operator chat and the questions to the operator. |
+| `redshift/advisor.py` | Tier 2: asks Gemma at the right moments, applies its advice when it is safe, runs the operator chat (commands and questions) and the questions to the operator. |
 | `redshift/server.py` | The web server (FastAPI): WebSocket `/ws`, `GET /api/health`, `GET /api/truth`, `POST /api/reset`, `POST /api/hazard`, `POST /api/chat`, `POST /api/answer`, and the camera images from `camera.py`. Starts Gemma, then runs the sim in the background at `SIM_SPEED` times real time. |
 | `scripts/climb_test.py` | Drives a rover up ramps of known angle to check how steep it can climb. |
 | `scripts/gemma_bench.py` | Measures Gemma's speed and answers against a real Ollama. |
+| `scripts/camera_bench.py` | Camera render time per frame (320 x 240 and 1280 x 720 by default). |
 | `tests/test_smoke.py` | Runs 400 sim seconds on the default 120 m map with no hazards and checks the results and every message. |
 | `tests/test_hazards.py` | Runs every hazard in turn and checks how the rovers react, plus the v2 message fields and `/api/hazard`. |
 | `tests/test_camera.py` | Camera renders and the camera endpoint. |
 | `tests/test_gemma.py` | `gemma.py` against a stub Ollama server. |
 | `tests/test_brain.py` | Tier 2 with the fake model: goal switches, anomaly checks, questions, every chat command, Gemma offline, v3 messages, speed and budget. |
 | `tests/test_v4.py` | Water (a hole in the map, identified, avoided, the water sensor failsafe), spire fall and replan, motion tracks, observing a lifeform at a safe distance, the first-sighting question, point-and-click hazards and every 400, sampling, tubes and the cache, and the v4 message fields. |
+| `tests/test_v5.py` | Questions: intent (questions vs commands), Gemma's answer checks (a bad number or id falls back to the rules), grounded rule answers for every topic, fleet vs per-rover replies, `reply_to`, `stats`, camera sizes up to 1280 x 720. |
 
 `test_hazards.py` and `test_brain.py` replay scripted scenarios (seed 42, set times, exact sensor
 numbers) written for the old 80 m world, so they run with `MAP_SIZE` 80 and the v4 features (water,
@@ -71,11 +77,13 @@ uvicorn redshift.server:app --host 0.0.0.0 --port 8000
 GEMMA_FAKE=1 uvicorn redshift.server:app --port 8000      # fake Gemma: the whole pipeline without Ollama
 ```
 
-Talk to the rovers (the UI's chat box does the same), and answer their questions:
+Talk to the rovers (the UI's chat box does the same), ask them questions, and answer theirs:
 
 ```bash
 curl -X POST localhost:8000/api/chat -d '{"text": "rover 2, check out the area north of the lander"}'
 curl -X POST localhost:8000/api/chat -d '{"text": "go to 10, -5", "rover": "r1"}'
+curl -X POST localhost:8000/api/chat -d '{"text": "rover 2, what have you found?"}'
+curl -X POST localhost:8000/api/chat -d '{"text": "everyone, report battery"}'
 curl -X POST localhost:8000/api/answer -d '{"id": "q1", "option": "reroute"}'
 ```
 
@@ -148,6 +156,7 @@ python scripts/climb_test.py      # ramp test for the rover tuning
 | `OPERATOR_TIMEOUT_S` | 20 | wall seconds a question waits for the operator before the rover takes the safe default |
 | `OPERATOR_ASK_BELOW` | 0.75 | Gemma confidence below this makes the rover ask the operator |
 | `OPERATOR_ASK_FIRST` | 1 | the first anomaly after start or reset always asks the operator (reliable demo trigger) |
+| `CAMERA_SHADOWS` | 1 | 0 = camera renders without the sun's shadows (about 3 times faster with software OpenGL) |
 
 More Gemma settings (timeouts, tokens, model loading) are in `GEMMA.md`.
 
@@ -161,7 +170,9 @@ and up to 200 points of the latest LiDAR sweep (`scan`).
   Liquid gives no echo at all (the beam is absorbed or glances off), so a lake is a hole in the map.
   Hits on creatures go to the motion tracker instead of the map (see "Lifeforms").
 - **Camera** on the mast (`camera.py`): the rules take a small picture to check a LiDAR hole for blue
-  liquid; Gemma gets the camera picture for anomalies and for anything that moves.
+  liquid; Gemma gets the camera picture for anomalies and for anything that moves. The UI's pictures
+  (up to 1280 x 720) show a low warm sun with shadows, a hazy sky and distance haze (`visuals.py`);
+  the rules' own check frames use plain, even light (cheaper, true colours).
 - **Water sensor**: a wetness probe on the belly. Only matters if a rover ever drives into liquid.
 - **Spectrometer**: LiDAR hits on science targets within 8 m. `spectro` is the nearest one.
 - **IMU**: a MuJoCo `framequat` (attitude, like an AHRS chip) and `gyro` on the chassis, with a
@@ -312,6 +323,16 @@ Where Gemma helps:
    direction (for 3 minutes); sample a target; return home; hold; resume; avoid an area (a circle that
    is off limits for the whole fleet); anything unclear gets a question back. After a command is done
    the rover carries on on its own.
+6. **Questions.** "rover 2, what have you explored?", "any problems?", "everyone, report battery": the
+   message is a question (Gemma's reading, or the keyword rules: a question word, a trailing "?",
+   "tell me", "report", "status"). The rover (or the fleet, when nobody or everybody is asked; each
+   rover for "everyone, report battery") builds a fact sheet from its own memory and Gemma writes a
+   1 to 3 sentence reply from it: "I've mapped about 1,904 m2 (13.2% of the 14,400 m2 map), mostly
+   north-east of the lander, out past 35 m. I've driven 410 m." A number or id in the reply that is not
+   in the fact sheet, no reply within the 3 s budget, or Gemma offline: the rule-based answer is posted
+   instead (topics: status, exploration, finds, samples, battery, hazards, lifeforms, water, location,
+   why; anything else: "I can't answer that: I only know what my own sensors and memory recorded").
+   Replies are `kind: "reply"` with `reply_to` and `source` gemma or rules.
 
 **Hold** shows as state `idle` with goal `null` and a chat note ("r1: holding at (12, -4), say resume
 to continue"). A held rover still watches its battery: if it would not get home otherwise, it leaves
