@@ -238,6 +238,72 @@ add('graphics-low', async (page) => {
   }
 })
 
+// On the planet: no sector labels, the planet legend instead of the map legend, and the
+// live sector card next to the marker.
+add('planet-dom', async (page) => {
+  await toGlobe(page)
+  const tags = await page.locator('.rover-tag').count()
+  const marks = await page.locator('.place-mark').count()
+  if (tags || marks) fail(`sector labels over the planet: ${tags} rover tags, ${marks} place marks`)
+  const legend = (await page.locator('.globe-legend').innerText({ timeout: 10000 })).replace(/\s+/g, ' ')
+  log(`legend: ${legend}`)
+  for (const w of ['Redshift-b', 'Radius 12,742 km', '2.0 g', 'Landing site 4.4° N, 44.9° E', 'not to scale']) if (!legend.includes(w)) fail(`the planet legend lacks "${w}"`)
+  if (await page.locator('.hud-legend:not(.globe-legend)').count()) fail('the map legend is still up')
+  if (await page.locator('.dust-haze').count()) fail('the dust veil is over the planet')
+  await page.waitForSelector('.globe-card[data-settled]', { timeout: 15000 })
+  const card = (await page.locator('.globe-card').innerText()).replace(/\s+/g, ' ')
+  log(`card: ${card}`)
+  for (const w of ['Landing sector', '120 x 120 m, not to scale', 'Explored', 'Gravity', '2.0 g', 'Sim time', 'Fly down to the sector']) if (!card.includes(w)) fail(`the sector card lacks "${w}"`)
+  const rows = await page.locator('.globe-card .gc-rover').count()
+  if (rows < 3) fail(`the card lists ${rows} rovers`)
+  await shot(page, 'planet-card')
+})
+
+// The marker: in view at home, a pointer on hover, and a click flies back down.
+add('marker-click', async (page) => {
+  await toGlobe(page)
+  await page.waitForSelector('.globe-card[data-settled]', { timeout: 15000 })
+  const m = await page.evaluate(() => window.__redshift.globeSiteScreen())
+  log(`marker at ${JSON.stringify(m)}`)
+  if (!m?.visible) return fail('the landing marker is not in view at home')
+  const top = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.tagName, [m.x, m.y])
+  if (top !== 'CANVAS') fail(`something covers the marker (${top})`)
+  await page.mouse.move(m.x, m.y)
+  await page.waitForTimeout(500)
+  const cursor = await page.evaluate(() => document.body.style.cursor)
+  if (cursor !== 'pointer') fail(`hovering the marker shows cursor "${cursor}"`)
+  await page.mouse.click(m.x, m.y)
+  await settled(page, 'plane')
+  await page.waitForSelector('.rover-tag', { timeout: 15000 })
+  if (await page.locator('.globe-legend').count()) fail('the planet legend stayed after flying down')
+  await shot(page, 'back-on-sector')
+})
+
+// The card's own button flies back down too.
+add('card-button', async (page) => {
+  await toGlobe(page)
+  await page.locator('.globe-card[data-settled] .gc-down').click({ timeout: 15000 })
+  await settled(page, 'plane')
+})
+
+// An open sensor panel hides on the planet (the planet legend shows instead) and comes back
+// as it was, with the camera view the user picked.
+add('sensors-kept', async (page) => {
+  await page.keyboard.press('2')
+  const panel = page.locator('section.hud-sensors')
+  await panel.waitFor({ timeout: 15000 })
+  await panel.locator('[aria-label="Camera view"] button', { hasText: 'Chase' }).click({ timeout: 10000 })
+  await page.keyboard.press('g')
+  await settled(page, 'globe')
+  if (await panel.isVisible()) fail('the sensor panel is over the planet')
+  if (!(await page.locator('.globe-legend').isVisible())) fail('no planet legend while a rover is selected')
+  await page.keyboard.press('g')
+  await settled(page, 'plane')
+  await panel.waitFor({ timeout: 15000 })
+  const pressed = (await panel.locator('[aria-label="Camera view"] button[aria-pressed="true"]').innerText()).trim()
+  if (pressed !== 'Chase') fail(`the camera view came back as ${pressed}, not Chase`)
+})
+
 // Run every check in order.
 await api('/api/reset', { seed: 42 })
 await api('/api/_mock/rearm', { armed: false })
