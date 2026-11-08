@@ -571,7 +571,7 @@ Optional `features` keys, sent only when the flag is on:
 - `mesas`: `[{id, kind, x, y, radius, height, level}]`. `kind` is `mesa` or `butte`.
 - `canyon`: `{id, path: [[x, y]...], width, depth, ramps: [{x, y, heading, length}]}` or null.
 - `pits`: `[{id, kind, x, y, radius, depth}]`. `kind` is `sinkhole` or `skylight`.
-- `boulder_fields`: `[{id, x, y, radius, count}]`. The boulders are geoms `bfield_<i>` and are in the truth heights like rocks.
+- `boulder_fields`: `[{id, x, y, radius, count, rocks}]`. The boulders are geoms `bfield_<i>` and are in the truth heights like rocks; `rocks` lists that field's boulders as `[x, y, size]` (size: mean horizontal half-size, m), in geom order.
 
 ### Dunes and ice sheets
 
