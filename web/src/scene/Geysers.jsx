@@ -5,20 +5,23 @@ import { useSim } from '../state/store.js'
 import { useGraphics } from '../state/visualPrefs.js'
 import { groundAt, knownAt } from './ground.js'
 import { reducedMotion } from './sceneConstants.js'
+import { DrapedDisc, useDrape } from './drape.js'
 
 // v7 geysers (PROTOCOL.md, `features.geysers` and `fleet.geyser_zones`). Each vent is a squat sinter
 // mound: a pale ochre base, a white crust at the rim and a dark throat. While a vent erupts a column
-// of soft steam puffs billows up to its `height` with its `radius`, and a dark wet ring spreads on the
+// of soft steam puffs billows up to its `height` with its `radius`, and a soft dark wet patch darkens the
 // ground (it dries more slowly than the steam fades). The steam grows in from the vent and collapses
-// over about a second when `active` flips. All of it is instanced: four draw calls for every vent,
-// plus the dashed keep-out rings the fleet learned. A vent shows once the fleet knows the ground
+// over about a second when `active` flips. Mounds and steam are instanced (two draw calls for every
+// vent); each wet patch is a soft disc draped on the ground, drawn only while it is wet; plus the
+// dashed keep-out rings the fleet learned. A vent shows once the fleet knows the ground
 // there, or with Reality on. Low graphics draws fewer, larger puffs.
 
 const MAX = 32
 const PUFFS_HIGH = 26
 const PUFFS_LOW = 9
-const VENT_R = 1.05       // mound footprint (m), a little wider than the sim's 0.9 m vent geom
-const VENT_H = 0.5        // mound height above the base (m)
+const VENT_R = 1.25       // mound footprint (m), wider than the sim's 0.9 m vent geom
+const VENT_H = 0.7        // mound height above the base (m), so it stands clear of the mapped vent bump
+const WET_R = 2.0         // wet patch radius, in plume radii
 const HIDDEN = new THREE.Matrix4().makeScale(0, 0, 0)
 const _m = new THREE.Matrix4()
 const _p = new THREE.Vector3()
@@ -56,15 +59,53 @@ function moundGeometry() {
   return geo
 }
 
-// The lowest ground under the mound footprint: the fleet's map sees the vent like a rock, so the
-// centre sample can sit on top of it.
+// The ground under the vent from a ring of samples just outside it: the fleet's map sees the vent
+// like a rock, so the centre sample can sit on top of it. The mean keeps the mound level on a slope.
 function baseAt(x, y) {
-  let z = groundAt(x, y)
+  const z0 = groundAt(x, y)
+  let z = 0
   for (let k = 0; k < 6; k++) {
     const a = (k / 6) * Math.PI * 2
-    z = Math.min(z, groundAt(x + 1.4 * Math.cos(a), y + 1.4 * Math.sin(a), z))
+    z += groundAt(x + 1.5 * Math.cos(a), y + 1.5 * Math.sin(a), z0)
   }
-  return z
+  return z / 6
+}
+
+let wetTexture = null
+function wetMap() {
+  if (wetTexture || typeof document === 'undefined') return wetTexture
+  const c = document.createElement('canvas')
+  c.width = c.height = 64
+  const g = c.getContext('2d')
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32)
+  grad.addColorStop(0, 'rgba(255,255,255,1)')
+  grad.addColorStop(0.6, 'rgba(255,255,255,0.8)')
+  grad.addColorStop(1, 'rgba(255,255,255,0)')
+  g.fillStyle = grad
+  g.fillRect(0, 0, 64, 64)
+  wetTexture = new THREE.CanvasTexture(c)
+  return wetTexture
+}
+
+// The dark wet ground round one vent, draped on the terrain; its opacity follows the vent's wetness.
+function WetPatch({ v, fades, reality }) {
+  const disc = useMemo(() => new DrapedDisc(5, 32, { uvMode: 'disc' }), [])
+  const mesh = useRef()
+  const mat = useRef()
+  const R = (Number.isFinite(v.radius) && v.radius > 0 ? v.radius : 1.5) * WET_R
+  useDrape(() => disc.update(v.x, v.y, R, 0.06), [v.x, v.y, R])
+  useFrame(() => {
+    if (!mesh.current || !mat.current) return
+    const f = fades.current.get(v.id)
+    const w = f ? f.wet : 0
+    mesh.current.visible = w > 0.01 && (reality || knownAt(v.x, v.y))
+    mat.current.opacity = 0.5 * smooth(w)
+  })
+  return (
+    <mesh ref={mesh} geometry={disc.geometry} frustumCulled={false} renderOrder={1} visible={false}>
+      <meshBasicMaterial ref={mat} color="#1a100c" map={wetMap()} transparent opacity={0} depthWrite={false} polygonOffset polygonOffsetFactor={-2} polygonOffsetUnits={-2} />
+    </mesh>
+  )
 }
 
 function Ring({ x, y, r }) {
@@ -90,21 +131,19 @@ export function Geysers({ reality }) {
   const zones = useSim((s) => s.fleet?.geyser_zones)
   const graphics = useGraphics()
   const mound = useRef()
-  const wet = useRef()
   const steam = useRef()
   const fades = useRef(new Map())
   const list = Array.isArray(vents) ? vents.filter((v) => v && Number.isFinite(v.x) && Number.isFinite(v.y)).slice(0, MAX) : []
   const geos = useMemo(() => ({
     mound: moundGeometry(),
-    wet: new THREE.CircleGeometry(1, 28).rotateX(-Math.PI / 2),
     puff: new THREE.IcosahedronGeometry(1, 1),
   }), [])
   const puffs = graphics === 'low' ? PUFFS_LOW : PUFFS_HIGH
 
   useFrame(({ clock }, dt) => {
-    if (!mound.current || !wet.current || !steam.current) return
+    if (!mound.current || !steam.current) return
     const t = reducedMotion ? 0 : clock.elapsedTime
-    const step = Math.min(dt, 0.1)
+    const step = Math.min(dt, 0.25)
     const F = fades.current
     let np = 0
     for (let k = 0; k < MAX; k++) {
@@ -112,7 +151,6 @@ export function Geysers({ reality }) {
       const show = v && (reality || knownAt(v.x, v.y))
       if (!show) {
         mound.current.setMatrixAt(k, HIDDEN)
-        wet.current.setMatrixAt(k, HIDDEN)
         continue
       }
       // Steam fades over about a second; the wet ground dries over about six.
@@ -126,14 +164,9 @@ export function Geysers({ reality }) {
         f.wet = Math.max(0, f.wet - step / 6)
       }
       const gz = baseAt(v.x, v.y)
-      _m.compose(_p.set(v.x, gz - 0.08, -v.y), _q.identity(), _s.set(VENT_R, VENT_H, VENT_R))
+      _m.compose(_p.set(v.x, gz - 0.12, -v.y), _q.identity(), _s.set(VENT_R, VENT_H, VENT_R))
       mound.current.setMatrixAt(k, _m)
       const R = Number.isFinite(v.radius) && v.radius > 0 ? v.radius : 1.5
-      if (f.wet > 0.01) {
-        const wr = R * (1.0 + 0.9 * smooth(f.wet))
-        _m.compose(_p.set(v.x, gz + 0.06, -v.y), _q.identity(), _s.set(wr, 1, wr))
-        wet.current.setMatrixAt(k, _m)
-      } else wet.current.setMatrixAt(k, HIDDEN)
       if (f.steam <= 0.001) continue
       // Puffs rise through the column and loop; each is hidden above the risen part while the
       // eruption builds, swells as it climbs and thins out near the top.
@@ -162,7 +195,6 @@ export function Geysers({ reality }) {
     }
     for (let k = np; k < MAX * PUFFS_HIGH; k++) steam.current.setMatrixAt(k, HIDDEN)
     mound.current.instanceMatrix.needsUpdate = true
-    wet.current.instanceMatrix.needsUpdate = true
     steam.current.instanceMatrix.needsUpdate = true
     if (steam.current.instanceColor) steam.current.instanceColor.needsUpdate = true
   })
@@ -173,9 +205,7 @@ export function Geysers({ reality }) {
       <instancedMesh ref={mound} args={[geos.mound, undefined, MAX]} frustumCulled={false}>
         <meshStandardMaterial vertexColors roughness={0.95} />
       </instancedMesh>
-      <instancedMesh ref={wet} args={[geos.wet, undefined, MAX]} frustumCulled={false} renderOrder={1}>
-        <meshBasicMaterial color="#1c1210" transparent opacity={0.42} depthWrite={false} polygonOffset polygonOffsetFactor={-2} polygonOffsetUnits={-2} />
-      </instancedMesh>
+      {list.map((v) => <WetPatch key={v.id} v={v} fades={fades} reality={reality} />)}
       <instancedMesh ref={steam} args={[geos.puff, undefined, MAX * PUFFS_HIGH]} frustumCulled={false} renderOrder={2}>
         <meshLambertMaterial color="#ffffff" emissive="#c9c4be" transparent opacity={0.26} depthWrite={false} />
       </instancedMesh>
